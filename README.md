@@ -15,7 +15,10 @@ zk-activity is a bot that brings EVE Online killmails from zkillboard.com into y
 
 The bot works by subscribing to a data feed from zkillboard.com and processing the incoming data according to the filters you set up. This allows you to customize the bot to monitor specific regions of space for activity involving certain classes of ships, or to track a particular group of pilots.
 
-<img src="https://cdn.discordapp.com/attachments/972047941390987264/1210723339044393001/image.png?ex=65eb98fa&is=65d923fa&hm=e1aa3edc6723671aeeda0103e1fb4df9a11c62e4163675c9948f92989678dc9c&">
+<div style="display: flex; justify-content: space-between;">
+    <img src="https://i.imgur.com/Ozw3Cze.png" alt="Alt text for Image 2" width="500"/>
+    <img src="https://i.imgur.com/UxX2Sby.png" alt="Alt text for Image 1" width="500"/>
+</div>
 
 To use the bot, you invite it to your Discord server using a provided Discord invite URL link. Once the bot is on your server, you can set up feeds in a Discord channel. The bot will then start delivering killmails from EVE Online to your Discord channel based on the filters you've set up.
 
