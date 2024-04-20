@@ -39,6 +39,7 @@ export enum LimitType {
     MIN_NUM_INVOLVED = 'minNumInvolved',
     TIME_RANGE_START = 'startingTime',
     TIME_RANGE_END = 'endingTime',
+    NPC_ONLY = 'npcOnly',
 }
 
 export interface SubscriptionGuild {
@@ -51,7 +52,7 @@ export interface SubscriptionChannel {
 
 export interface Subscription {
     subType: SubscriptionType
-    id?: number
+    id?: string,
     minValue: number,
     // Mapping of LimitType to the value(s) to compare against
     limitTypes: Map<LimitType, string>,
@@ -323,6 +324,13 @@ export class ZKillSubscriber {
         if (subscription.limitTypes.size === 0) {
             await this.sendMessageToDiscord(guildId, channelId, subscription, data);
             return;
+        }
+        if (hasLimitType(subscription, LimitType.NPC_ONLY) && !data.zkb.npc) {
+            const val = getLimitType(subscription, LimitType.NPC_ONLY);
+            if (val != undefined && val === 'true') {
+                console.log('limiting kill due to NPC only filter');
+                return;
+            }
         }
         if (hasLimitType(subscription, LimitType.SHIP_INCLUSION_TYPE_ID)) {
             let nameFragment = '';
@@ -1123,7 +1131,7 @@ export class ZKillSubscriber {
         inclusionLimitAlsoComparesAttackerWeapons: boolean,
         exclusionLimitAlsoComparesAttacker: boolean,
         exclusionLimitAlsoComparesAttackerWeapons: boolean,
-        id?: number,
+        id?: string,
         minValue = 0,
     ) {
         if (!this.subscriptions.has(guildId)) {
@@ -1150,7 +1158,7 @@ export class ZKillSubscriber {
         fs.writeFileSync('./config/' + guildId + '.json', JSON.stringify(this.generateObject(guild)), 'utf8');
     }
 
-    public async unsubscribe(subType: SubscriptionType, guildId: string, channel: string, id?: number) {
+    public async unsubscribe(subType: SubscriptionType, guildId: string, channel: string, id?: string) {
         if (!this.subscriptions.has(guildId)) {
             return;
         }
