@@ -1,13 +1,12 @@
 # zk-activity
 
 [![TypeScript](https://badges.frapsoft.com/typescript/code/typescript.svg?v=101)](https://github.com/ellerbrock/typescript-badges/)
-<img alt="Github License" src="https://img.shields.io/github/license/ocn/zk-activity" />
+<img alt="GitHub Commit Activity (Month)" src="https://img.shields.io/github/commit-activity/m/ocn/zk-activity" />
+<img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ocn/zk-activity" />
 <img alt="GitHub Issues" src="https://img.shields.io/github/issues/ocn/zk-activity" />
 <img alt="GitHub Pull Requests" src="https://img.shields.io/github/issues-pr/ocn/zk-activity" />
-<img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ocn/zk-activity" />
 <img alt="GitHub Contributors" src="https://img.shields.io/github/contributors/ocn/zk-activity" />
-<img alt="GitHub Commit Activity (Month)" src="https://img.shields.io/github/commit-activity/m/ocn/zk-activity" />
-[![](https://img.shields.io/docker/pulls/ocn/zk-activity.svg)](https://hub.docker.com/r/ocn/zk-activity)
+<img alt="Github License" src="https://img.shields.io/github/license/ocn/zk-activity" />
 
 
 
