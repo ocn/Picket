@@ -362,17 +362,41 @@ export class ZKillSubscriber {
             return;
         }
         if (hasLimitType(subscription, LimitType.CHARACTER)) {
-            const characterIds = <string>getLimitType(subscription, LimitType.CHARACTER);
-            for (const characterId of characterIds.split(',')) {
-                if (data.victim.character_id === Number(characterId)) {
-                    requireSend = true;
-                    color = 'RED';
-                }
-                if (!requireSend) {
-                    for (const attacker of data.attackers) {
-                        if (attacker.character_id === Number(characterId)) {
+            const characterIdsStr = <string>getLimitType(subscription, LimitType.CHARACTER);
+
+            if (hasLimitType(subscription, LimitType.ALLIANCE)) {
+                // if the victim matches the character or alliance, not both, then one of the attackers must match the opposite (alliance or character), otherwise do not send
+                const characterIds = characterIdsStr.split(',') || [];
+                const allianceIds = getLimitType(subscription, LimitType.ALLIANCE)?.split(',') || [];
+
+                const victimCharId = data.victim.character_id;
+                if (victimCharId) {
+                    const victimMatchesCharacter = characterIds.includes(victimCharId.toString());
+                    const victimMatchesAlliance = allianceIds.includes(data.victim.alliance_id?.toString());
+
+                    if (victimMatchesCharacter !== victimMatchesAlliance) {
+                        // Victim matches either character or alliance, but not both
+                        const attackerMatchesCharacter = data.attackers.some(attacker => attacker.character_id && characterIds.includes(attacker.character_id?.toString()));
+                        const attackerMatchesAlliance = data.attackers.some(attacker => attacker.alliance_id && allianceIds.includes(attacker.alliance_id?.toString()));
+
+                        if (victimMatchesCharacter && attackerMatchesAlliance || victimMatchesAlliance && attackerMatchesCharacter) {
                             requireSend = true;
-                            break;
+                        }
+                    }
+                }
+            } else {
+                // just match based on matching character_id
+                for (const characterId of characterIdsStr.split(',')) {
+                    if (data.victim.character_id === Number(characterId)) {
+                        requireSend = true;
+                        color = 'RED';
+                    }
+                    if (!requireSend) {
+                        for (const attacker of data.attackers) {
+                            if (attacker.character_id === Number(characterId)) {
+                                requireSend = true;
+                                break;
+                            }
                         }
                     }
                 }
