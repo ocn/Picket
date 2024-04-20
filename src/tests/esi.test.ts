@@ -1,3 +1,6 @@
+import pack from 'bin-pack';
+import fs from 'fs';
+import * as util from 'util';
 import {EsiClient} from '../lib/esiClient';
 
 describe('ESI Client', () => {
@@ -17,4 +20,45 @@ describe('ESI Client', () => {
             console.log('done');
         })();
     });
+
+    it('should login or load cached sso token', async () => {
+        const client = new EsiClient();
+        const token = await client.eveSsoLogin();
+        console.log(token);
+    }, 100000);
+
+    it('should generate SW courier trip plans', async () => {
+        const client = new EsiClient();
+        const token = await client.eveSsoRefresh();
+
+        const tripName = 'Jita-Turnur';
+        // const tripName = 'Turnur-Jita';
+
+        let maxVolume;
+        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+        // @ts-ignore
+        if (tripName === 'Turnur-Jita') {
+            maxVolume = 201980;
+        } else {
+            maxVolume = 340763;
+        }
+
+        const trips = await client.processContracts(<string>token.access_token, maxVolume);
+        // Filter the trips to only include the trip with the specified name
+        const filteredTrips = trips.trips[tripName];
+
+        console.log(util.inspect(filteredTrips, false, 5, true /* enable colors */));
+
+        filteredTrips.forEach((trip, i) => {
+            const flattenedTrip = trip.contractsForTrip.map(contract => ({
+                volume: contract.volume,
+                reward: contract.reward,
+                ratio: contract.ratio,
+                trip: i + 1,
+                totalVolume: trip.totalVolume,
+                totalReward: trip.totalReward,
+            }));
+            console.table(flattenedTrip);
+        });
+    }, 100000);
 });
