@@ -28,6 +28,7 @@ export class SubscribeCommand extends AbstractCommand {
     protected EXCLUSION_LIMIT_COMPARES_ATTACKERS = 'ex-limit-compares-attackers';
     protected EXCLUSION_LIMIT_COMPARES_ATTACKER_WEAPONS = 'ex-limit-compares-attacker-weps';
     protected REQUIRED_NAME_FRAGMENT = 'required-name-fragment';
+    protected NPC_ONLY = 'npc-only';
 
     executeCommand(interaction: CommandInteraction): void {
         const sub = ZKillSubscriber.getInstance();
@@ -56,6 +57,7 @@ export class SubscribeCommand extends AbstractCommand {
         const timeRangeStart = interaction.options.getString(this.LIMIT_TIME_RANGE_START);
         const timeRangeEnd = interaction.options.getString(this.LIMIT_TIME_RANGE_END);
         const requiredNameFragment = interaction.options.getString(this.REQUIRED_NAME_FRAGMENT);
+        let npcOnly = interaction.options.getBoolean(this.NPC_ONLY);
         let inclusionLimitComparesAttackers = interaction.options.getBoolean(this.INCLUSION_LIMIT_COMPARES_ATTACKERS);
         let inclusionLimitComparesAttackerWeapons = interaction.options.getBoolean(this.INCLUSION_LIMIT_COMPARES_ATTACKER_WEAPONS);
         let exclusionLimitComparesAttackers = interaction.options.getBoolean(this.EXCLUSION_LIMIT_COMPARES_ATTACKERS);
@@ -72,8 +74,15 @@ export class SubscribeCommand extends AbstractCommand {
         if (exclusionLimitComparesAttackerWeapons == null) {
             exclusionLimitComparesAttackerWeapons = true;
         }
+        if (npcOnly == null) {
+            npcOnly = false;
+        }
         let reply = 'We subscribed to zkillboard channel: ' + interaction.options.getSubcommand();
         const limitTypes = new Map<LimitType, string>();
+        if (npcOnly) {
+            limitTypes.set(LimitType.NPC_ONLY, String(npcOnly));
+            reply += '\nNPC Only: + ' + npcOnly;
+        }
         if (limitAlliance) {
             limitTypes.set(LimitType.ALLIANCE, limitAlliance);
             reply += '\nAlliance filter: + ' + limitAlliance;
@@ -147,7 +156,7 @@ export class SubscribeCommand extends AbstractCommand {
             inclusionLimitComparesAttackerWeapons,
             exclusionLimitComparesAttackers,
             exclusionLimitComparesAttackerWeapons,
-            id ? id : undefined,
+            id ? String(id) : undefined,
             minValue ? minValue : 0,
         );
 
@@ -254,6 +263,11 @@ export class SubscribeCommand extends AbstractCommand {
             .addStringOption(option =>
                 option.setName(this.REQUIRED_NAME_FRAGMENT)
                     .setDescription('Require a name fragment in the name of the matched type IDs')
+                    .setRequired(false)
+            )
+            .addBooleanOption(option =>
+                option.setName(this.NPC_ONLY)
+                    .setDescription('Enable if only NPC kills should be considered')
                     .setRequired(false)
             )
             .addBooleanOption(option =>
