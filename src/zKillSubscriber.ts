@@ -1192,11 +1192,15 @@ export class ZKillSubscriber {
         }
         const guildChannel = guild.channels.get(channel);
         const ident = `${subType}${id ? id : ''}`;
+        const obj = util.inspect(guildChannel.subscriptions, {depth: 5});
+        console.log('content: ' + obj);
         if (!guildChannel?.subscriptions.has(ident)) {
             return;
         }
-        guildChannel.subscriptions.delete(ident);
-        fs.writeFileSync('./config/' + guildId + '.json', JSON.stringify(this.generateObject(guild)), 'utf8');
+        await this.asyncLock.acquire('sendKill', async (done) => {
+            guildChannel.subscriptions.delete(ident);
+            fs.writeFileSync('./config/' + guildId + '.json', JSON.stringify(this.generateObject(guild)), 'utf8');
+        });
     }
 
     public async unsubscribeGuild(guildId: string) {

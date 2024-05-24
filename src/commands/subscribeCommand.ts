@@ -30,12 +30,12 @@ export class SubscribeCommand extends AbstractCommand {
     protected REQUIRED_NAME_FRAGMENT = 'required-name-fragment';
     protected NPC_ONLY = 'npc-only';
 
-    executeCommand(interaction: CommandInteraction): void {
+    async executeCommand(interaction: CommandInteraction): Promise<void> {
         const sub = ZKillSubscriber.getInstance();
         if (!interaction.inGuild()) {
             // eslint-disable-next-line @typescript-eslint/ban-ts-comment
             // @ts-ignore
-            interaction.reply('Subscription is not possible in PM!');
+            await interaction.reply('Subscription is not possible in PM!');
             return;
         }
         const subCommand = interaction.options.getSubcommand(true) as SubscriptionType;
@@ -166,7 +166,7 @@ export class SubscribeCommand extends AbstractCommand {
         if (minValue) {
             reply += ' Min Value: ' + minValue.toLocaleString('en');
         }
-        interaction.reply({content: reply, ephemeral: true});
+        await interaction.reply({content: reply, ephemeral: true});
     }
 
     getCommand(): SlashCommandBuilder {
