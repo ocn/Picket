@@ -1,7 +1,7 @@
 import {SlashCommandBuilder, SlashCommandSubcommandBuilder} from '@discordjs/builders';
 import {CommandInteraction} from 'discord.js';
 import {AbstractCommand} from './abstractCommand';
-import {LimitType, SubscriptionType, ZKillSubscriber} from '../zKillSubscriber';
+import {LimitType, SubscriptionType, SubscriptionFlags, ZKillSubscriber} from '../zKillSubscriber';
 
 export class SubscribeCommand extends AbstractCommand {
     protected name = 'zkill-subscribe';
@@ -29,13 +29,14 @@ export class SubscribeCommand extends AbstractCommand {
     protected EXCLUSION_LIMIT_COMPARES_ATTACKER_WEAPONS = 'ex-limit-compares-attacker-weps';
     protected REQUIRED_NAME_FRAGMENT = 'required-name-fragment';
     protected NPC_ONLY = 'npc-only';
+    protected LY_RANGE_TO_SYSTEM_WITH_NAME = 'ly-to-sys-by-name';
 
-    async executeCommand(interaction: CommandInteraction): Promise<void> {
+    executeCommand(interaction: CommandInteraction): void {
         const sub = ZKillSubscriber.getInstance();
         if (!interaction.inGuild()) {
             // eslint-disable-next-line @typescript-eslint/ban-ts-comment
             // @ts-ignore
-            await interaction.reply('Subscription is not possible in PM!');
+            interaction.reply('Subscription is not possible in PM!');
             return;
         }
         const subCommand = interaction.options.getSubcommand(true) as SubscriptionType;
@@ -57,26 +58,14 @@ export class SubscribeCommand extends AbstractCommand {
         const timeRangeStart = interaction.options.getString(this.LIMIT_TIME_RANGE_START);
         const timeRangeEnd = interaction.options.getString(this.LIMIT_TIME_RANGE_END);
         const requiredNameFragment = interaction.options.getString(this.REQUIRED_NAME_FRAGMENT);
-        let npcOnly = interaction.options.getBoolean(this.NPC_ONLY);
-        let inclusionLimitComparesAttackers = interaction.options.getBoolean(this.INCLUSION_LIMIT_COMPARES_ATTACKERS);
-        let inclusionLimitComparesAttackerWeapons = interaction.options.getBoolean(this.INCLUSION_LIMIT_COMPARES_ATTACKER_WEAPONS);
-        let exclusionLimitComparesAttackers = interaction.options.getBoolean(this.EXCLUSION_LIMIT_COMPARES_ATTACKERS);
-        let exclusionLimitComparesAttackerWeapons = interaction.options.getBoolean(this.EXCLUSION_LIMIT_COMPARES_ATTACKER_WEAPONS);
-        if (inclusionLimitComparesAttackers == null) {
-            inclusionLimitComparesAttackers = true;
-        }
-        if (inclusionLimitComparesAttackerWeapons == null) {
-            inclusionLimitComparesAttackerWeapons = true;
-        }
-        if (exclusionLimitComparesAttackers == null) {
-            exclusionLimitComparesAttackers = true;
-        }
-        if (exclusionLimitComparesAttackerWeapons == null) {
-            exclusionLimitComparesAttackerWeapons = true;
-        }
-        if (npcOnly == null) {
-            npcOnly = false;
-        }
+        // set to false if null
+        const npcOnly = interaction.options.getBoolean(this.NPC_ONLY) ?? false;
+        const inclusionLimitComparesAttackers = interaction.options.getBoolean(this.INCLUSION_LIMIT_COMPARES_ATTACKERS) ?? true;
+        const inclusionLimitComparesAttackerWeapons = interaction.options.getBoolean(this.INCLUSION_LIMIT_COMPARES_ATTACKER_WEAPONS) ?? true;
+        const exclusionLimitComparesAttackers = interaction.options.getBoolean(this.EXCLUSION_LIMIT_COMPARES_ATTACKERS) ?? true;
+        const exclusionLimitComparesAttackerWeapons = interaction.options.getBoolean(this.EXCLUSION_LIMIT_COMPARES_ATTACKER_WEAPONS) ?? true;
+        const LyRangeToSystemWithName = interaction.options.getString(this.LY_RANGE_TO_SYSTEM_WITH_NAME);
+
         let reply = 'We subscribed to zkillboard channel: ' + interaction.options.getSubcommand();
         const limitTypes = new Map<LimitType, string>();
         if (npcOnly) {
@@ -147,15 +136,25 @@ export class SubscribeCommand extends AbstractCommand {
             limitTypes.set(LimitType.NAME_FRAGMENT, requiredNameFragment);
             reply += '\nRequired name fragment: + ' + requiredNameFragment;
         }
+        if (LyRangeToSystemWithName) {
+            limitTypes.set(LimitType.LY_RANGE_TO_SYSTEM_WITH_NAME, LyRangeToSystemWithName);
+            reply += '\nLY Range to system with name: + ' + LyRangeToSystemWithName;
+        }
+
+        // use SubscriptionFlags type
+        const flags: SubscriptionFlags = {
+            inclusionLimitAlsoComparesAttacker: inclusionLimitComparesAttackers,
+            inclusionLimitAlsoComparesAttackerWeapons: inclusionLimitComparesAttackerWeapons,
+            exclusionLimitAlsoComparesAttacker: exclusionLimitComparesAttackers,
+            exclusionLimitAlsoComparesAttackerWeapons: exclusionLimitComparesAttackerWeapons,
+        };
+
         sub.subscribe(
             subCommand,
             interaction.guildId,
             interaction.channelId,
             limitTypes,
-            inclusionLimitComparesAttackers,
-            inclusionLimitComparesAttackerWeapons,
-            exclusionLimitComparesAttackers,
-            exclusionLimitComparesAttackerWeapons,
+            flags,
             id ? String(id) : undefined,
             minValue ? minValue : 0,
         );
@@ -166,7 +165,7 @@ export class SubscribeCommand extends AbstractCommand {
         if (minValue) {
             reply += ' Min Value: ' + minValue.toLocaleString('en');
         }
-        await interaction.reply({content: reply, ephemeral: true});
+        interaction.reply({content: reply, ephemeral: true});
     }
 
     getCommand(): SlashCommandBuilder {

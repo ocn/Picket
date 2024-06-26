@@ -1,5 +1,12 @@
 import {Client, Intents} from 'discord.js';
-import {LimitType, Subscription, SubscriptionType, ZkData, ZKillSubscriber} from '../zKillSubscriber';
+import {
+    LimitType,
+    Subscription,
+    SubscriptionFlags,
+    SubscriptionType,
+    ZkData,
+    ZKillSubscriber
+} from '../zKillSubscriber';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -20,11 +27,17 @@ describe('ZK Subscriber', () => {
             .withSystems('../config/')
             .withShips('../config/')
             .withNames('../config/');
+        const flags: SubscriptionFlags = {
+            inclusionLimitAlsoComparesAttacker: true,
+            inclusionLimitAlsoComparesAttackerWeapons: true,
+            exclusionLimitAlsoComparesAttacker: true,
+            exclusionLimitAlsoComparesAttackerWeapons: true,
+        };
         const subscription = {
-            'exclusionLimitAlsoComparesAttacker': true,
-            'exclusionLimitAlsoComparesAttackerWeapons': true,
             'inclusionLimitAlsoComparesAttacker': true,
             'inclusionLimitAlsoComparesAttackerWeapons': true,
+            'exclusionLimitAlsoComparesAttacker': true,
+            'exclusionLimitAlsoComparesAttackerWeapons': true,
             'limitTypes': new Map([
                 [LimitType.SECURITY_MIN_INCLUSIVE, '0.0'],
                 [LimitType.SECURITY_MAX_EXCLUSIVE, '0.5'],
@@ -32,8 +45,9 @@ describe('ZK Subscriber', () => {
             'minValue': 0,
             'subType': SubscriptionType.PUBLIC,
         };
+
         client.once('ready', async () => {
-            sub.subscribe(SubscriptionType.PUBLIC, '888224317991706685', '1115807643748012072', new Map(), true, true, true, true, String(1));
+            sub.subscribe(SubscriptionType.PUBLIC, '888224317991706685', '1115807643748012072', new Map(), flags, String(1));
 
             let zk_data = readTestData('115769073_ostingele.json');
             await sub.sendMessageToDiscord('888224317991706685', '1115807643748012072', subscription, zk_data, {
@@ -156,10 +170,10 @@ describe('ZK Subscriber', () => {
         ]);
 
         const highsecSub: Subscription = {
-            exclusionLimitAlsoComparesAttacker: true,
-            exclusionLimitAlsoComparesAttackerWeapons: true,
-            inclusionLimitAlsoComparesAttacker: true,
-            inclusionLimitAlsoComparesAttackerWeapons: true,
+            'inclusionLimitAlsoComparesAttacker': true,
+            'inclusionLimitAlsoComparesAttackerWeapons': true,
+            'exclusionLimitAlsoComparesAttacker': true,
+            'exclusionLimitAlsoComparesAttackerWeapons': true,
             limitTypes: highsecOnlyLimit,
             minValue: 0,
             subType: SubscriptionType.PUBLIC
@@ -172,10 +186,10 @@ describe('ZK Subscriber', () => {
         }
 
         const lowsecSub: Subscription = {
-            exclusionLimitAlsoComparesAttacker: true,
-            exclusionLimitAlsoComparesAttackerWeapons: true,
-            inclusionLimitAlsoComparesAttacker: true,
-            inclusionLimitAlsoComparesAttackerWeapons: true,
+            'inclusionLimitAlsoComparesAttacker': true,
+            'inclusionLimitAlsoComparesAttackerWeapons': true,
+            'exclusionLimitAlsoComparesAttacker': true,
+            'exclusionLimitAlsoComparesAttackerWeapons': true,
             limitTypes: lowsecOnlyLimit,
             minValue: 0,
             subType: SubscriptionType.PUBLIC
@@ -189,10 +203,10 @@ describe('ZK Subscriber', () => {
         }
 
         const nullsecSub: Subscription = {
-            exclusionLimitAlsoComparesAttacker: true,
-            exclusionLimitAlsoComparesAttackerWeapons: true,
-            inclusionLimitAlsoComparesAttacker: true,
-            inclusionLimitAlsoComparesAttackerWeapons: true,
+            'inclusionLimitAlsoComparesAttacker': true,
+            'inclusionLimitAlsoComparesAttackerWeapons': true,
+            'exclusionLimitAlsoComparesAttacker': true,
+            'exclusionLimitAlsoComparesAttackerWeapons': true,
             limitTypes: nullsecOnlyLimit,
             minValue: 0,
             subType: SubscriptionType.PUBLIC
@@ -296,10 +310,10 @@ describe('ZK Subscriber', () => {
         ]);
 
         const highsecSub: Subscription = {
-            exclusionLimitAlsoComparesAttacker: true,
-            exclusionLimitAlsoComparesAttackerWeapons: true,
-            inclusionLimitAlsoComparesAttacker: true,
-            inclusionLimitAlsoComparesAttackerWeapons: true,
+            'inclusionLimitAlsoComparesAttacker': true,
+            'inclusionLimitAlsoComparesAttackerWeapons': true,
+            'exclusionLimitAlsoComparesAttacker': true,
+            'exclusionLimitAlsoComparesAttackerWeapons': true,
             limitTypes: highsecOnlyLimit,
             minValue: 0,
             subType: SubscriptionType.PUBLIC
@@ -312,10 +326,10 @@ describe('ZK Subscriber', () => {
         }
 
         const lowsecSub: Subscription = {
-            exclusionLimitAlsoComparesAttacker: true,
-            exclusionLimitAlsoComparesAttackerWeapons: true,
-            inclusionLimitAlsoComparesAttacker: true,
-            inclusionLimitAlsoComparesAttackerWeapons: true,
+            'inclusionLimitAlsoComparesAttacker': true,
+            'inclusionLimitAlsoComparesAttackerWeapons': true,
+            'exclusionLimitAlsoComparesAttacker': true,
+            'exclusionLimitAlsoComparesAttackerWeapons': true,
             limitTypes: lowsecOnlyLimit,
             minValue: 0,
             subType: SubscriptionType.PUBLIC
@@ -329,10 +343,10 @@ describe('ZK Subscriber', () => {
         }
 
         const nullsecSub: Subscription = {
-            exclusionLimitAlsoComparesAttacker: true,
-            exclusionLimitAlsoComparesAttackerWeapons: true,
-            inclusionLimitAlsoComparesAttacker: true,
-            inclusionLimitAlsoComparesAttackerWeapons: true,
+            'inclusionLimitAlsoComparesAttacker': true,
+            'inclusionLimitAlsoComparesAttackerWeapons': true,
+            'exclusionLimitAlsoComparesAttacker': true,
+            'exclusionLimitAlsoComparesAttackerWeapons': true,
             limitTypes: nullsecOnlyLimit,
             minValue: 0,
             subType: SubscriptionType.PUBLIC
