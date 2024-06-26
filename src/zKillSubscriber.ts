@@ -40,6 +40,7 @@ export enum LimitType {
     TIME_RANGE_START = 'startingTime',
     TIME_RANGE_END = 'endingTime',
     NPC_ONLY = 'npcOnly',
+    LY_RANGE_TO_SYSTEM_WITH_NAME = 'lyRangeToSystemWithName',
 }
 
 export interface SubscriptionGuild {
@@ -731,13 +732,30 @@ export class ZKillSubscriber {
         const systemRegion = await this.getSystemData(params.data.solar_system_id);
         let victimDetails = '';
         let attackerDetails = '';
-        let killmailDetails = '';
+        let locationDetails = '';
         let victimShipName = '';
+
+        const closestCelestial = await this.getClosestCelestial(
+            systemRegion.id,
+            params.data.victim.position.x,
+            params.data.victim.position.y,
+            params.data.victim.position.z
+        );
+        const distance = (closestCelestial.distance / 1000);
+        let distanceInUnits;
+        if (distance > 1500000) {
+            distanceInUnits = (distance / 150000000).toFixed(2) + ' au';
+        } else {
+            distanceInUnits = Math.round(distance) + ' km';
+        }
+        const closestCelestialName = closestCelestial.itemName;
+        locationDetails += `on [${closestCelestialName}](${this.strLocation(closestCelestial.itemId)}) ${distanceInUnits} away\n`;
+        locationDetails += `in [${systemRegion.systemName}](${this.strSystemDotlan(systemRegion.id)}) ([${systemRegion.regionName}](${this.strRegionDotlan(systemRegion.regionId)}))`;
 
         if (params.data.victim.ship_type_id != null) {
             try {
                 victimShipName = await this.getNameForEntityId(params.data.victim.ship_type_id);
-                victimDetails += `Ship: [${victimShipName}](${params.data.zkb.url})\n`;
+                // victimDetails += `Ship: [${victimShipName.substring(0, 18)}](${params.data.zkb.url})\n`;
             } catch (e) {
                 console.log(e);
             }
@@ -745,7 +763,7 @@ export class ZKillSubscriber {
         if (params.data.victim.alliance_id != null) {
             try {
                 const victimAllianceName = await this.getNameForAlliance(params.data.victim.alliance_id);
-                victimDetails += `Alliance: [${victimAllianceName}](${this.strAllianceZk(params.data.victim.alliance_id)})\n`;
+                victimDetails += `Alliance: [${victimAllianceName.substring(0, 18)}](${this.strAllianceZk(params.data.victim.alliance_id)})\n`;
             } catch (e) {
                 console.log(e);
             }
@@ -753,7 +771,7 @@ export class ZKillSubscriber {
         if (params.data.victim.corporation_id != null) {
             try {
                 const victimCorporationName = await this.getNameForCorporation(params.data.victim.corporation_id);
-                victimDetails += `Corp: [${victimCorporationName}](${this.strCorpZk(params.data.victim.corporation_id)})\n`;
+                victimDetails += `Corp: [${victimCorporationName.substring(0, 18)}](${this.strCorpZk(params.data.victim.corporation_id)})\n`;
             } catch (e) {
                 console.log(e);
             }
@@ -761,7 +779,7 @@ export class ZKillSubscriber {
         if (params.data.victim.character_id != null) {
             try {
                 const victimCharacterName = await this.getNameForCharacter(params.data.victim.character_id);
-                victimDetails += `Pilot: [${victimCharacterName}](${this.strPilotZk(params.data.victim.character_id)})\n`;
+                victimDetails += `Pilot: [${victimCharacterName.substring(0, 18)}](${this.strPilotZk(params.data.victim.character_id)})\n`;
             } catch (e) {
                 console.log(e);
             }
@@ -781,18 +799,18 @@ export class ZKillSubscriber {
             console.log('No final blow attacker found, using first attacker as last hit attacker');
             lastHitAttacker = params.data.attackers[0];
         }
-        if (lastHitAttacker.ship_type_id != null) {
-            try {
-                const attackerShipName = await this.getNameForEntityId(lastHitAttacker.ship_type_id);
-                attackerDetails += `Ship: [${attackerShipName}](${this.strShipZk(lastHitAttacker.ship_type_id)})\n`;
-            } catch (e) {
-                console.log(e);
-            }
-        }
+        // if (lastHitAttacker.ship_type_id != null) {
+        //     try {
+        //         const attackerShipName = await this.getNameForEntityId(lastHitAttacker.ship_type_id);
+        //         attackerDetails += `Ship: [${attackerShipName}](${this.strShipZk(lastHitAttacker.ship_type_id)})\n`;
+        //     } catch (e) {
+        //         console.log(e);
+        //     }
+        // }
         if (lastHitAttacker.alliance_id != null) {
             try {
                 const attackerAllianceName = await this.getNameForAlliance(lastHitAttacker.alliance_id);
-                attackerDetails += `Alliance: [${attackerAllianceName}](${this.strAllianceZk(lastHitAttacker.alliance_id)})\n`;
+                attackerDetails += `Alliance: [${attackerAllianceName.substring(0, 18)}](${this.strAllianceZk(lastHitAttacker.alliance_id)})\n`;
             } catch (e) {
                 console.log(e);
             }
@@ -800,7 +818,7 @@ export class ZKillSubscriber {
         if (lastHitAttacker.corporation_id != null) {
             try {
                 const attackerCorporationName = await this.getNameForCorporation(lastHitAttacker.corporation_id);
-                attackerDetails += `Corp: [${attackerCorporationName}](${this.strCorpZk(lastHitAttacker.corporation_id)})\n`;
+                attackerDetails += `Corp: [${attackerCorporationName.substring(0, 18)}](${this.strCorpZk(lastHitAttacker.corporation_id)})\n`;
             } catch (e) {
                 console.log(e);
             }
@@ -808,7 +826,7 @@ export class ZKillSubscriber {
         if (lastHitAttacker.character_id != null) {
             try {
                 const attackerCharacterName = await this.getNameForCharacter(lastHitAttacker.character_id);
-                attackerDetails += `Pilot: [${attackerCharacterName}](${this.strPilotZk(lastHitAttacker.character_id)})\n`;
+                attackerDetails += `Pilot: [${attackerCharacterName.substring(0, 18)}](${this.strPilotZk(lastHitAttacker.character_id)})\n`;
             } catch (e) {
                 console.log(e);
             }
@@ -860,7 +878,7 @@ export class ZKillSubscriber {
         }
         console.log('rendering icon: ' + this.strItemRenderById(idOfIconToRender));
 
-        let affiliation = '```';
+        let affiliation = locationDetails + '```';
         const allianceCountMap = new Map<string, number>();
         for (const attacker of params.data.attackers) {
             const id = attacker.alliance_id ? attacker.alliance_id : attacker.corporation_id;
@@ -909,7 +927,7 @@ export class ZKillSubscriber {
         let othersCount = 0;
         let firstEntry = true;
         for (const [key, value] of sortedEntries) {
-            if (value > 2 || firstEntry) {
+            if (value > 10 || firstEntry) {
                 const spaces = maxNameLength - Math.min(key.length, 26) + padding;
                 const formattedKey = key.length > 26 ? key.slice(0, 26) + '-\n' + key.slice(26) : key;
                 affiliation += `${formattedKey}${' '.repeat(spaces)}x${value}\n`;
@@ -927,22 +945,6 @@ export class ZKillSubscriber {
         console.log('attackerparams.dataDone');
 
         console.log(systemRegion);
-        killmailDetails += `System: [${systemRegion.systemName}](${this.strSystemDotlan(systemRegion.id)}) ([${systemRegion.regionName}](${this.strRegionDotlan(systemRegion.regionId)}))\n`;
-        const closestCelestial = await this.getClosestCelestial(
-            systemRegion.id,
-            params.data.victim.position.x,
-            params.data.victim.position.y,
-            params.data.victim.position.z
-        );
-        const distance = (closestCelestial.distance / 1000);
-        let distanceInUnits;
-        if (distance > 1500000) {
-            distanceInUnits = (distance / 150000000).toFixed(2) + ' au';
-        } else {
-            distanceInUnits = Math.round(distance) + ' km';
-        }
-        const closestCelestialName = closestCelestial.itemName;
-        killmailDetails += `Celestial: [${closestCelestialName}](${this.strLocation(closestCelestial.itemId)}) (${distanceInUnits})\n`;
         // convert params.data.killmail_time into a relative time
         const killmailTime = new Date(params.data.killmail_time);
         const now = new Date();
@@ -956,34 +958,35 @@ export class ZKillSubscriber {
         const years = Math.floor(months / 12);
         let relativeTime: string;
         if (years > 1) {
-            relativeTime = years + ' years ago';
+            relativeTime = years + ' years';
         } else if (years === 1) {
-            relativeTime = '1 year ago';
+            relativeTime = '1 year';
         } else if (months > 1) {
-            relativeTime = months + ' months ago';
+            relativeTime = months + ' months';
         } else if (months === 1) {
-            relativeTime = '1 month ago';
+            relativeTime = '1 month';
         } else if (weeks > 1) {
-            relativeTime = weeks + ' weeks ago';
+            relativeTime = weeks + ' weeks';
         } else if (weeks === 1) {
-            relativeTime = '1 week ago';
+            relativeTime = '1 week';
         } else if (days > 1) {
-            relativeTime = days + ' days ago';
+            relativeTime = days + ' days';
         } else if (days === 1) {
-            relativeTime = '1 day ago';
+            relativeTime = '1 day';
         } else if (hours > 1) {
-            relativeTime = hours + ' hours ago';
+            relativeTime = hours + ' hours';
         } else if (hours === 1) {
-            relativeTime = '1 hour ago';
+            relativeTime = '1 hour';
         } else if (minutes > 1) {
-            relativeTime = minutes + ' minutes ago';
+            relativeTime = minutes + ' minutes';
         } else if (minutes === 1) {
-            relativeTime = '1 minute ago';
+            relativeTime = '1 minute';
         } else if (seconds > 1) {
-            relativeTime = seconds + ' seconds ago';
+            relativeTime = seconds + ' seconds';
         } else {
-            relativeTime = '1 second ago';
+            relativeTime = '1 second';
         }
+        relativeTime = `posted ${relativeTime} later`;
 
         // convert the killmail_time `2023-01-17T01:53:02Z` to YYYY/MM/DD HH:MM
         // const killmailTimeFormatted = killmailTime.toISOString().replace(/T/, ' ').replace(/\..+/, '');
@@ -995,14 +998,9 @@ export class ZKillSubscriber {
         const fields: { inline: boolean; name: string; value: string }[] = [];
         [
             {
-                name: `__Attackers__ - ${params.data.attackers.length} pilots involved`,
+                name: `__Engagement__ - ${params.data.attackers.length} pilots involved`,
                 value: affiliation,
                 inline: false,
-            },
-            {
-                name: '__Victim__',
-                value: victimDetails,
-                inline: true
             },
             {
                 name: '__Attacker (Final Blow)__',
@@ -1010,9 +1008,9 @@ export class ZKillSubscriber {
                 inline: true
             },
             {
-                name: '__Details__',
-                value: killmailDetails,
-                inline: false
+                name: '__Victim__',
+                value: victimDetails,
+                inline: true
             },
         ].forEach((field) => fields.push(field));
 
@@ -1045,24 +1043,24 @@ export class ZKillSubscriber {
         //     authorText = '';
         // }
         if (params.minNumInvolved != null) {
-            authorText = `Fleet activity (${params.data.attackers.length}) in ${systemRegion.systemName} (${systemRegion.regionName})`;
+            authorText = `${params.data.attackers.length}+ ships killed ${victimShipName} in ${systemRegion.systemName} (${systemRegion.regionName})`;
             if (mostCommonShip != null) {
                 const mostCommonShipName = await this.getNameForEntityId(mostCommonShip.shipTypeId);
-                title = `${this.getArticle(victimShipName)} \`${victimShipName}\` died to ${mostCommonShip.count}x \`${mostCommonShipName}\` ${relativeTime}, _${distanceInUnits} from ${closestCelestialName}_`;
+                title = `${mostCommonShip.count}x \`${mostCommonShipName}\` most common ships in the fleet, ${relativeTime}`;
             } else {
-                title = `${this.getArticle(victimShipName)} \`${victimShipName}\` died ${relativeTime}, _${distanceInUnits} from ${closestCelestialName}_`;
+                title = `Died ${relativeTime}`;
             }
         } else if (params.matchedShip?.shipName != null) {
             if (params.messageColor === 'GREEN') {
-                authorText = `${params.matchedShip.shipName} active in ${systemRegion.systemName} (${systemRegion.regionName})`;
-                title = `${this.getArticle(params.matchedShip.shipName)} \`${params.matchedShip.shipName}\` killed ${this.getArticle(victimShipName, false)} \`${victimShipName}\` ${relativeTime}, _${distanceInUnits} from ${closestCelestialName}_`;
+                authorText = `${params.matchedShip.shipName} attacking in ${systemRegion.systemName} (${systemRegion.regionName})`;
+                title = `\`${victimShipName}\` destroyed, ${relativeTime}`;
             } else {
-                authorText = `${params.matchedShip.shipName} died in ${systemRegion.systemName} (${systemRegion.regionName})`;
+                authorText = `${params.matchedShip.shipName} killed in ${systemRegion.systemName} (${systemRegion.regionName})`;
                 if (mostCommonShip != null) {
                     const mostCommonShipName = await this.getNameForEntityId(mostCommonShip.shipTypeId);
-                    title = `${this.getArticle(params.matchedShip.shipName)} \`${params.matchedShip.shipName}\` died to ${mostCommonShip.count}x \`${mostCommonShipName}\` ${relativeTime}, _${distanceInUnits} from ${closestCelestialName}_`;
+                    title = `Died to ${mostCommonShip.count}x \`${mostCommonShipName}\`, ${relativeTime}`;
                 } else {
-                    title = `${this.getArticle(params.matchedShip.shipName)} \`${params.matchedShip.shipName}\` died ${relativeTime}, _${distanceInUnits} from ${closestCelestialName}_`;
+                    title = `Died ${relativeTime}`;
                 }
             }
         } else {
@@ -1087,7 +1085,7 @@ export class ZKillSubscriber {
             fields: fields,
             timestamp: killmailTime.getTime(),
             footer: {
-                text: `Value: ${killmail_value} • Time: ${relativeTime}`,
+                text: `Value: ${killmail_value} • EVE Time: ${killmailTime.toLocaleString('en-GB', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}`,
             }
         }];
     }
@@ -1127,6 +1125,7 @@ export class ZKillSubscriber {
     }
 
     public getArticle(word: string, capitalize = true): string {
+        console.log(word);
         const vowels = ['a', 'e', 'i', 'o', 'u'];
         let res = vowels.includes(word[0].toLowerCase()) ? 'An' : 'A';
         if (!capitalize) {
