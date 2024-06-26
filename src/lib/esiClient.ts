@@ -221,6 +221,8 @@ export class EsiClient {
             1042334218683: 'Turnur',
             1044223724672: 'Hasateem',
             1043235801721: 'Turnur',
+            1043136314480: 'Ahbazon',
+            1022167642188: 'Amamake',
             // Add more mappings here
         };
         const name = systemNames[locationId];
@@ -243,17 +245,16 @@ export class EsiClient {
         });
         let contracts = await client.getCorporationContracts(98697633);
 
-
-        // Filter out contracts that are waiting to be accepted
-        contracts = contracts.filter(contract => contract.type === 'courier' && !['finished', 'deleted', 'failed', 'in_progress'].includes(contract.status) && contract.collateral <= 0);
-        console.log(`Processing ${contracts.length} contracts`);
-
         // Calculate the ratio between the reward and the volume for each contract
         contracts.forEach(contract => {
             contract.reward = parseFloat(contract.reward.toFixed(2));
             contract.volume = parseFloat(contract.volume.toFixed(2));
             contract.rewardVolumeRatio = parseFloat((contract.reward / contract.volume).toFixed(2));
         });
+
+        // Filter out contracts that are waiting to be accepted
+        contracts = contracts.filter(contract => contract.type === 'courier' && !['finished', 'deleted', 'failed', 'in_progress'].includes(contract.status) && contract.collateral <= 0 && <number>contract.rewardVolumeRatio >= 350);
+        console.log(`Processing ${contracts.length} contracts`);
 
         // Group contracts based on matching start_location_id and end_location_id values
         const groupedContracts: { [key: string]: Contract[] } = {};
@@ -281,10 +282,10 @@ export class EsiClient {
 
             // Sort the contracts by volume and reward, highest values first
             group.sort((a, b) => {
-                if (b.rewardVolumeRatio === a.rewardVolumeRatio) {
+                if (b.volume === a.volume) {
                     return b.reward - a.reward;
                 }
-                return <number>b.rewardVolumeRatio - <number>a.rewardVolumeRatio;
+                return <number>b.volume - <number>a.volume;
             });
 
             // Use the bin-packing algorithm to best-fit the contracts into the maximum volume

@@ -38,9 +38,9 @@ describe('ESI Client', () => {
         // eslint-disable-next-line @typescript-eslint/ban-ts-comment
         // @ts-ignore
         if (tripName === 'Turnur-Jita') {
-            maxVolume = 201980;
+            maxVolume = 209687;
         } else {
-            maxVolume = 340763;
+            maxVolume = 321580;
         }
 
         const trips = await client.processContracts(<string>token.access_token, maxVolume);
