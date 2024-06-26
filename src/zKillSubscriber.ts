@@ -56,6 +56,13 @@ export interface Subscription {
     minValue: number,
     // Mapping of LimitType to the value(s) to compare against
     limitTypes: Map<LimitType, string>,
+    inclusionLimitAlsoComparesAttacker: boolean,
+    inclusionLimitAlsoComparesAttackerWeapons: boolean,
+    exclusionLimitAlsoComparesAttacker: boolean,
+    exclusionLimitAlsoComparesAttackerWeapons: boolean
+}
+
+export interface SubscriptionFlags {
     // If true, the limitTypes will be compared against the attacker's ship
     inclusionLimitAlsoComparesAttacker: boolean
     // If true, the limitTypes will be compared against the weapon type IDs on the attacker's ship
@@ -201,14 +208,7 @@ export type ZkData = {
 };
 
 function hasLimitType(subscription: Subscription, limitType: LimitType): boolean {
-    if (subscription.limitTypes instanceof Map) {
-        return subscription.limitTypes.has(limitType);
-    } else {
-        console.log('subscription is not of type Map, exiting');
-        console.log(`subscription.limitTypes: ${subscription.limitTypes}`);
-        console.log(`subscription.limitTypes type: ${typeof subscription.limitTypes}`);
-        process.exit(1);
-    }
+    return subscription.limitTypes.has(limitType);
 }
 
 function getLimitType(subscription: Subscription, limitType: LimitType): string | undefined {
@@ -307,6 +307,15 @@ export class ZKillSubscriber {
         });
     }
 
+    private init_subscription_flags(): SubscriptionFlags {
+        return {
+            inclusionLimitAlsoComparesAttacker: true,
+            inclusionLimitAlsoComparesAttackerWeapons: true,
+            exclusionLimitAlsoComparesAttacker: true,
+            exclusionLimitAlsoComparesAttackerWeapons: true,
+        };
+    }
+
     private async process_subscription(
         subscription: Subscription,
         data: ZkData,
@@ -325,9 +334,9 @@ export class ZKillSubscriber {
             await this.sendMessageToDiscord(guildId, channelId, subscription, data);
             return;
         }
-        if (hasLimitType(subscription, LimitType.NPC_ONLY) && !data.zkb.npc) {
-            const val = getLimitType(subscription, LimitType.NPC_ONLY);
-            if (val != undefined && val === 'true') {
+        if (hasLimitType(subscription, LimitType.NPC_ONLY) && data.zkb.npc) {
+            const val = getLimitType(subscription, LimitType.NPC_ONLY) ?? 'false';
+            if (val === 'true') {
                 console.log('limiting kill due to NPC only filter');
                 return;
             }
@@ -1151,10 +1160,7 @@ export class ZKillSubscriber {
         guildId: string,
         channel: string,
         limitTypes: Map<LimitType, string>,
-        inclusionLimitAlsoComparesAttacker: boolean,
-        inclusionLimitAlsoComparesAttackerWeapons: boolean,
-        exclusionLimitAlsoComparesAttacker: boolean,
-        exclusionLimitAlsoComparesAttackerWeapons: boolean,
+        flags: SubscriptionFlags,
         id?: string,
         minValue = 0,
     ) {
@@ -1173,10 +1179,10 @@ export class ZKillSubscriber {
                 id,
                 minValue,
                 limitTypes,
-                inclusionLimitAlsoComparesAttacker,
-                inclusionLimitAlsoComparesAttackerWeapons,
-                exclusionLimitAlsoComparesAttacker,
-                exclusionLimitAlsoComparesAttackerWeapons,
+                inclusionLimitAlsoComparesAttacker: flags.inclusionLimitAlsoComparesAttacker,
+                inclusionLimitAlsoComparesAttackerWeapons: flags.inclusionLimitAlsoComparesAttackerWeapons,
+                exclusionLimitAlsoComparesAttacker: flags.exclusionLimitAlsoComparesAttacker,
+                exclusionLimitAlsoComparesAttackerWeapons: flags.exclusionLimitAlsoComparesAttackerWeapons
             });
         }
         fs.writeFileSync('./config/' + guildId + '.json', JSON.stringify(this.generateObject(guild)), 'utf8');
@@ -1192,15 +1198,11 @@ export class ZKillSubscriber {
         }
         const guildChannel = guild.channels.get(channel);
         const ident = `${subType}${id ? id : ''}`;
-        const obj = util.inspect(guildChannel.subscriptions, {depth: 5});
-        console.log('content: ' + obj);
         if (!guildChannel?.subscriptions.has(ident)) {
             return;
         }
-        await this.asyncLock.acquire('sendKill', async (done) => {
-            guildChannel.subscriptions.delete(ident);
-            fs.writeFileSync('./config/' + guildId + '.json', JSON.stringify(this.generateObject(guild)), 'utf8');
-        });
+        guildChannel.subscriptions.delete(ident);
+        fs.writeFileSync('./config/' + guildId + '.json', JSON.stringify(this.generateObject(guild)), 'utf8');
     }
 
     public async unsubscribeGuild(guildId: string) {
@@ -1280,7 +1282,6 @@ export class ZKillSubscriber {
                 // round to nearest tenth decimal
                 system.securityStatus = Math.round(system.securityStatus * 10) / 10;
             }
-            console.log('system: ' + system.systemName + ' - ' + system.securityStatus);
             done(undefined, system);
             return;
         });
