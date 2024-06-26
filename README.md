@@ -1,23 +1,26 @@
 # zk-activity
 
 [![TypeScript](https://badges.frapsoft.com/typescript/code/typescript.svg?v=101)](https://github.com/ellerbrock/typescript-badges/)
-<img alt="GitHub Commit Activity (Month)" src="https://img.shields.io/github/commit-activity/m/ocn/zk-activity" />
-<img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ocn/zk-activity" />
-<img alt="GitHub Issues" src="https://img.shields.io/github/issues/ocn/zk-activity" />
-<img alt="GitHub Pull Requests" src="https://img.shields.io/github/issues-pr/ocn/zk-activity" />
-<img alt="GitHub Contributors" src="https://img.shields.io/github/contributors/ocn/zk-activity" />
 <img alt="Github License" src="https://img.shields.io/github/license/ocn/zk-activity" />
+<img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ocn/zk-activity" />
+<img alt="GitHub Commit Activity (Month)" src="https://img.shields.io/github/commit-activity/m/ocn/zk-activity" />
+<img alt="GitHub Contributors" src="https://img.shields.io/github/contributors/ocn/zk-activity" />
+<img alt="GitHub Issues" src="https://img.shields.io/github/issues/ocn/zk-activity" />
 
+<p align="center">
+  <img src="https://media.discordapp.net/attachments/1171884090123890729/1172291509601710171/PartnerBadge2.png?ex=667c8c8c&is=667b3b0c&hm=d6ef80dc17913743c229c054a0cf430d64ffc1ec97db04f184248752cb4bffe5&=&format=webp&quality=lossless&width=357&height=150"  style="max-height: 150px;" /> 
+</p>
 
+zk-activity is a bot that brings EVE Online killmails from zkillboard.com into your Discord channel. It provides a way to filter the incoming mails according to your preferences. 
 
-zk-activity is a bot that brings EVE Online killmails from zkillboard.com into your Discord channel. It provides a way to filter the incoming mails according to your preferences. This bot is a derivative of [hazardous](https://github.com/SvenBrnn/hazardous-killbot).
+The bot operates by subscribing to a data feed from zkillboard.com and processes the incoming data based on the filters that you configure. This allows for monitoring of specific regions of space for activity involving certain classes of ships or tracking a particular group of pilots.  
 
-The bot works by subscribing to a data feed from zkillboard.com and processing the incoming data according to the filters you set up. This allows you to customize the bot to monitor specific regions of space for activity involving certain classes of ships, or to track a particular group of pilots.
+The bot's versatility allows for tracking of any killmails involving specific categories such as capitals, structures, structure modules, or fighters within a specific region and time frame. The filters can be combined to achieve nearly any sort of tracking of a person, corporation, alliance, ship-type, fleet size, or location that you desire.
 
-<div style="display: flex; justify-content: space-between;">
-    <img src="https://i.imgur.com/Ozw3Cze.png" alt="Alt text for Image 2" width="500"/>
-    <img src="https://i.imgur.com/UxX2Sby.png" alt="Alt text for Image 1" width="500"/>
-</div>
+<p float="left">
+  <img src="https://i.imgur.com/GL0Uquc.png"  style="width: 49%; max-width: 500px;" />
+  <img src="https://i.imgur.com/OmiUVoa.png"  style="width: 49%; max-width: 500px;" /> 
+</p>
 
 To use the bot, you invite it to your Discord server using a provided Discord invite URL link. Once the bot is on your server, you can set up feeds in a Discord channel. The bot will then start delivering killmails from EVE Online to your Discord channel based on the filters you've set up.
 
@@ -260,6 +263,8 @@ DISCORD_CLIENT_ID=your_discord_client_id
 Please replace the placeholders with your actual Discord bot token and application client ID.
 
 ## Contact
+
+This bot is a derivative of [hazardous](https://github.com/SvenBrnn/hazardous-killbot).
 
 For any inquiries or if you need assistance with hosting the bot, please contact the developer at [this public email address](mailto:wands.larch.0y@icloud.com?subject=[GitHub]).
 
