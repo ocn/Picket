@@ -6,19 +6,18 @@ import {SubscriptionType, ZKillSubscriber} from '../zKillSubscriber';
 export class UnsubscribeCommand extends AbstractCommand {
     protected name = 'zkill-unsubscribe';
 
-    async executeCommand(interaction: CommandInteraction): Promise<void> {
+    executeCommand(interaction: CommandInteraction): void {
         const sub = ZKillSubscriber.getInstance();
         if(!interaction.inGuild()) {
-            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
             // @ts-ignore
-            await interaction.reply('Subscription is not possible in PM!');
+            interaction.reply('Subscription is not possible in PM!');
             return;
         }
         const subCommand = interaction.options.getSubcommand(true) as SubscriptionType;
-        const id = interaction.options.getNumber('id', true);
-        await sub.unsubscribe(subCommand, interaction.guildId, interaction.channelId, id ? String(id) : undefined);
-        await interaction.reply({
-            content: 'Unsubscribed to zkillboard channel: ' + interaction.options.getSubcommand() + ' ' + id,
+        const id = interaction.options.getString('id', false);
+        sub.unsubscribe(subCommand, interaction.guildId, interaction.channelId, id ? id : undefined);
+        interaction.reply({
+            content: 'Unsubscribed to zkillboard channel: ' + interaction.options.getSubcommand() + ' ' + interaction.options.getString('id'),
             ephemeral: true
         });
     }
@@ -28,7 +27,7 @@ export class UnsubscribeCommand extends AbstractCommand {
             .setDescription('Unsubscribe from zkill');
         slashCommand.addSubcommand( new SlashCommandSubcommandBuilder().setName('feed')
             .setDescription('Unsubscribe feed from channel')
-            .addNumberOption(option =>
+            .addStringOption(option =>
                 option.setName('id')
                     .setDescription('ID for the feed')
                     .setRequired(true)
