@@ -68,6 +68,9 @@ describe('ZK Subscriber', () => {
             zk_data = readTestData('115797013_guardian_fight.json');
             await sub.sendMessageToDiscord('888224317991706685', '1115807643748012072', subscription, zk_data, null, 30, 'GREEN');
 
+            zk_data = readTestData('119689329_nid_solo.json');
+            await sub.sendMessageToDiscord('888224317991706685', '1115807643748012072', subscription, zk_data, null, 1, 'GREEN');
+
             // await sub.sendMessageToDiscord('888224317991706685', '1115807643748012072', subscription, zk_data, {
             //     shipName: 'Mobile Small Warp Disruptor II',
             //     typeId: 26892,
