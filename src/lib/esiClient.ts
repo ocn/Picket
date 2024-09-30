@@ -16,6 +16,7 @@ const GET_TYPE_DATA_URL = 'universe/types/%1/';
 const GET_ALLIANCE_URL = 'alliances/%1/';
 const GET_CORPORATION_URL = 'corporations/%1/';
 const GET_CHARACTER_URL = 'characters/%1/';
+const GET_FACTION_URL = 'universe/factions/%1/';
 
 interface Token {
     access_token: string;
@@ -146,7 +147,7 @@ export class EsiClient {
     async getTypeName(typeId: number): Promise<string> {
         const itemData = await this.fetch(GET_TYPE_DATA_URL.replace('%1', typeId.toString()));
         if (itemData.data.error) {
-            throw new Error('ITEM_FETCH_ERROR');
+            throw new Error('TYPE_FETCH_ERROR');
         }
         return itemData.data.name;
     }
@@ -154,7 +155,7 @@ export class EsiClient {
     async getTypeGroupId(shipId: number): Promise<number> {
         const itemData = await this.fetch(GET_TYPE_DATA_URL.replace('%1', shipId.toString()));
         if (itemData.data.error) {
-            throw new Error('ITEM_FETCH_ERROR');
+            throw new Error('TYPE_GROUP_FETCH_ERROR');
         }
         return Number.parseInt(itemData.data.group_id);
     }
@@ -162,26 +163,36 @@ export class EsiClient {
     async getAllianceName(allianceId: number): Promise<string> {
         const itemData = await this.fetch(GET_ALLIANCE_URL.replace('%1', allianceId.toString()));
         if (itemData.data.error) {
-            throw new Error('ITEM_FETCH_ERROR');
+            throw new Error('ALLIANCE_FETCH_ERROR');
         }
+        console.log(itemData.data);
         return itemData.data.name;
     }
 
     async getCorporationName(corporationId: number): Promise<string> {
         const itemData = await this.fetch(GET_CORPORATION_URL.replace('%1', corporationId.toString()));
         if (itemData.data.error) {
-            throw new Error('ITEM_FETCH_ERROR');
+            throw new Error('CORPORATION_FETCH_ERROR');
         }
+        console.log(itemData.data);
         return itemData.data.name;
     }
 
     async getCharacterName(characterId: number): Promise<string> {
         const itemData = await this.fetch(GET_CHARACTER_URL.replace('%1', characterId.toString()));
         if (itemData.data.error) {
-            throw new Error('ITEM_FETCH_ERROR');
+            throw new Error('CHARACTER_FETCH_ERROR');
         }
         return itemData.data.name;
     }
+
+    // async getFactionName(factionId: number): Promise<string> {
+    //     const itemData = await this.fetch(GET_FACTION_URL.replace('%1', factionId.toString()));
+    //     if (itemData.data.error) {
+    //         throw new Error(`FACTION_FETCH_ERROR ${factionId}: ${itemData.data.error}`);
+    //     }
+    //     return itemData.data.name;
+    // }
 
     async getCelestial(systemId: number, x: number, y: number, z: number): Promise<ClosestCelestial> {
         const axios = new Axios({

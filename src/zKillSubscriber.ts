@@ -109,6 +109,7 @@ export class Attacker {
     ship_type_id?: number;
     weapon_type_id?: number;
     character_id?: number;
+    faction_id?: number;
 
     constructor(
         alliance_id: number,
@@ -118,7 +119,8 @@ export class Attacker {
         security_status: number,
         weapon_type_id: number,
         ship_type_id?: number,
-        character_id?: number
+        character_id?: number,
+        faction_id?: number
     ) {
         this.alliance_id = alliance_id;
         this.corporation_id = corporation_id;
@@ -128,6 +130,7 @@ export class Attacker {
         this.weapon_type_id = weapon_type_id;
         this.ship_type_id = ship_type_id;
         this.character_id = character_id;
+        this.faction_id = faction_id;
     }
 }
 
@@ -328,7 +331,8 @@ export class ZKillSubscriber {
         let matchedShip: FilterShipMatch | null = null;
 
         if (subscription.minValue > data.zkb.totalValue) {
-            return; // Do not send if below the min value
+            // console.log(`Channel ${channelId}: limiting kill due to minValue filter`);
+            return;
         }
 
         if (subscription.limitTypes.size === 0) {
@@ -336,10 +340,16 @@ export class ZKillSubscriber {
             return;
         }
         if (hasLimitType(subscription, LimitType.NPC_ONLY) && data.zkb.npc) {
-            const val = getLimitType(subscription, LimitType.NPC_ONLY) ?? 'false';
+            const val = (getLimitType(subscription, LimitType.NPC_ONLY) ?? 'false').toLowerCase();
+            console.log(`Channel ${channelId}: NPC_ONLY filter value is ${val}`);
             if (val === 'true') {
-                console.log('limiting kill due to NPC only filter');
-                return;
+                if (data.zkb.npc) {
+                    console.log(`Channel ${channelId}: sending kill due to NPC only filter`);
+                    requireSend = true;
+                } else {
+                    console.log(`Channel ${channelId}: limiting kill due to NPC only filter - not an NPC kill`);
+                    return;
+                }
             }
         }
         if (hasLimitType(subscription, LimitType.SHIP_INCLUSION_TYPE_ID)) {
@@ -357,18 +367,25 @@ export class ZKillSubscriber {
             requireSend = __ret.requireSend;
             color = __ret.color;
             matchedShip = __ret.matchedShip;
-            if (!requireSend) return;
+            if (!requireSend) {
+                // console.log(`Channel ${channelId}: limiting kill due to inclusion ship filter`);
+                return;
+            }
         }
         if (!await this.checkSecurityMaxExclusive(subscription, data)) {
+            console.log(`Channel ${channelId}: limiting kill due to max exclusive security filter`);
             return;
         }
         if (!await this.checkSecurityMinExclusive(subscription, data)) {
+            console.log(`Channel ${channelId}: limiting kill due to min exclusive security filter`);
             return;
         }
         if (!await this.checkSecurityMaxInclusive(subscription, data)) {
+            console.log(`Channel ${channelId}: limiting kill in due to max inclusive security filter`);
             return;
         }
         if (!await this.checkSecurityMinInclusive(subscription, data)) {
+            console.log(`Channel ${channelId}: limiting kill due to min inclusive security filter`);
             return;
         }
         if (hasLimitType(subscription, LimitType.CHARACTER)) {
@@ -453,14 +470,17 @@ export class ZKillSubscriber {
             hasLimitType(subscription, LimitType.CONSTELLATION) ||
             hasLimitType(subscription, LimitType.SYSTEM)) {
             requireSend = await this.isInLocationLimit(subscription, data.solar_system_id);
-            if (!requireSend) return;
+            if (!requireSend) {
+                console.log(`Channel ${channelId}: limiting kill due to location filter`);
+                return;
+            }
         }
         let minNumInvolved: number | null = null;
         if (hasLimitType(subscription, LimitType.MIN_NUM_INVOLVED)) {
             minNumInvolved = Number(<string>getLimitType(subscription, LimitType.MIN_NUM_INVOLVED));
             const numInvolved = data.attackers.length + 1;
             if (numInvolved < minNumInvolved) {
-                console.log(`limiting kill due to minimum number of involved parties filter: ${numInvolved} < ${minNumInvolved}`);
+                console.log(`Channel ${channelId}: limiting kill due to minimum number of involved parties filter: ${numInvolved} < ${minNumInvolved}`);
                 return;
             }
         }
@@ -472,12 +492,12 @@ export class ZKillSubscriber {
 
             if (startTime < endTime) {
                 if (killmailHour < startTime || killmailHour > endTime) {
-                    console.log(`limiting kill due to time range filter: ${killmailHour} not in range ${startTime} - ${endTime}`);
+                    console.log(`Channel ${channelId}: limiting kill due to time range filter: ${killmailHour} not in range ${startTime} - ${endTime}`);
                     return;
                 }
             } else {
                 if (killmailHour < startTime && killmailHour > endTime) {
-                    console.log(`limiting kill due to time range filter: ${killmailHour} not in range ${startTime} - ${endTime}`);
+                    console.log(`Channel ${channelId}: limiting kill due to time range filter: ${killmailHour} not in range ${startTime} - ${endTime}`);
                     return;
                 }
             }
@@ -501,7 +521,7 @@ export class ZKillSubscriber {
             const systemData = await this.getSystemData(data.solar_system_id);
             const maximumSecurityStatus = Number(<string>getLimitType(subscription, LimitType.SECURITY_MAX_INCLUSIVE));
             if (maximumSecurityStatus < systemData.securityStatus) {
-                console.log(`limiting kill in ${systemData.systemName} due to inclusive maximum security status filter: ${systemData.securityStatus} > ${maximumSecurityStatus}`);
+                // console.log(`limiting kill in ${systemData.systemName} due to inclusive maximum security status filter: ${systemData.securityStatus} > ${maximumSecurityStatus}`);
                 return false;
             }
         }
@@ -513,7 +533,7 @@ export class ZKillSubscriber {
             const systemData = await this.getSystemData(data.solar_system_id);
             const maximumSecurityStatus = Number(<string>getLimitType(subscription, LimitType.SECURITY_MAX_EXCLUSIVE));
             if (maximumSecurityStatus <= systemData.securityStatus) {
-                console.log(`limiting kill in ${systemData.systemName} due to exclusive maximum security status filter: ${systemData.securityStatus} >= ${maximumSecurityStatus}`);
+                // console.log(`limiting kill in ${systemData.systemName} due to exclusive maximum security status filter: ${systemData.securityStatus} >= ${maximumSecurityStatus}`);
                 return false;
             }
         }
@@ -525,7 +545,7 @@ export class ZKillSubscriber {
             const systemData = await this.getSystemData(data.solar_system_id);
             const minimumSecurityStatus = Number(<string>getLimitType(subscription, LimitType.SECURITY_MIN_INCLUSIVE));
             if (minimumSecurityStatus > systemData.securityStatus) {
-                console.log(`limiting kill in ${systemData.systemName} due to inclusive minimum security status filter: ${systemData.securityStatus} < ${minimumSecurityStatus}`);
+                // console.log(`limiting kill in ${systemData.systemName} due to inclusive minimum security status filter: ${systemData.securityStatus} < ${minimumSecurityStatus}`);
                 return false;
             }
         }
@@ -537,7 +557,7 @@ export class ZKillSubscriber {
             const systemData = await this.getSystemData(data.solar_system_id);
             const minimumSecurityStatus = Number(<string>getLimitType(subscription, LimitType.SECURITY_MIN_EXCLUSIVE));
             if (minimumSecurityStatus >= systemData.securityStatus) {
-                console.log(`limiting kill in ${systemData.systemName} due to exclusive minimum security status filter: ${systemData.securityStatus} <= ${minimumSecurityStatus}`);
+                // console.log(`limiting kill in ${systemData.systemName} due to exclusive minimum security status filter: ${systemData.securityStatus} <= ${minimumSecurityStatus}`);
                 return false;
             }
         }
@@ -663,7 +683,9 @@ export class ZKillSubscriber {
 
             const channel = <TextChannel>this.doClient.channels.cache.get(channelId);
             if (!channel) {
-                await this.unsubscribe(subscription.subType, guildId, channelId, subscription.id);
+                const owner = await this.doClient.users.fetch('146451271497416704');
+                await owner.send(`The bot unsubscribed from channel ${channelId} because it was not found. This would delete the channel.`);
+                // await this.unsubscribe(subscription.subType, guildId, channelId, subscription.id);
                 done();
                 return;
             }
@@ -734,6 +756,8 @@ export class ZKillSubscriber {
         let attackerDetails = '';
         let locationDetails = '';
         let victimShipName = '';
+        let victimLink = 'Victim';
+        let attackerLink = 'Attacker';
 
         const closestCelestial = await this.getClosestCelestial(
             systemRegion.id,
@@ -741,16 +765,9 @@ export class ZKillSubscriber {
             params.data.victim.position.y,
             params.data.victim.position.z
         );
-        const distance = (closestCelestial.distance / 1000);
-        let distanceInUnits;
-        if (distance > 1500000) {
-            distanceInUnits = (distance / 150000000).toFixed(2) + ' au';
-        } else {
-            distanceInUnits = Math.round(distance) + ' km';
-        }
-        const closestCelestialName = closestCelestial.itemName;
-        locationDetails += `on [${closestCelestialName}](${this.strLocation(closestCelestial.itemId)}) ${distanceInUnits} away\n`;
-        locationDetails += `in [${systemRegion.systemName}](${this.strSystemDotlan(systemRegion.id)}) ([${systemRegion.regionName}](${this.strRegionDotlan(systemRegion.regionId)}))`;
+        const distanceInUnits = this.distanceTo(closestCelestial);
+        const closestCelestialName = closestCelestial.itemName.substring(0, 36);
+        locationDetails += `on [${closestCelestialName}](${this.strLocation(closestCelestial.itemId)}), ${distanceInUnits} away`;
 
         if (params.data.victim.ship_type_id != null) {
             try {
@@ -763,23 +780,27 @@ export class ZKillSubscriber {
         if (params.data.victim.alliance_id != null) {
             try {
                 const victimAllianceName = await this.getNameForAlliance(params.data.victim.alliance_id);
-                victimDetails += `Alliance: [${victimAllianceName.substring(0, 18)}](${this.strAllianceZk(params.data.victim.alliance_id)})\n`;
+                victimDetails += `[${victimAllianceName.substring(0, 25)}](${this.strAllianceZk(params.data.victim.alliance_id)})`;
             } catch (e) {
+                victimDetails += `N/A`;
                 console.log(e);
             }
         }
         if (params.data.victim.corporation_id != null) {
             try {
                 const victimCorporationName = await this.getNameForCorporation(params.data.victim.corporation_id);
-                victimDetails += `Corp: [${victimCorporationName.substring(0, 18)}](${this.strCorpZk(params.data.victim.corporation_id)})\n`;
+                if (victimDetails.length !== 0) {
+                    victimDetails += ' / ';
+                }
+                victimDetails += `[${victimCorporationName.substring(0, 15)}](${this.strCorpZk(params.data.victim.corporation_id)})`;
             } catch (e) {
                 console.log(e);
             }
         }
         if (params.data.victim.character_id != null) {
             try {
-                const victimCharacterName = await this.getNameForCharacter(params.data.victim.character_id);
-                victimDetails += `Pilot: [${victimCharacterName.substring(0, 18)}](${this.strPilotZk(params.data.victim.character_id)})\n`;
+                // const victimCharacterName = await this.getNameForCharacter(params.data.victim.character_id);
+                victimLink = `[Victim](${this.strPilotZk(params.data.victim.character_id)})`;
             } catch (e) {
                 console.log(e);
             }
@@ -801,7 +822,7 @@ export class ZKillSubscriber {
         }
         // if (lastHitAttacker.ship_type_id != null) {
         //     try {
-        //         const attackerShipName = await this.getNameForEntityId(lastHitAttacker.ship_type_id);
+        //         const attackerShipName = await this.getNameForE/ntityId(lastHitAttacker.ship_type_id);
         //         attackerDetails += `Ship: [${attackerShipName}](${this.strShipZk(lastHitAttacker.ship_type_id)})\n`;
         //     } catch (e) {
         //         console.log(e);
@@ -810,15 +831,19 @@ export class ZKillSubscriber {
         if (lastHitAttacker.alliance_id != null) {
             try {
                 const attackerAllianceName = await this.getNameForAlliance(lastHitAttacker.alliance_id);
-                attackerDetails += `Alliance: [${attackerAllianceName.substring(0, 18)}](${this.strAllianceZk(lastHitAttacker.alliance_id)})\n`;
+                attackerDetails += `[${attackerAllianceName.substring(0, 25)}](${this.strAllianceZk(lastHitAttacker.alliance_id)})`;
             } catch (e) {
+                attackerDetails += `N/A`;
                 console.log(e);
             }
         }
         if (lastHitAttacker.corporation_id != null) {
             try {
                 const attackerCorporationName = await this.getNameForCorporation(lastHitAttacker.corporation_id);
-                attackerDetails += `Corp: [${attackerCorporationName.substring(0, 18)}](${this.strCorpZk(lastHitAttacker.corporation_id)})\n`;
+                if (attackerDetails.length !== 0) {
+                    attackerDetails += ' / ';
+                }
+                attackerDetails += `[${attackerCorporationName.substring(0, 15)}](${this.strCorpZk(lastHitAttacker.corporation_id)})`;
             } catch (e) {
                 console.log(e);
             }
@@ -826,9 +851,28 @@ export class ZKillSubscriber {
         if (lastHitAttacker.character_id != null) {
             try {
                 const attackerCharacterName = await this.getNameForCharacter(lastHitAttacker.character_id);
-                attackerDetails += `Pilot: [${attackerCharacterName.substring(0, 18)}](${this.strPilotZk(lastHitAttacker.character_id)})\n`;
+                attackerLink = `[Attacker](${this.strPilotZk(lastHitAttacker.character_id)})`;
             } catch (e) {
                 console.log(e);
+            }
+        }
+        // if (lastHitAttacker.faction_id != null) {
+        //     try {
+        //         const attackerFactionName = await this.getNameForFaction(lastHitAttacker.faction_id);
+        //         attackerDetails += `Faction: [${attackerFactionName.substring(0, 18)}](${this.strFactionZk(lastHitAttacker.faction_id)})\n`;
+        //     } catch (e) {
+        //         console.log(e);
+        //     }
+        // }
+        if (attackerDetails === '') {
+            // ship_type_id
+            if (lastHitAttacker.ship_type_id != null) {
+                try {
+                    const attackerShipName = await this.getNameForEntityId(lastHitAttacker.ship_type_id);
+                    attackerDetails += `Ship: [${attackerShipName}](${this.strShipZk(lastHitAttacker.ship_type_id)})\n`;
+                } catch (e) {
+                    console.log(`failed to query ship entity name for attacker: ${e}`);
+                }
             }
         }
         const mostCommonShip = this.findMostCommonShipTypeIdAndCount(params.data.attackers);
@@ -878,7 +922,7 @@ export class ZKillSubscriber {
         }
         console.log('rendering icon: ' + this.strItemRenderById(idOfIconToRender));
 
-        let affiliation = locationDetails + '```';
+        let affiliation = locationDetails + `\n${victimLink}: ${victimDetails}\n${attackerLink}: ${attackerDetails}\`\`\``;
         const allianceCountMap = new Map<string, number>();
         for (const attacker of params.data.attackers) {
             const id = attacker.alliance_id ? attacker.alliance_id : attacker.corporation_id;
@@ -912,81 +956,52 @@ export class ZKillSubscriber {
                 allianceCountMap.set(name, 1);
             }
         }
+        // Separate entries that will be displayed from those that will be collapsed into "others"
+        let othersCount = 0;
+        const displayedEntries: [string, number][] = [];
+        const threshold = 15;
+        const sortedEntries = Array.from(allianceCountMap.entries()).sort((a, b) => b[1] - a[1]);
+
+        sortedEntries.forEach(([key, value], index) => {
+            if (value >= threshold || index === 0) {
+                displayedEntries.push([key, value]);
+            } else {
+                othersCount += value;
+            }
+        });
+
+        // Calculate maxNameLength based only on displayed entries
         let maxNameLength = 0;
-        Array.from(allianceCountMap.keys()).forEach((name: string) => {
+        displayedEntries.forEach(([name]) => {
             if (name.length > maxNameLength) {
                 maxNameLength = name.length;
             }
         });
-        if (maxNameLength >= 26) {
-            maxNameLength = 26;
-        }
-        console.log('maxNameLength: ' + maxNameLength);
-        const sortedEntries = Array.from(allianceCountMap.entries()).sort((a, b) => b[1] - a[1]);
+        maxNameLength = Math.min(maxNameLength, 26);  // Cap max length at 26 characters
         const padding = 3;
-        let othersCount = 0;
-        let firstEntry = true;
-        for (const [key, value] of sortedEntries) {
-            if (value > 10 || firstEntry) {
-                const spaces = maxNameLength - Math.min(key.length, 26) + padding;
-                const formattedKey = key.length > 26 ? key.slice(0, 26) + '-\n' + key.slice(26) : key;
-                affiliation += `${formattedKey}${' '.repeat(spaces)}x${value}\n`;
-                firstEntry = false;
-            } else {
-                othersCount += value;
-            }
-        }
+
+        // Build the affiliation display string for displayed entries
+        displayedEntries.forEach(([key, value]) => {
+            const spaces = maxNameLength - Math.min(key.length, 26) + padding;
+            const formattedKey = key.length > 26 ? key.slice(0, 26) + '-\n' + key.slice(26) : key;
+            affiliation += `${formattedKey}${' '.repeat(spaces)}x${value}\n`;
+        });
+
+        // Add the "others" entry if there were collapsed entries
         if (othersCount > 0) {
             const others = '...others';
             const spaces = maxNameLength - others.length + padding;
             affiliation += `${others}${' '.repeat(spaces)}x${othersCount}\n`;
         }
+
         affiliation += '```';
         console.log('attackerparams.dataDone');
 
         console.log(systemRegion);
         // convert params.data.killmail_time into a relative time
         const killmailTime = new Date(params.data.killmail_time);
-        const now = new Date();
-        const diff = now.getTime() - killmailTime.getTime();
-        const seconds = Math.floor(diff / 1000);
-        const minutes = Math.floor(seconds / 60);
-        const hours = Math.floor(minutes / 60);
-        const days = Math.floor(hours / 24);
-        const weeks = Math.floor(days / 7);
-        const months = Math.floor(weeks / 4);
-        const years = Math.floor(months / 12);
-        let relativeTime: string;
-        if (years > 1) {
-            relativeTime = years + ' years';
-        } else if (years === 1) {
-            relativeTime = '1 year';
-        } else if (months > 1) {
-            relativeTime = months + ' months';
-        } else if (months === 1) {
-            relativeTime = '1 month';
-        } else if (weeks > 1) {
-            relativeTime = weeks + ' weeks';
-        } else if (weeks === 1) {
-            relativeTime = '1 week';
-        } else if (days > 1) {
-            relativeTime = days + ' days';
-        } else if (days === 1) {
-            relativeTime = '1 day';
-        } else if (hours > 1) {
-            relativeTime = hours + ' hours';
-        } else if (hours === 1) {
-            relativeTime = '1 hour';
-        } else if (minutes > 1) {
-            relativeTime = minutes + ' minutes';
-        } else if (minutes === 1) {
-            relativeTime = '1 minute';
-        } else if (seconds > 1) {
-            relativeTime = seconds + ' seconds';
-        } else {
-            relativeTime = '1 second';
-        }
-        relativeTime = `posted ${relativeTime} later`;
+        let relativeTime = this.getRelativeTime(params.data.killmail_time);
+        relativeTime = `Posted ${relativeTime} later`;
 
         // convert the killmail_time `2023-01-17T01:53:02Z` to YYYY/MM/DD HH:MM
         // const killmailTimeFormatted = killmailTime.toISOString().replace(/T/, ' ').replace(/\..+/, '');
@@ -998,75 +1013,42 @@ export class ZKillSubscriber {
         const fields: { inline: boolean; name: string; value: string }[] = [];
         [
             {
-                name: `__Engagement__ - ${params.data.attackers.length} pilots involved`,
+                name: `(${params.data.attackers.length}) Pilots Involved`,
                 value: affiliation,
                 inline: false,
-            },
-            {
-                name: '__Attacker (Final Blow)__',
-                value: attackerDetails,
-                inline: true
-            },
-            {
-                name: '__Victim__',
-                value: victimDetails,
-                inline: true
             },
         ].forEach((field) => fields.push(field));
 
         let title: string;
         let authorText: string;
 
-        // if (params.minNumInvolved != null) {
-        //     authorText = `Fleet activity (${params.data.attackers.length}) in ${systemRegion.systemName} (${systemRegion.regionName})`;
-        //     if (mostCommonShip != null) {
-        //         const mostCommonShipName = await this.getNameForEntityId(mostCommonShip.shipTypeId);
-        //         title = `${this.getArticle(victimShipName)} \`${victimShipName}\` died to ${mostCommonShip.count}x \`${mostCommonShipName}\`\n_${distanceInUnits} from ${closestCelestialName}_`;
-        //     } else {
-        //         title = `${this.getArticle(victimShipName)} \`${victimShipName}\` died _${distanceInUnits} from ${closestCelestialName}_`;
-        //     }
-        // } else if (params.matchedShip?.shipName != null) {
-        //     if (params.messageColor === 'GREEN') {
-        //         authorText = `${params.matchedShip.shipName} active in ${systemRegion.systemName} (${systemRegion.regionName})`;
-        //         title = `${this.getArticle(params.matchedShip.shipName)} \`${params.matchedShip.shipName}\` killed ${this.getArticle(victimShipName, false)} \`${victimShipName}\`\n_${distanceInUnits} from ${closestCelestialName}_`;
-        //     } else {
-        //         authorText = `${params.matchedShip.shipName} died in ${systemRegion.systemName} (${systemRegion.regionName})`;
-        //         if (mostCommonShip != null) {
-        //             const mostCommonShipName = await this.getNameForEntityId(mostCommonShip.shipTypeId);
-        //             title = `${this.getArticle(params.matchedShip.shipName)} \`${params.matchedShip.shipName}\` died to ${mostCommonShip.count}x \`${mostCommonShipName}\`\n_${distanceInUnits} from ${closestCelestialName}_`;
-        //         } else {
-        //             title = `${this.getArticle(params.matchedShip.shipName)} \`${params.matchedShip.shipName}\` died _${distanceInUnits} from ${closestCelestialName}_`;
-        //         }
-        //     }
-        // } else {
-        //     title = params.embedding?.result.ogTitle;
-        //     authorText = '';
-        // }
         if (params.minNumInvolved != null) {
-            authorText = `${params.data.attackers.length}+ ships killed ${victimShipName} in ${systemRegion.systemName} (${systemRegion.regionName})`;
+            authorText = `${params.data.attackers.length}+ ships in ${systemRegion.systemName} (${systemRegion.regionName})`;
             if (mostCommonShip != null) {
                 const mostCommonShipName = await this.getNameForEntityId(mostCommonShip.shipTypeId);
-                title = `${mostCommonShip.count}x \`${mostCommonShipName}\` most common ships in the fleet, ${relativeTime}`;
+                title = `\`${victimShipName}\` died to ${mostCommonShip.count}x \`${mostCommonShipName}\``;
             } else {
-                title = `Died ${relativeTime}`;
+                title = `Missing 0`;
             }
         } else if (params.matchedShip?.shipName != null) {
-            if (params.messageColor === 'GREEN') {
-                authorText = `${params.matchedShip.shipName} attacking in ${systemRegion.systemName} (${systemRegion.regionName})`;
-                title = `\`${victimShipName}\` destroyed, ${relativeTime}`;
-            } else {
-                authorText = `${params.matchedShip.shipName} killed in ${systemRegion.systemName} (${systemRegion.regionName})`;
-                if (mostCommonShip != null) {
-                    const mostCommonShipName = await this.getNameForEntityId(mostCommonShip.shipTypeId);
-                    title = `Died to ${mostCommonShip.count}x \`${mostCommonShipName}\`, ${relativeTime}`;
+            authorText = `${params.matchedShip.shipName} in ${systemRegion.systemName} (${systemRegion.regionName})`;
+            if (mostCommonShip != null) {
+                const mostCommonShipName = await this.getNameForEntityId(mostCommonShip.shipTypeId);
+                if (params.messageColor === 'GREEN') {
+                    authorText = `${params.matchedShip.shipName} in ${systemRegion.systemName} (${systemRegion.regionName})`;
+                    title = `\`${victimShipName}\` destroyed`;
                 } else {
-                    title = `Died ${relativeTime}`;
+                    authorText = `${params.matchedShip.shipName} in ${systemRegion.systemName} (${systemRegion.regionName})`;
+                    title = `Died to ${mostCommonShip.count}x \`${mostCommonShipName}\``;
                 }
+            } else {
+                title = `${relativeTime}`;
             }
         } else {
             title = params.embedding?.result.ogTitle;
             authorText = '';
         }
+        authorText += `\n${relativeTime}`
 
         return [{
             title: title,
@@ -1085,9 +1067,48 @@ export class ZKillSubscriber {
             fields: fields,
             timestamp: killmailTime.getTime(),
             footer: {
-                text: `Value: ${killmail_value} • EVE Time: ${killmailTime.toLocaleString('en-GB', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}`,
+                text: `Value: ${killmail_value} • EVETime: ${killmailTime.toLocaleString('en-GB', { hour: '2-digit', minute: '2-digit', year: '2-digit', month: '2-digit', day: '2-digit' })}`,
             }
         }];
+    }
+
+    private distanceTo(closestCelestial: ClosestCelestial) {
+        const distance = (closestCelestial.distance / 1000);
+        if (distance > 1500000) {
+            return (distance / 150000000).toFixed(2) + ' au';
+        } else {
+            return Math.round(distance) + ' km';
+        }
+    }
+
+    private getRelativeTime(killmailTime: string): string {
+        const killmailDate = new Date(killmailTime);
+        const now = new Date();
+        const diff = now.getTime() - killmailDate.getTime();
+
+        const seconds = Math.floor(diff / 1000);
+        const minutes = Math.floor(seconds / 60);
+        const hours = Math.floor(minutes / 60);
+        const days = Math.floor(hours / 24);
+        const weeks = Math.floor(days / 7);
+        const months = Math.floor(weeks / 4);
+        const years = Math.floor(months / 12);
+
+        if (years > 1) return `${years} years`;
+        if (years === 1) return `1 year`;
+        if (months > 1) return `${months} months`;
+        if (months === 1) return `1 month`;
+        if (weeks > 1) return `${weeks} weeks`;
+        if (weeks === 1) return `1 week`;
+        if (days > 1) return `${days} days`;
+        if (days === 1) return `1 day`;
+        if (hours > 1) return `${hours} hours`;
+        if (hours === 1) return `1 hour`;
+        if (minutes > 1) return `${minutes} minutes`;
+        if (minutes === 1) return `1 minute`;
+        if (seconds > 1) return `${seconds} seconds`;
+
+        return `1 second`;
     }
 
     public abbreviateNumber(n: number) {
@@ -1133,6 +1154,7 @@ export class ZKillSubscriber {
         }
         return res;
     }
+
     private async handlePermissionError(channel: TextChannel) {
         const owner = await channel.guild.fetchOwner();
         await owner.send(`The bot unsubscribed from channel ${channel.name} on ${channel.guild.name} because it was not able to write in it! Fix the permissions and subscribe again!`);
@@ -1383,6 +1405,22 @@ export class ZKillSubscriber {
         });
     }
 
+    // private async getNameForFaction(factionId: number): Promise<string> {
+    //     return await this.asyncLock.acquire('fetchName', async (done) => {
+    //
+    //         let name = this.names.get(factionId);
+    //         if (name) {
+    //             done(undefined, name);
+    //             return;
+    //         }
+    //         name = await this.esiClient.getFactionName(factionId);
+    //         this.names.set(factionId, name);
+    //         fs.writeFileSync('./config/names.json', JSON.stringify(Object.fromEntries(this.names)), 'utf8');
+    //
+    //         done(undefined, name);
+    //     });
+    // }
+
     private async getClosestCelestial(systemId: number, x: number, y: number, z: number): Promise<ClosestCelestial> {
         return await this.esiClient.getCelestial(systemId, x, y, z);
     }
@@ -1466,6 +1504,14 @@ export class ZKillSubscriber {
     strAllianceZk(allianceId: number): string {
         try {
             return `https://zkillboard.com/alliance/${allianceId.toString()}/`;
+        } catch {
+            return '';
+        }
+    }
+
+    strFactionZk(factionId: number): string {
+        try {
+            return `https://zkillboard.com/factions/${factionId.toString()}/`;
         } catch {
             return '';
         }
