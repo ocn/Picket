@@ -1,6 +1,7 @@
 version: '3.6'
 services:
   discordbot:
+    container_name: discordbot
     image: ocn-killbot:latest
     restart: unless-stopped
     build:
@@ -11,6 +12,18 @@ services:
       DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID}
     volumes:
       - ./config:/workspace/dist/config:delegated
+
+  restarter:
+    image: docker:stable
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >
+      sh -c "while true; do
+        sleep 3600;
+        docker restart discordbot;
+      done"
+    depends_on:
+      - discordbot
 
 networks:
   default:
