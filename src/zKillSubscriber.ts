@@ -65,15 +65,15 @@ export interface Subscription {
 
 export interface SubscriptionFlags {
     // If true, the limitTypes will be compared against the attacker's ship
-    inclusionLimitAlsoComparesAttacker: boolean
+    inclusionLimitAlsoComparesAttacker: boolean;
     // If true, the limitTypes will be compared against the weapon type IDs on the attacker's ship
     // zKillboard will sometimes list weapon type IDs as the attacking ship, instead of the actual ship type ID
-    inclusionLimitAlsoComparesAttackerWeapons: boolean
+    inclusionLimitAlsoComparesAttackerWeapons: boolean;
     // If true, the limitTypes will be compared against the attacker's ship
-    exclusionLimitAlsoComparesAttacker: boolean
+    exclusionLimitAlsoComparesAttacker: boolean;
     // If true, the limitTypes will be compared against the weapon type IDs on the attacker's ship
     // zKillboard will sometimes list weapon type IDs as the attacking ship, instead of the actual ship type ID
-    exclusionLimitAlsoComparesAttackerWeapons: boolean
+    exclusionLimitAlsoComparesAttackerWeapons: boolean;
 }
 
 export type AllianceDescription = {
@@ -767,7 +767,7 @@ export class ZKillSubscriber {
         );
         const distanceInUnits = this.distanceTo(closestCelestial);
         const closestCelestialName = closestCelestial.itemName.substring(0, 36);
-        locationDetails += `on [${closestCelestialName}](${this.strLocation(closestCelestial.itemId)}), ${distanceInUnits} away`;
+        locationDetails += `on: [${closestCelestialName}](${this.strLocation(closestCelestial.itemId)}), ${distanceInUnits} away`;
 
         if (params.data.victim.ship_type_id != null) {
             try {
@@ -780,7 +780,7 @@ export class ZKillSubscriber {
         if (params.data.victim.alliance_id != null) {
             try {
                 const victimAllianceName = await this.getNameForAlliance(params.data.victim.alliance_id);
-                victimDetails += `[${victimAllianceName.substring(0, 25)}](${this.strAllianceZk(params.data.victim.alliance_id)})`;
+                victimDetails += `[${victimAllianceName.substring(0, 40)}](${this.strAllianceZk(params.data.victim.alliance_id)})`;
             } catch (e) {
                 victimDetails += `N/A`;
                 console.log(e);
@@ -790,9 +790,9 @@ export class ZKillSubscriber {
             try {
                 const victimCorporationName = await this.getNameForCorporation(params.data.victim.corporation_id);
                 if (victimDetails.length !== 0) {
-                    victimDetails += ' / ';
+                } else {
+                    victimDetails += `[${victimCorporationName.substring(0, 30)}](${this.strCorpZk(params.data.victim.corporation_id)})`;
                 }
-                victimDetails += `[${victimCorporationName.substring(0, 15)}](${this.strCorpZk(params.data.victim.corporation_id)})`;
             } catch (e) {
                 console.log(e);
             }
@@ -922,7 +922,7 @@ export class ZKillSubscriber {
         }
         console.log('rendering icon: ' + this.strItemRenderById(idOfIconToRender));
 
-        let affiliation = locationDetails + `\n${victimLink}: ${victimDetails}\n${attackerLink}: ${attackerDetails}\`\`\``;
+        let attackerAlliances = '```';
         const allianceCountMap = new Map<string, number>();
         for (const attacker of params.data.attackers) {
             const id = attacker.alliance_id ? attacker.alliance_id : attacker.corporation_id;
@@ -984,17 +984,18 @@ export class ZKillSubscriber {
         displayedEntries.forEach(([key, value]) => {
             const spaces = maxNameLength - Math.min(key.length, 26) + padding;
             const formattedKey = key.length > 26 ? key.slice(0, 26) + '-\n' + key.slice(26) : key;
-            affiliation += `${formattedKey}${' '.repeat(spaces)}x${value}\n`;
+            attackerAlliances += `${formattedKey}${' '.repeat(spaces)}x${value}\n`;
         });
 
         // Add the "others" entry if there were collapsed entries
         if (othersCount > 0) {
             const others = '...others';
             const spaces = maxNameLength - others.length + padding;
-            affiliation += `${others}${' '.repeat(spaces)}x${othersCount}\n`;
+            attackerAlliances += `${others}${' '.repeat(spaces)}x${othersCount}\n`;
         }
 
-        affiliation += '```';
+        attackerAlliances += '```';
+
         console.log('attackerparams.dataDone');
 
         console.log(systemRegion);
@@ -1009,15 +1010,6 @@ export class ZKillSubscriber {
         console.log('total value: ' + params.data.zkb.totalValue);
         const killmail_value = this.abbreviateNumber(params.data.zkb.totalValue);
         console.log('killmail_value: ' + killmail_value);
-
-        const fields: { inline: boolean; name: string; value: string }[] = [];
-        [
-            {
-                name: `(${params.data.attackers.length}) Pilots Involved`,
-                value: affiliation,
-                inline: false,
-            },
-        ].forEach((field) => fields.push(field));
 
         let title: string;
         let authorText: string;
@@ -1039,7 +1031,7 @@ export class ZKillSubscriber {
                     title = `\`${victimShipName}\` destroyed`;
                 } else {
                     authorText = `${params.matchedShip.shipName} in ${systemRegion.systemName} (${systemRegion.regionName})`;
-                    title = `Died to ${mostCommonShip.count}x \`${mostCommonShipName}\``;
+                    title = `\`${victimShipName}\` died to ${mostCommonShip.count}x \`${mostCommonShipName}\``;
                 }
             } else {
                 title = `${relativeTime}`;
@@ -1048,7 +1040,22 @@ export class ZKillSubscriber {
             title = params.embedding?.result.ogTitle;
             authorText = '';
         }
-        authorText += `\n${relativeTime}`
+        authorText += `\n${relativeTime}`;
+
+        console.log('TIME: ' + killmailTime.getTime());
+
+        const related = `https://br.evetools.org/related/${systemRegion.id}/${this.formatDateToTimestamp(killmailTime)}`;
+
+        const affiliation = `${attackerAlliances}[killed](${related}): ${victimDetails}\nin: [${systemRegion.systemName}](${this.strSystemDotlan(systemRegion.id)}) ([${systemRegion.regionName}](${this.strRegionDotlan(systemRegion.regionId)}))\n${locationDetails}`;
+
+        const fields: { inline: boolean; name: string; value: string }[] = [];
+        [
+            {
+                name: `(${params.data.attackers.length}) Attackers Involved`,
+                value: affiliation,
+                inline: false,
+            },
+        ].forEach((field) => fields.push(field));
 
         return [{
             title: title,
@@ -1067,7 +1074,13 @@ export class ZKillSubscriber {
             fields: fields,
             timestamp: killmailTime.getTime(),
             footer: {
-                text: `Value: ${killmail_value} • EVETime: ${killmailTime.toLocaleString('en-GB', { hour: '2-digit', minute: '2-digit', year: '2-digit', month: '2-digit', day: '2-digit' })}`,
+                text: `Value: ${killmail_value} • EVETime: ${killmailTime.toLocaleString('en-GB', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    year: '2-digit',
+                    month: '2-digit',
+                    day: '2-digit'
+                })}`,
             }
         }];
     }
@@ -1079,6 +1092,17 @@ export class ZKillSubscriber {
         } else {
             return Math.round(distance) + ' km';
         }
+    }
+
+    private formatDateToTimestamp(date: Date): string {
+        const year = date.getUTCFullYear();
+        const month = (date.getUTCMonth() + 1).toString().padStart(2, '0'); // Months are 0-indexed
+        const day = date.getUTCDate().toString().padStart(2, '0');
+        const hours = date.getUTCHours().toString().padStart(2, '0');
+
+        // Always round down to the hour, so minutes are ignored
+        const roundedTimestamp = `${year}${month}${day}${hours}00`;
+        return roundedTimestamp;
     }
 
     private getRelativeTime(killmailTime: string): string {
@@ -1119,7 +1143,7 @@ export class ZKillSubscriber {
         if (n >= 1e12) return +(n / 1e12).toFixed(1) + 'tril';
     }
 
-    findMostCommonShipTypeIdAndCount(attackers: Attacker[]): {shipTypeId: number, count: number} | null {
+    findMostCommonShipTypeIdAndCount(attackers: Attacker[]): { shipTypeId: number, count: number } | null {
         const frequency: { [key: number]: number } = {};
 
         for (const attacker of attackers) {
