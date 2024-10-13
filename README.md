@@ -7,9 +7,9 @@
 <img alt="GitHub Contributors" src="https://img.shields.io/github/contributors/ocn/zk-activity" />
 <img alt="GitHub Issues" src="https://img.shields.io/github/issues/ocn/zk-activity" />
 
-<p align="center">
-  <img src="https://media.discordapp.net/attachments/1171884090123890729/1172291509601710171/PartnerBadge2.png?ex=667c8c8c&is=667b3b0c&hm=d6ef80dc17913743c229c054a0cf430d64ffc1ec97db04f184248752cb4bffe5&=&format=webp&quality=lossless&width=357&height=150"  style="max-height: 150px;" /> 
-</p>
+<div style="display: flex; justify-content: center;">
+  <img src="https://i.imgur.com/QmHC1Yx.png"  style="height: 100%; max-height: 150px;" /> 
+</div>
 
 zk-activity is a bot that brings EVE Online killmails from zkillboard.com into your Discord channel. It provides a way to filter the incoming mails according to your preferences. 
 
@@ -18,8 +18,8 @@ The bot operates by subscribing to a data feed from zkillboard.com and processes
 The bot's versatility allows for tracking of any killmails involving specific categories such as capitals, structures, structure modules, or fighters within a specific region and time frame. The filters can be combined to achieve nearly any sort of tracking of a person, corporation, alliance, ship-type, fleet size, or location that you desire.
 
 <p float="left">
-  <img src="https://i.imgur.com/GL0Uquc.png"  style="width: 49%; max-width: 500px;" />
-  <img src="https://i.imgur.com/OmiUVoa.png"  style="width: 49%; max-width: 500px;" /> 
+  <img src="https://i.imgur.com/gTIwRwx.png"  style="width: 49%; max-width: 500px;" />
+  <img src="https://i.imgur.com/xFL3aoh.png"  style="width: 49%; max-width: 500px;" /> 
 </p>
 
 To use the bot, you invite it to your Discord server using a provided Discord invite URL link. Once the bot is on your server, you can set up feeds in a Discord channel. The bot will then start delivering killmails from EVE Online to your Discord channel based on the filters you've set up.
