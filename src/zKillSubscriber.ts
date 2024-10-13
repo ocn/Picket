@@ -34,6 +34,7 @@ export enum LimitType {
     ALLIANCE = 'alliance',
     CORPORATION = 'corporation',
     CHARACTER = 'character',
+    FACTION = 'faction',
     // A partial name of the entity type to require for sending
     NAME_FRAGMENT = 'nameFragment',
     MIN_NUM_INVOLVED = 'minNumInvolved',
@@ -175,8 +176,9 @@ export type Victim = {
     damage_taken: number;
     items: VictimItem[];
     position: Position;
-    ship_type_id?: number; // ship_type_id is now optional
+    ship_type_id?: number; // ship_type_id is optional
     character_id?: number; // character_id is optional and may be present instead of ship_type_id
+    faction_id?: number; // faction_id is optional
 };
 
 export type VictimItem = {
@@ -424,6 +426,24 @@ export class ZKillSubscriber {
                                 requireSend = true;
                                 break;
                             }
+                        }
+                    }
+                }
+            }
+            if (!requireSend) return;
+        }
+        if (hasLimitType(subscription, LimitType.FACTION)) {
+            const factionIds = <string>getLimitType(subscription, LimitType.FACTION);
+            for (const factionId of factionIds.split(',')) {
+                if (data.victim.faction_id === Number(factionId)) {
+                    requireSend = true;
+                    color = 'RED';
+                }
+                if (!requireSend) {
+                    for (const attacker of data.attackers) {
+                        if (attacker.faction_id === Number(factionId)) {
+                            requireSend = true;
+                            break;
                         }
                     }
                 }

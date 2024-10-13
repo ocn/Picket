@@ -73,6 +73,7 @@ If you choose to host the bot yourself, follow these steps:
 |                              | - `limit_character_ids`: Limit to certain character IDs (comma-separated, optional)                        |
 |                              | - `limit_corporation_ids`: Limit to certain corporation IDs (comma-separated, optional)                    |
 |                              | - `limit_alliance_ids`: Limit to certain alliance IDs (comma-separated, optional)                          |
+|                              | - `limit_faction_ids`: Limit to certain faction IDs (comma-separated, optional)                            |
 |                              | - `limit_region_ids`: Limit to certain region IDs (comma-separated, optional)                              |
 |                              | - `limit_security_max_inclusive`: Inclusive limit to a maximum security (optional)                         |
 |                              | - `limit_security_max_exclusive`: Exclusive limit to a maximum security (optional)                         |

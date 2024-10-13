@@ -21,6 +21,7 @@ export class SubscribeCommand extends AbstractCommand {
     protected LIMIT_ALLIANCE_IDS = 'limit-alliance-ids';
     protected LIMIT_CORPORATION_IDS = 'limit-corporation-ids';
     protected LIMIT_CHARACTER_IDS = 'limit-character-ids';
+    protected LIMIT_FACTION_IDS = 'limit-faction-ids';
     protected LIMIT_TIME_RANGE_START = 'limit-time-range-start';
     protected LIMIT_TIME_RANGE_END = 'limit-time-range-end';
     protected INCLUSION_LIMIT_COMPARES_ATTACKERS = 'in-limit-compares-attackers';
@@ -44,6 +45,7 @@ export class SubscribeCommand extends AbstractCommand {
         const minValue = interaction.options.getNumber(this.MIN_VALUE);
         const minNumInvolved = interaction.options.getNumber(this.MIN_NUM_INVOLVED);
         const limitCharacter = interaction.options.getString(this.LIMIT_CHARACTER_IDS);
+        const limitFaction = interaction.options.getString(this.LIMIT_FACTION_IDS);
         const limitCorporation = interaction.options.getString(this.LIMIT_CORPORATION_IDS);
         const limitAlliance = interaction.options.getString(this.LIMIT_ALLIANCE_IDS);
         const limitRegion = interaction.options.getString(this.LIMIT_REGION_IDS);
@@ -83,6 +85,10 @@ export class SubscribeCommand extends AbstractCommand {
         if (limitCharacter) {
             limitTypes.set(LimitType.CHARACTER, limitCharacter);
             reply += '\nCharacter filter: + ' + limitCharacter;
+        }
+        if (limitFaction) {
+            limitTypes.set(LimitType.FACTION, limitFaction);
+            reply += '\nCharacter filter: + ' + limitFaction;
         }
         if (limitRegion) {
             limitTypes.set(LimitType.REGION, limitRegion);
@@ -197,6 +203,11 @@ export class SubscribeCommand extends AbstractCommand {
             .addStringOption(option =>
                 option.setName(this.LIMIT_CHARACTER_IDS)
                     .setDescription('Limit to character id, comma seperated ids')
+                    .setRequired(false)
+            )
+            .addStringOption(option =>
+                option.setName(this.LIMIT_FACTION_IDS)
+                    .setDescription('Limit to faction id, comma seperated ids')
                     .setRequired(false)
             )
             .addStringOption(option =>
