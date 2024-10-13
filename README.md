@@ -51,10 +51,15 @@ To use this bot, you can either host it yourself or contact the developer for ho
 
 If you choose to host the bot yourself, follow these steps:
 
-1. Clone this repository to your local machine.
+1. Clone this repository to your local machine and `cd` into it.
+
+#### Manual build
 2. Install the required dependencies by running `yarn install` or `npm install`.
 3. Copy the `env.sample` file to `.env` and fill out the required parameters.
 4. Run `docker-compose up -d` to start the bot.
+
+#### Docker + Docker Compose
+2. Run `docker build -t ocn-killbot:latest . && docker-compose down && docker-compose up -d && sleep 2 && docker-compose logs`
 
 ## Commands
 
