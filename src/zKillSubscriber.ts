@@ -88,7 +88,8 @@ export type PrepareEmbedFields = {
     channelId: string,
     subscription: Subscription,
     embedding: any,
-    data: ZkData,
+    data: KillmailData,
+    zkb: Zkb,
     matchedShip: FilterShipMatch | null,
     minNumInvolved: number | null,
     messageColor: ColorResolvable,
@@ -204,12 +205,17 @@ export type Zkb = {
     url: string;
 };
 
-export type ZkData = {
+export type KillmailData = {
     attackers: Attacker[];
     killmail_id: number;
     killmail_time: string;
     solar_system_id: number;
     victim: Victim;
+};
+
+export type ZkData = {
+    killID: number;
+    killmail: KillmailData;
     zkb: Zkb;
 };
 
@@ -298,18 +304,21 @@ export class ZKillSubscriber {
     
 
     protected async onMessage(data: ZkData) {
-        if (!data || !data.victim || data.solar_system_id === undefined) {
+        const killmailData = data.killmail;
+        const zkbData = data.zkb;
+
+        if (!killmailData || killmailData.solar_system_id === undefined || !zkbData) {
             console.warn(`Skipping killmail due to missing data: ${JSON.stringify(data)}`);
             return;
         }
 
         this.subscriptions.forEach((guild, guildId) => {
-            const log_prefix = `["${data.killmail_id}"][${new Date()}] `;
+            const log_prefix = `["${killmailData.killmail_id}"][${new Date()}] `;
             console.log(log_prefix);
             guild.channels.forEach((channel, channelId) => {
                 channel.subscriptions.forEach(async (subscription) => {
                     try {
-                        await this.process_subscription(subscription, data, guildId, channelId);
+                        await this.process_subscription(subscription, killmailData, zkbData, guildId, channelId);
                     } catch (e) {
                         console.log(e);
                     }
@@ -329,7 +338,8 @@ export class ZKillSubscriber {
 
     private async process_subscription(
         subscription: Subscription,
-        data: ZkData,
+        killmailData: KillmailData,
+        zkbData: Zkb,
         guildId: string,
         channelId: string,
     ) {
@@ -337,20 +347,20 @@ export class ZKillSubscriber {
         let requireSend = false;
         let matchedShip: FilterShipMatch | null = null;
 
-        if (subscription.minValue > data.zkb.totalValue) {
+        if (subscription.minValue > zkbData.totalValue) {
             // console.log(`Channel ${channelId}: limiting kill due to minValue filter`);
             return;
         }
 
         if (subscription.limitTypes.size === 0) {
-            await this.sendMessageToDiscord(guildId, channelId, subscription, data);
+            await this.sendMessageToDiscord(guildId, channelId, subscription, killmailData, zkbData);
             return;
         }
-        if (hasLimitType(subscription, LimitType.NPC_ONLY) && data.zkb.npc) {
+        if (hasLimitType(subscription, LimitType.NPC_ONLY) && zkbData.npc) {
             const val = (getLimitType(subscription, LimitType.NPC_ONLY) ?? 'false').toLowerCase();
             console.log(`Channel ${channelId}: NPC_ONLY filter value is ${val}`);
             if (val === 'true') {
-                if (data.zkb.npc) {
+                if (zkbData.npc) {
                     console.log(`Channel ${channelId}: sending kill due to NPC only filter`);
                     requireSend = true;
                 } else {
@@ -365,7 +375,7 @@ export class ZKillSubscriber {
                 nameFragment = <string>getLimitType(subscription, LimitType.NAME_FRAGMENT);
             }
             const __ret = await this.sendIfAnyShipsMatchLimitFilter(
-                data,
+                killmailData,
                 <string>getLimitType(subscription, LimitType.SHIP_INCLUSION_TYPE_ID),
                 nameFragment,
                 subscription.inclusionLimitAlsoComparesAttacker,
@@ -379,19 +389,19 @@ export class ZKillSubscriber {
                 return;
             }
         }
-        if (!await this.checkSecurityMaxExclusive(subscription, data)) {
+        if (!await this.checkSecurityMaxExclusive(subscription, killmailData)) {
             console.log(`Channel ${channelId}: limiting kill due to max exclusive security filter`);
             return;
         }
-        if (!await this.checkSecurityMinExclusive(subscription, data)) {
+        if (!await this.checkSecurityMinExclusive(subscription, killmailData)) {
             console.log(`Channel ${channelId}: limiting kill due to min exclusive security filter`);
             return;
         }
-        if (!await this.checkSecurityMaxInclusive(subscription, data)) {
+        if (!await this.checkSecurityMaxInclusive(subscription, killmailData)) {
             console.log(`Channel ${channelId}: limiting kill in due to max inclusive security filter`);
             return;
         }
-        if (!await this.checkSecurityMinInclusive(subscription, data)) {
+        if (!await this.checkSecurityMinInclusive(subscription, killmailData)) {
             console.log(`Channel ${channelId}: limiting kill due to min inclusive security filter`);
             return;
         }
@@ -403,15 +413,15 @@ export class ZKillSubscriber {
                 const characterIds = characterIdsStr.split(',') || [];
                 const allianceIds = getLimitType(subscription, LimitType.ALLIANCE)?.split(',') || [];
 
-                const victimCharId = data.victim.character_id;
+                const victimCharId = killmailData.victim.character_id;
                 if (victimCharId) {
                     const victimMatchesCharacter = characterIds.includes(victimCharId.toString());
-                    const victimMatchesAlliance = allianceIds.includes(data.victim.alliance_id?.toString());
+                    const victimMatchesAlliance = allianceIds.includes(killmailData.victim.alliance_id?.toString());
 
                     if (victimMatchesCharacter !== victimMatchesAlliance) {
                         // Victim matches either character or alliance, but not both
-                        const attackerMatchesCharacter = data.attackers.some(attacker => attacker.character_id && characterIds.includes(attacker.character_id?.toString()));
-                        const attackerMatchesAlliance = data.attackers.some(attacker => attacker.alliance_id && allianceIds.includes(attacker.alliance_id?.toString()));
+                        const attackerMatchesCharacter = killmailData.attackers.some(attacker => attacker.character_id && characterIds.includes(attacker.character_id?.toString()));
+                        const attackerMatchesAlliance = killmailData.attackers.some(attacker => attacker.alliance_id && allianceIds.includes(attacker.alliance_id?.toString()));
 
                         if (victimMatchesCharacter && attackerMatchesAlliance || victimMatchesAlliance && attackerMatchesCharacter) {
                             requireSend = true;
@@ -421,12 +431,12 @@ export class ZKillSubscriber {
             } else {
                 // just match based on matching character_id
                 for (const characterId of characterIdsStr.split(',')) {
-                    if (data.victim.character_id === Number(characterId)) {
+                    if (killmailData.victim.character_id === Number(characterId)) {
                         requireSend = true;
                         color = 'RED';
                     }
                     if (!requireSend) {
-                        for (const attacker of data.attackers) {
+                        for (const attacker of killmailData.attackers) {
                             if (attacker.character_id === Number(characterId)) {
                                 requireSend = true;
                                 break;
@@ -441,12 +451,12 @@ export class ZKillSubscriber {
             const factionIds = <string>getLimitType(subscription, LimitType.FACTION);
             requireSend = false;
             for (const factionId of factionIds.split(',')) {
-                if (data.victim.faction_id === Number(factionId) && data.victim) {
+                if (killmailData.victim.faction_id === Number(factionId) && killmailData.victim) {
                     requireSend = true;
                     color = 'RED';
                 }
                 if (!requireSend) {
-                    for (const attacker of data.attackers) {
+                    for (const attacker of killmailData.attackers) {
                         if (attacker.faction_id === Number(factionId)) {
                             requireSend = true;
                             break;
@@ -463,12 +473,12 @@ export class ZKillSubscriber {
             const corporationIds = <string>getLimitType(subscription, LimitType.CORPORATION);
             requireSend = false;
             for (const corporationId of corporationIds.split(',')) {
-                if (data.victim.corporation_id === Number(corporationId)) {
+                if (killmailData.victim.corporation_id === Number(corporationId)) {
                     requireSend = true;
                     color = 'RED';
                 }
                 if (!requireSend) {
-                    for (const attacker of data.attackers) {
+                    for (const attacker of killmailData.attackers) {
                         if (attacker.corporation_id === Number(corporationId)) {
                             requireSend = true;
                             break;
@@ -485,13 +495,13 @@ export class ZKillSubscriber {
             const allianceIds = <string>getLimitType(subscription, LimitType.ALLIANCE);
             requireSend = false;
             for (const allianceId of allianceIds.split(',')) {
-                if (data.victim.alliance_id === Number(allianceId)) {
+                if (killmailData.victim.alliance_id === Number(allianceId)) {
                     requireSend = true;
                     color = 'RED';
                     break;
                 }
                 if (!requireSend) {
-                    for (const attacker of data.attackers) {
+                    for (const attacker of killmailData.attackers) {
                         if (attacker.alliance_id === Number(allianceId)) {
                             requireSend = true;
                             break;
@@ -510,7 +520,7 @@ export class ZKillSubscriber {
         if (hasLimitType(subscription, LimitType.REGION) ||
             hasLimitType(subscription, LimitType.CONSTELLATION) ||
             hasLimitType(subscription, LimitType.SYSTEM)) {
-            requireSend = await this.isInLocationLimit(subscription, data.solar_system_id);
+            requireSend = await this.isInLocationLimit(subscription, killmailData.solar_system_id);
             if (!requireSend) {
                 console.log(`Channel ${channelId}: limiting kill due to location filter`);
                 return;
@@ -519,7 +529,7 @@ export class ZKillSubscriber {
         let minNumInvolved: number | null = null;
         if (hasLimitType(subscription, LimitType.MIN_NUM_INVOLVED)) {
             minNumInvolved = Number(<string>getLimitType(subscription, LimitType.MIN_NUM_INVOLVED));
-            const numInvolved = data.attackers.length + 1;
+            const numInvolved = killmailData.attackers.length + 1;
             if (numInvolved < minNumInvolved) {
                 console.log(`Channel ${channelId}: limiting kill due to minimum number of involved parties filter: ${numInvolved} < ${minNumInvolved}`);
                 return;
@@ -528,7 +538,7 @@ export class ZKillSubscriber {
         if (hasLimitType(subscription, LimitType.TIME_RANGE_START) && hasLimitType(subscription, LimitType.TIME_RANGE_END)) {
             const startTime = Number(<string>getLimitType(subscription, LimitType.TIME_RANGE_START));
             const endTime = Number(<string>getLimitType(subscription, LimitType.TIME_RANGE_END));
-            const killmailTime = new Date(data.killmail_time);
+            const killmailTime = new Date(killmailData.killmail_time);
             const killmailHour = killmailTime.getUTCHours();
 
             if (startTime < endTime) {
@@ -549,7 +559,8 @@ export class ZKillSubscriber {
                 guildId,
                 channelId,
                 subscription,
-                data,
+                killmailData,
+                zkbData,
                 matchedShip,
                 minNumInvolved,
                 color
@@ -557,9 +568,9 @@ export class ZKillSubscriber {
         }
     }
 
-    public async checkSecurityMaxInclusive(subscription: Subscription, data: ZkData): Promise<boolean> {
+    public async checkSecurityMaxInclusive(subscription: Subscription, killmailData: KillmailData): Promise<boolean> {
         if (hasLimitType(subscription, LimitType.SECURITY_MAX_INCLUSIVE)) {
-            const systemData = await this.getSystemData(data.solar_system_id);
+            const systemData = await this.getSystemData(killmailData.solar_system_id);
             const maximumSecurityStatus = Number(<string>getLimitType(subscription, LimitType.SECURITY_MAX_INCLUSIVE));
             if (maximumSecurityStatus < systemData.securityStatus) {
                 // console.log(`limiting kill in ${systemData.systemName} due to inclusive maximum security status filter: ${systemData.securityStatus} > ${maximumSecurityStatus}`);
@@ -569,9 +580,9 @@ export class ZKillSubscriber {
         return true;
     }
 
-    public async checkSecurityMaxExclusive(subscription: Subscription, data: ZkData): Promise<boolean> {
+    public async checkSecurityMaxExclusive(subscription: Subscription, killmailData: KillmailData): Promise<boolean> {
         if (hasLimitType(subscription, LimitType.SECURITY_MAX_EXCLUSIVE)) {
-            const systemData = await this.getSystemData(data.solar_system_id);
+            const systemData = await this.getSystemData(killmailData.solar_system_id);
             const maximumSecurityStatus = Number(<string>getLimitType(subscription, LimitType.SECURITY_MAX_EXCLUSIVE));
             if (maximumSecurityStatus <= systemData.securityStatus) {
                 // console.log(`limiting kill in ${systemData.systemName} due to exclusive maximum security status filter: ${systemData.securityStatus} >= ${maximumSecurityStatus}`);
@@ -581,9 +592,9 @@ export class ZKillSubscriber {
         return true;
     }
 
-    public async checkSecurityMinInclusive(subscription: Subscription, data: ZkData): Promise<boolean> {
+    public async checkSecurityMinInclusive(subscription: Subscription, killmailData: KillmailData): Promise<boolean> {
         if (hasLimitType(subscription, LimitType.SECURITY_MIN_INCLUSIVE)) {
-            const systemData = await this.getSystemData(data.solar_system_id);
+            const systemData = await this.getSystemData(killmailData.solar_system_id);
             const minimumSecurityStatus = Number(<string>getLimitType(subscription, LimitType.SECURITY_MIN_INCLUSIVE));
             if (minimumSecurityStatus > systemData.securityStatus) {
                 // console.log(`limiting kill in ${systemData.systemName} due to inclusive minimum security status filter: ${systemData.securityStatus} < ${minimumSecurityStatus}`);
@@ -593,9 +604,9 @@ export class ZKillSubscriber {
         return true;
     }
 
-    public async checkSecurityMinExclusive(subscription: Subscription, data: ZkData): Promise<boolean> {
+    public async checkSecurityMinExclusive(subscription: Subscription, killmailData: KillmailData): Promise<boolean> {
         if (hasLimitType(subscription, LimitType.SECURITY_MIN_EXCLUSIVE)) {
-            const systemData = await this.getSystemData(data.solar_system_id);
+            const systemData = await this.getSystemData(killmailData.solar_system_id);
             const minimumSecurityStatus = Number(<string>getLimitType(subscription, LimitType.SECURITY_MIN_EXCLUSIVE));
             if (minimumSecurityStatus >= systemData.securityStatus) {
                 // console.log(`limiting kill in ${systemData.systemName} due to exclusive minimum security status filter: ${systemData.securityStatus} <= ${minimumSecurityStatus}`);
@@ -606,7 +617,7 @@ export class ZKillSubscriber {
     }
 
     private async sendIfAnyShipsMatchLimitFilter(
-        data: ZkData,
+        killmailData: KillmailData,
         limitIds: string,
         nameFragment: string,
         alsoCompareAttackers: boolean,
@@ -614,7 +625,7 @@ export class ZKillSubscriber {
     ) {
         const limitGroupOfShipIds = limitIds?.split(',') || [];
         const shouldCheckNameFragment = nameFragment != null && nameFragment != '';
-        const shipTypeId = data.victim.ship_type_id;
+        const shipTypeId = killmailData.victim.ship_type_id;
         if (shipTypeId == null) {
             console.log('WARNING: shipTypeId is null');
             return {
@@ -635,15 +646,15 @@ export class ZKillSubscriber {
                     matchedShip: {
                         shipName: await this.getNameForEntityId(shipTypeId),
                         typeId: shipTypeId,
-                        corpId: data.victim.corporation_id,
-                        allianceId: data.victim.alliance_id,
+                        corpId: killmailData.victim.corporation_id,
+                        allianceId: killmailData.victim.alliance_id,
                     },
                 };
             }
 
             // If the victim's ship doesn't match, check the attackers' ships
             if (alsoCompareAttackers) {
-                for (const attacker of data.attackers) {
+                for (const attacker of killmailData.attackers) {
                     if (await this.isShipMatch(attacker.ship_type_id, permittedGroupOfShipId, shouldCheckNameFragment, nameFragment)) {
                         const id = attacker.ship_type_id;
                         if (id == null) {
@@ -709,13 +720,14 @@ export class ZKillSubscriber {
         guildId: string,
         channelId: string,
         subscription: Subscription,
-        data: ZkData,
+        killmailData: KillmailData,
+        zkbData: Zkb,
         matchedShip: FilterShipMatch | null = null,
         minNumInvolved: number | null = null,
         messageColor: ColorResolvable = 'GREY',
     ) {
         await this.asyncLock.acquire('sendKill', async (done) => {
-            const cacheKey = `${channelId}_${data.killmail_id}`;
+            const cacheKey = `${channelId}_${killmailData.killmail_id}`;
             if (MemoryCache.get(cacheKey)) {
                 // Mail was already sent, prevent from sending twice
                 done();
@@ -731,13 +743,14 @@ export class ZKillSubscriber {
                 return;
             }
 
-            const embedding = await ogs({url: data.zkb.url}).catch(() => null);
+            const embedding = await ogs({url: zkbData.url}).catch(() => null);
             const params: PrepareEmbedFields = {
                 guildId,
                 channelId,
                 subscription,
                 embedding,
-                data,
+                data: killmailData,
+                zkb: zkbData,
                 matchedShip,
                 minNumInvolved,
                 messageColor,
@@ -781,12 +794,12 @@ export class ZKillSubscriber {
                         // @ts-ignore
                         width: params.embedding?.result.ogImage?.width
                     },
-                    url: params.data.zkb.url,
+                    url: params.zkb.url,
                     color: params.messageColor,
                 }]
             };
         } else {
-            return {content: params.data.zkb.url};
+            return {content: params.zkb.url};
         }
     }
 
@@ -958,7 +971,7 @@ export class ZKillSubscriber {
                 affiliationIconURLToRender = this.strItemRenderById(idOfIconToRender);
             }
         } else {
-            console.log(`failed to find an icon to render for ${params.data.zkb.url}`);
+            console.log(`failed to find an icon to render for ${params.zkb.url}`);
             throw new Error('failed to find an icon to render');
         }
         console.log('rendering icon: ' + this.strItemRenderById(idOfIconToRender));
@@ -1048,8 +1061,8 @@ export class ZKillSubscriber {
         // convert the killmail_time `2023-01-17T01:53:02Z` to YYYY/MM/DD HH:MM
         // const killmailTimeFormatted = killmailTime.toISOString().replace(/T/, ' ').replace(/\..+/, '');
 
-        console.log('total value: ' + params.data.zkb.totalValue);
-        const killmail_value = this.abbreviateNumber(params.data.zkb.totalValue);
+        console.log('total value: ' + params.zkb.totalValue);
+        const killmail_value = this.abbreviateNumber(params.zkb.totalValue);
         console.log('killmail_value: ' + killmail_value);
 
         let title: string;
@@ -1103,14 +1116,14 @@ export class ZKillSubscriber {
             author: {
                 iconURL: affiliationIconURLToRender,
                 name: authorText,
-                url: params.data.zkb.url,
+                url: params.zkb.url,
             },
             thumbnail: {
                 url: this.strItemRenderById(idOfIconToRender),
                 height: params.embedding?.result.ogImage?.height,
                 width: params.embedding?.result.ogImage?.width
             },
-            url: params.data.zkb.url,
+            url: params.zkb.url,
             color: params.messageColor,
             fields: fields,
             timestamp: killmailTime.getTime(),

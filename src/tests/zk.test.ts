@@ -1,5 +1,6 @@
 import {Client, Intents} from 'discord.js';
 import {
+    KillmailData,
     LimitType,
     Subscription,
     SubscriptionFlags,
@@ -50,7 +51,7 @@ describe('ZK Subscriber', () => {
             sub.subscribe(SubscriptionType.PUBLIC, '888224317991706685', '1115807643748012072', new Map(), flags, String(1));
 
             let zk_data = readTestData('115769073_ostingele.json');
-            await sub.sendMessageToDiscord('888224317991706685', '1115807643748012072', subscription, zk_data, {
+            await sub.sendMessageToDiscord('888224317991706685', '1115807643748012072', subscription, zk_data.killmail, zk_data.zkb, {
                 shipName: 'Zirnitra',
                 typeId: 52907,
                 corpId: 98588237,
@@ -58,7 +59,7 @@ describe('ZK Subscriber', () => {
             }, null, 'GREEN');
 
             zk_data = readTestData('115787551_astrahus.json');
-            await sub.sendMessageToDiscord('888224317991706685', '1115807643748012072', subscription, zk_data, {
+            await sub.sendMessageToDiscord('888224317991706685', '1115807643748012072', subscription, zk_data.killmail, zk_data.zkb, {
                 shipName: 'Astrahus',
                 typeId: 35832,
                 corpId: 1089040789,
@@ -66,10 +67,10 @@ describe('ZK Subscriber', () => {
             }, null, 'RED');
 
             zk_data = readTestData('115797013_guardian_fight.json');
-            await sub.sendMessageToDiscord('888224317991706685', '1115807643748012072', subscription, zk_data, null, 30, 'GREEN');
+            await sub.sendMessageToDiscord('888224317991706685', '1115807643748012072', subscription, zk_data.killmail, zk_data.zkb, null, 30, 'GREEN');
 
             zk_data = readTestData('119689329_nid_solo.json');
-            await sub.sendMessageToDiscord('888224317991706685', '1115807643748012072', subscription, zk_data, null, 1, 'GREEN');
+            await sub.sendMessageToDiscord('888224317991706685', '1115807643748012072', subscription, zk_data.killmail, zk_data.zkb, null, 1, 'GREEN');
 
             // await sub.sendMessageToDiscord('888224317991706685', '1115807643748012072', subscription, zk_data, {
             //     shipName: 'Mobile Small Warp Disruptor II',
@@ -88,7 +89,7 @@ describe('ZK Subscriber', () => {
             .withSystems('../config/')
             .withShips('../config/')
             .withNames('../config/');
-        const data: ZkData = {
+        const data: KillmailData = {
             attackers: [],
             killmail_id: 0,
             killmail_time: '',
@@ -99,19 +100,6 @@ describe('ZK Subscriber', () => {
                 damage_taken: 0,
                 items: [],
                 position: { x: 0, y: 0, z: 0 }
-            }, zkb: {
-                locationID: 0,
-                hash: '',
-                fittedValue: 0,
-                droppedValue: 0,
-                destroyedValue: 0,
-                totalValue: 0,
-                points: 0,
-                npc: false,
-                solo: false,
-                awox: false,
-                esi: '',
-                url: '',
             }
         };
         const lowsec0point1 = [
@@ -228,7 +216,7 @@ describe('ZK Subscriber', () => {
             .withSystems('../config/')
             .withShips('../config/')
             .withNames('../config/');
-        const data: ZkData = {
+        const data: KillmailData = {
             attackers: [],
             killmail_id: 0,
             killmail_time: '',
@@ -239,19 +227,6 @@ describe('ZK Subscriber', () => {
                 damage_taken: 0,
                 items: [],
                 position: { x: 0, y: 0, z: 0 }
-            }, zkb: {
-                locationID: 0,
-                hash: '',
-                fittedValue: 0,
-                droppedValue: 0,
-                destroyedValue: 0,
-                totalValue: 0,
-                points: 0,
-                npc: false,
-                solo: false,
-                awox: false,
-                esi: '',
-                url: '',
             }
         };
         const lowsec0point1 = [
