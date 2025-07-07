@@ -260,6 +260,7 @@ export class ZKillSubscriber {
 
     protected asyncLock: AsyncLock;
     protected esiClient: EsiClient;
+    private _queueId: string;
 
     constructor(client: Client, connect = true) {
         this.asyncLock = new AsyncLock();
@@ -270,6 +271,7 @@ export class ZKillSubscriber {
         this.names = new Map<number, string>();
         this.doClient = client;
         this.rest = new REST({version: '9'}).setToken(process.env.DISCORD_BOT_TOKEN || '');
+        this._queueId = Math.random().toString(36).substring(2) + Date.now().toString(36);
         if (connect) {
             this.listen();
         }
@@ -277,7 +279,11 @@ export class ZKillSubscriber {
 
     protected async listen() {
         try {
-            const response = await axios.get('https://zkillredisq.stream/listen.php');
+            const response = await axios.get('https://zkillredisq.stream/listen.php', {
+                params: {
+                    queueID: this._queueId
+                }
+            });
             if (response.data && response.data.package) {
                 this.onMessage(response.data.package);
             }
@@ -292,6 +298,11 @@ export class ZKillSubscriber {
     
 
     protected async onMessage(data: ZkData) {
+        if (!data || !data.victim || data.solar_system_id === undefined) {
+            console.warn(`Skipping killmail due to missing data: ${JSON.stringify(data)}`);
+            return;
+        }
+
         this.subscriptions.forEach((guild, guildId) => {
             const log_prefix = `["${data.killmail_id}"][${new Date()}] `;
             console.log(log_prefix);
