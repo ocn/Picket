@@ -7,7 +7,7 @@ import {
     MessageOptions,
     TextChannel
 } from 'discord.js';
-import {MessageEvent, WebSocket} from 'ws';
+import axios from 'axios';
 import {REST} from '@discordjs/rest';
 import AsyncLock from 'async-lock';
 import MemoryCache from 'memory-cache';
@@ -177,7 +177,7 @@ export type Victim = {
     items: VictimItem[];
     position: Position;
     ship_type_id?: number; // ship_type_id is optional
-    character_id?: number; // character_id is optional and may be present instead of ship_type_id
+    character_id?: number; // character_id is optional and may be present instead of ship_type_id; won't be present for NPCs either
     faction_id?: number; // faction_id is optional
 };
 
@@ -261,7 +261,7 @@ export class ZKillSubscriber {
     protected asyncLock: AsyncLock;
     protected esiClient: EsiClient;
 
-    protected constructor(client: Client, connect = true) {
+    constructor(client: Client, connect = true) {
         this.asyncLock = new AsyncLock();
         this.esiClient = new EsiClient();
         this.subscriptions = new Map<string, SubscriptionGuild>();
@@ -271,33 +271,27 @@ export class ZKillSubscriber {
         this.doClient = client;
         this.rest = new REST({version: '9'}).setToken(process.env.DISCORD_BOT_TOKEN || '');
         if (connect) {
-            ZKillSubscriber.connect(this);
+            this.listen();
         }
     }
 
-    protected static connect(sub: ZKillSubscriber) {
-        const websocket = new WebSocket('wss://zkillboard.com/websocket/');
-        websocket.onmessage = sub.onMessage.bind(sub);
-        websocket.onopen = () => {
-            websocket.send(JSON.stringify({
-                'action': 'sub',
-                'channel': 'killstream'
-            }));
-        };
-        websocket.onclose = (e) => {
-            console.log('Socket is closed. Reconnect will be attempted in 1 second.', e.reason);
-            setTimeout(function () {
-                ZKillSubscriber.connect(sub);
-            }, 1000);
-        };
-        websocket.onerror = (error) => {
-            console.error('Socket encountered error: ', error.message, 'Closing socket');
-            websocket.close();
-        };
+    protected async listen() {
+        try {
+            const response = await axios.get('https://zkillredisq.stream/listen.php');
+            if (response.data && response.data.package) {
+                this.onMessage(response.data.package);
+            }
+        } catch (error) {
+            console.error('Error fetching from RedisQ:', error);
+        } finally {
+            // Poll again after a short delay
+            setTimeout(() => this.listen(), 1000);
+        }
     }
 
-    protected async onMessage(event: MessageEvent) {
-        const data: ZkData = JSON.parse(event.data.toString());
+    
+
+    protected async onMessage(data: ZkData) {
         this.subscriptions.forEach((guild, guildId) => {
             const log_prefix = `["${data.killmail_id}"][${new Date()}] `;
             console.log(log_prefix);
@@ -434,8 +428,9 @@ export class ZKillSubscriber {
         }
         if (hasLimitType(subscription, LimitType.FACTION)) {
             const factionIds = <string>getLimitType(subscription, LimitType.FACTION);
+            requireSend = false;
             for (const factionId of factionIds.split(',')) {
-                if (data.victim.faction_id === Number(factionId)) {
+                if (data.victim.faction_id === Number(factionId) && data.victim) {
                     requireSend = true;
                     color = 'RED';
                 }
@@ -447,11 +442,15 @@ export class ZKillSubscriber {
                         }
                     }
                 }
+                if (requireSend) {
+                    break;
+                }
             }
             if (!requireSend) return;
         }
         if (hasLimitType(subscription, LimitType.CORPORATION)) {
             const corporationIds = <string>getLimitType(subscription, LimitType.CORPORATION);
+            requireSend = false;
             for (const corporationId of corporationIds.split(',')) {
                 if (data.victim.corporation_id === Number(corporationId)) {
                     requireSend = true;
@@ -465,15 +464,20 @@ export class ZKillSubscriber {
                         }
                     }
                 }
+                if (requireSend) {
+                    break;
+                }
             }
             if (!requireSend) return;
         }
         if (hasLimitType(subscription, LimitType.ALLIANCE)) {
             const allianceIds = <string>getLimitType(subscription, LimitType.ALLIANCE);
+            requireSend = false;
             for (const allianceId of allianceIds.split(',')) {
                 if (data.victim.alliance_id === Number(allianceId)) {
                     requireSend = true;
                     color = 'RED';
+                    break;
                 }
                 if (!requireSend) {
                     for (const attacker of data.attackers) {
@@ -483,8 +487,14 @@ export class ZKillSubscriber {
                         }
                     }
                 }
+                if (requireSend) {
+                    break;
+                }
             }
-            if (!requireSend) return;
+            if (!requireSend) {
+                console.log(`Channel ${channelId}: limiting kill due to alliance filter`);
+                return;
+            }
         }
         if (hasLimitType(subscription, LimitType.REGION) ||
             hasLimitType(subscription, LimitType.CONSTELLATION) ||
@@ -1343,7 +1353,7 @@ export class ZKillSubscriber {
                 fs.writeFileSync('./config/systems.json', JSON.stringify(Object.fromEntries(this.systems)), 'utf8');
             }
             if (system.securityStatus >= 0.45) {
-                console.log('rounding security status: ' + system.securityStatus);
+                // console.log('rounding security status: ' + system.securityStatus);
                 // round to nearest tenth decimal
                 system.securityStatus = Math.round(system.securityStatus * 10) / 10;
             }
