@@ -4,7 +4,7 @@ use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
-use crate::discord_bot::get_system;
+use crate::discord_bot::{get_system, get_ship_group_id};
 use futures::future::{BoxFuture, FutureExt};
 
 pub async fn process_killmail(app_state: &Arc<AppState>, zk_data: &ZkData) -> Vec<Subscription> {
@@ -121,16 +121,21 @@ async fn evaluate_filter(filter: &Filter, zk_data: &ZkData, app_state: &Arc<AppS
                     .any(|a| a.ship_type_id.map_or(false, |id| ship_type_ids.contains(&id)))
         }
         Filter::ShipGroup(ship_group_ids) => {
-            let ships = app_state.ships.read().unwrap();
-            let victim_match = ships
-                .get(&killmail.victim.ship_type_id)
-                .map_or(false, |s| ship_group_ids.contains(&s.group_id));
-            victim_match
-                || killmail.attackers.iter().any(|a| {
-                    a.ship_type_id
-                        .and_then(|id| ships.get(&id))
-                        .map_or(false, |s| ship_group_ids.contains(&s.group_id))
-                })
+            if let Some(group_id) = get_ship_group_id(app_state, killmail.victim.ship_type_id).await {
+                if ship_group_ids.contains(&group_id) {
+                    return true;
+                }
+            }
+            for attacker in &killmail.attackers {
+                if let Some(ship_id) = attacker.ship_type_id {
+                    if let Some(group_id) = get_ship_group_id(app_state, ship_id).await {
+                        if ship_group_ids.contains(&group_id) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
         }
         Filter::LyRangeFrom { systems, range } => {
             if let Some(killmail_system) = get_system(app_state, killmail.solar_system_id).await {

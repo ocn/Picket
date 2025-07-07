@@ -1,7 +1,7 @@
 use reqwest::Client;
 use serde::Deserialize;
 use std::error::Error;
-use crate::config::{Name, Ship, System};
+use crate::config::System;
 
 const ESI_URL: &str = "https://esi.evetech.net/latest/";
 const FUZZWORK_URL: &str = "https://www.fuzzwork.co.uk/api/";
@@ -78,35 +78,19 @@ impl EsiClient {
         })
     }
 
-    pub async fn get_ship(&self, ship_id: u32) -> Result<Ship, Box<dyn Error + Send + Sync>> {
+    pub async fn get_ship_group_id(&self, ship_id: u32) -> Result<u32, Box<dyn Error + Send + Sync>> {
         #[derive(Deserialize)]
         struct EsiType {
-            name: String,
             group_id: u32,
         }
-        #[derive(Deserialize)]
-        struct EsiGroup {
-            name: String,
-            category_id: u32,
-        }
-        
         let type_info: EsiType = self.fetch(&format!("universe/types/{}/", ship_id)).await?;
-        let group_info: EsiGroup = self.fetch(&format!("universe/groups/{}/", type_info.group_id)).await?;
-
-        Ok(Ship {
-            id: ship_id,
-            name: type_info.name,
-            group_id: type_info.group_id,
-            group: group_info.name,
-        })
+        Ok(type_info.group_id)
     }
 
-    pub async fn get_name(&self, id: u64) -> Result<Name, Box<dyn Error + Send + Sync>> {
+    pub async fn get_name(&self, id: u64) -> Result<String, Box<dyn Error + Send + Sync>> {
         #[derive(Deserialize)]
         struct EsiName {
-            id: u64,
             name: String,
-            category: String,
         }
         let names: Vec<EsiName> = self.client.post(format!("{}universe/names/", ESI_URL))
             .json(&[id])
@@ -116,12 +100,7 @@ impl EsiClient {
             .await?;
         
         let name_info = names.into_iter().next().ok_or("No name found for ID")?;
-
-        Ok(Name {
-            id: name_info.id,
-            name: name_info.name,
-            category: name_info.category,
-        })
+        Ok(name_info.name)
     }
 
     pub async fn get_celestial(

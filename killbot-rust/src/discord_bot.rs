@@ -7,7 +7,7 @@ use serenity::http::Http;
 use serenity::model::prelude::{ChannelId, Interaction};
 use tracing::{info, error, warn};
 use chrono::{DateTime, Utc, FixedOffset};
-use crate::config::{AppState, Subscription, System, Ship, Name, save_systems, save_ships, save_names};
+use crate::config::{AppState, Subscription, System, save_systems, save_ships, save_names};
 use crate::esi::Celestial;
 use crate::models::ZkData;
 use serenity::model::guild::UnavailableGuild;
@@ -84,26 +84,26 @@ pub async fn get_system(app_state: &Arc<AppState>, system_id: u32) -> Option<Sys
     }
 }
 
-async fn get_ship(app_state: &Arc<AppState>, ship_id: u32) -> Option<Ship> {
+pub async fn get_ship_group_id(app_state: &Arc<AppState>, ship_id: u32) -> Option<u32> {
     {
         let ships = app_state.ships.read().unwrap();
-        if let Some(ship) = ships.get(&ship_id) {
-            return Some(ship.clone());
+        if let Some(group_id) = ships.get(&ship_id) {
+            return Some(*group_id);
         }
     }
-    match app_state.esi_client.get_ship(ship_id).await {
-        Ok(ship) => {
+    match app_state.esi_client.get_ship_group_id(ship_id).await {
+        Ok(group_id) => {
             let _lock = app_state.ships_file_lock.lock().await;
             let mut ships = app_state.ships.write().unwrap();
-            ships.insert(ship_id, ship.clone());
+            ships.insert(ship_id, group_id);
             save_ships(&ships);
-            Some(ship)
+            Some(group_id)
         },
-        Err(e) => { warn!("Failed to fetch ship data for {}: {}", ship_id, e); None }
+        Err(e) => { warn!("Failed to fetch ship group for {}: {}", ship_id, e); None }
     }
 }
 
-async fn get_name(app_state: &Arc<AppState>, id: u64) -> Option<Name> {
+async fn get_name(app_state: &Arc<AppState>, id: u64) -> Option<String> {
     {
         let names = app_state.names.read().unwrap();
         if let Some(name) = names.get(&id) {
@@ -211,12 +211,10 @@ async fn build_killmail_embed(app_state: &Arc<AppState>, zk_data: &ZkData) -> Cr
 
     let total_value_str = abbreviate_number(zk_data.zkb.total_value);
 
-    let victim_ship_name = get_ship(app_state, killmail.victim.ship_type_id).await.map_or("Unknown Ship".to_string(), |s| s.name);
+    let victim_ship_name = get_name(app_state, killmail.victim.ship_type_id as u64).await.unwrap_or_else(|| "Unknown Ship".to_string());
     let victim_corp_id = killmail.victim.corporation_id.unwrap_or(0);
     let victim_char_id = killmail.victim.character_id.unwrap_or(0);
-    let victim_name = async {
-        get_name(app_state, victim_char_id).await.or_else(|| futures::executor::block_on(get_name(app_state, victim_corp_id))).map(|n| n.name)
-    }.await.unwrap_or_else(|| "N/A".to_string());
+    let victim_name = get_name(app_state, victim_char_id).await.or_else(|| futures::executor::block_on(get_name(app_state, victim_corp_id))).unwrap_or_else(|| "N/A".to_string());
     let victim_details = format!("[{}]({})", victim_name, format!("https://zkillboard.com/character/{}/", victim_char_id));
 
     let final_blow_attacker = killmail.attackers.iter().find(|a| a.final_blow).or_else(|| killmail.attackers.first());
@@ -226,10 +224,8 @@ async fn build_killmail_embed(app_state: &Arc<AppState>, zk_data: &ZkData) -> Cr
         let attacker_char_id = attacker.character_id.unwrap_or(0);
         let attacker_corp_id = attacker.corporation_id.unwrap_or(0);
         let attacker_alliance_id = attacker.alliance_id.unwrap_or(0);
-        let attacker_name = async {
-            get_name(app_state, attacker_char_id).await.or_else(|| futures::executor::block_on(get_name(app_state, attacker_corp_id))).map(|n| n.name)
-        }.await.unwrap_or_else(|| "N/A".to_string());
-        let attacker_ship_name = if let Some(id) = attacker.ship_type_id { get_ship(app_state, id).await.map_or("Unknown Ship".to_string(), |s| s.name) } else { "Unknown Ship".to_string() };
+        let attacker_name = get_name(app_state, attacker_char_id).await.or_else(|| futures::executor::block_on(get_name(app_state, attacker_corp_id))).unwrap_or_else(|| "N/A".to_string());
+        let attacker_ship_name = if let Some(id) = attacker.ship_type_id { get_name(app_state, id as u64).await.unwrap_or_else(|| "Unknown Ship".to_string()) } else { "Unknown Ship".to_string() };
         attacker_details = format!("{} ({})", attacker_name, attacker_ship_name);
         if attacker_alliance_id != 0 {
             author_icon_url = str_alliance_icon(attacker_alliance_id);

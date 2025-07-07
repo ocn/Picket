@@ -14,35 +14,18 @@ use crate::esi::{Celestial, EsiClient};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct System {
-    #[serde(rename = "system_id")]
     pub id: u32,
-    #[serde(rename = "system_name")]
+    #[serde(rename = "systemName")]
     pub name: String,
+    #[serde(rename = "securityStatus")]
     pub security_status: f64,
+    #[serde(rename = "regionId")]
     pub region_id: u32,
-    #[serde(rename = "region_name")]
+    #[serde(rename = "regionName")]
     pub region: String,
     pub x: f64,
     pub y: f64,
     pub z: f64,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct Ship {
-    #[serde(rename = "ship_id")]
-    pub id: u32,
-    #[serde(rename = "ship_name")]
-    pub name: String,
-    pub group_id: u32,
-    #[serde(rename = "group_name")]
-    pub group: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct Name {
-    pub id: u64,
-    pub name: String,
-    pub category: String,
 }
 
 // --- Subscription AST Structs ---
@@ -106,8 +89,8 @@ pub struct AppConfig {
 
 pub struct AppState {
     pub systems: Arc<RwLock<HashMap<u32, System>>>,
-    pub ships: Arc<RwLock<HashMap<u32, Ship>>>,
-    pub names: Arc<RwLock<HashMap<u64, Name>>>,
+    pub ships: Arc<RwLock<HashMap<u32, u32>>>, // ship_id -> group_id
+    pub names: Arc<RwLock<HashMap<u64, String>>>, // id -> name
     pub subscriptions: Arc<RwLock<HashMap<GuildId, Vec<Subscription>>>>,
     pub app_config: Arc<AppConfig>,
     pub esi_client: EsiClient,
@@ -122,8 +105,8 @@ impl AppState {
     pub fn new(
         app_config: AppConfig,
         systems: HashMap<u32, System>,
-        ships: HashMap<u32, Ship>,
-        names: HashMap<u64, Name>,
+        ships: HashMap<u32, u32>,
+        names: HashMap<u64, String>,
         subscriptions: HashMap<GuildId, Vec<Subscription>>,
     ) -> Self {
         AppState {
@@ -165,11 +148,11 @@ pub fn save_systems(systems: &HashMap<u32, System>) {
     save_to_json_file("config/systems.json", systems);
 }
 
-pub fn save_ships(ships: &HashMap<u32, Ship>) {
+pub fn save_ships(ships: &HashMap<u32, u32>) {
     save_to_json_file("config/ships.json", ships);
 }
 
-pub fn save_names(names: &HashMap<u64, Name>) {
+pub fn save_names(names: &HashMap<u64, String>) {
     save_to_json_file("config/names.json", names);
 }
 
@@ -192,11 +175,11 @@ pub fn load_systems() -> Result<HashMap<u32, System>, ConfigError> {
     load_from_json_file(Path::new("config/systems.json"))
 }
 
-pub fn load_ships() -> Result<HashMap<u32, Ship>, ConfigError> {
+pub fn load_ships() -> Result<HashMap<u32, u32>, ConfigError> {
     load_from_json_file(Path::new("config/ships.json"))
 }
 
-pub fn load_names() -> Result<HashMap<u64, Name>, ConfigError> {
+pub fn load_names() -> Result<HashMap<u64, String>, ConfigError> {
     load_from_json_file(Path::new("config/names.json"))
 }
 
