@@ -1,5 +1,5 @@
 # Stage 1: Build the application
-FROM rust:1.78-buster as builder
+FROM rust:1.88-bullseye as builder
 
 WORKDIR /app
 
@@ -10,7 +10,7 @@ COPY ./killbot-rust/ .
 RUN cargo build --release
 
 # Stage 2: Create the final, minimal image
-FROM debian:buster-slim
+FROM debian:bullseye
 
 WORKDIR /app
 
