@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11.14", features = ["json"] }
+reqwest = { version = "0.11.14", default-features = false, features = ["json", "rustls-tls"] }
 rand = "0.8.5"
 serenity = { version = "0.11", default-features = false, features = ["client", "gateway", "rustls_backend", "model"] }
 serde = { version = "1.0", features = ["derive"] }
