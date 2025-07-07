@@ -115,7 +115,7 @@ async fn main() {
 
     // --- Main killmail processing loop ---
     let queue_id = generate_queue_id();
-    let listener = redis_q::RedisQListener::new(app_config.redis_q_url.clone(), &queue_id);
+    let listener = redis_q::RedisQListener::new(&queue_id);
     info!("Listening for killmails from RedisQ...");
 
     loop {

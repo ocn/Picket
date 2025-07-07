@@ -101,7 +101,6 @@ pub struct Subscription {
 pub struct AppConfig {
     pub discord_bot_token: String,
     pub discord_client_id: u64,
-    pub redis_q_url: String,
 }
 
 pub struct AppState {
@@ -145,10 +144,13 @@ fn load_from_json_file<T: for<'de> Deserialize<'de>>(file_path: &Path) -> Result
 
 pub fn load_app_config() -> Result<AppConfig, ConfigError> {
     let settings = Config::builder()
-        // Read from environment variables (e.g., `DISCORD_BOT_TOKEN`)
-        .add_source(Environment::default().separator("_"))
-        // Set a default for the RedisQ URL
-        .set_default("redis_q_url", "https://zkillredisq.stream/listen.php")?
+        .add_source(
+            Environment::default()
+                .separator("__")
+                .try_parsing(true)
+        )
+        .set_override("discord_bot_token", std::env::var("DISCORD_BOT_TOKEN").unwrap_or_default())?
+        .set_override("discord_client_id", std::env::var("DISCORD_CLIENT_ID").unwrap_or_default())?
         .build()?;
 
     settings.try_deserialize()

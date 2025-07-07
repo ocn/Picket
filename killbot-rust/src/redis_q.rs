@@ -3,14 +3,16 @@ use crate::models::{ZkData, RedisQResponse};
 use std::time::Duration;
 use tracing::info;
 
+const REDISQ_URL: &str = "https://zkillredisq.stream/listen.php";
+
 pub struct RedisQListener {
     client: Client,
     url: String,
 }
 
 impl RedisQListener {
-    pub fn new(base_url: String, queue_id: &str) -> Self {
-        let url = format!("{}?queueID={}", base_url, queue_id);
+    pub fn new(queue_id: &str) -> Self {
+        let url = format!("{}?queueID={}", REDISQ_URL, queue_id);
         info!("Listening to RedisQ at: {}", url);
         RedisQListener {
             client: Client::new(),
@@ -24,7 +26,6 @@ impl RedisQListener {
             .send()
             .await?;
 
-        // Ensure the request was successful
         if !response.status().is_success() {
             return Err(format!("Received non-success status: {}", response.status()).into());
         }
