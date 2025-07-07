@@ -7,7 +7,7 @@ use serenity::http::Http;
 use serenity::model::prelude::{ChannelId, Interaction};
 use tracing::{info, error, warn};
 use chrono::{DateTime, Utc, FixedOffset};
-use crate::config::{AppState, Subscription, System};
+use crate::config::{AppState, Subscription, System, Ship, Name, save_systems, save_ships, save_names};
 use crate::esi::Celestial;
 use crate::models::ZkData;
 use serenity::model::guild::UnavailableGuild;
@@ -63,30 +63,64 @@ impl EventHandler for Handler {
     }
 }
 
+// --- Dynamic Data Fetching and Caching ---
+
 pub async fn get_system(app_state: &Arc<AppState>, system_id: u32) -> Option<System> {
-    // First, check if the system is already in our map.
     {
         let systems = app_state.systems.read().unwrap();
         if let Some(system) = systems.get(&system_id) {
             return Some(system.clone());
         }
-    } // Read lock is dropped here
-
-    // If not found, fetch from ESI.
+    }
     match app_state.esi_client.get_system(system_id).await {
         Ok(system) => {
+            let _lock = app_state.systems_file_lock.lock().await;
             let mut systems = app_state.systems.write().unwrap();
             systems.insert(system_id, system.clone());
-            // TODO: Persist the new system data to systems.json
+            save_systems(&systems);
             Some(system)
         },
-        Err(e) => {
-            warn!("Failed to fetch system data for {}: {}", system_id, e);
-            None
-        }
+        Err(e) => { warn!("Failed to fetch system data for {}: {}", system_id, e); None }
     }
 }
 
+async fn get_ship(app_state: &Arc<AppState>, ship_id: u32) -> Option<Ship> {
+    {
+        let ships = app_state.ships.read().unwrap();
+        if let Some(ship) = ships.get(&ship_id) {
+            return Some(ship.clone());
+        }
+    }
+    match app_state.esi_client.get_ship(ship_id).await {
+        Ok(ship) => {
+            let _lock = app_state.ships_file_lock.lock().await;
+            let mut ships = app_state.ships.write().unwrap();
+            ships.insert(ship_id, ship.clone());
+            save_ships(&ships);
+            Some(ship)
+        },
+        Err(e) => { warn!("Failed to fetch ship data for {}: {}", ship_id, e); None }
+    }
+}
+
+async fn get_name(app_state: &Arc<AppState>, id: u64) -> Option<Name> {
+    {
+        let names = app_state.names.read().unwrap();
+        if let Some(name) = names.get(&id) {
+            return Some(name.clone());
+        }
+    }
+    match app_state.esi_client.get_name(id).await {
+        Ok(name) => {
+            let _lock = app_state.names_file_lock.lock().await;
+            let mut names = app_state.names.write().unwrap();
+            names.insert(id, name.clone());
+            save_names(&names);
+            Some(name)
+        },
+        Err(e) => { warn!("Failed to fetch name for ID {}: {}", id, e); None }
+    }
+}
 
 async fn get_closest_celestial(app_state: &Arc<AppState>, zk_data: &ZkData) -> Option<Arc<Celestial>> {
     let killmail = &zk_data.killmail;
@@ -111,6 +145,8 @@ async fn get_closest_celestial(app_state: &Arc<AppState>, zk_data: &ZkData) -> O
         None
     }
 }
+
+// --- Message Sending and Embed Building ---
 
 pub async fn send_killmail_message(
     http: &Arc<Http>,
@@ -168,8 +204,6 @@ fn str_ship_icon(id: u32) -> String { format!("https://images.evetech.net/types/
 async fn build_killmail_embed(app_state: &Arc<AppState>, zk_data: &ZkData) -> CreateEmbed {
     let mut embed = CreateEmbed::default();
     let killmail = &zk_data.killmail;
-    let names = app_state.names.read().unwrap();
-    let ships = app_state.ships.read().unwrap();
     
     let system_info = get_system(app_state, killmail.solar_system_id).await;
     let system_name = system_info.as_ref().map_or("Unknown System", |s| &s.name);
@@ -177,10 +211,12 @@ async fn build_killmail_embed(app_state: &Arc<AppState>, zk_data: &ZkData) -> Cr
 
     let total_value_str = abbreviate_number(zk_data.zkb.total_value);
 
-    let victim_ship_name = ships.get(&killmail.victim.ship_type_id).map_or("Unknown Ship", |s| &s.name);
+    let victim_ship_name = get_ship(app_state, killmail.victim.ship_type_id).await.map_or("Unknown Ship".to_string(), |s| s.name);
     let victim_corp_id = killmail.victim.corporation_id.unwrap_or(0);
     let victim_char_id = killmail.victim.character_id.unwrap_or(0);
-    let victim_name = names.get(&victim_char_id).or_else(|| names.get(&victim_corp_id)).map_or("N/A", |n| &n.name);
+    let victim_name = async {
+        get_name(app_state, victim_char_id).await.or_else(|| futures::executor::block_on(get_name(app_state, victim_corp_id))).map(|n| n.name)
+    }.await.unwrap_or_else(|| "N/A".to_string());
     let victim_details = format!("[{}]({})", victim_name, format!("https://zkillboard.com/character/{}/", victim_char_id));
 
     let final_blow_attacker = killmail.attackers.iter().find(|a| a.final_blow).or_else(|| killmail.attackers.first());
@@ -190,8 +226,10 @@ async fn build_killmail_embed(app_state: &Arc<AppState>, zk_data: &ZkData) -> Cr
         let attacker_char_id = attacker.character_id.unwrap_or(0);
         let attacker_corp_id = attacker.corporation_id.unwrap_or(0);
         let attacker_alliance_id = attacker.alliance_id.unwrap_or(0);
-        let attacker_name = names.get(&attacker_char_id).or_else(|| names.get(&attacker_corp_id)).map_or("N/A", |n| &n.name);
-        let attacker_ship_name = attacker.ship_type_id.and_then(|id| ships.get(&id)).map_or("Unknown Ship", |s| &s.name);
+        let attacker_name = async {
+            get_name(app_state, attacker_char_id).await.or_else(|| futures::executor::block_on(get_name(app_state, attacker_corp_id))).map(|n| n.name)
+        }.await.unwrap_or_else(|| "N/A".to_string());
+        let attacker_ship_name = if let Some(id) = attacker.ship_type_id { get_ship(app_state, id).await.map_or("Unknown Ship".to_string(), |s| s.name) } else { "Unknown Ship".to_string() };
         attacker_details = format!("{} ({})", attacker_name, attacker_ship_name);
         if attacker_alliance_id != 0 {
             author_icon_url = str_alliance_icon(attacker_alliance_id);

@@ -6,7 +6,8 @@ use std::sync::{Arc, RwLock};
 use config::{Config, ConfigError, Environment, File};
 use moka::future::Cache;
 use serenity::model::id::GuildId;
-use tracing::{info, warn};
+use tokio::sync::Mutex;
+use tracing::{info, warn, error};
 use crate::esi::{Celestial, EsiClient};
 
 // --- Static Game Data Structs ---
@@ -111,6 +112,10 @@ pub struct AppState {
     pub app_config: Arc<AppConfig>,
     pub esi_client: EsiClient,
     pub celestial_cache: Cache<u32, Arc<Celestial>>,
+    // Locks to prevent file write race conditions
+    pub systems_file_lock: Mutex<()>,
+    pub ships_file_lock: Mutex<()>,
+    pub names_file_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -129,6 +134,9 @@ impl AppState {
             app_config: Arc::new(app_config),
             esi_client: EsiClient::new(),
             celestial_cache: Cache::new(10_000),
+            systems_file_lock: Mutex::new(()),
+            ships_file_lock: Mutex::new(()),
+            names_file_lock: Mutex::new(()),
         }
     }
 }
@@ -141,6 +149,30 @@ fn load_from_json_file<T: for<'de> Deserialize<'de>>(file_path: &Path) -> Result
         .build()?
         .try_deserialize()
 }
+
+fn save_to_json_file<T: Serialize>(file_path: &str, data: &T) {
+    match serde_json::to_string_pretty(data) {
+        Ok(json_string) => {
+            if let Err(e) = fs::write(file_path, json_string) {
+                error!("Failed to write to {}: {}", file_path, e);
+            }
+        }
+        Err(e) => error!("Failed to serialize data for {}: {}", file_path, e),
+    }
+}
+
+pub fn save_systems(systems: &HashMap<u32, System>) {
+    save_to_json_file("config/systems.json", systems);
+}
+
+pub fn save_ships(ships: &HashMap<u32, Ship>) {
+    save_to_json_file("config/ships.json", ships);
+}
+
+pub fn save_names(names: &HashMap<u64, Name>) {
+    save_to_json_file("config/names.json", names);
+}
+
 
 pub fn load_app_config() -> Result<AppConfig, ConfigError> {
     let settings = Config::builder()
@@ -157,18 +189,15 @@ pub fn load_app_config() -> Result<AppConfig, ConfigError> {
 }
 
 pub fn load_systems() -> Result<HashMap<u32, System>, ConfigError> {
-    let systems_vec: Vec<System> = load_from_json_file(Path::new("config/systems.json"))?;
-    Ok(systems_vec.into_iter().map(|s| (s.id, s)).collect())
+    load_from_json_file(Path::new("config/systems.json"))
 }
 
 pub fn load_ships() -> Result<HashMap<u32, Ship>, ConfigError> {
-    let ships_vec: Vec<Ship> = load_from_json_file(Path::new("config/ships.json"))?;
-    Ok(ships_vec.into_iter().map(|s| (s.id, s)).collect())
+    load_from_json_file(Path::new("config/ships.json"))
 }
 
 pub fn load_names() -> Result<HashMap<u64, Name>, ConfigError> {
-    let names_vec: Vec<Name> = load_from_json_file(Path::new("config/names.json"))?;
-    Ok(names_vec.into_iter().map(|n| (n.id, n)).collect())
+    load_from_json_file(Path::new("config/names.json"))
 }
 
 pub fn load_all_subscriptions(dir: &str) -> HashMap<GuildId, Vec<Subscription>> {
