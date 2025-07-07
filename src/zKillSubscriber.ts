@@ -306,6 +306,7 @@ export class ZKillSubscriber {
     protected async onMessage(data: ZkData) {
         const killmailData = data.killmail;
         const zkbData = data.zkb;
+        zkbData.url = `https://zkillboard.com/kill/${data.killID}/`;
 
         if (!killmailData || killmailData.solar_system_id === undefined || !zkbData) {
             console.warn(`Skipping killmail due to missing data: ${JSON.stringify(data)}`);
