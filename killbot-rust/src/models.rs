@@ -8,15 +8,14 @@ pub struct RedisQResponse {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
 pub struct ZkData {
+    #[serde(rename = "killID")]
     pub kill_id: i64,
     pub killmail: KillmailData,
     pub zkb: Zkb,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
 pub struct KillmailData {
     pub attackers: Vec<Attacker>,
     pub killmail_id: i64,
@@ -26,8 +25,8 @@ pub struct KillmailData {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
 pub struct Zkb {
+    #[serde(rename = "locationID")]
     pub location_id: i64,
     pub hash: String,
     #[serde(rename = "fittedValue")]
@@ -42,12 +41,11 @@ pub struct Zkb {
     pub npc: bool,
     pub solo: bool,
     pub awox: bool,
+    #[serde(rename = "href")]
     pub esi: String,
-    pub url: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
 pub struct Attacker {
     pub alliance_id: Option<u64>,
     pub corporation_id: Option<u64>,
@@ -61,7 +59,6 @@ pub struct Attacker {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
 pub struct Victim {
     pub alliance_id: Option<u64>,
     pub corporation_id: Option<u64>,
@@ -74,7 +71,6 @@ pub struct Victim {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
 pub struct VictimItem {
     pub item_type_id: i64,
     pub singleton: i64,

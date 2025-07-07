@@ -122,7 +122,7 @@ async fn main() {
         match listener.listen().await {
             Ok(Some(zk_data)) => {
                 info!("Received killmail {}", zk_data.killmail.killmail_id);
-                let matched = processor::process_killmail(&app_state, &zk_data);
+                let matched = processor::process_killmail(&app_state, &zk_data).await;
 
                 if !matched.is_empty() {
                     info!(

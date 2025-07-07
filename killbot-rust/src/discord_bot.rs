@@ -53,20 +53,31 @@ impl EventHandler for Handler {
 
     async fn guild_delete(&self, _ctx: Context, incomplete: UnavailableGuild) {
         info!("Kicked from guild: {}", incomplete.id);
-        // TODO: Implement subscription removal
+        let mut subs = _ctx.data.write().await;
+        let app_state = subs.get_mut::<crate::AppStateContainer>().unwrap();
+        let mut subscriptions = app_state.subscriptions.write().unwrap();
+        subscriptions.remove(&incomplete.id);
+        if let Err(e) = crate::config::save_subscriptions_for_guild(incomplete.id, &[]) {
+            error!("Failed to delete subscription file for guild {}: {}", incomplete.id, e);
+        }
     }
 }
 
-async fn get_system(app_state: &Arc<AppState>, system_id: u32) -> Option<System> {
-    let mut systems = app_state.systems.write().unwrap();
-    if let Some(system) = systems.get(&system_id) {
-        return Some(system.clone());
-    }
-    
+pub async fn get_system(app_state: &Arc<AppState>, system_id: u32) -> Option<System> {
+    // First, check if the system is already in our map.
+    {
+        let systems = app_state.systems.read().unwrap();
+        if let Some(system) = systems.get(&system_id) {
+            return Some(system.clone());
+        }
+    } // Read lock is dropped here
+
+    // If not found, fetch from ESI.
     match app_state.esi_client.get_system(system_id).await {
         Ok(system) => {
+            let mut systems = app_state.systems.write().unwrap();
             systems.insert(system_id, system.clone());
-            // TODO: Add logic to save the updated systems map to a file.
+            // TODO: Persist the new system data to systems.json
             Some(system)
         },
         Err(e) => {
