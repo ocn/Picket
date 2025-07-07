@@ -738,7 +738,7 @@ export class ZKillSubscriber {
             if (!channel) {
                 const owner = await this.doClient.users.fetch('146451271497416704');
                 await owner.send(`The bot unsubscribed from channel ${channelId} because it was not found. This would delete the channel.`);
-                // await this.unsubscribe(subscription.subType, guildId, channelId, subscription.id);
+                await this.unsubscribe(subscription.subType, guildId, channelId, subscription.id);
                 done();
                 return;
             }
