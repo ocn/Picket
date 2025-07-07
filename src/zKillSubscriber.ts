@@ -1026,11 +1026,15 @@ export class ZKillSubscriber {
 
         // Calculate maxNameLength based only on displayed entries
         let maxNameLength = 0;
+        const others = '...others';
         displayedEntries.forEach(([name]) => {
             if (name.length > maxNameLength) {
                 maxNameLength = name.length;
             }
         });
+        if (othersCount > 0) {
+            maxNameLength = Math.max(maxNameLength, others.length);
+        }
         maxNameLength = Math.min(maxNameLength, 26);  // Cap max length at 26 characters
         const padding = 3;
 
@@ -1043,7 +1047,6 @@ export class ZKillSubscriber {
 
         // Add the "others" entry if there were collapsed entries
         if (othersCount > 0) {
-            const others = '...others';
             const spaces = maxNameLength - others.length + padding;
             attackerAlliances += `${others}${' '.repeat(spaces)}x${othersCount}\n`;
         }
