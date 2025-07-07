@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use config::{Config, ConfigError, File};
+use config::{Config, ConfigError, Environment, File};
 use moka::future::Cache;
 use serenity::model::id::GuildId;
 use tracing::{info, warn};
@@ -99,8 +99,8 @@ pub struct Subscription {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
-    pub discord_token: String,
-    pub application_id: u64,
+    pub discord_bot_token: String,
+    pub discord_client_id: u64,
     pub redis_q_url: String,
 }
 
@@ -136,7 +136,7 @@ impl AppState {
 
 // --- Configuration Loading & Saving ---
 
-fn load_from_file<T: for<'de> Deserialize<'de>>(file_path: &Path) -> Result<T, ConfigError> {
+fn load_from_json_file<T: for<'de> Deserialize<'de>>(file_path: &Path) -> Result<T, ConfigError> {
     Config::builder()
         .add_source(File::from(file_path))
         .build()?
@@ -144,21 +144,28 @@ fn load_from_file<T: for<'de> Deserialize<'de>>(file_path: &Path) -> Result<T, C
 }
 
 pub fn load_app_config() -> Result<AppConfig, ConfigError> {
-    load_from_file(Path::new("config/app_config.json"))
+    let settings = Config::builder()
+        // Read from environment variables (e.g., `DISCORD_BOT_TOKEN`)
+        .add_source(Environment::default().separator("_"))
+        // Set a default for the RedisQ URL
+        .set_default("redis_q_url", "https://zkillredisq.stream/listen.php")?
+        .build()?;
+
+    settings.try_deserialize()
 }
 
 pub fn load_systems() -> Result<HashMap<u32, System>, ConfigError> {
-    let systems_vec: Vec<System> = load_from_file(Path::new("config/systems.json"))?;
+    let systems_vec: Vec<System> = load_from_json_file(Path::new("config/systems.json"))?;
     Ok(systems_vec.into_iter().map(|s| (s.id, s)).collect())
 }
 
 pub fn load_ships() -> Result<HashMap<u32, Ship>, ConfigError> {
-    let ships_vec: Vec<Ship> = load_from_file(Path::new("config/ships.json"))?;
+    let ships_vec: Vec<Ship> = load_from_json_file(Path::new("config/ships.json"))?;
     Ok(ships_vec.into_iter().map(|s| (s.id, s)).collect())
 }
 
 pub fn load_names() -> Result<HashMap<u64, Name>, ConfigError> {
-    let names_vec: Vec<Name> = load_from_file(Path::new("config/names.json"))?;
+    let names_vec: Vec<Name> = load_from_json_file(Path::new("config/names.json"))?;
     Ok(names_vec.into_iter().map(|n| (n.id, n)).collect())
 }
 
@@ -176,7 +183,7 @@ pub fn load_all_subscriptions(dir: &str) -> HashMap<GuildId, Vec<Subscription>> 
             if let Some(filename_str) = path.file_name().and_then(|s| s.to_str()) {
                 if let Some(guild_id_str) = filename_str.strip_suffix(".json") {
                     if let Ok(guild_id) = guild_id_str.parse::<u64>() {
-                        match load_from_file::<Vec<Subscription>>(&path) {
+                        match load_from_json_file::<Vec<Subscription>>(&path) {
                             Ok(subs) => {
                                 info!("Loaded {} subscriptions for guild {}", subs.len(), guild_id);
                                 all_subscriptions.insert(GuildId(guild_id), subs);

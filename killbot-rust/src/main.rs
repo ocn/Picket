@@ -44,7 +44,7 @@ async fn main() {
     let app_config = match config::load_app_config() {
         Ok(config) => config,
         Err(e) => {
-            error!("Failed to load app_config.json: {}", e);
+            error!("Failed to load application configuration: {}", e);
             return;
         }
     };
@@ -92,7 +92,7 @@ async fn main() {
 
 
     // --- Start Discord Bot ---
-    let discord_token = app_config.discord_token.clone();
+    let discord_token = app_config.discord_bot_token.clone();
     let intents = GatewayIntents::non_privileged() | GatewayIntents::GUILDS | GatewayIntents::GUILD_INTEGRATIONS;
     let mut client = Client::builder(&discord_token, intents)
         .event_handler(discord_bot::Handler)
