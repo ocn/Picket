@@ -2,10 +2,11 @@
 FROM rust:1.78-buster as builder
 
 WORKDIR /app
-COPY . .
 
-# This command builds the application in release mode.
-# The output will be in /app/target/release/
+# Copy the source code into the builder
+COPY ./killbot-rust/ .
+
+# Build the application in release mode.
 RUN cargo build --release
 
 # Stage 2: Create the final, minimal image
@@ -16,8 +17,8 @@ WORKDIR /app
 # Copy the compiled binary from the builder stage
 COPY --from=builder /app/target/release/killbot-rust .
 
-# Copy the configuration files needed by the application
-COPY config ./config
+# The config directory will be mounted as a volume by docker-compose.
+# No need to copy it here.
 
 # Set the command to run the application
 CMD ["./killbot-rust"]

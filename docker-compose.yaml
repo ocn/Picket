@@ -5,13 +5,11 @@ services:
     image: ocn-killbot-rust:latest
     restart: unless-stopped
     build:
-      context: ./killbot-rust
-      dockerfile: Dockerfile.rust
+      context: .
+      dockerfile: ./killbot-rust/Dockerfile.rust
     environment:
       DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
       DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID}
-    volumes:
-      - ./config:/app/config:delegated
 
 networks:
   default:
