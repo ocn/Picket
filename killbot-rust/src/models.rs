@@ -66,7 +66,7 @@ pub struct Victim {
     pub faction_id: Option<u64>,
     pub damage_taken: i64,
     pub items: Vec<VictimItem>,
-    pub position: Position,
+    pub position: Option<Position>,
     pub ship_type_id: u32,
 }
 

@@ -19,6 +19,7 @@ use commands::subscribe::SubscribeCommand;
 use commands::unsubscribe::UnsubscribeCommand;
 use commands::diag::DiagCommand;
 use discord_bot::CommandMap;
+use crate::config::Subscription;
 
 pub struct AppStateContainer;
 
@@ -32,6 +33,28 @@ fn generate_queue_id() -> String {
         .take(12)
         .map(char::from)
         .collect()
+}
+
+fn log_loaded_subscriptions(subscriptions: &HashMap<serenity::model::id::GuildId, Vec<Subscription>>) {
+    info!("--- Loaded Subscriptions ---");
+    if subscriptions.is_empty() {
+        info!("No subscriptions found.");
+    } else {
+        for (guild_id, subs) in subscriptions {
+            info!("Guild: {}", guild_id);
+            let mut subs_by_channel: HashMap<u64, Vec<&Subscription>> = HashMap::new();
+            for sub in subs {
+                subs_by_channel.entry(sub.action.channel_id).or_default().push(sub);
+            }
+            for (channel_id, channel_subs) in subs_by_channel {
+                info!("  Channel: {}", channel_id);
+                for sub in channel_subs {
+                    info!("    - ID: '{}', Description: '{}'", sub.id, sub.description);
+                }
+            }
+        }
+    }
+    info!("--------------------------");
 }
 
 #[tokio::main]
@@ -63,6 +86,7 @@ async fn main() {
     });
     
     let subscriptions = config::load_all_subscriptions("config/");
+    log_loaded_subscriptions(&subscriptions);
 
     // --- Initialize application state ---
     let app_state = Arc::new(config::AppState::new(
@@ -121,17 +145,16 @@ async fn main() {
     loop {
         match listener.listen().await {
             Ok(Some(zk_data)) => {
-                info!("Received killmail {}", zk_data.killmail.killmail_id);
+                let kill_id = zk_data.killmail.killmail_id;
+                info!("Received killmail {}", kill_id);
                 let matched = processor::process_killmail(&app_state, &zk_data).await;
 
                 if !matched.is_empty() {
-                    info!(
-                        "Killmail {} matched {} subscriptions",
-                        zk_data.killmail.killmail_id,
-                        matched.len()
-                    );
-                    
                     for subscription in matched {
+                        info!(
+                            "[Kill: {}] Matched subscription '{}'. Sending notification to channel {}.",
+                            kill_id, subscription.id, subscription.action.channel_id
+                        );
                         if let Err(e) = discord_bot::send_killmail_message(
                             &http_client,
                             &app_state,

@@ -124,6 +124,10 @@ async fn get_name(app_state: &Arc<AppState>, id: u64) -> Option<String> {
 
 async fn get_closest_celestial(app_state: &Arc<AppState>, zk_data: &ZkData) -> Option<Arc<Celestial>> {
     let killmail = &zk_data.killmail;
+    if killmail.victim.position.is_none() {
+        return None;
+    }
+    let position = killmail.victim.position.as_ref().unwrap();
     let cache_key = killmail.solar_system_id;
 
     if let Some(celestial) = app_state.celestial_cache.get(&cache_key) {
@@ -132,9 +136,9 @@ async fn get_closest_celestial(app_state: &Arc<AppState>, zk_data: &ZkData) -> O
 
     let celestial = app_state.esi_client.get_celestial(
         killmail.solar_system_id,
-        killmail.victim.position.x,
-        killmail.victim.position.y,
-        killmail.victim.position.z,
+        position.x,
+        position.y,
+        position.z,
     ).await.ok();
 
     if let Some(celestial) = celestial {

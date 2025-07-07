@@ -3,16 +3,21 @@ use crate::models::ZkData;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 use crate::discord_bot::{get_system, get_ship_group_id};
 use futures::future::{BoxFuture, FutureExt};
 
 pub async fn process_killmail(app_state: &Arc<AppState>, zk_data: &ZkData) -> Vec<Subscription> {
     let mut matched_subscriptions = Vec::new();
     let subscriptions_map = app_state.subscriptions.read().unwrap();
+    let kill_id = zk_data.killmail.killmail_id;
 
     for subscriptions_vec in subscriptions_map.values() {
         for subscription in subscriptions_vec.iter() {
+            info!(
+                "[Kill: {}] Evaluating subscription '{}' for channel {}",
+                kill_id, subscription.id, subscription.action.channel_id
+            );
             if evaluate_filter_node(&subscription.root_filter, zk_data, app_state).await {
                 matched_subscriptions.push(subscription.clone());
             }
