@@ -1,12 +1,23 @@
-FROM rust:latest as builder
+# Stage 1: Build the application
+FROM rust:1.78-buster as builder
 
 WORKDIR /app
 COPY . .
+
+# This command builds the application in release mode.
+# The output will be in /app/target/release/
 RUN cargo build --release
 
+# Stage 2: Create the final, minimal image
 FROM debian:buster-slim
 
 WORKDIR /app
+
+# Copy the compiled binary from the builder stage
 COPY --from=builder /app/target/release/killbot-rust .
 
+# Copy the configuration files needed by the application
+COPY config ./config
+
+# Set the command to run the application
 CMD ["./killbot-rust"]
