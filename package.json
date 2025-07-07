@@ -16,6 +16,7 @@
     "open-graph-scraper": "^4.11.1",
     "prompt-sync": "^4.2.0",
     "simple-oauth2": "^5.0.0",
+    "ts-node": "^10.9.2",
     "ws": "^8.7.0"
   },
   "devDependencies": {
