@@ -13,9 +13,9 @@ export class UnsubscribeCommand extends AbstractCommand {
             interaction.reply('Subscription is not possible in PM!');
             return;
         }
-        const subCommand = interaction.options.getSubcommand(true) as SubscriptionType;
+        const subCommand = interaction.options.getSubcommand(true);
         const id = interaction.options.getString('id', false);
-        sub.unsubscribe(subCommand, interaction.guildId, interaction.channelId, id ? id : undefined);
+        sub.unsubscribe(subCommand as SubscriptionType, interaction.guildId, interaction.channelId, id ? id : undefined);
         interaction.reply({
             content: 'Unsubscribed to zkillboard channel: ' + interaction.options.getSubcommand() + ' ' + interaction.options.getString('id'),
             ephemeral: true
@@ -25,7 +25,7 @@ export class UnsubscribeCommand extends AbstractCommand {
     getCommand(): SlashCommandBuilder {
         const slashCommand = new SlashCommandBuilder().setName(this.name)
             .setDescription('Unsubscribe from zkill');
-        slashCommand.addSubcommand( new SlashCommandSubcommandBuilder().setName('feed')
+        slashCommand.addSubcommand( new SlashCommandSubcommandBuilder().setName(SubscriptionType.PUBLIC)
             .setDescription('Unsubscribe feed from channel')
             .addStringOption(option =>
                 option.setName('id')

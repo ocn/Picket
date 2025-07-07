@@ -1277,7 +1277,17 @@ export class ZKillSubscriber {
             return;
         }
         guildChannel.subscriptions.delete(ident);
-        fs.writeFileSync('./config/' + guildId + '.json', JSON.stringify(this.generateObject(guild)), 'utf8');
+
+        if (guildChannel.subscriptions.size === 0) {
+            guild.channels.delete(channel);
+        }
+
+        if (guild.channels.size === 0) {
+            this.subscriptions.delete(guildId);
+            fs.unlinkSync('./config/' + guildId + '.json');
+        } else {
+            fs.writeFileSync('./config/' + guildId + '.json', JSON.stringify(this.generateObject(guild)), 'utf8');
+        }
     }
 
     public async unsubscribeGuild(guildId: string) {
