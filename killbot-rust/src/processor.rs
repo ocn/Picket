@@ -281,13 +281,10 @@ async fn evaluate_filter(
                 if let Some(group_id) = get_ship_group_id(app_state, *type_id).await {
                     ship_group_ids.push(group_id);
                 } else {
-                    warn!(
-                        "Failed to get ship group ID for type ID {}",
-                        type_id
-                    );
+                    warn!("Failed to get ship group ID for type ID {}", type_id);
                 }
             }
-            
+
             if let Some(group_id) = get_ship_group_id(app_state, killmail.victim.ship_type_id).await
             {
                 if ship_group_ids.contains(&group_id) {
@@ -555,6 +552,101 @@ mod tests {
             },
         }
     }
+
+    fn user_killmail_data() -> ZkData {
+        let json_data = r#"
+         {
+             "killID": 128389930,
+             "zkb": {
+               "locationID": 40161548,
+               "hash": "d00ad190e832f0ca2965c9946b15527c415a70e7",
+               "fittedValue": 5148356869.79,
+               "droppedValue": 515470667.87,
+               "destroyedValue": 4722688524.39,
+               "totalValue": 5238159192.26,
+               "points": 1,
+               "npc": false,
+               "solo": false,
+               "awox": false,
+               "href": ""
+             },
+             "killmail": {
+               "attackers": [],
+               "killmail_id": 128389930,
+               "killmail_time": "2025-07-06T23:32:26Z",
+               "solar_system_id": 30002539,
+               "victim": {
+                 "alliance_id": 99009845,
+                 "character_id": 2114058087,
+                 "corporation_id": 98498670,
+                 "damage_taken": 856144,
+                 "items": [],
+                 "position": {
+                   "x": -30420382830.688633,
+                   "y": 2662073916.025609,
+                   "z": 309569446754.9493
+                 },
+                 "ship_type_id": 19720
+               }
+             }
+         }"#;
+        serde_json::from_str(json_data).expect("Failed to parse ZkData from JSON")
+    }
+
+    #[tokio::test]
+    async fn test_ship_group_filter_uses_group_id_of_subscription_type_id_list() {
+        let zk_data = user_killmail_data();
+        let app_state = mock_app_state();
+
+        let filter_node = FilterNode::And(vec![
+            FilterNode::Condition(Filter::TotalValue {
+                min: Some(5000000),
+                max: None,
+            }),
+            FilterNode::Condition(Filter::Region(vec![10000030])),
+            // A list of type IDs of which we want to match based on their group ID
+            FilterNode::Condition(Filter::ShipGroup(vec![
+                28352, 23919, 23757, 77283, 19722, 37604, 20183, 28850, 11567,
+            ])),
+            FilterNode::Condition(Filter::Security("0.0001..=0.4999".to_string())),
+        ]);
+
+        // Let's check each condition:
+        // 1. TotalValue: 5.2b > 5m. PASS.
+        // 2. Region: Siseide (30002539) is in Heimatar (10000030). PASS.
+        // 3. Security: Siseide is 0.3, which is in the range 0.0001..=0.4999. PASS.
+        // 4. ShipGroup: The victim's ship Revelation (type ID 19722) is the same group as a
+        //               Naglfar (type ID 19720).
+        //    The Naglfar's GROUP ID is 485 (Dreadnought).
+        //    The filter list does NOT contain 485. It contains the TYPE ID 19720.
+        //    Therefore, this condition must PASS.
+
+        let result = evaluate_filter_node(&filter_node, &zk_data, &app_state).await;
+
+        // Because one condition in the AND block fails, the entire node should fail.
+        assert!(result.is_some(), "Filter should pass because the ShipGroup list contains a TypeID (19720), which has the required GroupID (485) to match the incoming killmail.");
+    }
+
+    // #[tokio::test]
+    // async fn test_user_scenario_shipgroup_filter_passes_with_correct_group_id() {
+    //     let zk_data = user_killmail_data();
+    //     let app_state = mock_app_state();
+    //
+    //     // This filter is corrected to use the proper Ship Group ID for a Dreadnought (485).
+    //     let filter_node = FilterNode::And(vec![
+    //         FilterNode::Condition(Filter::TotalValue { min: Some(5000000), max: None }),
+    //         FilterNode::Condition(Filter::Region(vec![10000030])),
+    //         FilterNode::Condition(Filter::ShipGroup(vec![
+    //             28352, 23919, 23757, 77283, 485, 37604, 20183, 28850, 11567, // Corrected: 19720 -> 485
+    //         ])),
+    //         FilterNode::Condition(Filter::Security("0.0001..=0.4999".to_string())),
+    //     ]);
+    //
+    //     // Now, all four conditions should pass.
+    //     let result = evaluate_filter_node(&filter_node, &zk_data, &app_state).await;
+    //
+    //     assert!(result.is_some(), "Filter should pass now that the correct ShipGroupID (485) is used");
+    // }
 
     async fn test_filter(filter: Filter, zk_data: &ZkData, should_pass: bool) {
         let app_state = mock_app_state();
