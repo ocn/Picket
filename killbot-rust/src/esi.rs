@@ -123,7 +123,7 @@ impl EsiClient {
             "{}nearestCelestial.php?solarsystemid={}&x={}&y={}&z={}",
             FUZZWORK_URL, system_id, x, y, z
         );
-        tracing::info!("Fetching celestial data from Fuzzwork: {}", url);
+        tracing::trace!("Fetching celestial data from Fuzzwork: {}", url);
 
         let response = self.client.get(&url).send().await?;
         if !response.status().is_success() {

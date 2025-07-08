@@ -7,6 +7,7 @@ use chrono::{DateTime, FixedOffset, Utc};
 use futures::future::join_all;
 use serenity::async_trait;
 use serenity::builder::CreateEmbed;
+use serenity::http::error::Error;
 use serenity::http::Http;
 use serenity::model::gateway::Ready;
 use serenity::model::guild::UnavailableGuild;
@@ -15,7 +16,7 @@ use serenity::prelude::*;
 use serenity::utils::Colour;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 pub struct CommandMap;
 impl TypeMapKey for CommandMap {
@@ -204,17 +205,29 @@ pub async fn send_killmail_message(
 
     if let Err(e) = result {
         if let serenity::Error::Http(http_err) = &e {
-            if let serenity::http::error::Error::UnsuccessfulRequest(resp) = &**http_err {
-                if resp.status_code == serenity::http::StatusCode::FORBIDDEN {
+            match &**http_err {
+                Error::UnsuccessfulRequest(resp) => {
+                    if resp.status_code == serenity::http::StatusCode::FORBIDDEN {
+                        error!(
+                            "[Kill: {}] Forbidden to send message to channel {}. Removing subscriptions.",
+                            zk_data.kill_id, channel
+                        );
+                        return Err(Box::new(e));
+                    }
+                }
+                _ => {
                     error!(
-                        "Forbidden to send message to channel {}. Removing subscriptions.",
-                        channel
+                        "[Kill: {}] HTTP error while sending message to channel {}: {:#?}",
+                        zk_data.kill_id, channel, e
                     );
                     return Err(Box::new(e));
                 }
             }
         }
-        error!("Failed to send message to channel {}: {}", channel, e);
+        error!(
+            "[Kill: {}] Failed to send message to channel {}: {:#?}",
+            zk_data.kill_id, channel, e
+        );
         return Err(Box::new(e));
     }
     info!(
@@ -521,7 +534,7 @@ async fn build_killmail_embed(
             zk_data.kill_id
         );
     }
-    info!("Rendering icon: {}", str_ship_render(id_of_icon_to_render));
+    trace!("Rendering icon: {}", str_ship_render(id_of_icon_to_render));
 
     // --- Attacker Affiliation List ---
 
