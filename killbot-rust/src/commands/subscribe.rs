@@ -91,7 +91,7 @@ impl Command for SubscribeCommand {
             description,
             root_filter,
             action: Action {
-                channel_id: command.channel_id.0,
+                channel_id: command.channel_id.0.to_string(),
                 ping_type: None,
             },
         };

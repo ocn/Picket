@@ -158,7 +158,7 @@ pub async fn send_killmail_message(
     subscription: &Subscription,
     zk_data: &ZkData,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let channel = ChannelId(subscription.action.channel_id);
+    let channel = ChannelId(subscription.action.channel_id.parse()?);
     let embed = build_killmail_embed(app_state, zk_data).await;
 
     let result = channel.send_message(http, |m| m.set_embed(embed)).await;

@@ -35,7 +35,7 @@ impl Command for DiagCommand {
 
             if let Some(subs) = guild_subs {
                 let channel_subs: Vec<_> = subs.iter()
-                    .filter(|s| s.action.channel_id == command.channel_id.0)
+                    .filter(|s| s.action.channel_id == command.channel_id.0.to_string())
                     .collect();
 
                 if !channel_subs.is_empty() {

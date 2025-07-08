@@ -67,7 +67,7 @@ pub enum PingType {
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct Action {
-    pub channel_id: u64,
+    pub channel_id: String,
     pub ping_type: Option<PingType>,
 }
 
@@ -241,7 +241,7 @@ mod tests {
         let subscriptions = result.unwrap();
         assert_eq!(subscriptions.len(), 202, "Incorrect number of subscriptions loaded");
         assert_eq!(subscriptions[0].id, "1");
-        assert_eq!(subscriptions[0].action.channel_id, 1090110979083354200);
+        assert_eq!(subscriptions[0].action.channel_id, "1090110979083354200");
     }
 
     #[test]
@@ -250,7 +250,7 @@ mod tests {
             id: "complex_rule_1".to_string(),
             description: "Pings for valuable capital kills in key regions or near Jita".to_string(),
             action: Action {
-                channel_id: 123456789,
+                channel_id: "123456789".to_string(),
                 ping_type: Some(PingType::Here),
             },
             root_filter: FilterNode::And(vec![

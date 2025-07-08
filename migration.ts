@@ -20,7 +20,7 @@ interface OldSubscriptionGuild {
 
 // --- New Rust AST Format Interfaces ---
 interface Action {
-    channel_id: number;
+    channel_id: string;
     ping_type?: 'Here' | 'Everyone';
 }
 
@@ -132,7 +132,7 @@ function migrateGuildFile(filePath: string): NewSubscription[] {
                 id: subId,
                 description: `Migrated subscription: ${subId}`,
                 action: {
-                    channel_id: Number(channelId),
+                    channel_id: channelId,
                 },
                 filter: {
                     And: conditions

@@ -35,27 +35,27 @@ fn generate_queue_id() -> String {
         .collect()
 }
 
-fn log_loaded_subscriptions(subscriptions: &HashMap<serenity::model::id::GuildId, Vec<Subscription>>) {
-    info!("--- Loaded Subscriptions ---");
-    if subscriptions.is_empty() {
-        info!("No subscriptions found.");
-    } else {
-        for (guild_id, subs) in subscriptions {
-            info!("Guild: {}", guild_id);
-            let mut subs_by_channel: HashMap<u64, Vec<&Subscription>> = HashMap::new();
-            for sub in subs {
-                subs_by_channel.entry(sub.action.channel_id).or_default().push(sub);
-            }
-            for (channel_id, channel_subs) in subs_by_channel {
-                info!("  Channel: {}", channel_id);
-                for sub in channel_subs {
-                    info!("    - ID: '{}', Description: '{}'", sub.id, sub.description);
-                }
-            }
-        }
-    }
-    info!("--------------------------");
-}
+// fn log_loaded_subscriptions(subscriptions: &HashMap<serenity::model::id::GuildId, Vec<Subscription>>) {
+//     info!("--- Loaded Subscriptions ---");
+//     if subscriptions.is_empty() {
+//         info!("No subscriptions found.");
+//     } else {
+//         for (guild_id, subs) in subscriptions {
+//             info!("Guild: {}", guild_id);
+//             let mut subs_by_channel: HashMap<u64, Vec<&Subscription>> = HashMap::new();
+//             for sub in subs {
+//                 subs_by_channel.entry(sub.action.channel_id).or_default().push(sub);
+//             }
+//             for (channel_id, channel_subs) in subs_by_channel {
+//                 info!("  Channel: {}", channel_id);
+//                 for sub in channel_subs {
+//                     info!("    - ID: '{}', Description: '{}'", sub.id, sub.description);
+//                 }
+//             }
+//         }
+//     }
+//     info!("--------------------------");
+// }
 
 pub async fn run() {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
@@ -85,7 +85,7 @@ pub async fn run() {
     });
     
     let subscriptions = config::load_all_subscriptions("config/");
-    log_loaded_subscriptions(&subscriptions);
+    // log_loaded_subscriptions(&subscriptions);
 
     // --- Initialize application state ---
     let app_state = Arc::new(config::AppState::new(
