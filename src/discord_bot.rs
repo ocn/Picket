@@ -667,9 +667,8 @@ async fn build_killmail_embed(
     // console.log('attackerparams.dataDone');
 
     let affiliation = format!(
-        "{}[killed]({}): {}\nin: [{}]({}) ([{}]({}))\n{}",
+        "{}Victim: {}\nin: [{}]({}) ([{}]({}))\n{}",
         attacker_alliances,
-        related_br,
         victim_details,
         system_name,
         str_system_dotlan(system_id),
@@ -683,7 +682,7 @@ async fn build_killmail_embed(
     embed.url(killmail_url.clone());
     embed.author(|a| {
         a.name(author_text)
-            .url(killmail_url)
+            .url(related_br)
             .icon_url(affiliation_icon_url_to_render)
     });
     embed.thumbnail(str_ship_render(id_of_icon_to_render));
