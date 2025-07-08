@@ -229,19 +229,19 @@ fn get_relative_time(killmail_time: &str) -> String {
     let now = Utc::now();
     let diff = now.signed_duration_since(kill_time);
 
-    if diff.num_weeks() > 52 {
+    if diff.num_weeks() >= 52 {
         return format!("{} years ago", diff.num_weeks() / 52);
     }
-    if diff.num_weeks() > 1 {
+    if diff.num_weeks() >= 1 {
         return format!("{} weeks ago", diff.num_weeks());
     }
-    if diff.num_days() > 1 {
+    if diff.num_days() >= 1 {
         return format!("{} days ago", diff.num_days());
     }
-    if diff.num_hours() > 1 {
+    if diff.num_hours() >= 1 {
         return format!("{} hours ago", diff.num_hours());
     }
-    if diff.num_minutes() > 1 {
+    if diff.num_minutes() >= 1 {
         return format!("{} minutes ago", diff.num_minutes());
     }
     format!("{} seconds ago", diff.num_seconds())
@@ -250,18 +250,26 @@ fn get_relative_time(killmail_time: &str) -> String {
 fn str_alliance_icon(id: u64) -> String {
     format!("https://images.evetech.net/alliances/{}/logo?size=64", id)
 }
+
+#[allow(unused)]
 fn str_corp_icon(id: u64) -> String {
     format!(
         "https://images.evetech.net/corporations/{}/logo?size=64",
         id
     )
 }
+
+#[allow(unused)]
 fn str_ship_render(id: u32) -> String {
     format!("https://images.evetech.net/types/{}/render?size=128", id)
 }
+
+#[allow(unused)]
 fn str_ship_icon(id: u32) -> String {
     format!("https://images.evetech.net/types/{}/icon?size=64", id)
 }
+
+#[allow(unused)]
 fn str_pilot_zk(id: u64) -> String {
     format!("https://zkillboard.com/character/{}/", id)
 }
@@ -370,10 +378,7 @@ async fn build_killmail_embed(
             ));
         }
     }
-    if victim_corp_id != 0 {
-        if !victim_details.is_empty() {
-            victim_details.push_str(" / ");
-        }
+    if victim_corp_id != 0 && victim_details.is_empty() {
         if let Some(name) = get_name(app_state, victim_corp_id).await {
             victim_details.push_str(&format!(
                 "[{}]({})",
@@ -576,7 +581,7 @@ async fn build_killmail_embed(
         ));
     }
 
-    attacker_alliances.push("```");
+    attacker_alliances = format!("{}```", attacker_alliances);
 
     // console.log('attackerparams.dataDone');
 
