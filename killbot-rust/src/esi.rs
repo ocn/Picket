@@ -9,8 +9,11 @@ const FUZZWORK_URL: &str = "https://www.fuzzwork.co.uk/api/";
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Celestial {
+    #[serde(rename = "itemid")]
     pub item_id: u64,
+    #[serde(rename = "typeid")]
     pub type_id: u32,
+    #[serde(rename = "itemName")]
     pub item_name: String,
     pub distance: f64,
 }
