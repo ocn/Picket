@@ -49,6 +49,7 @@ pub enum Filter {
     IsSolo(bool),
     Pilots { min: Option<u32>, max: Option<u32> },
     NameFragment(String),
+    TimeRange { start: u32, end: u32 },
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]

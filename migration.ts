@@ -34,7 +34,9 @@ type Filter =
     | { Character: number[] }
     | { ShipType: number[] }
     | { IsNpc: boolean }
-    | { NameFragment: string };
+    | { NameFragment: string }
+    | { Pilots: { min?: number; max?: number } }
+    | { TimeRange: { start?: number; end?: number } };
 
 type FilterNode =
     | { Condition: Filter }
@@ -121,6 +123,8 @@ function transformLimitsToFilters(oldSub: OldSubscription): FilterNode[] {
     let securityMin = -1.0;
     let securityMax = 1.0;
     let securityFilterExists = false;
+    let timeStart: number | null = null;
+    let timeEnd: number | null = null;
 
     if (oldSub.minValue > 0) {
         filters.push({ TotalValue: { min: oldSub.minValue } });
@@ -150,8 +154,14 @@ function transformLimitsToFilters(oldSub: OldSubscription): FilterNode[] {
             case 'minNumInvolved':
                 filters.push({ Pilots: { min: Number(value) } });
                 break;
-            case 'nameFragment':                                                                                                                                             │
+            case 'nameFragment':
                 filters.push({ NameFragment: value });
+                break;
+            case 'startingTime':
+                timeStart = Number(value);
+                break;
+            case 'endingTime':
+                timeEnd = Number(value);
                 break;
             
             // --- Correct Security Logic ---
@@ -173,6 +183,10 @@ function transformLimitsToFilters(oldSub: OldSubscription): FilterNode[] {
                 securityFilterExists = true;
                 break;
         }
+    }
+
+    if (timeStart !== null && timeEnd !== null) {
+        filters.push({ TimeRange: { start: timeStart, end: timeEnd } });
     }
 
     if (securityFilterExists) {

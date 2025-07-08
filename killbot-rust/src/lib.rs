@@ -19,7 +19,6 @@ use commands::subscribe::SubscribeCommand;
 use commands::unsubscribe::UnsubscribeCommand;
 use commands::diag::DiagCommand;
 use discord_bot::CommandMap;
-use crate::config::Subscription;
 
 pub struct AppStateContainer;
 

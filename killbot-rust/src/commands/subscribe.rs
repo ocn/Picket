@@ -65,7 +65,18 @@ impl Command for SubscribeCommand {
                     .description("A fragment to match against ship names.")
                     .kind(CommandOptionType::String)
             })
-    }
+            .create_option(|option| {
+                option
+                    .name("time_range_start")
+                    .description("The start of the time range (0-23).")
+                    .kind(CommandOptionType::Integer)
+            })
+            .create_option(|option| {
+                option
+                    .name("time_range_end")
+                    .description("The end of the time range (0-23).")
+                    .kind(CommandOptionType::Integer)
+            })
     }
 
     async fn execute(&self, ctx: &Context, command: &ApplicationCommandInteraction, app_state: &Arc<AppState>) {
@@ -112,6 +123,12 @@ impl Command for SubscribeCommand {
 
         if let Some(CommandDataOptionValue::String(s)) = get_option_value(options, "name_fragment") {
             filters.push(Filter::NameFragment(s.clone()));
+        }
+
+        let time_range_start = get_option_value(options, "time_range_start").and_then(|v| if let CommandDataOptionValue::Integer(i) = v { Some(*i as u32) } else { None });
+        let time_range_end = get_option_value(options, "time_range_end").and_then(|v| if let CommandDataOptionValue::Integer(i) = v { Some(*i as u32) } else { None });
+        if let (Some(start), Some(end)) = (time_range_start, time_range_end) {
+            filters.push(Filter::TimeRange { start, end });
         }
 
         let root_filter = if filters.len() > 1 {

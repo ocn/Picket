@@ -103,7 +103,7 @@ pub async fn get_ship_group_id(app_state: &Arc<AppState>, ship_id: u32) -> Optio
     }
 }
 
-async fn get_name(app_state: &Arc<AppState>, id: u64) -> Option<String> {
+pub async fn get_name(app_state: &Arc<AppState>, id: u64) -> Option<String> {
     {
         let names = app_state.names.read().unwrap();
         if let Some(name) = names.get(&id) {

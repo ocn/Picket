@@ -5,6 +5,7 @@ use futures::future::{BoxFuture, FutureExt};
 use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::sync::Arc;
+use chrono::Timelike;
 use tracing::{info, warn};
 
 pub async fn process_killmail(app_state: &Arc<AppState>, zk_data: &ZkData) -> Vec<Subscription> {
@@ -189,7 +190,7 @@ async fn evaluate_filter(filter: &Filter, zk_data: &ZkData, app_state: &Arc<AppS
             let lower_fragment = fragment.to_lowercase();
 
             // Check victim ship name
-            if let Some(name) = get_name(app_state, killmail.victim.ship_type_id as u64).await {
+            if let Some(name) = crate::discord_bot::get_name(app_state, killmail.victim.ship_type_id as u64).await {
                 if name.to_lowercase().contains(&lower_fragment) {
                     return true;
                 }
@@ -198,7 +199,7 @@ async fn evaluate_filter(filter: &Filter, zk_data: &ZkData, app_state: &Arc<AppS
             // Check attacker ship names
             for attacker in &killmail.attackers {
                 if let Some(ship_id) = attacker.ship_type_id {
-                    if let Some(name) = get_name(app_state, ship_id as u64).await {
+                    if let Some(name) = crate::discord_bot::get_name(app_state, ship_id as u64).await {
                         if name.to_lowercase().contains(&lower_fragment) {
                             return true;
                         }
@@ -206,6 +207,21 @@ async fn evaluate_filter(filter: &Filter, zk_data: &ZkData, app_state: &Arc<AppS
                 }
             }
             false
+        }
+        Filter::TimeRange { start, end } => {
+            if let Ok(killmail_time) = chrono::DateTime::parse_from_rfc3339(&killmail.killmail_time) {
+                let killmail_hour = killmail_time.hour();
+                if start <= end {
+                    // Simple range within the same day
+                    killmail_hour >= *start && killmail_hour <= *end
+                } else {
+                    // Range extends across midnight (e.g., 22:00 to 04:00)
+                    killmail_hour >= *start || killmail_hour <= *end
+                }
+            } else {
+                warn!("Failed to parse killmail_time: {}", killmail.killmail_time);
+                false
+            }
         }
     }
 }
