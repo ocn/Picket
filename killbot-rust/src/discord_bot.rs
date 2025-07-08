@@ -148,8 +148,16 @@ async fn get_closest_celestial(
     zk_data: &ZkData,
 ) -> Option<Arc<Celestial>> {
     let killmail = &zk_data.killmail;
-    killmail.victim.position.as_ref()?;
-    let position = killmail.victim.position.as_ref().unwrap();
+    let position = match killmail.victim.position.as_ref() {
+        None => {
+            warn!(
+                "Killmail {} has no position data for victim: {:#?}\nLocation ID: {:#?}",
+                killmail.killmail_id, killmail.victim.position, zk_data.zkb.location_id
+            );
+            return None;
+        }
+        Some(pos) => pos,
+    };
     let cache_key = killmail.solar_system_id;
 
     if let Some(celestial) = app_state.celestial_cache.get(&cache_key) {
@@ -170,6 +178,10 @@ async fn get_closest_celestial(
             .await;
         Some(celestial_arc)
     } else {
+        warn!(
+            "Failed to fetch celestial data for system {}: {:#?}",
+            killmail.solar_system_id, zk_data.zkb.location_id
+        );
         None
     }
 }
@@ -203,7 +215,10 @@ pub async fn send_killmail_message(
         error!("Failed to send message to channel {}: {}", channel, e);
         return Err(Box::new(e));
     }
-    info!("[Kill: {}] Sent message to channel {}", zk_data.kill_id, channel);
+    info!(
+        "[Kill: {}] Sent message to channel {}",
+        zk_data.kill_id, channel
+    );
     Ok(())
 }
 
@@ -547,12 +562,12 @@ async fn build_killmail_embed(
     let mut attacker_alliances = "```\n".to_string();
     let mut displayed_entries: Vec<(String, u32)> = Vec::new();
     let mut others_count = 0;
-    const DISPLAY_THRESHOLD: u32 = 15;
+    const DISPLAY_THRESHOLD: u32 = 10;
 
     // Separate entries into "displayed" and "others".
     for (i, (name, count)) in sorted_attackers.into_iter().enumerate() {
         if count >= DISPLAY_THRESHOLD || i == 0 {
-            displayed_entries.push((name, count));
+            displayed_entries.push((name[0..name.len().min(26)].to_string(), count));
         } else {
             others_count += count;
         }
@@ -627,7 +642,7 @@ async fn build_killmail_embed(
         f.text(format!(
             "Value: {} • EVETime: {}",
             total_value_str,
-            format!("{}", killmail_time.format("%d/%m/%Y, %H:%M")),
+            killmail_time.format("%d/%m/%Y, %H:%M"),
         ))
     });
     if let Ok(timestamp) = DateTime::parse_from_rfc3339(&killmail.killmail_time) {
