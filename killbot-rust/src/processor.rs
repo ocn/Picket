@@ -273,7 +273,21 @@ async fn evaluate_filter(
             }
             None
         }
-        Filter::ShipGroup(ship_group_ids) => {
+        Filter::ShipGroup(ship_group_ids_as_type_ids) => {
+            // It is implicit that these "ship group IDs" are actually ship type IDs, and thus
+            // must be converted to the proper ship group IDs before use.
+            let mut ship_group_ids = vec![];
+            for type_id in ship_group_ids_as_type_ids {
+                if let Some(group_id) = get_ship_group_id(app_state, *type_id).await {
+                    ship_group_ids.push(group_id);
+                } else {
+                    warn!(
+                        "Failed to get ship group ID for type ID {}",
+                        type_id
+                    );
+                }
+            }
+            
             if let Some(group_id) = get_ship_group_id(app_state, killmail.victim.ship_type_id).await
             {
                 if ship_group_ids.contains(&group_id) {
