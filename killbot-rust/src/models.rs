@@ -26,8 +26,8 @@ pub struct KillmailData {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Zkb {
-    #[serde(rename = "locationID")]
-    pub location_id: i64,
+    #[serde(default, rename = "locationID")]
+    pub location_id: Option<i64>,
     pub hash: String,
     #[serde(rename = "fittedValue")]
     pub fitted_value: f64,

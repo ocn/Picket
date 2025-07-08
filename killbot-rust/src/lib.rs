@@ -1,23 +1,21 @@
+use rand::{distributions::Alphanumeric, Rng};
+use serenity::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio;
-use tracing::{error, info, Level, warn};
-use tracing_subscriber;
-use serenity::prelude::*;
-use rand::{distributions::Alphanumeric, Rng};
+use tracing::{error, info, warn, Level};
 
+pub mod commands;
 pub mod config;
 pub mod discord_bot;
+pub mod esi;
 pub mod models;
 pub mod processor;
 pub mod redis_q;
-pub mod esi;
-pub mod commands;
 
-use commands::{Command, PingCommand};
+use commands::diag::DiagCommand;
 use commands::subscribe::SubscribeCommand;
 use commands::unsubscribe::UnsubscribeCommand;
-use commands::diag::DiagCommand;
+use commands::{Command, PingCommand};
 use discord_bot::CommandMap;
 
 pub struct AppStateContainer;
@@ -69,20 +67,29 @@ pub async fn run() {
             return;
         }
     };
-    
+
     let systems = config::load_systems().unwrap_or_else(|e| {
-        warn!("Failed to load systems.json: {}. Starting with an empty map.", e);
+        warn!(
+            "Failed to load systems.json: {}. Starting with an empty map.",
+            e
+        );
         HashMap::new()
     });
     let ships = config::load_ships().unwrap_or_else(|e| {
-        warn!("Failed to load ships.json: {}. Starting with an empty map.", e);
+        warn!(
+            "Failed to load ships.json: {}. Starting with an empty map.",
+            e
+        );
         HashMap::new()
     });
     let names = config::load_names().unwrap_or_else(|e| {
-        warn!("Failed to load names.json: {}. Starting with an empty map.", e);
+        warn!(
+            "Failed to load names.json: {}. Starting with an empty map.",
+            e
+        );
         HashMap::new()
     });
-    
+
     let subscriptions = config::load_all_subscriptions("config/");
     // log_loaded_subscriptions(&subscriptions);
 
@@ -97,7 +104,7 @@ pub async fn run() {
 
     // --- Initialize Commands ---
     let mut command_map: HashMap<String, Box<dyn Command>> = HashMap::new();
-    
+
     let ping_command = Box::new(PingCommand);
     command_map.insert(ping_command.name(), ping_command);
 
@@ -112,10 +119,11 @@ pub async fn run() {
 
     let command_map_arc = Arc::new(command_map);
 
-
     // --- Start Discord Bot ---
     let discord_token = app_config.discord_bot_token.clone();
-    let intents = GatewayIntents::non_privileged() | GatewayIntents::GUILDS | GatewayIntents::GUILD_INTEGRATIONS;
+    let intents = GatewayIntents::non_privileged()
+        | GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_INTEGRATIONS;
     let mut client = Client::builder(&discord_token, intents)
         .event_handler(discord_bot::Handler)
         .await
@@ -126,7 +134,7 @@ pub async fn run() {
         data.insert::<AppStateContainer>(app_state.clone());
         data.insert::<CommandMap>(command_map_arc.clone());
     }
-    
+
     let http_client = client.cache_and_http.http.clone();
 
     tokio::spawn(async move {
@@ -148,7 +156,7 @@ pub async fn run() {
                 let matched = processor::process_killmail(&app_state, &zk_data).await;
 
                 if !matched.is_empty() {
-                    for subscription in matched {
+                    for (subscription, filter_result) in matched {
                         info!(
                             "[Kill: {}] Matched subscription '{}'. Sending notification to channel {}.",
                             kill_id, subscription.description, subscription.action.channel_id
@@ -158,6 +166,7 @@ pub async fn run() {
                             &app_state,
                             &subscription,
                             &zk_data,
+                            filter_result,
                         )
                         .await
                         {

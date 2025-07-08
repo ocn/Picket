@@ -32,7 +32,7 @@ type Filter =
     | { Alliance: number[] }
     | { Corporation: number[] }
     | { Character: number[] }
-    | { ShipType: number[] }
+    | { ShipGroup: number[] }
     | { IsNpc: boolean }
     | { NameFragment: string }
     | { Pilots: { min?: number; max?: number } }
@@ -75,9 +75,9 @@ function generateDescription(filterNode: FilterNode): string {
         }
     }
 
-    const shipTypeCondition = conditions.find(c => 'ShipType' in c);
-    if (shipTypeCondition && 'ShipType' in shipTypeCondition) {
-        parts.push(`involving one of ${shipTypeCondition.ShipType.length} specific ship types`);
+    const shipTypeCondition = conditions.find(c => 'ShipGroup' in c);
+    if (shipTypeCondition && 'ShipGroup' in shipTypeCondition) {
+        parts.push(`involving one of ${shipTypeCondition.ShipGroup.length} specific ship types`);
     }
 
     const regionCondition = conditions.find(c => 'Region' in c);
@@ -137,7 +137,7 @@ function transformLimitsToFilters(oldSub: OldSubscription): FilterNode[] {
                 filters.push({ Region: parseIds(value) });
                 break;
             case 'type':
-                filters.push({ ShipType: parseIds(value) });
+                filters.push({ ShipGroup: parseIds(value) });
                 break;
             case 'alliance':
                 filters.push({ Alliance: parseIds(value) });

@@ -32,7 +32,7 @@ impl RedisQListener {
 
         let text = response.text().await?;
         if text.contains("<!DOCTYPE html>") {
-             return Err(format!("Received HTML response instead of JSON").into());
+             return Err("Received HTML response instead of JSON".to_string().into());
         }
 
         let wrapper: RedisQResponse = serde_json::from_str(&text)

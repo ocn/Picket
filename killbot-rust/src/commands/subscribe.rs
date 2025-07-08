@@ -149,7 +149,7 @@ impl Command for SubscribeCommand {
 
         let response_content = {
             let mut subs_map = app_state.subscriptions.write().unwrap();
-            let guild_subs = subs_map.entry(guild_id).or_insert_with(Vec::new);
+            let guild_subs = subs_map.entry(guild_id).or_default();
             
             guild_subs.retain(|sub| sub.id != id);
             guild_subs.push(new_sub);

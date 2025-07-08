@@ -20,6 +20,12 @@ pub struct EsiClient {
     client: Client,
 }
 
+impl Default for EsiClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EsiClient {
     pub fn new() -> Self {
         EsiClient {

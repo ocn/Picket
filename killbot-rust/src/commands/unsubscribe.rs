@@ -58,7 +58,7 @@ impl Command for UnsubscribeCommand {
                     format!("No subscription found with ID '{}'.", id_to_remove)
                 }
             } else {
-                format!("No subscriptions found for this guild.")
+                "No subscriptions found for this guild.".to_string()
             }
         };
 
