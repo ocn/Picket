@@ -201,11 +201,14 @@ pub fn load_all_subscriptions(dir: &str) -> HashMap<GuildId, Vec<Subscription>> 
                 if let Some(guild_id_str) = filename_str.strip_suffix(".json") {
                     if let Ok(guild_id) = guild_id_str.parse::<u64>() {
                         // Use the correct parsing function for array-based JSON files
-                        if let Ok(subs) = load_vec_from_json_file::<Subscription>(&path) {
-                            info!("Loaded {} subscriptions for guild {}", subs.len(), guild_id);
-                            all_subscriptions.insert(GuildId(guild_id), subs);
-                        } else {
-                            warn!("Could not parse {} as subscription file.", filename_str);
+                        match load_vec_from_json_file::<Subscription>(&path) {
+                            Ok(subs) => {
+                                info!("Loaded {} subscriptions for guild {}", subs.len(), guild_id);
+                                all_subscriptions.insert(GuildId(guild_id), subs);
+                            }
+                            Err(e) => {
+                                warn!("Could not parse {} as subscription file: {:#?}", filename_str, e);
+                            }
                         }
                     }
                 }
@@ -241,7 +244,7 @@ mod tests {
         let subscriptions = result.unwrap();
         assert_eq!(subscriptions.len(), 202, "Incorrect number of subscriptions loaded");
         assert_eq!(subscriptions[0].id, "1");
-        assert_eq!(subscriptions[0].action.channel_id, "1090110979083354200");
+        assert_eq!(subscriptions[0].action.channel_id, "1090110979083354183");
     }
 
     #[test]
