@@ -254,27 +254,70 @@ fn abbreviate_number(n: f64) -> String {
 }
 
 fn get_relative_time(killmail_time: &str) -> String {
-    let kill_time = DateTime::parse_from_rfc3339(killmail_time)
-        .unwrap_or_else(|_| Utc::now().with_timezone(&FixedOffset::east_opt(0).unwrap()));
+    let kill_time = match DateTime::parse_from_rfc3339(killmail_time) {
+        Ok(t) => t.with_timezone(&Utc),
+        Err(e) => {
+            error!("Failed to parse killmail time '{}': {}", killmail_time, e);
+            return "just now".to_string();
+        } // Early return on parse failure
+    };
     let now = Utc::now();
     let diff = now.signed_duration_since(kill_time);
 
-    if diff.num_weeks() >= 52 {
-        return format!("{} years ago", diff.num_weeks() / 52);
+    let seconds = diff.num_seconds();
+    if seconds < 1 {
+        return "just now".to_string();
     }
-    if diff.num_weeks() >= 1 {
-        return format!("{} weeks ago", diff.num_weeks());
+    if seconds == 1 {
+        return "1 second ago".to_string();
     }
-    if diff.num_days() >= 1 {
-        return format!("{} days ago", diff.num_days());
+
+    let minutes = seconds / 60;
+    let hours = minutes / 60;
+    let days = hours / 24;
+    let weeks = days / 7;
+    // Approximation: 4 weeks per month. Note: This is not perfectly accurate.
+    let months = weeks / 4;
+    let years = months / 12;
+
+    if years > 1 {
+        return format!("{} years ago", years);
     }
-    if diff.num_hours() >= 1 {
-        return format!("{} hours ago", diff.num_hours());
+    if years == 1 {
+        return "1 year ago".to_string();
     }
-    if diff.num_minutes() >= 1 {
-        return format!("{} minutes ago", diff.num_minutes());
+    if months > 1 {
+        return format!("{} months ago", months);
     }
-    format!("{} seconds ago", diff.num_seconds())
+    if months == 1 {
+        return "1 month ago".to_string();
+    }
+    if weeks > 1 {
+        return format!("{} weeks ago", weeks);
+    }
+    if weeks == 1 {
+        return "1 week ago".to_string();
+    }
+    if days > 1 {
+        return format!("{} days ago", days);
+    }
+    if days == 1 {
+        return "1 day ago".to_string();
+    }
+    if hours > 1 {
+        return format!("{} hours ago", hours);
+    }
+    if hours == 1 {
+        return "1 hour ago".to_string();
+    }
+    if minutes > 1 {
+        return format!("{} minutes ago", minutes);
+    }
+    if minutes == 1 {
+        return "1 minute ago".to_string();
+    }
+
+    format!("{} seconds ago", seconds)
 }
 
 fn str_alliance_icon(id: u64) -> String {
