@@ -24,7 +24,6 @@ The bot operates by subscribing to a data feed from zkillboard.com and processes
 
 - [Usage](#usage)
 - [Commands](#commands)
-- [Filtering System](#filtering-system)
 - [Manual Configuration](#manual-configuration)
 - [Development](#development)
 - [Contact](#contact)
@@ -35,90 +34,73 @@ The bot operates by subscribing to a data feed from zkillboard.com and processes
 The primary way to use the bot is by inviting it to your Discord server and using slash commands to create and manage subscriptions.
 
 ### 1. Invite the Bot
-Use the following link to add the bot to your server:
+Use the following link to add the bot to your server. The owner of the bot will need to replace `YOUR_CLIENT_ID` with their bot's actual client ID.
 
 [**Invite zk-activity Bot**](https://discordapp.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=149504&scope=bot) 
-*(Note: The self-hosting owner will need to replace `YOUR_CLIENT_ID` with their bot's actual client ID).*
 
 ### 2. Create a Subscription
-In the channel where you want to receive killmails, use the `/subscribe` command. This command allows you to build a filter using its various options.
+In the channel where you want to receive killmails, use the `/subscribe` command. This command allows you to combine multiple filter options to create a specific alert. All specified filters are combined with an "AND" logic—the killmail must match **all** of them to be posted.
 
-**Example:** To track all kills of Dreadnoughts (group ID 485) and Marauders (group ID 547) in the Devoid region (ID 10000030), you would use:
+**Example:** To track kills of Dreadnoughts (group ID 485) and Marauders (group ID 547) in the Devoid region (ID 10000030) that are worth at least 1 billion ISK, you would use:
 ```
-/subscribe filter_json:{"Condition":{"And":[{"Condition":{"Region":[10000030]}},{"Condition":{"ShipGroup":[485,547]}}]}}
+/subscribe id: cap-watch-devoid description: Capital and Marauder kills in Devoid region_ids: 10000030 ship_group_ids: 485,547 min_value: 1000000000
 ```
 
-When you create your first subscription, the bot will automatically generate a configuration file on the host server named `[your_server_id].json` (e.g., `123456789012345678.json`). All subsequent subscriptions for that server will be managed through in-Discord commands.
+When you create your first subscription in a server, the bot will automatically generate a configuration file named `[your_server_id].json` (e.g., `123456789012345678.json`) on the host machine. All subsequent subscriptions for that server will be managed through in-Discord commands.
 
 ## Commands
 
-| Command         | Description                                                                                              |
-| --------------- | -------------------------------------------------------------------------------------------------------- |
-| `/subscribe`    | Creates a new killmail subscription for the current channel using a flexible JSON-based filter.          |
-| `/unsubscribe`  | Removes a subscription from the current channel. You will be prompted to choose which one to remove.     |
-| `/subscriptions`| Lists all active subscriptions for the current channel.                                                  |
+### `/subscribe`
+Creates or updates a killmail subscription for the current channel. All filter options are optional except for `id` and `description`.
 
-The `/subscribe` command takes a single, powerful `filter_json` argument where you define your filter rules. See the [Filtering System](#filtering-system) section for details on how to construct this JSON.
+-   `id` (Required): A unique name for the subscription (e.g., `my-first-filter`).
+-   `description` (Required): A brief explanation of what the subscription does.
+-   `min_value`: Minimum total ISK value.
+-   `max_value`: Maximum total ISK value.
+-   `region_ids`: Comma-separated list of region IDs.
+-   `system_ids`: Comma-separated list of system IDs.
+-   `alliance_ids`: Comma-separated list of alliance IDs.
+-   `corp_ids`: Comma-separated list of corporation IDs.
+-   `char_ids`: Comma-separated list of character IDs.
+-   `ship_type_ids`: Comma-separated list of ship type IDs.
+-   `ship_group_ids`: Comma-separated list of ship group IDs.
+-   `is_npc`: `True` for NPC-only kills, `False` for player-only.
+-   `is_solo`: `True` for solo kills only.
+-   `min_pilots`: Minimum number of pilots involved.
+-   `max_pilots`: Maximum number of pilots involved.
+-   `name_fragment`: A string that must appear in the ship's name.
+-   `time_range_start` / `time_range_end`: A UTC hour range (0-23) for the kill.
 
-## Filtering System
+### `/unsubscribe`
+Removes a subscription from the current channel.
+-   `id` (Required): The unique ID of the subscription to remove.
 
-The filtering logic is built around `FilterNode` objects, which can be nested to create complex rules. You provide these rules in the `filter_json` argument of the `/subscribe` command.
-
-### Filter Nodes
-
--   `And`: All child nodes must pass for the filter to be met.
--   `Or`: At least one child node must pass.
--   `Not`: Inverts the result of its child node.
--   `Condition`: A specific filter rule to evaluate.
-
-### Available Conditions
-
-| Condition      | Description                                                              | Example                                           |
-| -------------- | ------------------------------------------------------------------------ | ------------------------------------------------- |
-| `TotalValue`   | Filter by the total ISK value of the killmail.                           | `{ "TotalValue": { "min": 10000000 } }`            |
-| `DroppedValue` | Filter by the value of items that dropped in the wreck.                  | `{ "DroppedValue": { "max": 5000000 } }`           |
-| `Region`       | Match if the kill occurred in one of the specified region IDs.           | `{ "Region": [10000002, 10000043] }`               |
-| `System`       | Match if the kill occurred in one of the specified system IDs.           | `{ "System": [30000142] }`                         |
-| `Security`     | Match if the system's security status is within the inclusive range.     | `{ "Security": "0.1..=0.4" }`                      |
-| `Alliance`     | Match if the victim or any attacker is in one of the specified alliances. | `{ "Alliance": [99005338] }`                       |
-| `Corporation`  | Match if the victim or any attacker is in one of the specified corps.    | `{ "Corporation": [98389319] }`                    |
-| `Character`    | Match if the victim or any attacker is one of the specified characters.  | `{ "Character": [2112625428] }`                   |
-| `ShipType`     | Match if the victim's or an attacker's ship is one of the specified types. | `{ "ShipType": [19720, 17738] }`                   |
-| `ShipGroup`    | Match if the ship belongs to one of the specified group IDs.             | `{ "ShipGroup": [485, 547] }`                      |
-| `LyRangeFrom`  | Match if the kill is within a given light-year range of a system.        | `{ "LyRangeFrom": { "systems": [30000142], "range": 8.5 } }` |
-| `IsNpc`        | Match if the kill was performed by NPCs (`true`) or players (`false`).   | `{ "IsNpc": false }`                              |
-| `IsSolo`       | Match if the kill was a solo kill.                                       | `{ "IsSolo": true }`                              |
-| `Pilots`       | Filter by the number of pilots involved (victim + attackers).            | `{ "Pilots": { "min": 10, "max": 50 } }`           |
-| `NameFragment` | Match if a specified string appears in a ship's name.                    | `{ "NameFragment": "shuttle" }`                   |
-| `TimeRange`    | Match if the kill occurred within a specific UTC hour range.             | `{ "TimeRange": { "start": 20, "end": 4 } }`       |
+### `/diag`
+Displays diagnostic information for all subscriptions active in the current channel.
 
 ### Finding IDs
-
 To find the correct IDs for regions, systems, ships, and groups, you can use a third-party database site like [**EVE Ref**](https://everef.net/type) or Dotlan. For character, corporation, and alliance IDs, zKillboard is an excellent resource.
 
 ## Manual Configuration
 
-For advanced users or for migrating configurations, you can manually edit the JSON files located in the `config/` directory.
-
--   Each server (guild) gets its own configuration file named after its ID (e.g., `config/123456789012345678.json`).
--   This file contains an array of subscription objects.
+For advanced users or for migrating configurations, you can manually edit the JSON files located in the `config/` directory. The bot automatically creates a file named `[guild_id].json` for each server where a subscription is made.
 
 ### Example `[guild_id].json`
+This JSON structure is equivalent to the example `/subscribe` command shown above.
 
 ```json
 [
   {
-    "id": "capital-watch-devoid",
-    "description": "Alerts for killmails valued over 5M ISK, involving specific capital or battleship groups, in the Devoid region (lowsec only).",
+    "id": "cap-watch-devoid",
+    "description": "Capital and Marauder kills in Devoid",
     "action": {
       "channel_id": "YOUR_DISCORD_CHANNEL_ID"
     },
     "filter": {
       "And": [
-        { "Condition": { "TotalValue": { "min": 5000000 } } },
         { "Condition": { "Region": [ 10000030 ] } },
-        { "Condition": { "ShipGroup": [ 485, 547, 1538, 30 ] } },
-        { "Condition": { "Security": "0.0001..=0.4999" } }
+        { "Condition": { "ShipGroup": [ 485, 547 ] } },
+        { "Condition": { "TotalValue": { "min": 1000000000 } } }
       ]
     }
   }
