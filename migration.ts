@@ -33,7 +33,8 @@ type Filter =
     | { Corporation: number[] }
     | { Character: number[] }
     | { ShipType: number[] }
-    | { IsNpc: boolean };
+    | { IsNpc: boolean }
+    | { NameFragment: string };
 
 type FilterNode =
     | { Condition: Filter }
@@ -146,6 +147,14 @@ function transformLimitsToFilters(oldSub: OldSubscription): FilterNode[] {
             case 'npcOnly':
                 filters.push({ IsNpc: value.toLowerCase() === 'true' });
                 break;
+            case 'minNumInvolved':
+                filters.push({ Pilots: { min: Number(value) } });
+                break;
+            case 'nameFragment':                                                                                                                                             │
+                filters.push({ NameFragment: value });
+                break;
+            
+            // --- Correct Security Logic ---
             
             case 'securityMinInclusive':
                 securityMin = Math.max(securityMin, parseFloat(value));

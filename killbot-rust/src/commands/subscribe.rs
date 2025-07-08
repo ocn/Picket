@@ -41,7 +41,31 @@ impl Command for SubscribeCommand {
             .create_option(|option| option.name("ship_type_ids").description("A comma-separated list of ship type IDs to match.").kind(CommandOptionType::String))
             .create_option(|option| option.name("ship_group_ids").description("A comma-separated list of ship group IDs to match.").kind(CommandOptionType::String))
             .create_option(|option| option.name("is_npc").description("Filter for NPC kills (true/false).").kind(CommandOptionType::Boolean))
-            .create_option(|option| option.name("is_solo").description("Filter for solo kills (true/false).").kind(CommandOptionType::Boolean))
+            .create_option(|option| {
+                option
+                    .name("is_solo")
+                    .description("Filter for solo kills (true/false).")
+                    .kind(CommandOptionType::Boolean)
+            })
+            .create_option(|option| {
+                option
+                    .name("min_pilots")
+                    .description("Minimum number of pilots involved in the killmail.")
+                    .kind(CommandOptionType::Integer)
+            })
+            .create_option(|option| {
+                option
+                    .name("max_pilots")
+                    .description("Maximum number of pilots involved in the killmail.")
+                    .kind(CommandOptionType::Integer)
+            })
+            .create_option(|option| {
+                option
+                    .name("name_fragment")
+                    .description("A fragment to match against ship names.")
+                    .kind(CommandOptionType::String)
+            })
+    }
     }
 
     async fn execute(&self, ctx: &Context, command: &ApplicationCommandInteraction, app_state: &Arc<AppState>) {
@@ -79,6 +103,16 @@ impl Command for SubscribeCommand {
 
         if let Some(CommandDataOptionValue::Boolean(b)) = get_option_value(options, "is_npc") { filters.push(Filter::IsNpc(*b)); }
         if let Some(CommandDataOptionValue::Boolean(b)) = get_option_value(options, "is_solo") { filters.push(Filter::IsSolo(*b)); }
+
+        let min_pilots = get_option_value(options, "min_pilots").and_then(|v| if let CommandDataOptionValue::Integer(i) = v { Some(*i as u32) } else { None });
+        let max_pilots = get_option_value(options, "max_pilots").and_then(|v| if let CommandDataOptionValue::Integer(i) = v { Some(*i as u32) } else { None });
+        if min_pilots.is_some() || max_pilots.is_some() {
+            filters.push(Filter::Pilots { min: min_pilots, max: max_pilots });
+        }
+
+        if let Some(CommandDataOptionValue::String(s)) = get_option_value(options, "name_fragment") {
+            filters.push(Filter::NameFragment(s.clone()));
+        }
 
         let root_filter = if filters.len() > 1 {
             FilterNode::And(filters.into_iter().map(FilterNode::Condition).collect())

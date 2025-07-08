@@ -47,6 +47,8 @@ pub enum Filter {
     LyRangeFrom { systems: Vec<u32>, range: f64 },
     IsNpc(bool),
     IsSolo(bool),
+    Pilots { min: Option<u32>, max: Option<u32> },
+    NameFragment(String),
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]

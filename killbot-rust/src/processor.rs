@@ -181,5 +181,31 @@ async fn evaluate_filter(filter: &Filter, zk_data: &ZkData, app_state: &Arc<AppS
         }
         Filter::IsNpc(is_npc) => zk_data.zkb.npc == *is_npc,
         Filter::IsSolo(is_solo) => zk_data.zkb.solo == *is_solo,
+        Filter::Pilots { min, max } => {
+            let num_pilots = (killmail.attackers.len() + 1) as u32;
+            min.map_or(true, |m| num_pilots >= m) && max.map_or(true, |m| num_pilots <= m)
+        }
+        Filter::NameFragment(fragment) => {
+            let lower_fragment = fragment.to_lowercase();
+
+            // Check victim ship name
+            if let Some(name) = get_name(app_state, killmail.victim.ship_type_id as u64).await {
+                if name.to_lowercase().contains(&lower_fragment) {
+                    return true;
+                }
+            }
+
+            // Check attacker ship names
+            for attacker in &killmail.attackers {
+                if let Some(ship_id) = attacker.ship_type_id {
+                    if let Some(name) = get_name(app_state, ship_id as u64).await {
+                        if name.to_lowercase().contains(&lower_fragment) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
     }
 }
