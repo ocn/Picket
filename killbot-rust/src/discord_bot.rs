@@ -167,22 +167,24 @@ async fn get_closest_celestial(
     let celestial = app_state
         .esi_client
         .get_celestial(killmail.solar_system_id, position.x, position.y, position.z)
-        .await
-        .ok();
+        .await;
 
-    if let Some(celestial) = celestial {
-        let celestial_arc = Arc::new(celestial);
-        app_state
-            .celestial_cache
-            .insert(cache_key, celestial_arc.clone())
-            .await;
-        Some(celestial_arc)
-    } else {
-        warn!(
-            "Failed to fetch celestial data for system {}: {:#?}",
-            killmail.solar_system_id, zk_data.zkb.location_id
-        );
-        None
+    match celestial {
+        Ok(celestial) => {
+            let celestial_arc = Arc::new(celestial);
+            app_state
+                .celestial_cache
+                .insert(cache_key, celestial_arc.clone())
+                .await;
+            Some(celestial_arc)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to fetch celestial data for system {} and location {:#?}: {:#?}",
+                killmail.solar_system_id, zk_data.zkb.location_id, e
+            );
+            None
+        }
     }
 }
 
