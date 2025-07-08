@@ -335,8 +335,9 @@ async fn build_killmail_embed(
     let killmail_time = DateTime::parse_from_rfc3339(&killmail.killmail_time)
         .unwrap_or_else(|_| Utc::now().with_timezone(&FixedOffset::east_opt(0).unwrap()));
 
+    let killmail_url = format!("https://zkillboard.com/kill/{}/", killmail.killmail_id);
     let related_br = format!(
-        "https://br.evetools.org/related/${}/{}",
+        "https://br.evetools.org/related/{}/{}",
         system_id,
         format_datetime_to_timestamp(&killmail_time)
     );
@@ -428,8 +429,15 @@ async fn build_killmail_embed(
             title = relative_time.clone();
         }
     } else {
-        title = "Placeholder".to_string();
-        author_text = "".to_string();
+        title = if let Some((type_id, count)) = &most_common_ship {
+            let ship_name = get_name(app_state, *type_id)
+                .await
+                .unwrap_or_else(|| "Unknown Ship".to_string());
+            format!("`{}` died to {}x `{}`", victim_ship_name, count, ship_name)
+        } else {
+            format!("`{}` died", victim_ship_name)
+        };
+        author_text = format!("Killmail in {} ({})", system_name, region_name);
     }
     author_text += &format!("\n{}", relative_time);
 
@@ -536,7 +544,7 @@ async fn build_killmail_embed(
 
     // --- Format Attacker List for Embed ---
 
-    let mut attacker_alliances = "```".to_string();
+    let mut attacker_alliances = "```\n".to_string();
     let mut displayed_entries: Vec<(String, u32)> = Vec::new();
     let mut others_count = 0;
     const DISPLAY_THRESHOLD: u32 = 15;
@@ -599,12 +607,10 @@ async fn build_killmail_embed(
 
     // Build the embed
     embed.title(title);
+    embed.url(killmail_url.clone());
     embed.author(|a| {
         a.name(author_text)
-            .url(format!(
-                "https://zkillboard.com/kill/{}/",
-                killmail.killmail_id
-            ))
+            .url(killmail_url)
             .icon_url(affiliation_icon_url_to_render)
     });
     embed.thumbnail(str_ship_render(id_of_icon_to_render));
@@ -620,7 +626,8 @@ async fn build_killmail_embed(
     embed.footer(|f| {
         f.text(format!(
             "Value: {} • EVETime: {}",
-            total_value_str, relative_time,
+            total_value_str,
+            format!("{}", killmail_time.format("%d/%m/%Y, %H:%M")),
         ))
     });
     if let Ok(timestamp) = DateTime::parse_from_rfc3339(&killmail.killmail_time) {

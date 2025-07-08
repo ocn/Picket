@@ -219,10 +219,10 @@ async fn evaluate_filter(
                 .victim
                 .character_id
                 .is_some_and(|id| character_ids.contains(&id));
-            let attacker_match = killmail.attackers.iter().any(|a| {
-                a.character_id
-                    .is_some_and(|id| character_ids.contains(&id))
-            });
+            let attacker_match = killmail
+                .attackers
+                .iter()
+                .any(|a| a.character_id.is_some_and(|id| character_ids.contains(&id)));
             if victim_match || attacker_match {
                 Some(Default::default())
             } else {
@@ -416,5 +416,401 @@ async fn evaluate_filter(
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AppConfig, Filter, FilterNode, System};
+    use crate::models::{Attacker, KillmailData, Position, Victim, ZkData, Zkb};
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+    use moka::future::Cache;
+    use tokio::sync::Mutex;
+
+    // Helper to create a mock AppState
+    fn mock_app_state() -> Arc<AppState> {
+        let mut systems = HashMap::new();
+        systems.insert(
+            30000142, // Jita
+            System {
+                id: 30000142,
+                name: "Jita".to_string(),
+                region_id: 10000002, // The Forge
+                region: "The Forge".to_string(),
+                security_status: 0.9,
+                x: -993254832640.0,
+                y: 216484356096.0,
+                z: -973193297920.0,
+            },
+        );
+        systems.insert(
+            31002222, // Amarr
+            System {
+                id: 31002222,
+                name: "Amarr".to_string(),
+                region_id: 10000043, // Domain
+                region: "Domain".to_string(),
+                security_status: 1.0,
+                x: 1.0,
+                y: 1.0,
+                z: 1.0,
+            },
+        );
+
+        let mut ships = HashMap::new();
+        ships.insert(671, 27); // Catalyst, GroupID 27 (Destroyer)
+        ships.insert(587, 25); // Rifter, GroupID 25 (Frigate)
+        ships.insert(17738, 419); // Golem, GroupID 419 (Marauder)
+
+        let mut names = HashMap::new();
+        names.insert(671, "Catalyst".to_string());
+        names.insert(587, "Rifter".to_string());
+        names.insert(17738, "Golem".to_string());
+
+        Arc::new(AppState {
+            subscriptions: Default::default(),
+            systems: Arc::new(RwLock::new(systems)),
+            ships: Arc::new(RwLock::new(ships)),
+            names: Arc::new(RwLock::new(names)),
+            celestial_cache: Cache::new(10_000),
+            esi_client: Default::default(),
+            systems_file_lock: Mutex::new(()),
+            ships_file_lock: Mutex::new(()),
+            names_file_lock: Mutex::new(()),
+            app_config: Arc::new(AppConfig {
+                discord_bot_token: "".to_string(),
+                discord_client_id: 0,
+            }),
+        })
+    }
+
+    // Helper to create a default ZkData for testing
+    fn default_zk_data() -> ZkData {
+        ZkData {
+            kill_id: 1,
+            killmail: KillmailData {
+                killmail_id: 1,
+                killmail_time: "2025-07-08T12:00:00Z".to_string(),
+                solar_system_id: 30000142, // Jita
+                victim: Victim {
+                    damage_taken: 1000,
+                    ship_type_id: 587, // Rifter
+                    character_id: Some(1),
+                    corporation_id: Some(101),
+                    alliance_id: Some(1001),
+                    position: Some(Position {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    }),
+                    faction_id: None,
+                    items: vec![],
+                },
+                attackers: vec![Attacker {
+                    final_blow: true,
+                    damage_done: 1000,
+                    ship_type_id: Some(671), // Catalyst
+                    character_id: Some(2),
+                    corporation_id: Some(102),
+                    alliance_id: Some(1002),
+                    weapon_type_id: Some(3),
+                    security_status: 0.5,
+                    faction_id: None,
+                }],
+            },
+            zkb: Zkb {
+                total_value: 10_000_000.0,
+                dropped_value: 1_000_000.0,
+                npc: false,
+                solo: false,
+                location_id: None,
+                hash: "".to_string(),
+                fitted_value: 0.0,
+                destroyed_value: 0.0,
+                points: 0,
+                awox: false,
+                esi: "".to_string(),
+            },
+        }
+    }
+
+    async fn test_filter(filter: Filter, zk_data: &ZkData, should_pass: bool) {
+        let app_state = mock_app_state();
+        let result = evaluate_filter(&filter, zk_data, &app_state).await;
+        assert_eq!(
+            result.is_some(),
+            should_pass,
+            "Filter test failed for: {:?}",
+            filter
+        );
+    }
+
+    #[tokio::test]
+    async fn test_total_value_filter() {
+        let zk_data = default_zk_data();
+        test_filter(
+            Filter::TotalValue {
+                min: Some(5_000_000),
+                max: None,
+            },
+            &zk_data,
+            true,
+        )
+        .await;
+        test_filter(
+            Filter::TotalValue {
+                min: Some(15_000_000),
+                max: None,
+            },
+            &zk_data,
+            false,
+        )
+        .await;
+        test_filter(
+            Filter::TotalValue {
+                min: None,
+                max: Some(15_000_000),
+            },
+            &zk_data,
+            true,
+        )
+        .await;
+        test_filter(
+            Filter::TotalValue {
+                min: None,
+                max: Some(5_000_000),
+            },
+            &zk_data,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_region_filter() {
+        let zk_data = default_zk_data();
+        test_filter(Filter::Region(vec![10000002]), &zk_data, true).await; // The Forge
+        test_filter(Filter::Region(vec![10000043]), &zk_data, false).await; // Domain
+    }
+
+    #[tokio::test]
+    async fn test_system_filter() {
+        let zk_data = default_zk_data();
+        test_filter(Filter::System(vec![30000142]), &zk_data, true).await; // Jita
+        test_filter(Filter::System(vec![31002222]), &zk_data, false).await; // Amarr
+    }
+
+    #[tokio::test]
+    async fn test_security_filter() {
+        let zk_data = default_zk_data(); // Jita is 0.9
+        test_filter(Filter::Security("0.8..=1.0".to_string()), &zk_data, true).await;
+        test_filter(Filter::Security("0.1..=0.5".to_string()), &zk_data, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_alliance_filter() {
+        let zk_data = default_zk_data();
+        test_filter(Filter::Alliance(vec![1001]), &zk_data, true).await; // Victim's alliance
+        test_filter(Filter::Alliance(vec![1002]), &zk_data, true).await; // Attacker's alliance
+        test_filter(Filter::Alliance(vec![9999]), &zk_data, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_corporation_filter() {
+        let zk_data = default_zk_data();
+        test_filter(Filter::Corporation(vec![101]), &zk_data, true).await; // Victim's corp
+        test_filter(Filter::Corporation(vec![102]), &zk_data, true).await; // Attacker's corp
+        test_filter(Filter::Corporation(vec![9999]), &zk_data, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_ship_type_filter() {
+        let zk_data = default_zk_data();
+        test_filter(Filter::ShipType(vec![587]), &zk_data, true).await; // Victim's ship (Rifter)
+        test_filter(Filter::ShipType(vec![671]), &zk_data, true).await; // Attacker's ship (Catalyst)
+        test_filter(Filter::ShipType(vec![17738]), &zk_data, false).await; // Golem
+    }
+
+    #[tokio::test]
+    async fn test_ship_group_filter() {
+        let zk_data = default_zk_data();
+        // Victim is a Rifter (Frigate, group 25)
+        test_filter(Filter::ShipGroup(vec![25]), &zk_data, true).await;
+        // Attacker is a Catalyst (Destroyer, group 27)
+        test_filter(Filter::ShipGroup(vec![27]), &zk_data, true).await;
+        // Neither is a Marauder (group 419)
+        test_filter(Filter::ShipGroup(vec![419]), &zk_data, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_is_npc_filter() {
+        let mut zk_data = default_zk_data();
+        zk_data.zkb.npc = true;
+        test_filter(Filter::IsNpc(true), &zk_data, true).await;
+        test_filter(Filter::IsNpc(false), &zk_data, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_pilots_filter() {
+        let zk_data = default_zk_data(); // 2 pilots total
+        test_filter(
+            Filter::Pilots {
+                min: Some(2),
+                max: None,
+            },
+            &zk_data,
+            true,
+        )
+        .await;
+        test_filter(
+            Filter::Pilots {
+                min: Some(3),
+                max: None,
+            },
+            &zk_data,
+            false,
+        )
+        .await;
+        test_filter(
+            Filter::Pilots {
+                min: None,
+                max: Some(2),
+            },
+            &zk_data,
+            true,
+        )
+        .await;
+        test_filter(
+            Filter::Pilots {
+                min: None,
+                max: Some(1),
+            },
+            &zk_data,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_time_range_filter() {
+        let zk_data = default_zk_data(); // Time is 12:00:00
+        test_filter(Filter::TimeRange { start: 11, end: 13 }, &zk_data, true).await;
+        test_filter(Filter::TimeRange { start: 14, end: 16 }, &zk_data, false).await;
+        // Test overnight range
+        test_filter(Filter::TimeRange { start: 22, end: 4 }, &zk_data, false).await;
+        let mut zk_data_night = default_zk_data();
+        zk_data_night.killmail.killmail_time = "2025-07-08T23:00:00Z".to_string();
+        test_filter(
+            Filter::TimeRange { start: 22, end: 4 },
+            &zk_data_night,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_combined_and_filter_success() {
+        // User's case: ShipGroup in a certain Region.
+        // Test data: Rifter (Frigate, group 25) in Jita (The Forge, region 10000002)
+        let zk_data = default_zk_data();
+        let app_state = mock_app_state();
+
+        let filter_node = FilterNode::And(vec![
+            FilterNode::Condition(Filter::Region(vec![10000002])), // The Forge
+            FilterNode::Condition(Filter::ShipGroup(vec![25])),    // Frigate
+        ]);
+
+        let result = evaluate_filter_node(&filter_node, &zk_data, &app_state).await;
+        assert!(
+            result.is_some(),
+            "Combined AND filter should pass when all conditions are met"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_combined_and_filter_fail_region() {
+        // Test data: Rifter (Frigate, group 25) in Jita
+        // Filter: Wrong region, correct ship group
+        let zk_data = default_zk_data();
+        let app_state = mock_app_state();
+
+        let filter_node = FilterNode::And(vec![
+            FilterNode::Condition(Filter::Region(vec![10000043])), // Domain (Wrong)
+            FilterNode::Condition(Filter::ShipGroup(vec![25])),    // Frigate (Correct)
+        ]);
+
+        let result = evaluate_filter_node(&filter_node, &zk_data, &app_state).await;
+        assert!(
+            result.is_none(),
+            "Combined AND filter should fail when region is wrong"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_combined_and_filter_fail_shipgroup() {
+        // Test data: Rifter (Frigate, group 25) in Jita
+        // Filter: Correct region, wrong ship group
+        let zk_data = default_zk_data();
+        let app_state = mock_app_state();
+
+        let filter_node = FilterNode::And(vec![
+            FilterNode::Condition(Filter::Region(vec![10000002])), // The Forge (Correct)
+            FilterNode::Condition(Filter::ShipGroup(vec![419])),   // Marauder (Wrong)
+        ]);
+
+        let result = evaluate_filter_node(&filter_node, &zk_data, &app_state).await;
+        assert!(
+            result.is_none(),
+            "Combined AND filter should fail when ship group is wrong"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_combined_or_filter_success() {
+        // Test data: Rifter (Frigate, group 25) in Jita
+        // Filter: Wrong region OR correct ship group
+        let zk_data = default_zk_data();
+        let app_state = mock_app_state();
+
+        let filter_node = FilterNode::Or(vec![
+            FilterNode::Condition(Filter::Region(vec![10000043])), // Domain (Wrong)
+            FilterNode::Condition(Filter::ShipGroup(vec![25])),    // Frigate (Correct)
+        ]);
+
+        let result = evaluate_filter_node(&filter_node, &zk_data, &app_state).await;
+        assert!(
+            result.is_some(),
+            "Combined OR filter should pass when one condition is met"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_not_filter() {
+        let zk_data = default_zk_data();
+        let app_state = mock_app_state();
+
+        // This filter should pass on its own
+        let inner_filter = FilterNode::Condition(Filter::System(vec![30000142]));
+        // So the NOT filter should fail
+        let not_filter = FilterNode::Not(Box::new(inner_filter));
+
+        let result = evaluate_filter_node(&not_filter, &zk_data, &app_state).await;
+        assert!(
+            result.is_none(),
+            "NOT filter should fail when inner condition passes"
+        );
+
+        // This filter should fail on its own
+        let inner_filter_fail = FilterNode::Condition(Filter::System(vec![999]));
+        // So the NOT filter should pass
+        let not_filter_pass = FilterNode::Not(Box::new(inner_filter_fail));
+
+        let result_pass = evaluate_filter_node(&not_filter_pass, &zk_data, &app_state).await;
+        assert!(
+            result_pass.is_some(),
+            "NOT filter should pass when inner condition fails"
+        );
     }
 }
