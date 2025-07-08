@@ -365,7 +365,7 @@ async fn build_killmail_embed(
         if let Some(name) = get_name(app_state, alliance_id).await {
             victim_details.push_str(&format!(
                 "[{}]({})",
-                &name[0..40],
+                &name[0..name.len().min(40)],
                 str_alliance_zk(alliance_id)
             ));
         }
@@ -377,7 +377,7 @@ async fn build_killmail_embed(
         if let Some(name) = get_name(app_state, victim_corp_id).await {
             victim_details.push_str(&format!(
                 "[{}]({})",
-                &name[0..40],
+                &name[0..name.len().min(40)],
                 str_corp_zk(victim_corp_id)
             ));
         }
