@@ -1,14 +1,14 @@
+use crate::esi::{Celestial, EsiClient};
+use config::{Config, ConfigError, Environment, File};
+use moka::future::Cache;
 use serde::{Deserialize, Serialize};
+use serenity::model::id::GuildId;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use config::{Config, ConfigError, Environment, File};
-use moka::future::Cache;
-use serenity::model::id::GuildId;
 use tokio::sync::Mutex;
-use tracing::{info, warn, error};
-use crate::esi::{Celestial, EsiClient};
+use tracing::{error, info, warn};
 
 // --- Data Models ---
 
@@ -52,6 +52,92 @@ pub enum Filter {
     TimeRange { start: u32, end: u32 },
 }
 
+impl Filter {
+    /// Creates a human-readable name for the filter and its configuration.
+    pub fn name(&self) -> String {
+        match self {
+            Filter::TotalValue { min, max } => format!(
+                "TotalValue(min: {}, max: {})",
+                min.map_or("any".to_string(), |v| v.to_string()),
+                max.map_or("any".to_string(), |v| v.to_string())
+            ),
+            Filter::DroppedValue { min, max } => format!(
+                "DroppedValue(min: {}, max: {})",
+                min.map_or("any".to_string(), |v| v.to_string()),
+                max.map_or("any".to_string(), |v| v.to_string())
+            ),
+            Filter::Region(ids) => format!(
+                "Region({})",
+                ids.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Filter::System(ids) => format!(
+                "System({})",
+                ids.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Filter::Security(range) => format!("Security({})", range),
+            Filter::Alliance(ids) => format!(
+                "Alliance({})",
+                ids.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Filter::Corporation(ids) => format!(
+                "Corporation({})",
+                ids.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Filter::Character(ids) => format!(
+                "Character({})",
+                ids.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Filter::ShipType(ids) => format!(
+                "ShipType({})",
+                ids.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Filter::ShipGroup(ids) => format!(
+                "ShipGroup({})",
+                ids.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Filter::LyRangeFrom { systems, range } => format!(
+                "LyRangeFrom(systems: [{}], range: {})",
+                systems
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                range
+            ),
+            Filter::IsNpc(b) => format!("IsNpc({})", b),
+            Filter::IsSolo(b) => format!("IsSolo({})", b),
+            Filter::Pilots { min, max } => format!(
+                "Pilots(min: {}, max: {})",
+                min.map_or("any".to_string(), |v| v.to_string()),
+                max.map_or("any".to_string(), |v| v.to_string())
+            ),
+            Filter::NameFragment(s) => format!("NameFragment(\"{}\")", s),
+            Filter::TimeRange { start, end } => format!("TimeRange({}:00-{}:00)", start, end),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 pub enum FilterNode {
@@ -59,6 +145,34 @@ pub enum FilterNode {
     And(Vec<FilterNode>),
     Or(Vec<FilterNode>),
     Not(Box<FilterNode>),
+}
+
+impl FilterNode {
+    /// Recursively creates a human-readable name for the filter node and its children.
+    pub fn name(&self) -> String {
+        match self {
+            FilterNode::Condition(condition) => condition.name(),
+            FilterNode::And(nodes) => {
+                let children = nodes
+                    .iter()
+                    .map(FilterNode::name)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("And({})", children)
+            }
+            FilterNode::Or(nodes) => {
+                let children = nodes
+                    .iter()
+                    .map(FilterNode::name)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("Or({})", children)
+            }
+            FilterNode::Not(node) => {
+                format!("Not({})", node.name())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -81,6 +195,12 @@ pub struct Subscription {
     #[serde(rename = "filter")]
     pub root_filter: FilterNode,
     pub action: Action,
+}
+
+impl Subscription {
+    pub fn filter_name(&self) -> String {
+        self.root_filter.name()
+    }
 }
 
 // --- App Configuration & State ---
@@ -130,7 +250,9 @@ impl AppState {
 // --- Configuration Loading & Saving ---
 
 // Correctly parses a file containing a JSON array using serde_json
-fn load_vec_from_json_file<T: for<'de> Deserialize<'de>>(file_path: &Path) -> Result<Vec<T>, Box<dyn std::error::Error>> {
+fn load_vec_from_json_file<T: for<'de> Deserialize<'de>>(
+    file_path: &Path,
+) -> Result<Vec<T>, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(file_path)?;
     let data = serde_json::from_str(&content)?;
     Ok(data)
@@ -173,8 +295,14 @@ pub fn save_names(names: &HashMap<u64, String>) {
 pub fn load_app_config() -> Result<AppConfig, ConfigError> {
     let settings = Config::builder()
         .add_source(Environment::default().separator("__"))
-        .set_override("discord_bot_token", std::env::var("DISCORD_BOT_TOKEN").unwrap_or_default())?
-        .set_override("discord_client_id", std::env::var("DISCORD_CLIENT_ID").unwrap_or_default())?
+        .set_override(
+            "discord_bot_token",
+            std::env::var("DISCORD_BOT_TOKEN").unwrap_or_default(),
+        )?
+        .set_override(
+            "discord_client_id",
+            std::env::var("DISCORD_CLIENT_ID").unwrap_or_default(),
+        )?
         .build()?;
     settings.try_deserialize()
 }
@@ -194,7 +322,9 @@ pub fn load_names() -> Result<HashMap<u64, String>, ConfigError> {
 pub fn load_all_subscriptions(dir: &str) -> HashMap<GuildId, Vec<Subscription>> {
     let mut all_subscriptions = HashMap::new();
     let path = Path::new(dir);
-    if !path.is_dir() { return all_subscriptions; }
+    if !path.is_dir() {
+        return all_subscriptions;
+    }
 
     for entry in fs::read_dir(path).unwrap() {
         let entry = entry.unwrap();
@@ -210,7 +340,10 @@ pub fn load_all_subscriptions(dir: &str) -> HashMap<GuildId, Vec<Subscription>> 
                                 all_subscriptions.insert(GuildId(guild_id), subs);
                             }
                             Err(e) => {
-                                warn!("Could not parse {} as subscription file: {:#?}", filename_str, e);
+                                warn!(
+                                    "Could not parse {} as subscription file: {:#?}",
+                                    filename_str, e
+                                );
                             }
                         }
                     }
@@ -238,14 +371,26 @@ mod tests {
     #[test]
     fn test_load_subscription_file() {
         let path = Path::new("../config/888224317991706685.new.json");
-        assert!(path.exists(), "Subscription file does not exist at {:?}", path);
+        assert!(
+            path.exists(),
+            "Subscription file does not exist at {:?}",
+            path
+        );
 
         // Use the correct function that handles array-based JSON
         let result = load_vec_from_json_file::<Subscription>(path);
-        assert!(result.is_ok(), "Failed to parse subscription file: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to parse subscription file: {:?}",
+            result.err()
+        );
 
         let subscriptions = result.unwrap();
-        assert_eq!(subscriptions.len(), 202, "Incorrect number of subscriptions loaded");
+        assert_eq!(
+            subscriptions.len(),
+            202,
+            "Incorrect number of subscriptions loaded"
+        );
         assert_eq!(subscriptions[0].id, "1");
         assert_eq!(subscriptions[0].action.channel_id, "1090110979083354183");
     }
@@ -260,7 +405,10 @@ mod tests {
                 ping_type: Some(PingType::Here),
             },
             root_filter: FilterNode::And(vec![
-                FilterNode::Condition(Filter::TotalValue { min: Some(1_000_000_000), max: None }),
+                FilterNode::Condition(Filter::TotalValue {
+                    min: Some(1_000_000_000),
+                    max: None,
+                }),
                 FilterNode::Or(vec![
                     FilterNode::And(vec![
                         FilterNode::Condition(Filter::Region(vec![10000042])), // The Forge

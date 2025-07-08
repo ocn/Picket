@@ -152,7 +152,7 @@ pub async fn run() {
         match listener.listen().await {
             Ok(Some(zk_data)) => {
                 let kill_id = zk_data.killmail.killmail_id;
-                info!("Received killmail {}", kill_id);
+                info!("[Kill: {}] Received", kill_id);
                 let matched = processor::process_killmail(&app_state, &zk_data).await;
 
                 if !matched.is_empty() {

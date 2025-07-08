@@ -6,7 +6,7 @@ use futures::future::{BoxFuture, FutureExt};
 use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::warn;
 
 #[derive(Debug, Clone, Default)]
 pub struct FilterResult {
@@ -36,15 +36,15 @@ pub async fn process_killmail(
 ) -> Vec<(Subscription, FilterResult)> {
     let mut matched_subscriptions = Vec::new();
     let subscriptions_map = app_state.subscriptions.read().unwrap();
-    let kill_id = zk_data.killmail.killmail_id;
+    let _kill_id = zk_data.killmail.killmail_id;
 
-    for (guild_id, subscriptions_vec) in subscriptions_map.iter() {
-        info!(
-            "[Kill: {}] Evaluating kill against '{}' subscriptions for guild ID {}",
-            kill_id,
-            subscriptions_vec.len(),
-            guild_id.0
-        );
+    for (_guild_id, subscriptions_vec) in subscriptions_map.iter() {
+        // info!(
+        //     "[Kill: {}] Evaluating kill against '{}' subscriptions for guild ID {}",
+        //     kill_id,
+        //     subscriptions_vec.len(),
+        //     guild_id.0
+        // );
         for subscription in subscriptions_vec.iter() {
             if let Some(result) =
                 evaluate_filter_node(&subscription.root_filter, zk_data, app_state).await
@@ -62,6 +62,7 @@ fn evaluate_filter_node<'a>(
     app_state: &'a Arc<AppState>,
 ) -> BoxFuture<'a, Option<FilterResult>> {
     async move {
+        let kill_id = zk_data.killmail.killmail_id;
         match node {
             FilterNode::Condition(filter) => evaluate_filter(filter, zk_data, app_state).await,
             FilterNode::And(nodes) => {
@@ -70,6 +71,11 @@ fn evaluate_filter_node<'a>(
                     if let Some(result) = evaluate_filter_node(n, zk_data, app_state).await {
                         results.push(result);
                     } else {
+                        warn!(
+                            "[Kill: {}] Filter condition failed for node: {}",
+                            kill_id,
+                            n.name()
+                        );
                         return None; // One failure means the whole And block fails
                     }
                 }
@@ -424,9 +430,9 @@ mod tests {
     use super::*;
     use crate::config::{AppConfig, Filter, FilterNode, System};
     use crate::models::{Attacker, KillmailData, Position, Victim, ZkData, Zkb};
+    use moka::future::Cache;
     use std::collections::HashMap;
     use std::sync::{Arc, RwLock};
-    use moka::future::Cache;
     use tokio::sync::Mutex;
 
     // Helper to create a mock AppState

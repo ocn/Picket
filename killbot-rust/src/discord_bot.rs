@@ -439,7 +439,7 @@ async fn build_killmail_embed(
         };
         author_text = format!("Killmail in {} ({})", system_name, region_name);
     }
-    author_text += &format!("\n{}", relative_time);
+    author_text += &format!("\nPosted {}", relative_time);
 
     // console.log('attackerparams.data');
 
