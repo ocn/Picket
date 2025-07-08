@@ -329,7 +329,7 @@ async fn build_killmail_embed(
 
     let related_br = format!(
         "https://br.evetools.org/related/${}/{}",
-        region_id,
+        system_id,
         format_datetime_to_timestamp(&killmail_time)
     );
 
@@ -576,7 +576,7 @@ async fn build_killmail_embed(
         ));
     }
 
-    attacker_alliances.push('`');
+    attacker_alliances.push("```");
 
     // console.log('attackerparams.dataDone');
 
