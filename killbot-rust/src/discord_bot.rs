@@ -203,7 +203,7 @@ pub async fn send_killmail_message(
         error!("Failed to send message to channel {}: {}", channel, e);
         return Err(Box::new(e));
     }
-
+    info!("[Kill: {}] Sent message to channel {}", zk_data.kill_id, channel);
     Ok(())
 }
 

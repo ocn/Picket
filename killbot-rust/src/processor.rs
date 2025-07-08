@@ -71,7 +71,7 @@ fn evaluate_filter_node<'a>(
                     if let Some(result) = evaluate_filter_node(n, zk_data, app_state).await {
                         results.push(result);
                     } else {
-                        warn!(
+                        tracing::trace!(
                             "[Kill: {}] Filter condition failed for node: {}",
                             kill_id,
                             n.name()
