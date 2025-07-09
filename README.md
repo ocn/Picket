@@ -24,6 +24,7 @@ The bot operates by subscribing to a data feed from zkillboard.com and processes
 
 - [Usage](#usage)
 - [Commands](#commands)
+- [Advanced Examples](#advanced-examples)                                                                                                                                    
 - [Manual Configuration](#manual-configuration)
 - [Development](#development)
 - [Contact](#contact)
@@ -41,7 +42,7 @@ Use the following link to add the bot to your server. The owner of the bot will 
 ### 2. Create a Subscription
 In the channel where you want to receive killmails, use the `/subscribe` command. This command allows you to combine multiple filter options to create a specific alert. All specified filters are combined with an "AND" logic—the killmail must match **all** of them to be posted.
 
-**Example:** To track kills of Dreadnoughts (group ID 485) and Marauders (group ID 547) in the Devoid region (ID 10000030) that are worth at least 1 billion ISK, you would use:
+**Example:** To track kills involving Dreadnoughts (group ID 485) and Marauders (group ID 547) in the Devoid region (ID 10000030) that are worth at least 1 billion ISK, you would use:
 ```
 /subscribe id: cap-watch-devoid description: Capital and Marauder kills in Devoid region_ids: 10000030 ship_group_ids: 485,547 min_value: 1000000000
 ```
@@ -64,12 +65,16 @@ Creates or updates a killmail subscription for the current channel. All filter o
 -   `char_ids`: Comma-separated list of character IDs.
 -   `ship_type_ids`: Comma-separated list of ship type IDs.
 -   `ship_group_ids`: Comma-separated list of ship group IDs.
+-   `security`: A security status range (e.g., `"-1.0..=0.4"` for low/nullsec).                                                                                              
 -   `is_npc`: `True` for NPC-only kills, `False` for player-only.
 -   `is_solo`: `True` for solo kills only.
 -   `min_pilots`: Minimum number of pilots involved.
 -   `max_pilots`: Maximum number of pilots involved.
 -   `name_fragment`: A string that must appear in the ship's name.
 -   `time_range_start` / `time_range_end`: A UTC hour range (0-23) for the kill.
+-   `ly_ranges_json`: A JSON string for system ranges (e.g., `'[{"system_id":30000142, "range":10.0}]'`).
+-   `ping_type`: Ping `@here` or `@everyone` for a match.                                                                                                                    
+-   `max_ping_delay_minutes`: The maximum age of a killmail (in minutes) to be eligible for a ping.
 
 ### `/unsubscribe`
 Removes a subscription from the current channel.
@@ -81,12 +86,34 @@ Displays diagnostic information for all subscriptions active in the current chan
 ### Finding IDs
 To find the correct IDs for regions, systems, ships, and groups, you can use a third-party database site like [**EVE Ref**](https://everef.net/type) or Dotlan. For character, corporation, and alliance IDs, zKillboard is an excellent resource.
 
+## Advanced Examples                                                                                                                                                         
+                                                                                                                                                                             
+### Pinging for Capital Kills Near a Staging System                                                                                                                       
+                                                                                                                                                                             
+This example creates a subscription that pings `@everyone` if a killmail involving Capital ships occurs within 7.0 light-years of Turnur (system ID 30002086). The              
+ping will only be sent if the killmail is less than 10 minutes old.                                                                                                          
+                                                                                                                                                                             
+```                                                                                                                                                                          
+/subscribe id: capitals-radar description: Capitals near Turnur ship_group_ids: 485 ly_ranges_json: [{"system_id":30002086, "range":7.0}] ping_type: Everyone
+max_ping_delay_minutes: 10
+```                                                                                                                                                                          
+                                                                                                                                                                             
+### Monitoring Nullsec for Specific Alliances                                                                                                                                
+                                                                                                                                                                             
+This example tracks activity in nullsec (`-1.0` to `0.0`) involving either Pandemic Horde (alliance ID 498125261) or Goonswarm Federation (alliance ID                   
+1354830081) in the Curse (region ID 10000012) region.
+                                                                                                                                                                             
+```                                                                                                                                                                          
+/subscribe id: nullsec-blocs description: Horde vs. Goons activity in nullsec security: "-1.0..=0.0" alliance_ids: 498125261,1354830081 region_ids: 10000012
+```                                                                                                                                                                          
+
+
 ## Manual Configuration
 
 For advanced users or for migrating configurations, you can manually edit the JSON files located in the `config/` directory. The bot automatically creates a file named `[guild_id].json` for each server where a subscription is made.
 
 ### Example `[guild_id].json`
-This JSON structure is equivalent to the example `/subscribe` command shown above.
+This JSON structure is equivalent to the example `/subscribe` command shown above in step 2 of the usage guide.
 
 ```json
 [
