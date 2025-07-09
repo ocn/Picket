@@ -19,9 +19,9 @@ tracing-subscriber = "0.3"
 chrono = "0.4"
 futures = "0.3"
 
-oauth2 = "5"
-webbrowser = "1.0"
-rpassword = "7.4"
-knapsack = "0.1.0"
-phf = { version = "0.12", features = ["macros"] }
-url = "2.5"
+#oauth2 = "5"
+#webbrowser = "1.0"
+#rpassword = "7.4"
+#knapsack = "0.1.0"
+#phf = { version = "0.12", features = ["macros"] }
+#url = "2.5"
