@@ -213,7 +213,8 @@ async fn evaluate_filter(
                         get_system(app_state, killmail.solar_system_id).await,
                         parse_security_range(range_str),
                     ) {
-                        if range.contains(&system.security_status) {
+                        let rounded_sec = (system.security_status * 10.0).round() / 10.0;
+                        if range.contains(&rounded_sec) {
                             return Some(Default::default());
                         }
                     }
