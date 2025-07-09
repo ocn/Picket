@@ -351,7 +351,7 @@ impl Command for SubscribeCommand {
         if let Some(CommandDataOptionValue::String(s)) = get_option_value(options, "name_fragment")
         {
             filters.push(Filter::Targeted(TargetedFilter {
-                target: Target::Any,
+                target,
                 condition: TargetableCondition::NameFragment(s.clone()),
             }));
         }
