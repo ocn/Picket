@@ -252,7 +252,7 @@ pub async fn send_killmail_message(
                 if now.duration_since(*last_ping) > Duration::from_secs(300) {
                     *last_ping = now;
                     Some(match ping_type {
-                        PingType::Here { .. } => "@fermi. it worked",
+                        PingType::Here { .. } => "@here",
                         PingType::Everyone { .. } => "@everyone",
                     })
                 } else {
