@@ -34,25 +34,26 @@ pub async fn process_killmail(
     app_state: &Arc<AppState>,
     zk_data: &ZkData,
 ) -> Vec<(Subscription, FilterResult)> {
+    // Clone the subscriptions to release the lock before the async loop.
+    // We flatten the map of guilds into a single list of all subscriptions.
+    let all_subscriptions = {
+        let subs_guard = app_state.subscriptions.read().unwrap();
+        subs_guard.values().flatten().cloned().collect::<Vec<_>>()
+    };
+    // The `subs_guard` is dropped here, releasing the lock.
+
     let mut matched_subscriptions = Vec::new();
-    let subscriptions_map = app_state.subscriptions.read().unwrap();
     let _kill_id = zk_data.killmail.killmail_id;
 
-    for (_guild_id, subscriptions_vec) in subscriptions_map.iter() {
-        // info!(
-        //     "[Kill: {}] Evaluating kill against '{}' subscriptions for guild ID {}",
-        //     kill_id,
-        //     subscriptions_vec.len(),
-        //     guild_id.0
-        // );
-        for subscription in subscriptions_vec.iter() {
-            if let Some(result) =
-                evaluate_filter_node(&subscription.root_filter, zk_data, app_state).await
-            {
-                matched_subscriptions.push((subscription.clone(), result));
-            }
+    // Iterate over the cloned subscriptions. No lock is held here.
+    for subscription in all_subscriptions.iter() {
+        if let Some(result) =
+            evaluate_filter_node(&subscription.root_filter, zk_data, app_state).await
+        {
+            matched_subscriptions.push((subscription.clone(), result));
         }
     }
+    
     matched_subscriptions
 }
 
