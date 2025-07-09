@@ -97,7 +97,7 @@ fn evaluate_filter_node<'a>(
                     filter_result: FilterResult {
                         color: results
                             .iter()
-                            .find(|r| r.filter_result.matched_ship.is_some())
+                            .find(|r| r.filter_result.color.is_some())
                             .map_or(results[0].filter_result.color, |r| r.filter_result.color),
                         matched_ship: results
                             .iter()
