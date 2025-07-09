@@ -52,8 +52,14 @@ impl Command for DiagCommand {
                     let mut content = "Subscriptions for this channel:\n".to_string();
                     for sub in channel_subs {
                         content.push_str(&format!(
-                            "- ID: `{}`, Description: `{}`\nFilters: {}\nPing Type: {:#?}\n",
-                            sub.id, sub.description, sub.filter_name(), sub.action.ping_type
+                            "- ID: `{}`, Description: `{}`\nFilters: {}\nPing Type: {}\n",
+                            sub.id,
+                            sub.description,
+                            sub.filter_name(),
+                            sub.action
+                                .ping_type
+                                .as_ref()
+                                .map_or_else(|| "None".to_string(), |pt| pt.name())
                         ));
                     }
                     content

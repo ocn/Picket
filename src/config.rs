@@ -198,6 +198,17 @@ impl PingType {
             } => *max_ping_delay_minutes,
         }
     }
+
+    pub fn name(&self) -> String {
+        match self {
+            PingType::Here { max_ping_delay_minutes } => {
+                format!("Here (max delay: {} min)", max_ping_delay_minutes.unwrap_or(0))
+            }
+            PingType::Everyone { max_ping_delay_minutes } => {
+                format!("Everyone (max delay: {} min)", max_ping_delay_minutes.unwrap_or(0))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
