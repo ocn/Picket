@@ -442,6 +442,23 @@ fn str_location(id: u64) -> String {
     format!("https://zkillboard.com/location/{}/", id)
 }
 
+enum DotlanJumpType {
+    Super,
+    Fax,
+    Blops,
+}
+fn str_jump_dotlan(from: &str, to: &str, with: DotlanJumpType) -> String {
+    let with = match with {
+        DotlanJumpType::Super => "Nyx",
+        DotlanJumpType::Fax => "Lif",
+        DotlanJumpType::Blops => "Sin",
+    };
+    format!(
+        "https://evemaps.dotlan.net/jump/{},555/{}:{}",
+        with, from, to
+    )
+}
+
 // Returns: ID, count
 fn most_common_ship_type(attackers: &[Attacker]) -> Option<(u64, u64)> {
     attackers
@@ -745,10 +762,35 @@ async fn build_killmail_embed(
 
     attacker_alliances = format!("{}```", attacker_alliances);
 
+    let mut range_details = String::new();
+    if let Some(matched_system_range) = &filter_result.light_year_range {
+        let matched_base_system_name = get_system(app_state, matched_system_range.system_id)
+            .await
+            .map_or_else(|| "Unknown System".to_string(), |s| s.name);
+        if matched_system_range.range > 0.0 {
+            range_details = format!(
+                "\n\nRange: {:.2} LY from {}\nDotlan: [Supers]({}), [FAX]({}), [Blops]({})",
+                matched_system_range.range,
+                matched_base_system_name,
+                str_jump_dotlan(
+                    &matched_base_system_name,
+                    system_name,
+                    DotlanJumpType::Super
+                ),
+                str_jump_dotlan(&matched_base_system_name, system_name, DotlanJumpType::Fax),
+                str_jump_dotlan(
+                    &matched_base_system_name,
+                    system_name,
+                    DotlanJumpType::Blops
+                )
+            );
+        }
+    }
+
     // console.log('attackerparams.dataDone');
 
     let affiliation = format!(
-        "{}victim: {}\nin: [{}]({}) ([{}]({}))\n{}",
+        "{}victim: {}\nin: [{}]({}) ([{}]({}))\n{}{}",
         attacker_alliances,
         victim_details,
         system_name,
@@ -756,6 +798,7 @@ async fn build_killmail_embed(
         region_name,
         str_region_dotlan(region_id),
         location_details,
+        range_details
     );
 
     // Build the embed

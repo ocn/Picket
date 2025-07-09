@@ -1,4 +1,4 @@
-use crate::config::{AppState, Filter, FilterNode, Subscription, System};
+use crate::config::{AppState, Filter, FilterNode, Subscription, System, SystemRange};
 use crate::discord_bot::{get_ship_group_id, get_system};
 use crate::models::ZkData;
 use chrono::Timelike;
@@ -20,6 +20,7 @@ pub struct FilterResult {
     pub(crate) matched_ship: Option<MatchedShip>,
     pub(crate) color: Option<Color>,
     pub(crate) min_pilots: Option<u32>,
+    pub(crate) light_year_range: Option<SystemRange>,
 }
 
 #[derive(Debug, Copy, Clone, Default)]
@@ -104,6 +105,11 @@ fn evaluate_filter_node<'a>(
                             .find(|r| r.filter_result.matched_ship.is_some())
                             .and_then(|r| r.filter_result.matched_ship.clone()),
                         min_pilots: results.iter().find_map(|r| r.filter_result.min_pilots),
+                        // TODO: fold/accumulate here
+                        light_year_range: results
+                            .iter()
+                            .find(|r| r.filter_result.light_year_range.is_some())
+                            .and_then(|r| r.filter_result.light_year_range.clone()),
                     },
                 };
                 Some(final_result)
@@ -222,12 +228,14 @@ async fn evaluate_filter(
                     matched_ship: None,
                     color: Some(Color::Green),
                     min_pilots: None,
+                    light_year_range: None,
                 })
             } else if victim_match {
                 Some(FilterResult {
                     matched_ship: None,
                     color: Some(Color::Red),
                     min_pilots: None,
+                    light_year_range: None,
                 })
             } else {
                 None
@@ -247,12 +255,14 @@ async fn evaluate_filter(
                     matched_ship: None,
                     color: Some(Color::Green),
                     min_pilots: None,
+                    light_year_range: None,
                 })
             } else if victim_match {
                 Some(FilterResult {
                     matched_ship: None,
                     color: Some(Color::Red),
                     min_pilots: None,
+                    light_year_range: None,
                 })
             } else {
                 None
@@ -272,12 +282,14 @@ async fn evaluate_filter(
                     matched_ship: None,
                     color: Some(Color::Green),
                     min_pilots: None,
+                    light_year_range: None,
                 })
             } else if victim_match {
                 Some(FilterResult {
                     matched_ship: None,
                     color: Some(Color::Red),
                     min_pilots: None,
+                    light_year_range: None,
                 })
             } else {
                 None
@@ -300,6 +312,7 @@ async fn evaluate_filter(
                             alliance_id: killmail.victim.alliance_id,
                         }),
                         min_pilots: None,
+                        light_year_range: None,
                     },
                 });
             }
@@ -320,6 +333,7 @@ async fn evaluate_filter(
                                     alliance_id: attacker.alliance_id,
                                 }),
                                 min_pilots: None,
+                                light_year_range: None,
                             },
                         });
                     }
@@ -359,6 +373,7 @@ async fn evaluate_filter(
                                 alliance_id: killmail.victim.alliance_id,
                             }),
                             min_pilots: None,
+                            light_year_range: None,
                         },
                     });
                 }
@@ -381,6 +396,7 @@ async fn evaluate_filter(
                                         alliance_id: attacker.alliance_id,
                                     }),
                                     min_pilots: None,
+                                    light_year_range: None,
                                 },
                             });
                         }
@@ -391,6 +407,7 @@ async fn evaluate_filter(
         }
         Filter::LyRangeFrom(system_ranges) => {
             if let Some(killmail_system) = get_system(app_state, killmail.solar_system_id).await {
+                let mut matched_ranges: Vec<SystemRange> = vec![];
                 for system_range in system_ranges {
                     if let Some(target_system) = get_system(app_state, system_range.system_id).await
                     {
@@ -403,7 +420,10 @@ async fn evaluate_filter(
                             distance,
                         );
                         if distance <= system_range.range {
-                            return Some(Default::default()); // Found a match, return immediately
+                            matched_ranges.push(SystemRange {
+                                system_id: target_system.id,
+                                range: distance,
+                            })
                         }
                     } else {
                         warn!(
@@ -412,13 +432,28 @@ async fn evaluate_filter(
                         );
                     }
                 }
+                if matched_ranges.is_empty() {
+                    None
+                } else {
+                    // Sort descending, pop from the back for the shortest range match
+                    matched_ranges.sort_by(|a, b| b.range.total_cmp(&a.range));
+
+                    Some(FilterResult {
+                        matched_ship: None,
+                        color: None,
+                        min_pilots: None,
+                        light_year_range: Some(
+                            matched_ranges.pop().expect("non-empty matched vec"),
+                        ),
+                    })
+                }
             } else {
                 warn!(
                     "Could not find killmail system {} for LY range check",
                     killmail.solar_system_id
                 );
+                None
             }
-            None // No match found after checking all ranges
         }
         Filter::IsNpc(is_npc) => {
             if zk_data.zkb.npc == *is_npc {
@@ -441,6 +476,7 @@ async fn evaluate_filter(
                     color: None,
                     matched_ship: None,
                     min_pilots: Some(min.unwrap_or(0)),
+                    light_year_range: None,
                 })
             } else {
                 None
@@ -460,6 +496,7 @@ async fn evaluate_filter(
                             color: Some(Color::Red),
                             matched_ship: None,
                             min_pilots: None,
+                            light_year_range: None,
                         },
                     });
                 }
@@ -478,6 +515,7 @@ async fn evaluate_filter(
                                     color: Some(Color::Green),
                                     matched_ship: None,
                                     min_pilots: None,
+                                    light_year_range: None,
                                 },
                             });
                         }
