@@ -32,6 +32,12 @@ pub struct System {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct SystemRange {
+    pub system_id: u32,
+    pub range: f64,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 pub enum Filter {
     TotalValue { min: Option<u64>, max: Option<u64> },
@@ -44,7 +50,7 @@ pub enum Filter {
     Character(Vec<u64>),
     ShipType(Vec<u32>),
     ShipGroup(Vec<u32>),
-    LyRangeFrom { systems: Vec<u32>, range: f64 },
+    LyRangeFrom(Vec<SystemRange>),
     IsNpc(bool),
     IsSolo(bool),
     Pilots { min: Option<u32>, max: Option<u32> },
@@ -116,15 +122,13 @@ impl Filter {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Filter::LyRangeFrom { systems, range } => format!(
-                "LyRangeFrom(systems: [{}], range: {})",
-                systems
+            Filter::LyRangeFrom(system_ranges) => {
+                let parts: Vec<String> = system_ranges
                     .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                range
-            ),
+                    .map(|sr| format!("{}:{}ly", sr.system_id, sr.range))
+                    .collect();
+                format!("LyRangeFrom({})", parts.join(", "))
+            }
             Filter::IsNpc(b) => format!("IsNpc({})", b),
             Filter::IsSolo(b) => format!("IsSolo({})", b),
             Filter::Pilots { min, max } => format!(
@@ -416,10 +420,10 @@ mod tests {
                         FilterNode::Condition(Filter::Region(vec![10000042])), // The Forge
                         FilterNode::Condition(Filter::ShipGroup(vec![30, 883])), // Capitals, Supercarriers
                     ]),
-                    FilterNode::Condition(Filter::LyRangeFrom {
-                        systems: vec![30000142], // Jita
+                    FilterNode::Condition(Filter::LyRangeFrom(vec![SystemRange {
+                        system_id: 30000142,
                         range: 10.0,
-                    }),
+                    }])),
                 ]),
                 FilterNode::Not(Box::new(FilterNode::Condition(Filter::IsNpc(true)))),
             ]),
@@ -436,5 +440,40 @@ mod tests {
         assert!(and_conditions[0]["Condition"]["TotalValue"]["min"].is_number());
         assert!(and_conditions[1]["Or"].is_array());
         assert!(and_conditions[2]["Not"]["Condition"]["IsNpc"].is_boolean());
+    }
+
+    #[test]
+    fn test_distance() {
+        let system1 = System {
+            id: 30000142, // Jita
+            name: "Jita".to_string(),
+            security_status: 0.9,
+            region_id: 10000002, // The Forge
+            region: "The Forge".to_string(),
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+
+        let system2 = System {
+            id: 30000143, // Perimeter
+            name: "Perimeter".to_string(),
+            security_status: 0.9,
+            region_id: 10000002, // The Forge
+            region: "The Forge".to_string(),
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        };
+
+        let distance = ((system2.x - system1.x).powi(2)
+            + (system2.y - system1.y).powi(2)
+            + (system2.z - system1.z).powi(2))
+        .sqrt();
+
+        assert!(
+            (distance - 1.732).abs() < 0.001,
+            "Distance calculation is incorrect"
+        );
     }
 }

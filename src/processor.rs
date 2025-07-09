@@ -131,6 +131,10 @@ fn parse_security_range(s: &str) -> Result<RangeInclusive<f64>, ()> {
 }
 
 fn distance(system1: &System, system2: &System) -> f64 {
+    println!(
+        "Calculating distance between {} and {}",
+        system1.name, system2.name
+    );
     const LY_PER_M: f64 = 1.0 / 9_460_730_472_580_800.0;
     let dx = system1.x - system2.x;
     let dy = system1.y - system2.y;
@@ -363,17 +367,18 @@ async fn evaluate_filter(
             }
             None
         }
-        Filter::LyRangeFrom { systems, range } => {
+        Filter::LyRangeFrom(system_ranges) => {
             if let Some(killmail_system) = get_system(app_state, killmail.solar_system_id).await {
-                for target_system_id in systems {
-                    if let Some(target_system) = get_system(app_state, *target_system_id).await {
-                        if distance(&killmail_system, &target_system) <= *range {
-                            return Some(Default::default());
+                for system_range in system_ranges {
+                    if let Some(target_system) = get_system(app_state, system_range.system_id).await
+                    {
+                        if distance(&killmail_system, &target_system) <= system_range.range {
+                            return Some(Default::default()); // Found a match, return immediately
                         }
                     } else {
                         warn!(
                             "Could not find target system {} for LY range check",
-                            target_system_id
+                            system_range.system_id
                         );
                     }
                 }
@@ -383,7 +388,7 @@ async fn evaluate_filter(
                     killmail.solar_system_id
                 );
             }
-            None
+            None // No match found after checking all ranges
         }
         Filter::IsNpc(is_npc) => {
             if zk_data.zkb.npc == *is_npc {
@@ -473,7 +478,7 @@ async fn evaluate_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, Filter, FilterNode, System};
+    use crate::config::{AppConfig, Filter, FilterNode, System, SystemRange};
     use crate::models::{Attacker, KillmailData, Position, Victim, ZkData, Zkb};
     use moka::future::Cache;
     use std::collections::HashMap;
@@ -789,6 +794,68 @@ mod tests {
         test_filter(Filter::ShipGroup(vec![27]), &zk_data, true).await;
         // Neither is a Marauder (group 419)
         test_filter(Filter::ShipGroup(vec![419]), &zk_data, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_ly_filter() {
+        let mut zk_data = {
+            ZkData {
+                kill_id: 1,
+                killmail: KillmailData {
+                    killmail_id: 1,
+                    killmail_time: "2025-07-08T12:00:00Z".to_string(),
+                    solar_system_id: 30002086, // Turnur
+                    victim: Victim {
+                        damage_taken: 1000,
+                        ship_type_id: 587, // Rifter
+                        character_id: Some(1),
+                        corporation_id: Some(101),
+                        alliance_id: Some(1001),
+                        position: Some(Position {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                        }),
+                        faction_id: None,
+                        items: vec![],
+                    },
+                    attackers: vec![Attacker {
+                        final_blow: true,
+                        damage_done: 1000,
+                        ship_type_id: Some(671), // Catalyst
+                        character_id: Some(2),
+                        corporation_id: Some(102),
+                        alliance_id: Some(1002),
+                        weapon_type_id: Some(3),
+                        security_status: 0.5,
+                        faction_id: None,
+                    }],
+                },
+                zkb: Zkb {
+                    total_value: 10_000_000.0,
+                    dropped_value: 1_000_000.0,
+                    npc: false,
+                    solo: false,
+                    location_id: None,
+                    hash: "".to_string(),
+                    fitted_value: 0.0,
+                    destroyed_value: 0.0,
+                    points: 0,
+                    awox: false,
+                    esi: "".to_string(),
+                },
+            }
+        };
+        zk_data.zkb.npc = true;
+        test_filter(
+            Filter::LyRangeFrom(vec![SystemRange {
+                system_id: 30003067,
+                range: 8.0,
+            }]),
+            &zk_data,
+            true,
+        )
+        .await;
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use crate::commands::{get_option_value, Command};
 use crate::config::{
-    save_subscriptions_for_guild, Action, AppState, Filter, FilterNode, Subscription,
+    save_subscriptions_for_guild, Action, AppState, Filter, FilterNode, Subscription, SystemRange,
 };
 use serenity::async_trait;
 use serenity::builder::CreateApplicationCommand;
@@ -156,6 +156,12 @@ impl Command for SubscribeCommand {
                     .description("The end of the time range (0-23).")
                     .kind(CommandOptionType::Integer)
             })
+            .create_option(|option| {
+                option
+                    .name("ly_ranges_json")
+                    .description("A JSON string for system ranges, e.g., '[{\"system_id\":30000142, \"range\":10.0}]'")
+                    .kind(CommandOptionType::String)
+            })
     }
 
     async fn execute(
@@ -236,6 +242,37 @@ impl Command for SubscribeCommand {
         }
         if let Some(CommandDataOptionValue::Boolean(b)) = get_option_value(options, "is_solo") {
             filters.push(Filter::IsSolo(*b));
+        }
+
+        if let Some(CommandDataOptionValue::String(json_str)) =
+            get_option_value(options, "ly_ranges_json")
+        {
+            match serde_json::from_str::<Vec<SystemRange>>(json_str) {
+                Ok(system_ranges) => {
+                    if !system_ranges.is_empty() {
+                        filters.push(Filter::LyRangeFrom(system_ranges));
+                    }
+                }
+                Err(e) => {
+                    // Send a reply to the user that their JSON was invalid.
+                    if let Err(why) = command
+                        .create_interaction_response(&ctx.http, |response| {
+                            response.interaction_response_data(|message| {
+                                message
+                                    .content(format!(
+                                        "Invalid JSON format for ly_ranges_json: {}",
+                                        e
+                                    ))
+                                    .ephemeral(true)
+                            })
+                        })
+                        .await
+                    {
+                        error!("Cannot respond to slash command: {}", why);
+                        return;
+                    }
+                }
+            }
         }
 
         let min_pilots = get_option_value(options, "min_pilots").and_then(|v| {
