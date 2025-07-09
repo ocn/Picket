@@ -119,7 +119,7 @@ This application is written in Rust and containerized using Docker.
 ### Setup:
 
 1.  Clone this repository.
-2.  Copy `env.sample` to `.env` and add your Discord bot token and client ID.
+2.  Copy `docs/env.sample` to `.env` and add your Discord bot token and client ID.
 3.  Run `docker-compose up --build -d` to start the application.
 
 #### Example `.env` file
