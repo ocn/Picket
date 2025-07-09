@@ -304,7 +304,7 @@ fn get_relative_time(killmail_time: &str) -> String {
         return "just now".to_string();
     }
     if seconds == 1 {
-        return "1 second ago".to_string();
+        return "1 second later".to_string();
     }
 
     let minutes = seconds / 60;
@@ -316,43 +316,43 @@ fn get_relative_time(killmail_time: &str) -> String {
     let years = months / 12;
 
     if years > 1 {
-        return format!("{} years ago", years);
+        return format!("{} years later", years);
     }
     if years == 1 {
-        return "1 year ago".to_string();
+        return "1 year later".to_string();
     }
     if months > 1 {
-        return format!("{} months ago", months);
+        return format!("{} months later", months);
     }
     if months == 1 {
-        return "1 month ago".to_string();
+        return "1 month later".to_string();
     }
     if weeks > 1 {
-        return format!("{} weeks ago", weeks);
+        return format!("{} weeks later", weeks);
     }
     if weeks == 1 {
-        return "1 week ago".to_string();
+        return "1 week later".to_string();
     }
     if days > 1 {
-        return format!("{} days ago", days);
+        return format!("{} days later", days);
     }
     if days == 1 {
-        return "1 day ago".to_string();
+        return "1 day later".to_string();
     }
     if hours > 1 {
-        return format!("{} hours ago", hours);
+        return format!("{} hours later", hours);
     }
     if hours == 1 {
-        return "1 hour ago".to_string();
+        return "1 hour later".to_string();
     }
     if minutes > 1 {
-        return format!("{} minutes ago", minutes);
+        return format!("{} minutes later", minutes);
     }
     if minutes == 1 {
-        return "1 minute ago".to_string();
+        return "1 minute later".to_string();
     }
 
-    format!("{} seconds ago", seconds)
+    format!("{} seconds later", seconds)
 }
 
 fn str_alliance_icon(id: u64) -> String {
