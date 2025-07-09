@@ -4,7 +4,7 @@ FROM rust:1.88-bullseye AS builder
 WORKDIR /app
 
 # Copy the source code into the builder
-COPY ./killbot-rust/ .
+COPY . .
 
 # Build the application in release mode.
 RUN cargo build --release
