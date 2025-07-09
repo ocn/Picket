@@ -1,18 +1,24 @@
-FROM node:20-alpine
+# Stage 1: Build the application
+FROM rust:1.88-bullseye AS builder
 
-RUN apk add --no-cache --update python3 python3-dev
-ADD --chown=node:node . /workspace
-USER node
-WORKDIR /workspace
-RUN yarn && yarn build
+WORKDIR /app
 
-FROM node:20-alpine
-COPY --from=0 --chown=node:node /workspace/dist/ /workspace/dist/
-COPY --from=0 --chown=node:node /workspace/package.json /workspace/
-RUN mkdir /workspace/dist/config
-RUN chown -R node:node /workspace && apk add --no-cache --update python3 python3-dev
-USER node
-WORKDIR /workspace
-RUN yarn install --production=true
+# Copy the source code into the builder
+COPY . .
 
-CMD ["yarn", "start"]
+# Build the application in release mode.
+RUN cargo build --release
+
+# Stage 2: Create the final, minimal image
+FROM debian:bullseye
+
+WORKDIR /app
+
+# Copy the compiled binary from the builder stage
+COPY --from=builder /app/target/release/killbot-rust .
+
+# The config directory will be mounted as a volume by docker-compose.
+# No need to copy it here.
+
+# Set the command to run the application
+CMD ["./killbot-rust"]
