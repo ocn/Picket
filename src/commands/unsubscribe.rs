@@ -40,12 +40,14 @@ impl Command for UnsubscribeCommand {
             _ => { return; }
         };
 
+        let channel_id_str = command.channel_id.to_string();
+
         let response_content = {
             let mut subs_map = app_state.subscriptions.write().unwrap();
             if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
                 let initial_len = guild_subs.len();
-                guild_subs.retain(|sub| &sub.id != id_to_remove);
-                
+                guild_subs.retain(|sub| sub.id != *id_to_remove || sub.action.channel_id != channel_id_str);
+
                 if guild_subs.len() < initial_len {
                     match save_subscriptions_for_guild(guild_id, guild_subs) {
                         Ok(_) => format!("Successfully removed subscription '{}'.", id_to_remove),
