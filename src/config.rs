@@ -222,6 +222,7 @@ pub struct AppState {
     pub systems_file_lock: Mutex<()>,
     pub ships_file_lock: Mutex<()>,
     pub names_file_lock: Mutex<()>,
+    pub subscriptions_file_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -243,6 +244,7 @@ impl AppState {
             systems_file_lock: Mutex::new(()),
             ships_file_lock: Mutex::new(()),
             names_file_lock: Mutex::new(()),
+            subscriptions_file_lock: Mutex::new(()),
         }
     }
 }

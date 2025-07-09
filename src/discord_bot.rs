@@ -18,6 +18,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info, trace, warn};
 
+#[derive(Debug)]
+pub enum KillmailSendError {
+    CleanupChannel(serenity::Error),
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Display for KillmailSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KillmailSendError::CleanupChannel(e) => write!(f, "Channel cleanup required: {}", e),
+            KillmailSendError::Other(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl std::error::Error for KillmailSendError {}
+
 pub struct CommandMap;
 impl TypeMapKey for CommandMap {
     type Value = Arc<HashMap<String, Box<dyn Command>>>;
@@ -31,6 +48,7 @@ impl EventHandler for Handler {
         info!("Kicked from guild: {}", incomplete.id);
         let mut subs = _ctx.data.write().await;
         let app_state = subs.get_mut::<crate::AppStateContainer>().unwrap();
+        let _lock = app_state.subscriptions_file_lock.lock().await;
         let mut subscriptions = app_state.subscriptions.write().unwrap();
         subscriptions.remove(&incomplete.id);
         if let Err(e) = crate::config::save_subscriptions_for_guild(incomplete.id, &[]) {
@@ -197,8 +215,17 @@ pub async fn send_killmail_message(
     subscription: &Subscription,
     zk_data: &ZkData,
     filter_result: FilterResult,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let channel = ChannelId(subscription.action.channel_id.parse()?);
+) -> Result<(), KillmailSendError> {
+    let channel = match subscription.action.channel_id.parse::<u64>() {
+        Ok(id) => ChannelId(id),
+        Err(e) => {
+            error!(
+                "[Kill: {}] Invalid channel ID '{}': {:#?}",
+                zk_data.kill_id, subscription.action.channel_id, e
+            );
+            return Err(KillmailSendError::Other("Invalid channel ID".into()));
+        }
+    };
     let embed = build_killmail_embed(app_state, zk_data, filter_result).await; // Pass it here
 
     let result = channel.send_message(http, |m| m.set_embed(embed)).await;
@@ -206,21 +233,29 @@ pub async fn send_killmail_message(
     if let Err(e) = result {
         if let serenity::Error::Http(http_err) = &e {
             match &**http_err {
-                Error::UnsuccessfulRequest(resp) => {
-                    if resp.status_code == serenity::http::StatusCode::FORBIDDEN {
+                Error::UnsuccessfulRequest(resp) => match resp.status_code {
+                    serenity::http::StatusCode::FORBIDDEN => {
                         error!(
                             "[Kill: {}] Forbidden to send message to channel {}. Removing subscriptions.",
                             zk_data.kill_id, channel
                         );
-                        return Err(Box::new(e));
+                        return Err(KillmailSendError::CleanupChannel(e));
                     }
-                }
+                    serenity::http::StatusCode::NOT_FOUND => {
+                        error!(
+                            "[Kill: {}] Channel {} not found. Removing subscriptions.",
+                            zk_data.kill_id, channel
+                        );
+                        return Err(KillmailSendError::CleanupChannel(e));
+                    }
+                    _ => {}
+                },
                 _ => {
                     error!(
                         "[Kill: {}] HTTP error while sending message to channel {}: {:#?}",
                         zk_data.kill_id, channel, e
                     );
-                    return Err(Box::new(e));
+                    return Err(KillmailSendError::Other(Box::new(e)));
                 }
             }
         }
@@ -228,7 +263,7 @@ pub async fn send_killmail_message(
             "[Kill: {}] Failed to send message to channel {}: {:#?}",
             zk_data.kill_id, channel, e
         );
-        return Err(Box::new(e));
+        return Err(KillmailSendError::Other(Box::new(e)));
     }
     info!(
         "[Kill: {}] Sent message to channel {}",

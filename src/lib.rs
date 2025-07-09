@@ -156,7 +156,7 @@ pub async fn run() {
                 let matched = processor::process_killmail(&app_state, &zk_data).await;
 
                 if !matched.is_empty() {
-                    for (subscription, filter_result) in matched {
+                    for (guild_id, subscription, filter_result) in matched {
                         info!(
                             "[Kill: {}] Matched subscription '{}'. Sending notification to channel {}.",
                             kill_id, subscription.description, subscription.action.channel_id
@@ -170,10 +170,33 @@ pub async fn run() {
                         )
                         .await
                         {
-                            error!(
-                                "Error sending message for subscription {}: {}",
-                                subscription.id, e
-                            );
+                            match e {
+                                discord_bot::KillmailSendError::CleanupChannel(e) => {
+                                    warn!(
+                                        "Cleaning up subscriptions for channel {} due to error: {:#?}",
+                                        subscription.action.channel_id, e
+                                    );
+                                    let _lock = app_state.subscriptions_file_lock.lock().await;
+                                    let mut subs_map = app_state.subscriptions.write().unwrap();
+
+                                    if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
+                                        guild_subs.retain(|s| {
+                                            s.action.channel_id != subscription.action.channel_id
+                                        });
+                                        if let Err(save_err) = config::save_subscriptions_for_guild(
+                                            guild_id, guild_subs,
+                                        ) {
+                                            error!("Failed to save subscriptions after cleanup for guild {}: {}", guild_id, save_err);
+                                        }
+                                    }
+                                }
+                                discord_bot::KillmailSendError::Other(err) => {
+                                    error!(
+                                        "Error sending message for subscription {}: {}",
+                                        subscription.id, err
+                                    );
+                                }
+                            }
                         }
                     }
                 }

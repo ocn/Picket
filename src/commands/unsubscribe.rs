@@ -42,6 +42,7 @@ impl Command for UnsubscribeCommand {
 
         let channel_id_str = command.channel_id.to_string();
 
+        let _lock = app_state.subscriptions_file_lock.lock().await;
         let response_content = {
             let mut subs_map = app_state.subscriptions.write().unwrap();
             if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
@@ -63,6 +64,7 @@ impl Command for UnsubscribeCommand {
                 "No subscriptions found for this guild.".to_string()
             }
         };
+        drop(_lock);
 
         if let Err(why) = command
             .create_interaction_response(&ctx.http, |response| {

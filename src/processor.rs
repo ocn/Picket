@@ -3,6 +3,7 @@ use crate::discord_bot::{get_ship_group_id, get_system};
 use crate::models::ZkData;
 use chrono::Timelike;
 use futures::future::{BoxFuture, FutureExt};
+use serenity::model::prelude::GuildId;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -33,12 +34,12 @@ pub(crate) struct MatchedShip {
 pub async fn process_killmail(
     app_state: &Arc<AppState>,
     zk_data: &ZkData,
-) -> Vec<(Subscription, FilterResult)> {
+) -> Vec<(GuildId, Subscription, FilterResult)> {
     // Clone the subscriptions to release the lock before the async loop.
     // We flatten the map of guilds into a single list of all subscriptions.
     let all_subscriptions = {
         let subs_guard = app_state.subscriptions.read().unwrap();
-        subs_guard.values().flatten().cloned().collect::<Vec<_>>()
+        subs_guard.clone()
     };
     // The `subs_guard` is dropped here, releasing the lock.
 
@@ -46,14 +47,16 @@ pub async fn process_killmail(
     let _kill_id = zk_data.killmail.killmail_id;
 
     // Iterate over the cloned subscriptions. No lock is held here.
-    for subscription in all_subscriptions.iter() {
-        if let Some(result) =
-            evaluate_filter_node(&subscription.root_filter, zk_data, app_state).await
-        {
-            matched_subscriptions.push((subscription.clone(), result));
+    for (guild_id, subscriptions) in all_subscriptions.iter() {
+        for subscription in subscriptions {
+            if let Some(result) =
+                evaluate_filter_node(&subscription.root_filter, zk_data, app_state).await
+            {
+                matched_subscriptions.push((*guild_id, subscription.clone(), result));
+            }
         }
     }
-    
+
     matched_subscriptions
 }
 
@@ -527,6 +530,7 @@ mod tests {
             systems_file_lock: Mutex::new(()),
             ships_file_lock: Mutex::new(()),
             names_file_lock: Mutex::new(()),
+            subscriptions_file_lock: Mutex::new(()),
             app_config: Arc::new(AppConfig {
                 discord_bot_token: "".to_string(),
                 discord_client_id: 0,

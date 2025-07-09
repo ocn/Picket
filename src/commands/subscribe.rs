@@ -302,11 +302,13 @@ impl Command for SubscribeCommand {
         };
         let command_channel_id_str = command.channel_id.to_string();
 
+        let _lock = app_state.subscriptions_file_lock.lock().await;
         let response_content = {
             let mut subs_map = app_state.subscriptions.write().unwrap();
             let guild_subs = subs_map.entry(guild_id).or_default();
 
-            guild_subs.retain(|sub| sub.id != id || sub.action.channel_id != command_channel_id_str);
+            guild_subs
+                .retain(|sub| sub.id != id || sub.action.channel_id != command_channel_id_str);
             guild_subs.push(new_sub);
 
             match save_subscriptions_for_guild(guild_id, guild_subs) {
@@ -317,6 +319,7 @@ impl Command for SubscribeCommand {
                 }
             }
         };
+        drop(_lock);
 
         if let Err(why) = command
             .create_interaction_response(&ctx.http, |response| {
