@@ -177,6 +177,12 @@ impl Command for SubscribeCommand {
                     .description("The maximum age of a killmail (in minutes) to be eligible for a    ping.")
                  .kind(CommandOptionType::Integer)
          })
+            .create_option(|option| {
+                option
+                    .name("security")
+                    .description("A security status range (e.g., \"-1.0..=0.4\" for low/nullsec).")
+                    .kind(CommandOptionType::String)
+             })
     }
 
     async fn execute(
@@ -332,6 +338,10 @@ impl Command for SubscribeCommand {
         });
         if let (Some(start), Some(end)) = (time_range_start, time_range_end) {
             filters.push(Filter::TimeRange { start, end });
+        }
+
+        if let Some(CommandDataOptionValue::String(s)) = get_option_value(options, "security") {
+            filters.push(Filter::Security(s.clone()));
         }
 
         let max_ping_delay_minutes =

@@ -4,7 +4,7 @@ use crate::config::{
 };
 use crate::esi::Celestial;
 use crate::models::{Attacker, ZkData};
-use crate::processor::{Color, FilterResult};
+use crate::processor::{Color, NamedFilterResult};
 use chrono::{DateTime, FixedOffset, Utc};
 use futures::future::join_all;
 use serenity::async_trait;
@@ -218,7 +218,7 @@ pub async fn send_killmail_message(
     app_state: &Arc<AppState>,
     subscription: &Subscription,
     zk_data: &ZkData,
-    filter_result: FilterResult,
+    filter_result: NamedFilterResult,
 ) -> Result<(), KillmailSendError> {
     let channel = match subscription.action.channel_id.parse::<u64>() {
         Ok(id) => ChannelId(id),
@@ -472,9 +472,10 @@ fn format_datetime_to_timestamp(date: &DateTime<FixedOffset>) -> String {
 async fn build_killmail_embed(
     app_state: &Arc<AppState>,
     zk_data: &ZkData,
-    filter_result: &FilterResult,
+    named_filter_result: &NamedFilterResult,
 ) -> CreateEmbed {
     let mut embed = CreateEmbed::default();
+    let filter_result = &named_filter_result.filter_result;
     let killmail = &zk_data.killmail;
 
     let system_info = get_system(app_state, killmail.solar_system_id).await;

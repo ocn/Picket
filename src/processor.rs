@@ -10,6 +10,12 @@ use std::sync::Arc;
 use tracing::warn;
 
 #[derive(Debug, Clone, Default)]
+pub struct NamedFilterResult {
+    pub name: String,
+    pub filter_result: FilterResult,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct FilterResult {
     pub(crate) matched_ship: Option<MatchedShip>,
     pub(crate) color: Option<Color>,
@@ -34,7 +40,7 @@ pub(crate) struct MatchedShip {
 pub async fn process_killmail(
     app_state: &Arc<AppState>,
     zk_data: &ZkData,
-) -> Vec<(GuildId, Subscription, FilterResult)> {
+) -> Vec<(GuildId, Subscription, NamedFilterResult)> {
     // Clone the subscriptions to release the lock before the async loop.
     // We flatten the map of guilds into a single list of all subscriptions.
     let all_subscriptions = {
@@ -64,7 +70,7 @@ fn evaluate_filter_node<'a>(
     node: &'a FilterNode,
     zk_data: &'a ZkData,
     app_state: &'a Arc<AppState>,
-) -> BoxFuture<'a, Option<FilterResult>> {
+) -> BoxFuture<'a, Option<NamedFilterResult>> {
     async move {
         let kill_id = zk_data.killmail.killmail_id;
         match node {
@@ -84,16 +90,21 @@ fn evaluate_filter_node<'a>(
                     }
                 }
                 // Merge results
-                let final_result = FilterResult {
-                    color: results
+                let final_result = NamedFilterResult {
+                    name: results
                         .iter()
-                        .find(|r| r.matched_ship.is_some())
-                        .map_or(results[0].color, |r| r.color),
-                    matched_ship: results
-                        .iter()
-                        .find(|r| r.matched_ship.is_some())
-                        .and_then(|r| r.matched_ship.clone()),
-                    min_pilots: results.iter().find_map(|r| r.min_pilots),
+                        .fold(String::new(), |acc, b| format!("{} + {}", acc, b.name)),
+                    filter_result: FilterResult {
+                        color: results
+                            .iter()
+                            .find(|r| r.filter_result.matched_ship.is_some())
+                            .map_or(results[0].filter_result.color, |r| r.filter_result.color),
+                        matched_ship: results
+                            .iter()
+                            .find(|r| r.filter_result.matched_ship.is_some())
+                            .and_then(|r| r.filter_result.matched_ship.clone()),
+                        min_pilots: results.iter().find_map(|r| r.filter_result.min_pilots),
+                    },
                 };
                 Some(final_result)
             }
@@ -112,7 +123,10 @@ fn evaluate_filter_node<'a>(
                 {
                     None
                 } else {
-                    Some(FilterResult::default()) // Default success
+                    Some(NamedFilterResult {
+                        name: format!("Not({})", node.name()),
+                        filter_result: Default::default(), // Default success
+                    })
                 }
             }
         }
@@ -131,10 +145,6 @@ fn parse_security_range(s: &str) -> Result<RangeInclusive<f64>, ()> {
 }
 
 fn distance(system1: &System, system2: &System) -> f64 {
-    println!(
-        "Calculating distance between {} and {}",
-        system1.name, system2.name
-    );
     const LY_PER_M: f64 = 1.0 / 9_460_730_472_580_800.0;
     let dx = system1.x - system2.x;
     let dy = system1.y - system2.y;
@@ -146,10 +156,10 @@ async fn evaluate_filter(
     filter: &Filter,
     zk_data: &ZkData,
     app_state: &Arc<AppState>,
-) -> Option<FilterResult> {
+) -> Option<NamedFilterResult> {
     let killmail = &zk_data.killmail;
 
-    match filter {
+    let filter_result = match filter {
         Filter::TotalValue { min, max } => {
             let total_value = zk_data.zkb.total_value;
             if min.is_none_or(|m| total_value >= m as f64)
@@ -279,15 +289,18 @@ async fn evaluate_filter(
                     crate::discord_bot::get_name(app_state, killmail.victim.ship_type_id as u64)
                         .await
                         .unwrap_or_default();
-                return Some(FilterResult {
-                    color: Some(Color::Red), // Red for victim match
-                    matched_ship: Some(MatchedShip {
-                        ship_name,
-                        type_id: killmail.victim.ship_type_id,
-                        corp_id: killmail.victim.corporation_id,
-                        alliance_id: killmail.victim.alliance_id,
-                    }),
-                    min_pilots: None,
+                return Some(NamedFilterResult {
+                    name: filter.name(),
+                    filter_result: FilterResult {
+                        color: Some(Color::Red), // Red for victim match
+                        matched_ship: Some(MatchedShip {
+                            ship_name,
+                            type_id: killmail.victim.ship_type_id,
+                            corp_id: killmail.victim.corporation_id,
+                            alliance_id: killmail.victim.alliance_id,
+                        }),
+                        min_pilots: None,
+                    },
                 });
             }
             for attacker in &killmail.attackers {
@@ -296,15 +309,18 @@ async fn evaluate_filter(
                         let ship_name = crate::discord_bot::get_name(app_state, ship_id as u64)
                             .await
                             .unwrap_or_default();
-                        return Some(FilterResult {
-                            color: Some(Color::Green), // Green for attacker match
-                            matched_ship: Some(MatchedShip {
-                                ship_name,
-                                type_id: ship_id,
-                                corp_id: attacker.corporation_id,
-                                alliance_id: attacker.alliance_id,
-                            }),
-                            min_pilots: None,
+                        return Some(NamedFilterResult {
+                            name: filter.name(),
+                            filter_result: FilterResult {
+                                color: Some(Color::Green), // Green for attacker match
+                                matched_ship: Some(MatchedShip {
+                                    ship_name,
+                                    type_id: ship_id,
+                                    corp_id: attacker.corporation_id,
+                                    alliance_id: attacker.alliance_id,
+                                }),
+                                min_pilots: None,
+                            },
                         });
                     }
                 }
@@ -332,15 +348,18 @@ async fn evaluate_filter(
                     )
                     .await
                     .unwrap_or_default();
-                    return Some(FilterResult {
-                        color: Some(Color::Red),
-                        matched_ship: Some(MatchedShip {
-                            ship_name,
-                            type_id: killmail.victim.ship_type_id,
-                            corp_id: killmail.victim.corporation_id,
-                            alliance_id: killmail.victim.alliance_id,
-                        }),
-                        min_pilots: None,
+                    return Some(NamedFilterResult {
+                        name: filter.name(),
+                        filter_result: FilterResult {
+                            color: Some(Color::Red),
+                            matched_ship: Some(MatchedShip {
+                                ship_name,
+                                type_id: killmail.victim.ship_type_id,
+                                corp_id: killmail.victim.corporation_id,
+                                alliance_id: killmail.victim.alliance_id,
+                            }),
+                            min_pilots: None,
+                        },
                     });
                 }
             }
@@ -351,15 +370,18 @@ async fn evaluate_filter(
                             let ship_name = crate::discord_bot::get_name(app_state, ship_id as u64)
                                 .await
                                 .unwrap_or_default();
-                            return Some(FilterResult {
-                                color: Some(Color::Green),
-                                matched_ship: Some(MatchedShip {
-                                    ship_name,
-                                    type_id: ship_id,
-                                    corp_id: attacker.corporation_id,
-                                    alliance_id: attacker.alliance_id,
-                                }),
-                                min_pilots: None,
+                            return Some(NamedFilterResult {
+                                name: filter.name(),
+                                filter_result: FilterResult {
+                                    color: Some(Color::Green),
+                                    matched_ship: Some(MatchedShip {
+                                        ship_name,
+                                        type_id: ship_id,
+                                        corp_id: attacker.corporation_id,
+                                        alliance_id: attacker.alliance_id,
+                                    }),
+                                    min_pilots: None,
+                                },
                             });
                         }
                     }
@@ -372,7 +394,15 @@ async fn evaluate_filter(
                 for system_range in system_ranges {
                     if let Some(target_system) = get_system(app_state, system_range.system_id).await
                     {
-                        if distance(&killmail_system, &target_system) <= system_range.range {
+                        let distance = distance(&killmail_system, &target_system);
+                        println!(
+                            "[Kill: {}] Calculating distance between {} and {}: {} ly",
+                            killmail.killmail_id,
+                            killmail_system.name,
+                            target_system.name,
+                            distance,
+                        );
+                        if distance <= system_range.range {
                             return Some(Default::default()); // Found a match, return immediately
                         }
                     } else {
@@ -424,10 +454,13 @@ async fn evaluate_filter(
                 crate::discord_bot::get_name(app_state, killmail.victim.ship_type_id as u64).await
             {
                 if name.to_lowercase().contains(&lower_fragment) {
-                    return Some(FilterResult {
-                        color: Some(Color::Red),
-                        matched_ship: None,
-                        min_pilots: None,
+                    return Some(NamedFilterResult {
+                        name: filter.name(),
+                        filter_result: FilterResult {
+                            color: Some(Color::Red),
+                            matched_ship: None,
+                            min_pilots: None,
+                        },
                     });
                 }
             }
@@ -439,10 +472,13 @@ async fn evaluate_filter(
                         crate::discord_bot::get_name(app_state, ship_id as u64).await
                     {
                         if name.to_lowercase().contains(&lower_fragment) {
-                            return Some(FilterResult {
-                                color: Some(Color::Green),
-                                matched_ship: None,
-                                min_pilots: None,
+                            return Some(NamedFilterResult {
+                                name: filter.name(),
+                                filter_result: FilterResult {
+                                    color: Some(Color::Green),
+                                    matched_ship: None,
+                                    min_pilots: None,
+                                },
                             });
                         }
                     }
@@ -472,7 +508,11 @@ async fn evaluate_filter(
                 None
             }
         }
-    }
+    };
+    filter_result.map(|filter_result| NamedFilterResult {
+        name: filter.name(),
+        filter_result,
+    })
 }
 
 #[cfg(test)]
@@ -805,7 +845,7 @@ mod tests {
                 killmail: KillmailData {
                     killmail_id: 1,
                     killmail_time: "2025-07-08T12:00:00Z".to_string(),
-                    solar_system_id: 30002086, // Turnur
+                    solar_system_id: 31002057, // Turnur
                     victim: Victim {
                         damage_taken: 1000,
                         ship_type_id: 587, // Rifter
@@ -849,10 +889,16 @@ mod tests {
         };
         zk_data.zkb.npc = true;
         test_filter(
-            Filter::LyRangeFrom(vec![SystemRange {
-                system_id: 30003067,
-                range: 8.0,
-            }]),
+            Filter::LyRangeFrom(vec![
+                SystemRange {
+                    system_id: 30002086,
+                    range: 8.0,
+                },
+                SystemRange {
+                    system_id: 30003067,
+                    range: 8.0,
+                },
+            ]),
             &zk_data,
             true,
         )

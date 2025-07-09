@@ -158,8 +158,8 @@ pub async fn run() {
                 if !matched.is_empty() {
                     for (guild_id, subscription, filter_result) in matched {
                         info!(
-                            "[Kill: {}] Matched subscription '{}'. Sending notification to channel {}.",
-                            kill_id, subscription.description, subscription.action.channel_id
+                            "[Kill: {}] Matched subscription '{}' for channel {}, this filter was a match: {}",
+                            kill_id, subscription.description, subscription.action.channel_id, filter_result.name
                         );
                         if let Err(e) = discord_bot::send_killmail_message(
                             &http_client,
