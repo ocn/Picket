@@ -68,21 +68,7 @@ impl std::fmt::Display for Target {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-pub struct ShipGroupFilter {
-    pub ids: Vec<u32>,
-    #[serde(default)]
-    pub target: Target,
-}
 
-impl ShipGroupFilter {
-    pub fn from_ids(ids: Vec<u32>) -> Self {
-        ShipGroupFilter {
-            ids,
-            target: Default::default(),
-        }
-    }
-}
 
 // Filter conditions that can be targeted to either a victim or attacker
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -243,106 +229,7 @@ impl Filter {
     }
 }
 
-// impl<'de> serde::Deserialize<'de> for Filter {
-//     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-//     where
-//         D: serde::Deserializer<'de>,
-//     {
-//         // This is a private helper struct that mirrors the public `Filter` enum.
-//         // We can derive a standard `Deserialize` on this without causing recursion.
-//         #[derive(Deserialize)]
-//         enum FilterHelper {
-//             Simple(SimpleFilter),
-//             Targeted(TargetedFilter),
-//         }
-//
-//         // This is the internal representation of the old format.
-//         #[derive(Deserialize)]
-//         #[serde(rename_all = "PascalCase")]
-//         enum OldFilter {
-//             TotalValue { min: Option<u64>, max: Option<u64> },
-//             DroppedValue { min: Option<u64>, max: Option<u64> },
-//             Region(Vec<u32>),
-//             System(Vec<u32>),
-//             Security(String),
-//             Alliance(Vec<u64>),
-//             Corporation(Vec<u64>),
-//             Character(Vec<u64>),
-//             ShipType(Vec<u32>),
-//             ShipGroup(Vec<u32>),
-//             LyRangeFrom(Vec<SystemRange>),
-//             IsNpc(bool),
-//             IsSolo(bool),
-//             Pilots { min: Option<u32>, max: Option<u32> },
-//             NameFragment(String),
-//             TimeRange { start: u32, end: u32 },
-//         }
-//
-//         // This untagged enum is the key. Serde will try to deserialize into `New`,
-//         // and if that fails, it will fall back to trying `Old`.
-//         #[derive(Deserialize)]
-//         #[serde(untagged)]
-//         enum AnyFilter {
-//             New(FilterHelper),
-//             Old(OldFilter),
-//         }
-//
-//         // Deserialize into our flexible helper enum.
-//         let any_filter = AnyFilter::deserialize(deserializer)?;
-//
-//         // Now, convert whichever variant we got into the public `Filter` type.
-//         match any_filter {
-//             // If it was already in the new format, just map it over.
-//             AnyFilter::New(helper) => match helper {
-//                 FilterHelper::Simple(s) => Ok(Filter::Simple(s)),
-//                 FilterHelper::Targeted(t) => Ok(Filter::Targeted(t)),
-//             },
-//             // If we got the old format, run the migration logic.
-//             AnyFilter::Old(old_filter) => Ok(match old_filter {
-//                 OldFilter::TotalValue { min, max } => {
-//                     Filter::Simple(SimpleFilter::TotalValue { min, max })
-//                 }
-//                 OldFilter::DroppedValue { min, max } => {
-//                     Filter::Simple(SimpleFilter::DroppedValue { min, max })
-//                 }
-//                 OldFilter::Region(ids) => Filter::Simple(SimpleFilter::Region(ids)),
-//                 OldFilter::System(ids) => Filter::Simple(SimpleFilter::System(ids)),
-//                 OldFilter::Security(s) => Filter::Simple(SimpleFilter::Security(s)),
-//                 OldFilter::LyRangeFrom(r) => Filter::Simple(SimpleFilter::LyRangeFrom(r)),
-//                 OldFilter::IsNpc(b) => Filter::Simple(SimpleFilter::IsNpc(b)),
-//                 OldFilter::IsSolo(b) => Filter::Simple(SimpleFilter::IsSolo(b)),
-//                 OldFilter::Pilots { min, max } => Filter::Simple(SimpleFilter::Pilots { min, max }),
-//                 OldFilter::TimeRange { start, end } => {
-//                     Filter::Simple(SimpleFilter::TimeRange { start, end })
-//                 }
-//                 OldFilter::Alliance(ids) => Filter::Targeted(TargetedFilter {
-//                     condition: TargetableCondition::Alliance(ids),
-//                     target: Target::Any,
-//                 }),
-//                 OldFilter::Corporation(ids) => Filter::Targeted(TargetedFilter {
-//                     condition: TargetableCondition::Corporation(ids),
-//                     target: Target::Any,
-//                 }),
-//                 OldFilter::Character(ids) => Filter::Targeted(TargetedFilter {
-//                     condition: TargetableCondition::Character(ids),
-//                     target: Target::Any,
-//                 }),
-//                 OldFilter::ShipType(ids) => Filter::Targeted(TargetedFilter {
-//                     condition: TargetableCondition::ShipType(ids),
-//                     target: Target::Any,
-//                 }),
-//                 OldFilter::ShipGroup(ids) => Filter::Targeted(TargetedFilter {
-//                     condition: TargetableCondition::ShipGroup(ids),
-//                     target: Target::Any,
-//                 }),
-//                 OldFilter::NameFragment(s) => Filter::Targeted(TargetedFilter {
-//                     condition: TargetableCondition::NameFragment(s),
-//                     target: Target::Any,
-//                 }),
-//             }),
-//         }
-//     }
-// }
+
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase")]
@@ -632,7 +519,7 @@ mod tests {
         let subscriptions = result.unwrap();
         assert_eq!(
             subscriptions.len(),
-            201,
+            192,
             "Incorrect number of subscriptions loaded"
         );
         assert_eq!(subscriptions[0].id, "1");
