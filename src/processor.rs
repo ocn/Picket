@@ -200,8 +200,18 @@ async fn evaluate_filter(
                 .attackers
                 .iter()
                 .any(|a| a.alliance_id.is_some_and(|id| alliance_ids.contains(&id)));
-            if victim_match || attacker_match {
-                Some(Default::default())
+            if attacker_match {
+                Some(FilterResult {
+                    matched_ship: None,
+                    color: Some(Color::Green),
+                    min_pilots: None,
+                })
+            } else if victim_match {
+                Some(FilterResult {
+                    matched_ship: None,
+                    color: Some(Color::Red),
+                    min_pilots: None,
+                })
             } else {
                 None
             }
@@ -215,8 +225,18 @@ async fn evaluate_filter(
                 a.corporation_id
                     .is_some_and(|id| corporation_ids.contains(&id))
             });
-            if victim_match || attacker_match {
-                Some(Default::default())
+            if attacker_match {
+                Some(FilterResult {
+                    matched_ship: None,
+                    color: Some(Color::Green),
+                    min_pilots: None,
+                })
+            } else if victim_match {
+                Some(FilterResult {
+                    matched_ship: None,
+                    color: Some(Color::Red),
+                    min_pilots: None,
+                })
             } else {
                 None
             }
@@ -230,8 +250,18 @@ async fn evaluate_filter(
                 .attackers
                 .iter()
                 .any(|a| a.character_id.is_some_and(|id| character_ids.contains(&id)));
-            if victim_match || attacker_match {
-                Some(Default::default())
+            if attacker_match {
+                Some(FilterResult {
+                    matched_ship: None,
+                    color: Some(Color::Green),
+                    min_pilots: None,
+                })
+            } else if victim_match {
+                Some(FilterResult {
+                    matched_ship: None,
+                    color: Some(Color::Red),
+                    min_pilots: None,
+                })
             } else {
                 None
             }
