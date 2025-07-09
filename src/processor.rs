@@ -540,6 +540,7 @@ mod tests {
                 discord_bot_token: "".to_string(),
                 discord_client_id: 0,
             }),
+            last_ping_times: Mutex::new(HashMap::new()),
         })
     }
 

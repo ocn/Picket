@@ -1,6 +1,7 @@
 use crate::commands::{get_option_value, Command};
 use crate::config::{
-    save_subscriptions_for_guild, Action, AppState, Filter, FilterNode, Subscription, SystemRange,
+    save_subscriptions_for_guild, Action, AppState, Filter, FilterNode, PingType, Subscription,
+    SystemRange,
 };
 use serenity::async_trait;
 use serenity::builder::CreateApplicationCommand;
@@ -162,6 +163,20 @@ impl Command for SubscribeCommand {
                     .description("A JSON string for system ranges, e.g., '[{\"system_id\":30000142, \"range\":10.0}]'")
                     .kind(CommandOptionType::String)
             })
+            .create_option(|option| {
+                option
+                    .name("ping_type")
+                    .description("Whether to ping @here or @everyone for a    match.")
+                    .kind(CommandOptionType::String)
+                    .add_string_choice("Here", "here")
+                    .add_string_choice("Everyone", "everyone")
+            })
+            .create_option(|option| {
+                option
+                    .name("max_ping_delay_minutes")
+                    .description("The maximum age of a killmail (in minutes) to be eligible for a    ping.")
+                 .kind(CommandOptionType::Integer)
+         })
     }
 
     async fn execute(
@@ -319,6 +334,30 @@ impl Command for SubscribeCommand {
             filters.push(Filter::TimeRange { start, end });
         }
 
+        let max_ping_delay_minutes =
+            get_option_value(options, "max_ping_delay_minutes").and_then(|v| {
+                if let CommandDataOptionValue::Integer(i) = v {
+                    Some(*i as u32)
+                } else {
+                    None
+                }
+            });
+        let ping_type = get_option_value(options, "ping_type").and_then(|v| {
+            if let CommandDataOptionValue::String(s) = v {
+                match s.as_str() {
+                    "here" => Some(PingType::Here {
+                        max_ping_delay_minutes,
+                    }),
+                    "everyone" => Some(PingType::Everyone {
+                        max_ping_delay_minutes,
+                    }),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        });
+
         let root_filter = if filters.len() > 1 {
             FilterNode::And(filters.into_iter().map(FilterNode::Condition).collect())
         } else {
@@ -334,7 +373,7 @@ impl Command for SubscribeCommand {
             root_filter,
             action: Action {
                 channel_id: command.channel_id.0.to_string(),
-                ping_type: None,
+                ping_type,
             },
         };
         let command_channel_id_str = command.channel_id.to_string();

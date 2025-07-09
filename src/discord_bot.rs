@@ -1,5 +1,7 @@
 use crate::commands::Command;
-use crate::config::{save_names, save_ships, save_systems, AppState, Subscription, System};
+use crate::config::{
+    save_names, save_ships, save_systems, AppState, PingType, Subscription, System,
+};
 use crate::esi::Celestial;
 use crate::models::{Attacker, ZkData};
 use crate::processor::{Color, FilterResult};
@@ -16,6 +18,8 @@ use serenity::prelude::*;
 use serenity::utils::Colour;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
 use tracing::{error, info, trace, warn};
 
 #[derive(Debug)]
@@ -226,9 +230,50 @@ pub async fn send_killmail_message(
             return Err(KillmailSendError::Other("Invalid channel ID".into()));
         }
     };
-    let embed = build_killmail_embed(app_state, zk_data, filter_result).await; // Pass it here
+    let embed = build_killmail_embed(app_state, zk_data, &filter_result).await; // Pass it here
 
-    let result = channel.send_message(http, |m| m.set_embed(embed)).await;
+    let content = match &subscription.action.ping_type {
+        None => None,
+        Some(ping_type) => {
+            let kill_time = DateTime::parse_from_rfc3339(&zk_data.killmail.killmail_time)
+                .unwrap_or_else(|_| Utc::now().into());
+            let kill_age = Utc::now().signed_duration_since(kill_time);
+
+            let max_delay = ping_type.max_ping_delay_in_minutes().unwrap_or(0);
+            if max_delay == 0 || kill_age.num_minutes() <= max_delay as i64 {
+                let channel_id = subscription.action.channel_id.parse::<u64>().unwrap_or(0);
+                let mut ping_times = app_state.last_ping_times.lock().await;
+
+                let now = Instant::now();
+                let last_ping = ping_times
+                    .entry(channel_id)
+                    .or_insert(now - Duration::from_secs(301));
+
+                if now.duration_since(*last_ping) > Duration::from_secs(300) {
+                    *last_ping = now;
+                    Some(match ping_type {
+                        PingType::Here { .. } => "@fermi. it worked",
+                        PingType::Everyone { .. } => "@everyone",
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+    };
+
+    let result = channel
+        .send_message(http, |m| {
+            if let Some(content) = content {
+                m.content(content)
+            } else {
+                m
+            }
+            .set_embed(embed)
+        })
+        .await;
 
     if let Err(e) = result {
         if let serenity::Error::Http(http_err) = &e {
@@ -427,7 +472,7 @@ fn format_datetime_to_timestamp(date: &DateTime<FixedOffset>) -> String {
 async fn build_killmail_embed(
     app_state: &Arc<AppState>,
     zk_data: &ZkData,
-    filter_result: FilterResult,
+    filter_result: &FilterResult,
 ) -> CreateEmbed {
     let mut embed = CreateEmbed::default();
     let killmail = &zk_data.killmail;

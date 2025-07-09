@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 // --- Data Models ---
@@ -182,8 +183,21 @@ impl FilterNode {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 pub enum PingType {
-    Here,
-    Everyone,
+    Here { max_ping_delay_minutes: Option<u32> },
+    Everyone { max_ping_delay_minutes: Option<u32> },
+}
+
+impl PingType {
+    pub fn max_ping_delay_in_minutes(&self) -> Option<u32> {
+        match self {
+            PingType::Here {
+                max_ping_delay_minutes,
+            } => *max_ping_delay_minutes,
+            PingType::Everyone {
+                max_ping_delay_minutes,
+            } => *max_ping_delay_minutes,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -227,6 +241,7 @@ pub struct AppState {
     pub ships_file_lock: Mutex<()>,
     pub names_file_lock: Mutex<()>,
     pub subscriptions_file_lock: Mutex<()>,
+    pub last_ping_times: Mutex<HashMap<u64, Instant>>,
 }
 
 impl AppState {
@@ -249,6 +264,7 @@ impl AppState {
             ships_file_lock: Mutex::new(()),
             names_file_lock: Mutex::new(()),
             subscriptions_file_lock: Mutex::new(()),
+            last_ping_times: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -266,7 +282,7 @@ fn load_vec_from_json_file<T: for<'de> Deserialize<'de>>(
 
 fn load_map_from_json_file<K, V>(file_path: &Path) -> Result<HashMap<K, V>, ConfigError>
 where
-    K: std::cmp::Eq + std::hash::Hash + for<'de> Deserialize<'de>,
+    K: Eq + std::hash::Hash + for<'de> Deserialize<'de>,
     V: for<'de> Deserialize<'de>,
 {
     Config::builder()
@@ -408,7 +424,9 @@ mod tests {
             description: "Pings for valuable capital kills in key regions or near Jita".to_string(),
             action: Action {
                 channel_id: "123456789".to_string(),
-                ping_type: Some(PingType::Here),
+                ping_type: Some(PingType::Here {
+                    max_ping_delay_minutes: None,
+                }),
             },
             root_filter: FilterNode::And(vec![
                 FilterNode::Condition(Filter::TotalValue {
@@ -476,4 +494,63 @@ mod tests {
             "Distance calculation is incorrect"
         );
     }
+
+    // #[test]
+    // fn test_migrate_schema() {
+    //     // You would run this logic once, perhaps in a separate binary or a temporary function call.
+    //
+    //     // 1. Define the old structures exactly as they were.
+    //     #[derive(Deserialize)]
+    //     struct OldAction {
+    //         channel_id: String,
+    //         ping_type: Option<OldPingType>,
+    //     }
+    //
+    //     #[derive(Deserialize)]
+    //     #[serde(rename_all = "PascalCase")]
+    //     enum OldPingType {
+    //         Here,
+    //         Everyone,
+    //     }
+    //
+    //     #[derive(Deserialize)]
+    //     struct OldSubscription {
+    //         id: String,
+    //         description: String,
+    //         root_filter: FilterNode,
+    //         action: OldAction,
+    //     }
+    //
+    //     // 2. Read and deserialize the old file.
+    //     let old_json = fs::read_to_string("config/your_guild_id.json")?;
+    //     let old_subscriptions: Vec<OldSubscription> = serde_json::from_str(&old_json)?;
+    //
+    //     // 3. Convert to the new format.
+    //     let new_subscriptions: Vec<Subscription> = old_subscriptions
+    //         .into_iter()
+    //         .map(|old_sub| {
+    //             let new_ping_type = old_sub.action.ping_type.map(|pt| match pt {
+    //                 OldPingType::Here => PingType::Here {
+    //                     max_ping_delay_minutes: None,
+    //                 },
+    //                 OldPingType::Everyone => PingType::Everyone {
+    //                     max_ping_delay_minutes: None,
+    //                 },
+    //             });
+    //
+    //             Subscription {
+    //                 id: old_sub.id,
+    //                 description: old_sub.description,
+    //                 root_filter: old_sub.root_filter,
+    //                 action: Action {
+    //                     channel_id: old_sub.action.channel_id,
+    //                     ping_type: new_ping_type,
+    //                 },
+    //             }
+    //         })
+    //         .collect();
+    //
+    //     // 4. Save the new file.
+    //     save_subscriptions_for_guild(guild_id, &new_subscriptions)?;
+    // }
 }
