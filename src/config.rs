@@ -248,10 +248,18 @@ impl<'de> serde::Deserialize<'de> for Filter {
     where
         D: serde::Deserializer<'de>,
     {
-        // Define the old structure internally for deserialization
-        #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+        // This is a private helper struct that mirrors the public `Filter` enum.
+        // We can derive a standard `Deserialize` on this without causing recursion.
+        #[derive(Deserialize)]
+        enum FilterHelper {
+            Simple(SimpleFilter),
+            Targeted(TargetedFilter),
+        }
+
+        // This is the internal representation of the old format.
+        #[derive(Deserialize)]
         #[serde(rename_all = "PascalCase")]
-        pub enum OldFilter {
+        enum OldFilter {
             TotalValue { min: Option<u64>, max: Option<u64> },
             DroppedValue { min: Option<u64>, max: Option<u64> },
             Region(Vec<u32>),
@@ -270,54 +278,69 @@ impl<'de> serde::Deserialize<'de> for Filter {
             TimeRange { start: u32, end: u32 },
         }
 
-        // Deserialize into the old format first
-        let old_filter = OldFilter::deserialize(deserializer)?;
+        // This untagged enum is the key. Serde will try to deserialize into `New`,
+        // and if that fails, it will fall back to trying `Old`.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum AnyFilter {
+            New(FilterHelper),
+            Old(OldFilter),
+        }
 
-        // Now, map the old format to the new, structured format
-        Ok(match old_filter {
-            OldFilter::TotalValue { min, max } => {
-                Filter::Simple(SimpleFilter::TotalValue { min, max })
-            }
-            OldFilter::DroppedValue { min, max } => {
-                Filter::Simple(SimpleFilter::DroppedValue { min, max })
-            }
-            OldFilter::Region(ids) => Filter::Simple(SimpleFilter::Region(ids)),
-            OldFilter::System(ids) => Filter::Simple(SimpleFilter::System(ids)),
-            OldFilter::Security(s) => Filter::Simple(SimpleFilter::Security(s)),
-            OldFilter::LyRangeFrom(r) => Filter::Simple(SimpleFilter::LyRangeFrom(r)),
-            OldFilter::IsNpc(b) => Filter::Simple(SimpleFilter::IsNpc(b)),
-            OldFilter::IsSolo(b) => Filter::Simple(SimpleFilter::IsSolo(b)),
-            OldFilter::Pilots { min, max } => Filter::Simple(SimpleFilter::Pilots { min, max }),
-            OldFilter::TimeRange { start, end } => {
-                Filter::Simple(SimpleFilter::TimeRange { start, end })
-            }
+        // Deserialize into our flexible helper enum.
+        let any_filter = AnyFilter::deserialize(deserializer)?;
 
-            // Map targetable filters to the new structure with a default target
-            OldFilter::Alliance(ids) => Filter::Targeted(TargetedFilter {
-                condition: TargetableCondition::Alliance(ids),
-                target: Target::Any,
+        // Now, convert whichever variant we got into the public `Filter` type.
+        match any_filter {
+            // If it was already in the new format, just map it over.
+            AnyFilter::New(helper) => match helper {
+                FilterHelper::Simple(s) => Ok(Filter::Simple(s)),
+                FilterHelper::Targeted(t) => Ok(Filter::Targeted(t)),
+            },
+            // If we got the old format, run the migration logic.
+            AnyFilter::Old(old_filter) => Ok(match old_filter {
+                OldFilter::TotalValue { min, max } => {
+                    Filter::Simple(SimpleFilter::TotalValue { min, max })
+                }
+                OldFilter::DroppedValue { min, max } => {
+                    Filter::Simple(SimpleFilter::DroppedValue { min, max })
+                }
+                OldFilter::Region(ids) => Filter::Simple(SimpleFilter::Region(ids)),
+                OldFilter::System(ids) => Filter::Simple(SimpleFilter::System(ids)),
+                OldFilter::Security(s) => Filter::Simple(SimpleFilter::Security(s)),
+                OldFilter::LyRangeFrom(r) => Filter::Simple(SimpleFilter::LyRangeFrom(r)),
+                OldFilter::IsNpc(b) => Filter::Simple(SimpleFilter::IsNpc(b)),
+                OldFilter::IsSolo(b) => Filter::Simple(SimpleFilter::IsSolo(b)),
+                OldFilter::Pilots { min, max } => Filter::Simple(SimpleFilter::Pilots { min, max }),
+                OldFilter::TimeRange { start, end } => {
+                    Filter::Simple(SimpleFilter::TimeRange { start, end })
+                }
+                OldFilter::Alliance(ids) => Filter::Targeted(TargetedFilter {
+                    condition: TargetableCondition::Alliance(ids),
+                    target: Target::Any,
+                }),
+                OldFilter::Corporation(ids) => Filter::Targeted(TargetedFilter {
+                    condition: TargetableCondition::Corporation(ids),
+                    target: Target::Any,
+                }),
+                OldFilter::Character(ids) => Filter::Targeted(TargetedFilter {
+                    condition: TargetableCondition::Character(ids),
+                    target: Target::Any,
+                }),
+                OldFilter::ShipType(ids) => Filter::Targeted(TargetedFilter {
+                    condition: TargetableCondition::ShipType(ids),
+                    target: Target::Any,
+                }),
+                OldFilter::ShipGroup(ids) => Filter::Targeted(TargetedFilter {
+                    condition: TargetableCondition::ShipGroup(ids),
+                    target: Target::Any,
+                }),
+                OldFilter::NameFragment(s) => Filter::Targeted(TargetedFilter {
+                    condition: TargetableCondition::NameFragment(s),
+                    target: Target::Any,
+                }),
             }),
-            OldFilter::Corporation(ids) => Filter::Targeted(TargetedFilter {
-                condition: TargetableCondition::Corporation(ids),
-                target: Target::Any,
-            }),
-            OldFilter::Character(ids) => Filter::Targeted(TargetedFilter {
-                condition: TargetableCondition::Character(ids),
-                target: Target::Any,
-            }),
-            OldFilter::ShipType(ids) => Filter::Targeted(TargetedFilter {
-                condition: TargetableCondition::ShipType(ids),
-                target: Target::Any,
-            }),
-            OldFilter::ShipGroup(ids) => Filter::Targeted(TargetedFilter {
-                condition: TargetableCondition::ShipGroup(ids),
-                target: Target::Any,
-            }),
-            OldFilter::NameFragment(s) => Filter::Targeted(TargetedFilter {
-                condition: TargetableCondition::NameFragment(s),
-                target: Target::Any,
-            }),
-        })
+        }
     }
 }
 
