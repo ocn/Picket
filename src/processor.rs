@@ -1,5 +1,8 @@
-use crate::config::{AppState, Filter, FilterNode, Subscription, System, SystemRange};
-use crate::discord_bot::{get_ship_group_id, get_system};
+use crate::config::{
+    AppState, Filter, FilterNode, SimpleFilter, Subscription, System, SystemRange, Target,
+    TargetableCondition,
+};
+use crate::discord_bot::{get_name, get_ship_group_id, get_system};
 use crate::models::ZkData;
 use chrono::Timelike;
 use futures::future::{BoxFuture, FutureExt};
@@ -166,387 +169,364 @@ async fn evaluate_filter(
     let killmail = &zk_data.killmail;
 
     let filter_result = match filter {
-        Filter::TotalValue { min, max } => {
-            let total_value = zk_data.zkb.total_value;
-            if min.is_none_or(|m| total_value >= m as f64)
-                && max.is_none_or(|m| total_value <= m as f64)
-            {
-                Some(Default::default())
-            } else {
-                None
-            }
-        }
-        Filter::DroppedValue { min, max } => {
-            let dropped_value = zk_data.zkb.dropped_value;
-            if min.is_none_or(|m| dropped_value >= m as f64)
-                && max.is_none_or(|m| dropped_value <= m as f64)
-            {
-                Some(Default::default())
-            } else {
-                None
-            }
-        }
-        Filter::Region(region_ids) => {
-            if get_system(app_state, killmail.solar_system_id)
-                .await
-                .is_some_and(|s| region_ids.contains(&s.region_id))
-            {
-                Some(Default::default())
-            } else {
-                None
-            }
-        }
-        Filter::System(system_ids) => {
-            if system_ids.contains(&killmail.solar_system_id) {
-                Some(Default::default())
-            } else {
-                None
-            }
-        }
-        Filter::Security(range_str) => {
-            if let (Some(system), Ok(range)) = (
-                get_system(app_state, killmail.solar_system_id).await,
-                parse_security_range(range_str),
-            ) {
-                if range.contains(&system.security_status) {
-                    return Some(Default::default());
-                }
-            }
-            None
-        }
-        Filter::Alliance(alliance_ids) => {
-            let victim_match = killmail
-                .victim
-                .alliance_id
-                .is_some_and(|id| alliance_ids.contains(&id));
-            let attacker_match = killmail
-                .attackers
-                .iter()
-                .any(|a| a.alliance_id.is_some_and(|id| alliance_ids.contains(&id)));
-            if attacker_match {
-                Some(FilterResult {
-                    matched_ship: None,
-                    color: Some(Color::Green),
-                    min_pilots: None,
-                    light_year_range: None,
-                })
-            } else if victim_match {
-                Some(FilterResult {
-                    matched_ship: None,
-                    color: Some(Color::Red),
-                    min_pilots: None,
-                    light_year_range: None,
-                })
-            } else {
-                None
-            }
-        }
-        Filter::Corporation(corporation_ids) => {
-            let victim_match = killmail
-                .victim
-                .corporation_id
-                .is_some_and(|id| corporation_ids.contains(&id));
-            let attacker_match = killmail.attackers.iter().any(|a| {
-                a.corporation_id
-                    .is_some_and(|id| corporation_ids.contains(&id))
-            });
-            if attacker_match {
-                Some(FilterResult {
-                    matched_ship: None,
-                    color: Some(Color::Green),
-                    min_pilots: None,
-                    light_year_range: None,
-                })
-            } else if victim_match {
-                Some(FilterResult {
-                    matched_ship: None,
-                    color: Some(Color::Red),
-                    min_pilots: None,
-                    light_year_range: None,
-                })
-            } else {
-                None
-            }
-        }
-        Filter::Character(character_ids) => {
-            let victim_match = killmail
-                .victim
-                .character_id
-                .is_some_and(|id| character_ids.contains(&id));
-            let attacker_match = killmail
-                .attackers
-                .iter()
-                .any(|a| a.character_id.is_some_and(|id| character_ids.contains(&id)));
-            if attacker_match {
-                Some(FilterResult {
-                    matched_ship: None,
-                    color: Some(Color::Green),
-                    min_pilots: None,
-                    light_year_range: None,
-                })
-            } else if victim_match {
-                Some(FilterResult {
-                    matched_ship: None,
-                    color: Some(Color::Red),
-                    min_pilots: None,
-                    light_year_range: None,
-                })
-            } else {
-                None
-            }
-        }
-        Filter::ShipType(ship_type_ids) => {
-            if ship_type_ids.contains(&killmail.victim.ship_type_id) {
-                let ship_name =
-                    crate::discord_bot::get_name(app_state, killmail.victim.ship_type_id as u64)
-                        .await
-                        .unwrap_or_default();
-                return Some(NamedFilterResult {
-                    name: filter.name(),
-                    filter_result: FilterResult {
-                        color: Some(Color::Red), // Red for victim match
-                        matched_ship: Some(MatchedShip {
-                            ship_name,
-                            type_id: killmail.victim.ship_type_id,
-                            corp_id: killmail.victim.corporation_id,
-                            alliance_id: killmail.victim.alliance_id,
-                        }),
-                        min_pilots: None,
-                        light_year_range: None,
-                    },
-                });
-            }
-            for attacker in &killmail.attackers {
-                if let Some(ship_id) = attacker.ship_type_id {
-                    if ship_type_ids.contains(&ship_id) {
-                        let ship_name = crate::discord_bot::get_name(app_state, ship_id as u64)
-                            .await
-                            .unwrap_or_default();
-                        return Some(NamedFilterResult {
-                            name: filter.name(),
-                            filter_result: FilterResult {
-                                color: Some(Color::Green), // Green for attacker match
-                                matched_ship: Some(MatchedShip {
-                                    ship_name,
-                                    type_id: ship_id,
-                                    corp_id: attacker.corporation_id,
-                                    alliance_id: attacker.alliance_id,
-                                }),
-                                min_pilots: None,
-                                light_year_range: None,
-                            },
-                        });
+        Filter::Simple(sf) => {
+            match sf {
+                SimpleFilter::TotalValue { min, max } => {
+                    let total_value = zk_data.zkb.total_value;
+                    if min.is_none_or(|m| total_value >= m as f64)
+                        && max.is_none_or(|m| total_value <= m as f64)
+                    {
+                        Some(Default::default())
+                    } else {
+                        None
                     }
                 }
-            }
-            None
-        }
-        Filter::ShipGroup(ship_group_ids_as_type_ids) => {
-            // It is implicit that these "ship group IDs" are actually ship type IDs, and thus
-            // must be converted to the proper ship group IDs before use.
-            let mut ship_group_ids = vec![];
-            for type_id in ship_group_ids_as_type_ids {
-                if let Some(group_id) = get_ship_group_id(app_state, *type_id).await {
-                    ship_group_ids.push(group_id);
-                } else {
-                    warn!("Failed to get ship group ID for type ID {}", type_id);
+                SimpleFilter::DroppedValue { min, max } => {
+                    let dropped_value = zk_data.zkb.dropped_value;
+                    if min.is_none_or(|m| dropped_value >= m as f64)
+                        && max.is_none_or(|m| dropped_value <= m as f64)
+                    {
+                        Some(Default::default())
+                    } else {
+                        None
+                    }
                 }
-            }
-
-            if let Some(group_id) = get_ship_group_id(app_state, killmail.victim.ship_type_id).await
-            {
-                if ship_group_ids.contains(&group_id) {
-                    let ship_name = crate::discord_bot::get_name(
-                        app_state,
-                        killmail.victim.ship_type_id as u64,
-                    )
-                    .await
-                    .unwrap_or_default();
-                    return Some(NamedFilterResult {
-                        name: filter.name(),
-                        filter_result: FilterResult {
-                            color: Some(Color::Red),
-                            matched_ship: Some(MatchedShip {
-                                ship_name,
-                                type_id: killmail.victim.ship_type_id,
-                                corp_id: killmail.victim.corporation_id,
-                                alliance_id: killmail.victim.alliance_id,
-                            }),
-                            min_pilots: None,
-                            light_year_range: None,
-                        },
-                    });
+                SimpleFilter::Region(region_ids) => {
+                    if get_system(app_state, killmail.solar_system_id)
+                        .await
+                        .is_some_and(|s| region_ids.contains(&s.region_id))
+                    {
+                        Some(Default::default())
+                    } else {
+                        None
+                    }
                 }
-            }
-            for attacker in &killmail.attackers {
-                if let Some(ship_id) = attacker.ship_type_id {
-                    if let Some(group_id) = get_ship_group_id(app_state, ship_id).await {
-                        if ship_group_ids.contains(&group_id) {
-                            let ship_name = crate::discord_bot::get_name(app_state, ship_id as u64)
-                                .await
-                                .unwrap_or_default();
-                            return Some(NamedFilterResult {
-                                name: filter.name(),
-                                filter_result: FilterResult {
-                                    color: Some(Color::Green),
-                                    matched_ship: Some(MatchedShip {
-                                        ship_name,
-                                        type_id: ship_id,
-                                        corp_id: attacker.corporation_id,
-                                        alliance_id: attacker.alliance_id,
-                                    }),
-                                    min_pilots: None,
-                                    light_year_range: None,
-                                },
-                            });
+                SimpleFilter::System(system_ids) => {
+                    if system_ids.contains(&killmail.solar_system_id) {
+                        Some(Default::default())
+                    } else {
+                        None
+                    }
+                }
+                SimpleFilter::Security(range_str) => {
+                    if let (Some(system), Ok(range)) = (
+                        get_system(app_state, killmail.solar_system_id).await,
+                        parse_security_range(range_str),
+                    ) {
+                        if range.contains(&system.security_status) {
+                            return Some(Default::default());
                         }
                     }
+                    None
                 }
-            }
-            None
-        }
-        Filter::LyRangeFrom(system_ranges) => {
-            if let Some(killmail_system) = get_system(app_state, killmail.solar_system_id).await {
-                let mut matched_ranges: Vec<SystemRange> = vec![];
-                for system_range in system_ranges {
-                    if let Some(target_system) = get_system(app_state, system_range.system_id).await
+                SimpleFilter::LyRangeFrom(system_ranges) => {
+                    if let Some(killmail_system) =
+                        get_system(app_state, killmail.solar_system_id).await
                     {
-                        let distance = distance(&killmail_system, &target_system);
-                        println!(
-                            "[Kill: {}] Calculating distance between {} and {}: {} ly",
-                            killmail.killmail_id,
-                            killmail_system.name,
-                            target_system.name,
-                            distance,
-                        );
-                        if distance <= system_range.range {
-                            matched_ranges.push(SystemRange {
-                                system_id: target_system.id,
-                                range: distance,
+                        let mut matched_ranges: Vec<SystemRange> = vec![];
+                        for system_range in system_ranges {
+                            if let Some(target_system) =
+                                get_system(app_state, system_range.system_id).await
+                            {
+                                let distance = distance(&killmail_system, &target_system);
+                                println!(
+                                    "[Kill: {}] Calculating distance between {} and {}: {} ly",
+                                    killmail.killmail_id,
+                                    killmail_system.name,
+                                    target_system.name,
+                                    distance,
+                                );
+                                if distance <= system_range.range {
+                                    matched_ranges.push(SystemRange {
+                                        system_id: target_system.id,
+                                        range: distance,
+                                    })
+                                }
+                            } else {
+                                warn!(
+                                    "Could not find target system {} for LY range check",
+                                    system_range.system_id
+                                );
+                            }
+                        }
+                        if matched_ranges.is_empty() {
+                            None
+                        } else {
+                            // Sort descending, pop from the back for the shortest range match
+                            matched_ranges.sort_by(|a, b| b.range.total_cmp(&a.range));
+
+                            Some(FilterResult {
+                                matched_ship: None,
+                                color: None,
+                                min_pilots: None,
+                                light_year_range: Some(
+                                    matched_ranges.pop().expect("non-empty matched vec"),
+                                ),
                             })
                         }
                     } else {
                         warn!(
-                            "Could not find target system {} for LY range check",
-                            system_range.system_id
+                            "Could not find killmail system {} for LY range check",
+                            killmail.solar_system_id
                         );
+                        None
                     }
                 }
-                if matched_ranges.is_empty() {
-                    None
-                } else {
-                    // Sort descending, pop from the back for the shortest range match
-                    matched_ranges.sort_by(|a, b| b.range.total_cmp(&a.range));
-
-                    Some(FilterResult {
-                        matched_ship: None,
-                        color: None,
-                        min_pilots: None,
-                        light_year_range: Some(
-                            matched_ranges.pop().expect("non-empty matched vec"),
-                        ),
-                    })
+                SimpleFilter::IsNpc(is_npc) => {
+                    if zk_data.zkb.npc == *is_npc {
+                        Some(Default::default())
+                    } else {
+                        None
+                    }
                 }
-            } else {
-                warn!(
-                    "Could not find killmail system {} for LY range check",
-                    killmail.solar_system_id
-                );
-                None
-            }
-        }
-        Filter::IsNpc(is_npc) => {
-            if zk_data.zkb.npc == *is_npc {
-                Some(Default::default())
-            } else {
-                None
-            }
-        }
-        Filter::IsSolo(is_solo) => {
-            if zk_data.zkb.solo == *is_solo {
-                Some(Default::default())
-            } else {
-                None
-            }
-        }
-        Filter::Pilots { min, max } => {
-            let num_pilots = (killmail.attackers.len() + 1) as u32;
-            if min.is_none_or(|m| num_pilots >= m) && max.is_none_or(|m| num_pilots <= m) {
-                Some(FilterResult {
-                    color: None,
-                    matched_ship: None,
-                    min_pilots: Some(min.unwrap_or(0)),
-                    light_year_range: None,
-                })
-            } else {
-                None
-            }
-        }
-        Filter::NameFragment(fragment) => {
-            let lower_fragment = fragment.to_lowercase();
-
-            // Check victim ship name
-            if let Some(name) =
-                crate::discord_bot::get_name(app_state, killmail.victim.ship_type_id as u64).await
-            {
-                if name.to_lowercase().contains(&lower_fragment) {
-                    return Some(NamedFilterResult {
-                        name: filter.name(),
-                        filter_result: FilterResult {
-                            color: Some(Color::Red),
+                SimpleFilter::IsSolo(is_solo) => {
+                    if zk_data.zkb.solo == *is_solo {
+                        Some(Default::default())
+                    } else {
+                        None
+                    }
+                }
+                SimpleFilter::Pilots { min, max } => {
+                    let num_pilots = (killmail.attackers.len() + 1) as u32;
+                    if min.is_none_or(|m| num_pilots >= m) && max.is_none_or(|m| num_pilots <= m) {
+                        Some(FilterResult {
+                            color: None,
                             matched_ship: None,
-                            min_pilots: None,
+                            min_pilots: Some(min.unwrap_or(0)),
                             light_year_range: None,
-                        },
-                    });
+                        })
+                    } else {
+                        None
+                    }
+                }
+                SimpleFilter::TimeRange { start, end } => {
+                    let res = if let Ok(killmail_time) =
+                        chrono::DateTime::parse_from_rfc3339(&killmail.killmail_time)
+                    {
+                        let killmail_hour = killmail_time.hour();
+                        if start <= end {
+                            // Simple range within the same day
+                            killmail_hour >= *start && killmail_hour <= *end
+                        } else {
+                            // Range extends across midnight (e.g., 22:00 to 04:00)
+                            killmail_hour >= *start || killmail_hour <= *end
+                        }
+                    } else {
+                        warn!("Failed to parse killmail_time: {}", killmail.killmail_time);
+                        false
+                    };
+                    if res {
+                        Some(Default::default())
+                    } else {
+                        None
+                    }
                 }
             }
+        }
+        Filter::Targeted(tf) => {
+            let mut result = FilterResult {
+                matched_ship: None,
+                color: None,
+                min_pilots: None,
+                light_year_range: None,
+            };
 
-            // Check attacker ship names
-            for attacker in &killmail.attackers {
-                if let Some(ship_id) = attacker.ship_type_id {
-                    if let Some(name) =
-                        crate::discord_bot::get_name(app_state, ship_id as u64).await
-                    {
-                        if name.to_lowercase().contains(&lower_fragment) {
-                            return Some(NamedFilterResult {
-                                name: filter.name(),
-                                filter_result: FilterResult {
-                                    color: Some(Color::Green),
-                                    matched_ship: None,
-                                    min_pilots: None,
-                                    light_year_range: None,
-                                },
-                            });
+            let victim_match = if tf.target.is_victim() {
+                match &tf.condition {
+                    TargetableCondition::Alliance(alliance_ids) => killmail
+                        .victim
+                        .alliance_id
+                        .is_some_and(|id| alliance_ids.contains(&id)),
+                    TargetableCondition::Corporation(corporation_ids) => killmail
+                        .victim
+                        .corporation_id
+                        .is_some_and(|id| corporation_ids.contains(&id)),
+                    TargetableCondition::Character(character_ids) => killmail
+                        .victim
+                        .character_id
+                        .is_some_and(|id| character_ids.contains(&id)),
+                    TargetableCondition::ShipType(ship_type_ids) => {
+                        if ship_type_ids.contains(&killmail.victim.ship_type_id) {
+                            let ship_name =
+                                get_name(app_state, killmail.victim.ship_type_id as u64)
+                                    .await
+                                    .unwrap_or_default();
+                            let matched_ship = MatchedShip {
+                                ship_name,
+                                type_id: killmail.victim.ship_type_id,
+                                corp_id: killmail.victim.corporation_id,
+                                alliance_id: killmail.victim.alliance_id,
+                            };
+                            result.matched_ship = Some(matched_ship);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    TargetableCondition::ShipGroup(ship_group_ids_as_type_ids) => {
+                        // It is implicit that these "ship group IDs" are actually ship type IDs, and thus
+                        // must be converted to the proper ship group IDs before use.
+                        let mut ship_group_ids = vec![];
+                        for type_id in ship_group_ids_as_type_ids {
+                            if let Some(group_id) = get_ship_group_id(app_state, *type_id).await {
+                                ship_group_ids.push(group_id);
+                            } else {
+                                warn!("Failed to get ship group ID for type ID {}", type_id);
+                            }
+                        }
+
+                        if let Some(victim_ship_group_id) =
+                            get_ship_group_id(app_state, killmail.victim.ship_type_id).await
+                        {
+                            if ship_group_ids.contains(&victim_ship_group_id) {
+                                let ship_name =
+                                    get_name(app_state, killmail.victim.ship_type_id as u64)
+                                        .await
+                                        .unwrap_or_default();
+                                let matched_ship = MatchedShip {
+                                    ship_name,
+                                    type_id: killmail.victim.ship_type_id,
+                                    corp_id: killmail.victim.corporation_id,
+                                    alliance_id: killmail.victim.alliance_id,
+                                };
+                                result.matched_ship = Some(matched_ship);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                    TargetableCondition::NameFragment(fragment) => {
+                        let lower_fragment = fragment.to_lowercase();
+                        if let Some(name) =
+                            get_name(app_state, killmail.victim.ship_type_id as u64).await
+                        {
+                            name.to_lowercase().contains(&lower_fragment)
+                        } else {
+                            false
                         }
                     }
                 }
-            }
-            None
-        }
-        Filter::TimeRange { start, end } => {
-            let res = if let Ok(killmail_time) =
-                chrono::DateTime::parse_from_rfc3339(&killmail.killmail_time)
-            {
-                let killmail_hour = killmail_time.hour();
-                if start <= end {
-                    // Simple range within the same day
-                    killmail_hour >= *start && killmail_hour <= *end
-                } else {
-                    // Range extends across midnight (e.g., 22:00 to 04:00)
-                    killmail_hour >= *start || killmail_hour <= *end
-                }
             } else {
-                warn!("Failed to parse killmail_time: {}", killmail.killmail_time);
                 false
             };
-            if res {
-                Some(Default::default())
+
+            let attacker_match = if tf.target.is_attacker() {
+                match &tf.condition {
+                    TargetableCondition::Alliance(alliance_ids) => killmail
+                        .attackers
+                        .iter()
+                        .any(|a| a.alliance_id.is_some_and(|id| alliance_ids.contains(&id))),
+                    TargetableCondition::Corporation(corporation_ids) => {
+                        killmail.attackers.iter().any(|a| {
+                            a.corporation_id
+                                .is_some_and(|id| corporation_ids.contains(&id))
+                        })
+                    }
+                    TargetableCondition::Character(character_ids) => killmail
+                        .attackers
+                        .iter()
+                        .any(|a| a.character_id.is_some_and(|id| character_ids.contains(&id))),
+                    TargetableCondition::ShipType(ship_type_ids) => {
+                        let mut matched = false;
+                        for attacker in &killmail.attackers {
+                            if let Some(ship_id) = attacker.ship_type_id {
+                                if ship_type_ids.contains(&ship_id) {
+                                    let ship_name = get_name(app_state, ship_id as u64)
+                                        .await
+                                        .unwrap_or_default();
+                                    let matched_ship = MatchedShip {
+                                        ship_name,
+                                        type_id: ship_id,
+                                        corp_id: attacker.corporation_id,
+                                        alliance_id: attacker.alliance_id,
+                                    };
+                                    result.matched_ship = Some(matched_ship);
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                        }
+                        matched
+                    }
+                    TargetableCondition::ShipGroup(ship_group_ids_as_type_ids) => {
+                        // It is implicit that these "ship group IDs" are actually ship type IDs, and thus
+                        // must be converted to the proper ship group IDs before use.
+                        let mut ship_group_ids = vec![];
+                        for type_id in ship_group_ids_as_type_ids {
+                            if let Some(group_id) = get_ship_group_id(app_state, *type_id).await {
+                                ship_group_ids.push(group_id);
+                            } else {
+                                warn!("Failed to get ship group ID for type ID {}", type_id);
+                            }
+                        }
+                        let mut matched = false;
+                        for attacker in &killmail.attackers {
+                            if let Some(attacker_ship_id) = attacker.ship_type_id {
+                                if let Some(attacker_ship_group_id) =
+                                    get_ship_group_id(app_state, attacker_ship_id).await
+                                {
+                                    if ship_group_ids.contains(&attacker_ship_group_id) {
+                                        let ship_name =
+                                            get_name(app_state, attacker_ship_id as u64)
+                                                .await
+                                                .unwrap_or_default();
+                                        let matched_ship = MatchedShip {
+                                            ship_name,
+                                            type_id: attacker_ship_id,
+                                            corp_id: attacker.corporation_id,
+                                            alliance_id: attacker.alliance_id,
+                                        };
+                                        result.matched_ship = Some(matched_ship);
+                                        matched = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        matched
+                    }
+                    TargetableCondition::NameFragment(fragment) => {
+                        let lower_fragment = fragment.to_lowercase();
+                        let mut matched = false;
+                        for attacker in &killmail.attackers {
+                            if let Some(ship_id) = attacker.ship_type_id {
+                                if let Some(name) = get_name(app_state, ship_id as u64).await {
+                                    if name.to_lowercase().contains(&lower_fragment) {
+                                        matched = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        matched
+                    }
+                }
+            } else {
+                false
+            };
+
+            let is_match = match tf.target {
+                Target::Any => victim_match || attacker_match,
+                Target::Attacker => attacker_match,
+                Target::Victim => victim_match,
+            };
+
+            if is_match {
+                result.color = if victim_match {
+                    Some(Color::Red)
+                } else {
+                    Some(Color::Green)
+                };
+                Some(result)
             } else {
                 None
             }
         }
     };
+
     filter_result.map(|filter_result| NamedFilterResult {
         name: filter.name(),
         filter_result,
@@ -555,7 +535,8 @@ async fn evaluate_filter(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::config::TargetedFilter;
+use super::*;
     use crate::config::{AppConfig, Filter, FilterNode, System, SystemRange};
     use crate::models::{Attacker, KillmailData, Position, Victim, ZkData, Zkb};
     use moka::future::Cache;
@@ -718,18 +699,22 @@ mod tests {
         let app_state = mock_app_state();
 
         let filter_node = FilterNode::And(vec![
-            FilterNode::Condition(Filter::TotalValue {
+            FilterNode::Condition(Filter::Simple(SimpleFilter::TotalValue {
                 min: Some(5000000),
                 max: None,
-            }),
-            FilterNode::Condition(Filter::Region(vec![10000030])),
+            })),
+            FilterNode::Condition(Filter::Simple(SimpleFilter::Region(vec![10000030]))),
             // A list of type IDs of which we want to match based on their group ID
-            FilterNode::Condition(Filter::ShipGroup(vec![
-                28352, 23919, 23757, 77283, 19722, 37604, 20183, 28850, 11567,
-            ])),
-            FilterNode::Condition(Filter::Security("0.0001..=0.4999".to_string())),
+            FilterNode::Condition(Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::ShipGroup(vec![
+                    28352, 23919, 23757, 77283, 19722, 37604, 20183, 28850, 11567,
+                ]),
+                target: Default::default(),
+            })),
+            FilterNode::Condition(Filter::Simple(SimpleFilter::Security(
+                "0.0001..=0.4999".to_string(),
+            ))),
         ]);
-
         // Let's check each condition:
         // 1. TotalValue: 5.2b > 5m. PASS.
         // 2. Region: Siseide (30002539) is in Heimatar (10000030). PASS.
@@ -782,37 +767,37 @@ mod tests {
     async fn test_total_value_filter() {
         let zk_data = default_zk_data();
         test_filter(
-            Filter::TotalValue {
+            Filter::Simple(SimpleFilter::TotalValue {
                 min: Some(5_000_000),
                 max: None,
-            },
+            }),
             &zk_data,
             true,
         )
         .await;
         test_filter(
-            Filter::TotalValue {
+            Filter::Simple(SimpleFilter::TotalValue {
                 min: Some(15_000_000),
                 max: None,
-            },
+            }),
             &zk_data,
             false,
         )
         .await;
         test_filter(
-            Filter::TotalValue {
+            Filter::Simple(SimpleFilter::TotalValue {
                 min: None,
                 max: Some(15_000_000),
-            },
+            }),
             &zk_data,
             true,
         )
         .await;
         test_filter(
-            Filter::TotalValue {
+            Filter::Simple(SimpleFilter::TotalValue {
                 min: None,
                 max: Some(5_000_000),
-            },
+            }),
             &zk_data,
             false,
         )
@@ -822,57 +807,183 @@ mod tests {
     #[tokio::test]
     async fn test_region_filter() {
         let zk_data = default_zk_data();
-        test_filter(Filter::Region(vec![10000002]), &zk_data, true).await; // The Forge
-        test_filter(Filter::Region(vec![10000043]), &zk_data, false).await; // Domain
+        test_filter(
+            Filter::Simple(SimpleFilter::Region(vec![10000002])),
+            &zk_data,
+            true,
+        )
+        .await; // The Forge
+        test_filter(
+            Filter::Simple(SimpleFilter::Region(vec![10000043])),
+            &zk_data,
+            false,
+        )
+        .await; // Domain
     }
 
     #[tokio::test]
     async fn test_system_filter() {
         let zk_data = default_zk_data();
-        test_filter(Filter::System(vec![30000142]), &zk_data, true).await; // Jita
-        test_filter(Filter::System(vec![31002222]), &zk_data, false).await; // Amarr
+        test_filter(
+            Filter::Simple(SimpleFilter::System(vec![30000142])),
+            &zk_data,
+            true,
+        )
+        .await; // Jita
+        test_filter(
+            Filter::Simple(SimpleFilter::System(vec![31002222])),
+            &zk_data,
+            false,
+        )
+        .await; // Amarr
     }
 
     #[tokio::test]
     async fn test_security_filter() {
         let zk_data = default_zk_data(); // Jita is 0.9
-        test_filter(Filter::Security("0.8..=1.0".to_string()), &zk_data, true).await;
-        test_filter(Filter::Security("0.1..=0.5".to_string()), &zk_data, false).await;
+        test_filter(
+            Filter::Simple(SimpleFilter::Security("0.8..=1.0".to_string())),
+            &zk_data,
+            true,
+        )
+        .await;
+        test_filter(
+            Filter::Simple(SimpleFilter::Security("0.1..=0.5".to_string())),
+            &zk_data,
+            false,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn test_alliance_filter() {
         let zk_data = default_zk_data();
-        test_filter(Filter::Alliance(vec![1001]), &zk_data, true).await; // Victim's alliance
-        test_filter(Filter::Alliance(vec![1002]), &zk_data, true).await; // Attacker's alliance
-        test_filter(Filter::Alliance(vec![9999]), &zk_data, false).await;
+        test_filter(
+            Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::Alliance(vec![1001]),
+            }),
+            &zk_data,
+            true,
+        )
+        .await; // Victim's alliance
+        test_filter(
+            Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::Alliance(vec![1002]),
+            }),
+            &zk_data,
+            true,
+        )
+        .await; // Attacker's alliance
+        test_filter(
+            Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::Alliance(vec![9999]),
+            }),
+            &zk_data,
+            false,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn test_corporation_filter() {
         let zk_data = default_zk_data();
-        test_filter(Filter::Corporation(vec![101]), &zk_data, true).await; // Victim's corp
-        test_filter(Filter::Corporation(vec![102]), &zk_data, true).await; // Attacker's corp
-        test_filter(Filter::Corporation(vec![9999]), &zk_data, false).await;
+        test_filter(
+            Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::Corporation(vec![101]),
+            }),
+            &zk_data,
+            true,
+        )
+        .await; // Victim's corp
+        test_filter(
+            Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::Corporation(vec![102]),
+            }),
+            &zk_data,
+            true,
+        )
+        .await; // Attacker's corp
+        test_filter(
+            Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::Corporation(vec![9999]),
+            }),
+            &zk_data,
+            false,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn test_ship_type_filter() {
         let zk_data = default_zk_data();
-        test_filter(Filter::ShipType(vec![587]), &zk_data, true).await; // Victim's ship (Rifter)
-        test_filter(Filter::ShipType(vec![671]), &zk_data, true).await; // Attacker's ship (Catalyst)
-        test_filter(Filter::ShipType(vec![17738]), &zk_data, false).await; // Golem
+        test_filter(
+            Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::ShipType(vec![587]),
+            }),
+            &zk_data,
+            true,
+        )
+        .await; // Victim's ship (Rifter)
+        test_filter(
+            Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::ShipType(vec![671]),
+            }),
+            &zk_data,
+            true,
+        )
+        .await; // Attacker's ship (Catalyst)
+        test_filter(
+            Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::ShipType(vec![17738]),
+            }),
+            &zk_data,
+            false,
+        )
+        .await; // Golem
     }
 
     #[tokio::test]
     async fn test_ship_group_filter() {
         let zk_data = default_zk_data();
         // Victim is a Rifter (Frigate, group 25)
-        test_filter(Filter::ShipGroup(vec![25]), &zk_data, true).await;
+        test_filter(
+            Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::ShipGroup(vec![587]),
+            }),
+            &zk_data,
+            true,
+        )
+        .await;
         // Attacker is a Catalyst (Destroyer, group 27)
-        test_filter(Filter::ShipGroup(vec![27]), &zk_data, true).await;
+        test_filter(
+            Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::ShipGroup(vec![671]),
+            }),
+            &zk_data,
+            true,
+        )
+        .await;
         // Neither is a Marauder (group 419)
-        test_filter(Filter::ShipGroup(vec![419]), &zk_data, false).await;
+        test_filter(
+            Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::ShipGroup(vec![28661]),
+            }),
+            &zk_data,
+            false,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -883,7 +994,7 @@ mod tests {
                 killmail: KillmailData {
                     killmail_id: 1,
                     killmail_time: "2025-07-08T12:00:00Z".to_string(),
-                    solar_system_id: 31002057, // Turnur
+                    solar_system_id: 30002086, // Turnur
                     victim: Victim {
                         damage_taken: 1000,
                         ship_type_id: 587, // Rifter
@@ -927,7 +1038,7 @@ mod tests {
         };
         zk_data.zkb.npc = true;
         test_filter(
-            Filter::LyRangeFrom(vec![
+            Filter::Simple(SimpleFilter::LyRangeFrom(vec![
                 SystemRange {
                     system_id: 30002086,
                     range: 8.0,
@@ -936,7 +1047,7 @@ mod tests {
                     system_id: 30003067,
                     range: 8.0,
                 },
-            ]),
+            ])),
             &zk_data,
             true,
         )
@@ -947,45 +1058,45 @@ mod tests {
     async fn test_is_npc_filter() {
         let mut zk_data = default_zk_data();
         zk_data.zkb.npc = true;
-        test_filter(Filter::IsNpc(true), &zk_data, true).await;
-        test_filter(Filter::IsNpc(false), &zk_data, false).await;
+        test_filter(Filter::Simple(SimpleFilter::IsNpc(true)), &zk_data, true).await;
+        test_filter(Filter::Simple(SimpleFilter::IsNpc(false)), &zk_data, false).await;
     }
 
     #[tokio::test]
     async fn test_pilots_filter() {
         let zk_data = default_zk_data(); // 2 pilots total
         test_filter(
-            Filter::Pilots {
+            Filter::Simple(SimpleFilter::Pilots {
                 min: Some(2),
                 max: None,
-            },
+            }),
             &zk_data,
             true,
         )
         .await;
         test_filter(
-            Filter::Pilots {
+            Filter::Simple(SimpleFilter::Pilots {
                 min: Some(3),
                 max: None,
-            },
+            }),
             &zk_data,
             false,
         )
         .await;
         test_filter(
-            Filter::Pilots {
+            Filter::Simple(SimpleFilter::Pilots {
                 min: None,
                 max: Some(2),
-            },
+            }),
             &zk_data,
             true,
         )
         .await;
         test_filter(
-            Filter::Pilots {
+            Filter::Simple(SimpleFilter::Pilots {
                 min: None,
                 max: Some(1),
-            },
+            }),
             &zk_data,
             false,
         )
@@ -995,14 +1106,29 @@ mod tests {
     #[tokio::test]
     async fn test_time_range_filter() {
         let zk_data = default_zk_data(); // Time is 12:00:00
-        test_filter(Filter::TimeRange { start: 11, end: 13 }, &zk_data, true).await;
-        test_filter(Filter::TimeRange { start: 14, end: 16 }, &zk_data, false).await;
+        test_filter(
+            Filter::Simple(SimpleFilter::TimeRange { start: 11, end: 13 }),
+            &zk_data,
+            true,
+        )
+        .await;
+        test_filter(
+            Filter::Simple(SimpleFilter::TimeRange { start: 14, end: 16 }),
+            &zk_data,
+            false,
+        )
+        .await;
         // Test overnight range
-        test_filter(Filter::TimeRange { start: 22, end: 4 }, &zk_data, false).await;
+        test_filter(
+            Filter::Simple(SimpleFilter::TimeRange { start: 22, end: 4 }),
+            &zk_data,
+            false,
+        )
+        .await;
         let mut zk_data_night = default_zk_data();
         zk_data_night.killmail.killmail_time = "2025-07-08T23:00:00Z".to_string();
         test_filter(
-            Filter::TimeRange { start: 22, end: 4 },
+            Filter::Simple(SimpleFilter::TimeRange { start: 22, end: 4 }),
             &zk_data_night,
             true,
         )
@@ -1017,8 +1143,11 @@ mod tests {
         let app_state = mock_app_state();
 
         let filter_node = FilterNode::And(vec![
-            FilterNode::Condition(Filter::Region(vec![10000002])), // The Forge
-            FilterNode::Condition(Filter::ShipGroup(vec![25])),    // Frigate
+            FilterNode::Condition(Filter::Simple(SimpleFilter::Region(vec![10000002]))), // The Forge
+            FilterNode::Condition(Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::ShipGroup(vec![587]), // group 25 for frigate
+            })), // Frigate
         ]);
 
         let result = evaluate_filter_node(&filter_node, &zk_data, &app_state).await;
@@ -1036,8 +1165,11 @@ mod tests {
         let app_state = mock_app_state();
 
         let filter_node = FilterNode::And(vec![
-            FilterNode::Condition(Filter::Region(vec![10000043])), // Domain (Wrong)
-            FilterNode::Condition(Filter::ShipGroup(vec![25])),    // Frigate (Correct)
+            FilterNode::Condition(Filter::Simple(SimpleFilter::Region(vec![10000043]))), // Domain (Wrong)
+            FilterNode::Condition(Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::ShipGroup(vec![25]),
+            })), // Frigate (Correct)
         ]);
 
         let result = evaluate_filter_node(&filter_node, &zk_data, &app_state).await;
@@ -1055,8 +1187,11 @@ mod tests {
         let app_state = mock_app_state();
 
         let filter_node = FilterNode::And(vec![
-            FilterNode::Condition(Filter::Region(vec![10000002])), // The Forge (Correct)
-            FilterNode::Condition(Filter::ShipGroup(vec![419])),   // Marauder (Wrong)
+            FilterNode::Condition(Filter::Simple(SimpleFilter::Region(vec![10000002]))), // The Forge (Correct)
+            FilterNode::Condition(Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::ShipGroup(vec![419]),
+            })), // Marauder (Wrong)
         ]);
 
         let result = evaluate_filter_node(&filter_node, &zk_data, &app_state).await;
@@ -1074,8 +1209,11 @@ mod tests {
         let app_state = mock_app_state();
 
         let filter_node = FilterNode::Or(vec![
-            FilterNode::Condition(Filter::Region(vec![10000043])), // Domain (Wrong)
-            FilterNode::Condition(Filter::ShipGroup(vec![25])),    // Frigate (Correct)
+            FilterNode::Condition(Filter::Simple(SimpleFilter::Region(vec![10000043]))), // Domain (Wrong)
+            FilterNode::Condition(Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::ShipGroup(vec![587]), // group 25 for frigate
+            })), // Frigate (Correct)
         ]);
 
         let result = evaluate_filter_node(&filter_node, &zk_data, &app_state).await;
@@ -1091,7 +1229,8 @@ mod tests {
         let app_state = mock_app_state();
 
         // This filter should pass on its own
-        let inner_filter = FilterNode::Condition(Filter::System(vec![30000142]));
+        let inner_filter =
+            FilterNode::Condition(Filter::Simple(SimpleFilter::System(vec![30000142])));
         // So the NOT filter should fail
         let not_filter = FilterNode::Not(Box::new(inner_filter));
 
@@ -1102,7 +1241,8 @@ mod tests {
         );
 
         // This filter should fail on its own
-        let inner_filter_fail = FilterNode::Condition(Filter::System(vec![999]));
+        let inner_filter_fail =
+            FilterNode::Condition(Filter::Simple(SimpleFilter::System(vec![999])));
         // So the NOT filter should pass
         let not_filter_pass = FilterNode::Not(Box::new(inner_filter_fail));
 

@@ -4,6 +4,7 @@ use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use serenity::model::id::GuildId;
 use std::collections::HashMap;
+use std::fmt::Formatter;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -38,108 +39,285 @@ pub struct SystemRange {
     pub range: f64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Default)]
+pub enum Target {
+    #[default]
+    Any,
+    Attacker,
+    Victim,
+}
+
+impl Target {
+    pub fn is_attacker(&self) -> bool {
+        matches!(self, Target::Attacker | Target::Any)
+    }
+
+    pub fn is_victim(&self) -> bool {
+        matches!(self, Target::Attacker | Target::Any)
+    }
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Target::Any => "Any",
+            Target::Attacker => "Attacker",
+            Target::Victim => "Victim",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ShipGroupFilter {
+    pub ids: Vec<u32>,
+    #[serde(default)]
+    pub target: Target,
+}
+
+impl ShipGroupFilter {
+    pub fn from_ids(ids: Vec<u32>) -> Self {
+        ShipGroupFilter {
+            ids,
+            target: Default::default(),
+        }
+    }
+}
+
+// Filter conditions that can be targeted to either a victim or attacker
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase")]
-pub enum Filter {
-    TotalValue { min: Option<u64>, max: Option<u64> },
-    DroppedValue { min: Option<u64>, max: Option<u64> },
-    Region(Vec<u32>),
-    System(Vec<u32>),
-    Security(String),
+pub enum TargetableCondition {
     Alliance(Vec<u64>),
     Corporation(Vec<u64>),
     Character(Vec<u64>),
     ShipType(Vec<u32>),
     ShipGroup(Vec<u32>),
+    NameFragment(String),
+}
+
+// Combines a targetable condition with a target
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct TargetedFilter {
+    pub condition: TargetableCondition,
+    #[serde(default)]
+    pub target: Target,
+}
+
+impl TargetedFilter {
+    pub fn name(&self) -> String {
+        match &self.condition {
+            TargetableCondition::Alliance(ids) => {
+                format!(
+                    "Alliance(ids: [{}], target: {})",
+                    ids.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    self.target
+                )
+            }
+            TargetableCondition::Corporation(ids) => {
+                format!(
+                    "Corporation(ids: [{}], target: {})",
+                    ids.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    self.target
+                )
+            }
+            TargetableCondition::Character(ids) => {
+                format!(
+                    "Character(ids: [{}], target: {})",
+                    ids.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    self.target
+                )
+            }
+            TargetableCondition::ShipType(ids) => {
+                format!(
+                    "ShipType(ids: [{}], target: {})",
+                    ids.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    self.target
+                )
+            }
+            TargetableCondition::ShipGroup(ids) => {
+                format!(
+                    "ShipGroup(ids: [{}], target: {})",
+                    ids.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    self.target
+                )
+            }
+            TargetableCondition::NameFragment(s) => {
+                format!("NameFragment(fragment: \"{}\", target: {})", s, self.target)
+            }
+        }
+    }
+}
+
+// Simple, non-targeted conditions
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "PascalCase")]
+pub enum SimpleFilter {
+    TotalValue { min: Option<u64>, max: Option<u64> },
+    DroppedValue { min: Option<u64>, max: Option<u64> },
+    Region(Vec<u32>),
+    System(Vec<u32>),
+    Security(String),
     LyRangeFrom(Vec<SystemRange>),
     IsNpc(bool),
     IsSolo(bool),
     Pilots { min: Option<u32>, max: Option<u32> },
-    NameFragment(String),
     TimeRange { start: u32, end: u32 },
 }
 
-impl Filter {
-    /// Creates a human-readable name for the filter and its configuration.
+impl SimpleFilter {
     pub fn name(&self) -> String {
-        match self {
-            Filter::TotalValue { min, max } => format!(
+        match &self {
+            SimpleFilter::TotalValue { min, max } => format!(
                 "TotalValue(min: {}, max: {})",
                 min.map_or("any".to_string(), |v| v.to_string()),
                 max.map_or("any".to_string(), |v| v.to_string())
             ),
-            Filter::DroppedValue { min, max } => format!(
+            SimpleFilter::DroppedValue { min, max } => format!(
                 "DroppedValue(min: {}, max: {})",
                 min.map_or("any".to_string(), |v| v.to_string()),
                 max.map_or("any".to_string(), |v| v.to_string())
             ),
-            Filter::Region(ids) => format!(
+            SimpleFilter::Region(ids) => format!(
                 "Region({})",
                 ids.iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Filter::System(ids) => format!(
+            SimpleFilter::System(ids) => format!(
                 "System({})",
                 ids.iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Filter::Security(range) => format!("Security({})", range),
-            Filter::Alliance(ids) => format!(
-                "Alliance({})",
-                ids.iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Filter::Corporation(ids) => format!(
-                "Corporation({})",
-                ids.iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Filter::Character(ids) => format!(
-                "Character({})",
-                ids.iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Filter::ShipType(ids) => format!(
-                "ShipType({})",
-                ids.iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Filter::ShipGroup(ids) => format!(
-                "ShipGroup({})",
-                ids.iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Filter::LyRangeFrom(system_ranges) => {
+            SimpleFilter::Security(range) => format!("Security({})", range),
+            SimpleFilter::LyRangeFrom(system_ranges) => {
                 let parts: Vec<String> = system_ranges
                     .iter()
                     .map(|sr| format!("{}:{}ly", sr.system_id, sr.range))
                     .collect();
                 format!("LyRangeFrom({})", parts.join(", "))
             }
-            Filter::IsNpc(b) => format!("IsNpc({})", b),
-            Filter::IsSolo(b) => format!("IsSolo({})", b),
-            Filter::Pilots { min, max } => format!(
+            SimpleFilter::IsNpc(b) => format!("IsNpc({})", b),
+            SimpleFilter::IsSolo(b) => format!("IsSolo({})", b),
+            SimpleFilter::Pilots { min, max } => format!(
                 "Pilots(min: {}, max: {})",
                 min.map_or("any".to_string(), |v| v.to_string()),
                 max.map_or("any".to_string(), |v| v.to_string())
             ),
-            Filter::NameFragment(s) => format!("NameFragment(\"{}\")", s),
-            Filter::TimeRange { start, end } => format!("TimeRange({}:00-{}:00)", start, end),
+            SimpleFilter::TimeRange { start, end } => format!("TimeRange({}:00-{}:00)", start, end),
         }
+    }
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub enum Filter {
+    Simple(SimpleFilter),
+    Targeted(TargetedFilter),
+}
+
+impl Filter {
+    /// Creates a human-readable name for the filter and its configuration.
+    pub fn name(&self) -> String {
+        match self {
+            Filter::Simple(sf) => sf.name(),
+            Filter::Targeted(tf) => tf.name(),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Filter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Define the old structure internally for deserialization
+        #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+        #[serde(rename_all = "PascalCase")]
+        pub enum OldFilter {
+            TotalValue { min: Option<u64>, max: Option<u64> },
+            DroppedValue { min: Option<u64>, max: Option<u64> },
+            Region(Vec<u32>),
+            System(Vec<u32>),
+            Security(String),
+            Alliance(Vec<u64>),
+            Corporation(Vec<u64>),
+            Character(Vec<u64>),
+            ShipType(Vec<u32>),
+            ShipGroup(Vec<u32>),
+            LyRangeFrom(Vec<SystemRange>),
+            IsNpc(bool),
+            IsSolo(bool),
+            Pilots { min: Option<u32>, max: Option<u32> },
+            NameFragment(String),
+            TimeRange { start: u32, end: u32 },
+        }
+
+        // Deserialize into the old format first
+        let old_filter = OldFilter::deserialize(deserializer)?;
+
+        // Now, map the old format to the new, structured format
+        Ok(match old_filter {
+            OldFilter::TotalValue { min, max } => {
+                Filter::Simple(SimpleFilter::TotalValue { min, max })
+            }
+            OldFilter::DroppedValue { min, max } => {
+                Filter::Simple(SimpleFilter::DroppedValue { min, max })
+            }
+            OldFilter::Region(ids) => Filter::Simple(SimpleFilter::Region(ids)),
+            OldFilter::System(ids) => Filter::Simple(SimpleFilter::System(ids)),
+            OldFilter::Security(s) => Filter::Simple(SimpleFilter::Security(s)),
+            OldFilter::LyRangeFrom(r) => Filter::Simple(SimpleFilter::LyRangeFrom(r)),
+            OldFilter::IsNpc(b) => Filter::Simple(SimpleFilter::IsNpc(b)),
+            OldFilter::IsSolo(b) => Filter::Simple(SimpleFilter::IsSolo(b)),
+            OldFilter::Pilots { min, max } => Filter::Simple(SimpleFilter::Pilots { min, max }),
+            OldFilter::TimeRange { start, end } => {
+                Filter::Simple(SimpleFilter::TimeRange { start, end })
+            }
+
+            // Map targetable filters to the new structure with a default target
+            OldFilter::Alliance(ids) => Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::Alliance(ids),
+                target: Target::Any,
+            }),
+            OldFilter::Corporation(ids) => Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::Corporation(ids),
+                target: Target::Any,
+            }),
+            OldFilter::Character(ids) => Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::Character(ids),
+                target: Target::Any,
+            }),
+            OldFilter::ShipType(ids) => Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::ShipType(ids),
+                target: Target::Any,
+            }),
+            OldFilter::ShipGroup(ids) => Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::ShipGroup(ids),
+                target: Target::Any,
+            }),
+            OldFilter::NameFragment(s) => Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::NameFragment(s),
+                target: Target::Any,
+            }),
+        })
     }
 }
 
@@ -201,11 +379,21 @@ impl PingType {
 
     pub fn name(&self) -> String {
         match self {
-            PingType::Here { max_ping_delay_minutes } => {
-                format!("Here (max delay: {} min)", max_ping_delay_minutes.unwrap_or(0))
+            PingType::Here {
+                max_ping_delay_minutes,
+            } => {
+                format!(
+                    "Here (max delay: {} min)",
+                    max_ping_delay_minutes.unwrap_or(0)
+                )
             }
-            PingType::Everyone { max_ping_delay_minutes } => {
-                format!("Everyone (max delay: {} min)", max_ping_delay_minutes.unwrap_or(0))
+            PingType::Everyone {
+                max_ping_delay_minutes,
+            } => {
+                format!(
+                    "Everyone (max delay: {} min)",
+                    max_ping_delay_minutes.unwrap_or(0)
+                )
             }
         }
     }
@@ -403,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_load_subscription_file() {
-        let path = Path::new("../config/888224317991706685.new.json");
+        let path = Path::new("config/888224317991706685.new.json");
         assert!(
             path.exists(),
             "Subscription file does not exist at {:?}",
@@ -421,11 +609,12 @@ mod tests {
         let subscriptions = result.unwrap();
         assert_eq!(
             subscriptions.len(),
-            202,
+            201,
             "Incorrect number of subscriptions loaded"
         );
         assert_eq!(subscriptions[0].id, "1");
         assert_eq!(subscriptions[0].action.channel_id, "1090110979083354183");
+        println!("{:#?}", subscriptions);
     }
 
     #[test]
@@ -440,21 +629,28 @@ mod tests {
                 }),
             },
             root_filter: FilterNode::And(vec![
-                FilterNode::Condition(Filter::TotalValue {
+                FilterNode::Condition(Filter::Simple(SimpleFilter::TotalValue {
                     min: Some(1_000_000_000),
                     max: None,
-                }),
+                })),
                 FilterNode::Or(vec![
                     FilterNode::And(vec![
-                        FilterNode::Condition(Filter::Region(vec![10000042])), // The Forge
-                        FilterNode::Condition(Filter::ShipGroup(vec![30, 883])), // Capitals, Supercarriers
+                        FilterNode::Condition(Filter::Simple(SimpleFilter::Region(vec![10000042]))), // The Forge
+                        FilterNode::Condition(Filter::Targeted(TargetedFilter {
+                            condition: TargetableCondition::ShipGroup(vec![30, 883]),
+                            target: Default::default(),
+                        })), // Capitals, Supercarriers
                     ]),
-                    FilterNode::Condition(Filter::LyRangeFrom(vec![SystemRange {
-                        system_id: 30000142,
-                        range: 10.0,
-                    }])),
+                    FilterNode::Condition(Filter::Simple(SimpleFilter::LyRangeFrom(vec![
+                        SystemRange {
+                            system_id: 30000142,
+                            range: 10.0,
+                        },
+                    ]))),
                 ]),
-                FilterNode::Not(Box::new(FilterNode::Condition(Filter::IsNpc(true)))),
+                FilterNode::Not(Box::new(FilterNode::Condition(Filter::Simple(
+                    SimpleFilter::IsNpc(true),
+                )))),
             ]),
         };
 
@@ -466,9 +662,13 @@ mod tests {
         assert!(parsed_value["filter"]["And"].is_array());
         let and_conditions = parsed_value["filter"]["And"].as_array().unwrap();
         assert_eq!(and_conditions.len(), 3);
-        assert!(and_conditions[0]["Condition"]["TotalValue"]["min"].is_number());
+        assert!(
+            and_conditions[0]["Condition"]["Simple"]["TotalValue"]["min"].is_number(),
+            "{}",
+            and_conditions[0]["Condition"]["Simple"]["TotalValue"]["min"]
+        );
         assert!(and_conditions[1]["Or"].is_array());
-        assert!(and_conditions[2]["Not"]["Condition"]["IsNpc"].is_boolean());
+        assert!(and_conditions[2]["Not"]["Condition"]["Simple"]["IsNpc"].is_boolean());
     }
 
     #[test]

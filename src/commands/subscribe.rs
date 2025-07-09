@@ -1,7 +1,7 @@
 use crate::commands::{get_option_value, Command};
 use crate::config::{
-    save_subscriptions_for_guild, Action, AppState, Filter, FilterNode, PingType, Subscription,
-    SystemRange,
+    save_subscriptions_for_guild, Action, AppState, Filter, FilterNode, PingType, 
+    SimpleFilter, Subscription, SystemRange, Target, TargetableCondition, TargetedFilter,
 };
 use serenity::async_trait;
 use serenity::builder::CreateApplicationCommand;
@@ -116,6 +116,14 @@ impl Command for SubscribeCommand {
                     .kind(CommandOptionType::String)
             })
             .create_option(|option| {
+                 option
+                     .name("target")
+                     .description("Apply filters like ships/alliances to: any, attacker, or victim.")
+                     .kind(CommandOptionType::String)
+                     .add_string_choice("Any", "any")
+                     .add_string_choice("Attacker", "attacker")
+                     .add_string_choice("Victim", "victim")
+             })            .create_option(|option| {
                 option
                     .name("is_npc")
                     .description("Filter for NPC kills (true/false).")
@@ -230,39 +238,62 @@ impl Command for SubscribeCommand {
             }
         });
         if min_value.is_some() || max_value.is_some() {
-            filters.push(Filter::TotalValue {
+            filters.push(Filter::Simple(SimpleFilter::TotalValue {
                 min: min_value,
                 max: max_value,
-            });
+            }));
         }
+
+        let target = match get_option_value(options, "target") {
+            Some(CommandDataOptionValue::String(s)) => match s.as_str() {
+                "attacker" => Target::Attacker,
+                "victim" => Target::Victim,
+                _ => Target::Any,
+            },
+            _ => Target::Any,
+        };
 
         if let Some(ids) = parse_ids::<u32>(options, "region_ids") {
-            filters.push(Filter::Region(ids));
+            filters.push(Filter::Simple(SimpleFilter::Region(ids)));
         }
         if let Some(ids) = parse_ids::<u32>(options, "system_ids") {
-            filters.push(Filter::System(ids));
+            filters.push(Filter::Simple(SimpleFilter::System(ids)));
         }
         if let Some(ids) = parse_ids::<u64>(options, "alliance_ids") {
-            filters.push(Filter::Alliance(ids));
+            filters.push(Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::Alliance(ids),
+                target,
+            }));
         }
         if let Some(ids) = parse_ids::<u64>(options, "corp_ids") {
-            filters.push(Filter::Corporation(ids));
+            filters.push(Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::Corporation(ids),
+                target,
+            }));
         }
         if let Some(ids) = parse_ids::<u64>(options, "char_ids") {
-            filters.push(Filter::Character(ids));
+            filters.push(Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::Character(ids),
+                target,
+            }));
         }
         if let Some(ids) = parse_ids::<u32>(options, "ship_type_ids") {
-            filters.push(Filter::ShipType(ids));
+            filters.push(Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::ShipType(ids),
+                target,
+            }));
         }
         if let Some(ids) = parse_ids::<u32>(options, "ship_group_ids") {
-            filters.push(Filter::ShipGroup(ids));
+            filters.push(Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::ShipGroup(ids),
+                target,
+            }));
         }
-
         if let Some(CommandDataOptionValue::Boolean(b)) = get_option_value(options, "is_npc") {
-            filters.push(Filter::IsNpc(*b));
+            filters.push(Filter::Simple(SimpleFilter::IsNpc(*b)));
         }
         if let Some(CommandDataOptionValue::Boolean(b)) = get_option_value(options, "is_solo") {
-            filters.push(Filter::IsSolo(*b));
+            filters.push(Filter::Simple(SimpleFilter::IsSolo(*b)));
         }
 
         if let Some(CommandDataOptionValue::String(json_str)) =
@@ -271,7 +302,7 @@ impl Command for SubscribeCommand {
             match serde_json::from_str::<Vec<SystemRange>>(json_str) {
                 Ok(system_ranges) => {
                     if !system_ranges.is_empty() {
-                        filters.push(Filter::LyRangeFrom(system_ranges));
+                        filters.push(Filter::Simple(SimpleFilter::LyRangeFrom(system_ranges)));
                     }
                 }
                 Err(e) => {
@@ -311,15 +342,18 @@ impl Command for SubscribeCommand {
             }
         });
         if min_pilots.is_some() || max_pilots.is_some() {
-            filters.push(Filter::Pilots {
+            filters.push(Filter::Simple(SimpleFilter::Pilots {
                 min: min_pilots,
                 max: max_pilots,
-            });
+            }));
         }
 
         if let Some(CommandDataOptionValue::String(s)) = get_option_value(options, "name_fragment")
         {
-            filters.push(Filter::NameFragment(s.clone()));
+            filters.push(Filter::Targeted(TargetedFilter {
+                target: Target::Any,
+                condition: TargetableCondition::NameFragment(s.clone()),
+            }));
         }
 
         let time_range_start = get_option_value(options, "time_range_start").and_then(|v| {
@@ -337,11 +371,11 @@ impl Command for SubscribeCommand {
             }
         });
         if let (Some(start), Some(end)) = (time_range_start, time_range_end) {
-            filters.push(Filter::TimeRange { start, end });
+            filters.push(Filter::Simple(SimpleFilter::TimeRange { start, end }));
         }
 
         if let Some(CommandDataOptionValue::String(s)) = get_option_value(options, "security") {
-            filters.push(Filter::Security(s.clone()));
+            filters.push(Filter::Simple(SimpleFilter::Security(s.clone())));
         }
 
         let max_ping_delay_minutes =
