@@ -702,7 +702,7 @@ async fn build_killmail_embed(
     // console.log('attackerparams.dataDone');
 
     let affiliation = format!(
-        "{}Victim: {}\nin: [{}]({}) ([{}]({}))\n{}",
+        "{}victim: {}\nin: [{}]({}) ([{}]({}))\n{}",
         attacker_alliances,
         victim_details,
         system_name,
