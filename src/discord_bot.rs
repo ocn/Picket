@@ -147,9 +147,10 @@ impl EventHandler for Handler {
                                         let _lock = app_state.subscriptions_file_lock.lock().await;
                                         let mut subs_map = app_state.subscriptions.write().unwrap();
                                         if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
+                                            let original_channel_id = sso_state.original_interaction.channel_id.to_string();
                                             if let Some(sub) = guild_subs
                                                 .iter_mut()
-                                                .find(|s| s.id == sso_state.subscription_id)
+                                                .find(|s| s.id == sso_state.subscription_id && s.action.channel_id == original_channel_id)
                                             {
                                                 let new_filter =
                                                     FilterNode::Condition(Filter::Simple(
@@ -348,9 +349,10 @@ impl EventHandler for Handler {
                                 let _lock = app_state.subscriptions_file_lock.lock().await;
                                 let mut subs_map = app_state.subscriptions.write().unwrap();
                                 if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
+                                    let original_channel_id = sso_state.original_interaction.channel_id.to_string();
                                     if let Some(sub) = guild_subs
                                         .iter_mut()
-                                        .find(|s| s.id == sso_state.subscription_id)
+                                        .find(|s| s.id == sso_state.subscription_id && s.action.channel_id == original_channel_id)
                                     {
                                         let new_filter = FilterNode::Condition(Filter::Simple(
                                             SimpleFilter::IgnoreHighStanding {
