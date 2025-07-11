@@ -1,5 +1,9 @@
 use crate::commands::sync_standings::SyncStandingsCommand;
-use crate::config::{save_names, save_ships, save_systems, save_user_standings, AppState, Filter, FilterNode, PingType, SimpleFilter, StandingSource, Subscription, System};
+use crate::commands::Command;
+use crate::config::{
+    save_names, save_ships, save_systems, save_user_standings, AppState, Filter, FilterNode,
+    PingType, SimpleFilter, StandingSource, Subscription, System,
+};
 use crate::esi::Celestial;
 use crate::models::{Attacker, ZkData};
 use crate::processor::{Color, NamedFilterResult};
@@ -20,7 +24,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{error, info, trace, warn};
-use crate::commands::Command;
 
 #[derive(Debug)]
 pub enum KillmailSendError {
@@ -105,49 +108,100 @@ impl EventHandler for Handler {
                     let state = custom_id.strip_prefix("standings_select_").unwrap();
                     let sso_state = app_state.sso_states.lock().await.remove(state);
 
-                    if let (Some(sso_state), Some(values)) = (sso_state, Some(&component_interaction.data.values)) {
+                    if let (Some(sso_state), Some(values)) =
+                        (sso_state, Some(&component_interaction.data.values))
+                    {
                         if let Some(character_id_str) = values.get(0) {
                             let character_id = character_id_str.parse::<u64>().unwrap();
-                            
+
                             let token_clone = {
                                 let standings_map = app_state.user_standings.read().unwrap();
-                                if let Some(user_standings) = standings_map.get(&sso_state.discord_user_id) {
-                                    user_standings.tokens.iter().find(|t| t.character_id == character_id).cloned()
+                                if let Some(user_standings) =
+                                    standings_map.get(&sso_state.discord_user_id)
+                                {
+                                    user_standings
+                                        .tokens
+                                        .iter()
+                                        .find(|t| t.character_id == character_id)
+                                        .cloned()
                                 } else {
                                     None
                                 }
                             };
 
                             if let Some(token) = token_clone {
-                                let (corp_id, alliance_id) = app_state.esi_client.get_character_affiliation(token.character_id).await.unwrap();
-                                let source_entity_id = match sso_state.standing_source {
-                                    StandingSource::Character => token.character_id,
-                                    StandingSource::Corporation => corp_id,
-                                    StandingSource::Alliance => alliance_id.unwrap_or(corp_id),
-                                };
-
-                                let guild_id = sso_state.original_interaction.guild_id.unwrap();
+                                if let Ok((corp_id, alliance_id)) = app_state
+                                    .esi_client
+                                    .get_character_affiliation(token.character_id)
+                                    .await
                                 {
-                                    let mut subs_map = app_state.subscriptions.write().unwrap();
-                                    if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
-                                        if let Some(sub) = guild_subs.iter_mut().find(|s| s.id == sso_state.subscription_id) {
-                                            let new_filter = FilterNode::Condition(Filter::Simple(SimpleFilter::IgnoreHighStanding {
-                                                synched_by_user_id: sso_state.discord_user_id.0,
-                                                source: sso_state.standing_source,
-                                                source_entity_id,
-                                            }));
-                                            if let FilterNode::And(ref mut conditions) = sub.root_filter {
-                                                conditions.push(new_filter);
-                                            } else {
-                                                sub.root_filter = FilterNode::And(vec![sub.root_filter.clone(), new_filter]);
+                                    let source_entity_id = match sso_state.standing_source {
+                                        StandingSource::Character => token.character_id,
+                                        StandingSource::Corporation => corp_id,
+                                        StandingSource::Alliance => alliance_id.unwrap_or(corp_id),
+                                    };
+
+                                    let guild_id = sso_state.original_interaction.guild_id.unwrap();
+                                    let mut subscription_updated = false;
+                                    {
+                                        let _lock = app_state.subscriptions_file_lock.lock().await;
+                                        let mut subs_map = app_state.subscriptions.write().unwrap();
+                                        if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
+                                            if let Some(sub) = guild_subs
+                                                .iter_mut()
+                                                .find(|s| s.id == sso_state.subscription_id)
+                                            {
+                                                let new_filter =
+                                                    FilterNode::Condition(Filter::Simple(
+                                                        SimpleFilter::IgnoreHighStanding {
+                                                            synched_by_user_id: sso_state
+                                                                .discord_user_id
+                                                                .0,
+                                                            source: sso_state.standing_source,
+                                                            source_entity_id,
+                                                        },
+                                                    ));
+                                                if let FilterNode::And(ref mut conditions) =
+                                                    sub.root_filter
+                                                {
+                                                    conditions.push(new_filter);
+                                                } else {
+                                                    sub.root_filter = FilterNode::And(vec![
+                                                        sub.root_filter.clone(),
+                                                        new_filter,
+                                                    ]);
+                                                }
+
+                                                if let Err(e) =
+                                                    crate::config::save_subscriptions_for_guild(
+                                                        guild_id, guild_subs,
+                                                    )
+                                                {
+                                                    error!("Failed to save subscriptions for guild {}: {}", guild_id, e);
+                                                } else {
+                                                    subscription_updated = true;
+                                                }
                                             }
-                                            let _ = crate::config::save_subscriptions_for_guild(guild_id, guild_subs);
+                                        }
+                                    }
+
+                                    if subscription_updated {
+                                        if let Err(why) = component_interaction
+                                            .create_interaction_response(&ctx.http, |r| {
+                                                r.interaction_response_data(|m| {
+                                                    m.content(format!(
+                                                        "Subscription '{}' updated successfully.",
+                                                        sso_state.subscription_id
+                                                    ))
+                                                    .ephemeral(true)
+                                                })
+                                            })
+                                            .await
+                                        {
+                                            error!("Cannot respond to interaction: {}", why);
                                         }
                                     }
                                 }
-                                let _ = component_interaction.create_interaction_response(&ctx.http, |r| {
-                                    r.interaction_response_data(|m| m.content(format!("Subscription '{}' updated successfully.", sso_state.subscription_id)).ephemeral(true))
-                                }).await;
                             }
                         }
                     }
@@ -156,10 +210,17 @@ impl EventHandler for Handler {
                     let sso_states = app_state.sso_states.lock().await;
                     if let Some(sso_state) = sso_states.get(state) {
                         let sync_command = SyncStandingsCommand;
-                        sync_command.initiate_sso(&ctx, &sso_state.original_interaction, app_state, state).await;
-                        let _ = component_interaction.create_interaction_response(&ctx.http, |r| {
-                            r.interaction_response_data(|m| m.content("A new authorization link has been sent to your DMs.").ephemeral(true))
-                        }).await;
+                        sync_command
+                            .initiate_sso(&ctx, &sso_state.original_interaction, app_state, state)
+                            .await;
+                        let _ = component_interaction
+                            .create_interaction_response(&ctx.http, |r| {
+                                r.interaction_response_data(|m| {
+                                    m.content("A new authorization link has been sent to your DMs.")
+                                        .ephemeral(true)
+                                })
+                            })
+                            .await;
                     }
                 }
             }
@@ -284,6 +345,7 @@ impl EventHandler for Handler {
                             let guild_id = sso_state.original_interaction.guild_id.unwrap();
                             let mut subscription_updated = false;
                             {
+                                let _lock = app_state.subscriptions_file_lock.lock().await;
                                 let mut subs_map = app_state.subscriptions.write().unwrap();
                                 if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
                                     if let Some(sub) = guild_subs
@@ -306,16 +368,27 @@ impl EventHandler for Handler {
                                             sub.root_filter =
                                                 FilterNode::And(vec![old_root, new_filter]);
                                         }
-                                        let _ = crate::config::save_subscriptions_for_guild(
+                                        if let Err(e) = crate::config::save_subscriptions_for_guild(
                                             guild_id, guild_subs,
-                                        );
-                                        subscription_updated = true;
+                                        ) {
+                                            error!("Failed to save subscriptions for guild {}: {}", guild_id, e);
+                                        } else {
+                                            subscription_updated = true;
+                                        }
                                     }
                                 }
                             }
 
                             if subscription_updated {
                                 let _ = msg.channel_id.say(&ctx.http, format!("Subscription '{}' has been successfully synced with {}'s standings.", sso_state.subscription_id, token.character_name)).await;
+                            } else {
+                                let _ = msg
+                                    .channel_id
+                                    .say(
+                                        &ctx.http,
+                                        "No matching subscription found. Please try again.",
+                                    )
+                                    .await;
                             }
                         }
                         Err(e) => {
