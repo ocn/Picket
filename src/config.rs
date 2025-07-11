@@ -511,6 +511,7 @@ pub fn load_app_config() -> Result<AppConfig, ConfigError> {
             std::env::var("EVE_CLIENT_SECRET").unwrap_or_default(),
         )?
         .build()?;
+    info!("App Config: {:#?}", settings);
     settings.try_deserialize()
 }
 
