@@ -10,6 +10,7 @@ use tracing::error;
 
 pub mod diag;
 pub mod subscribe;
+pub mod sync_standings;
 pub mod unsubscribe;
 
 #[async_trait]

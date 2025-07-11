@@ -322,6 +322,24 @@ async fn evaluate_filter(
                         None
                     }
                 }
+                SimpleFilter::IgnoreHighStanding { synched_by_user_id, source: _, source_entity_id } => {
+                    let standings_map = app_state.user_standings.read().unwrap();
+                    if let Some(user_standings) = standings_map.get(&serenity::model::id::UserId(*synched_by_user_id)) {
+                        if let Some(contacts) = user_standings.contact_lists.contacts.get(source_entity_id) {
+                            // Check only attackers
+                            for attacker in &killmail.attackers {
+                                let ids_to_check = [attacker.character_id, attacker.corporation_id, attacker.alliance_id];
+                                for id in ids_to_check.iter().flatten() {
+                                    if contacts.iter().any(|c| c.contact_id == *id && c.standing >= 5.0) {
+                                        return None; // Found a blue attacker, so fail the filter
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // If no high-standing attackers are found, the filter passes.
+                    Some(Default::default())
+                }
             }
         }
         Filter::Targeted(tf) => {
@@ -599,8 +617,13 @@ use super::*;
             app_config: Arc::new(AppConfig {
                 discord_bot_token: "".to_string(),
                 discord_client_id: 0,
+                eve_client_id: "".to_string(),
+                eve_client_secret: "".to_string(),
             }),
             last_ping_times: Mutex::new(HashMap::new()),
+            user_standings: Arc::new(Default::default()),
+            user_standings_file_lock: Default::default(),
+            sso_states: Arc::new(Default::default()),
         })
     }
 

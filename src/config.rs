@@ -2,7 +2,8 @@ use crate::esi::{Celestial, EsiClient};
 use config::{Config, ConfigError, Environment, File};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
-use serenity::model::id::GuildId;
+use serenity::model::id::{GuildId, UserId};
+use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
 use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::fs;
@@ -164,6 +165,11 @@ pub enum SimpleFilter {
     IsSolo(bool),
     Pilots { min: Option<u32>, max: Option<u32> },
     TimeRange { start: u32, end: u32 },
+    IgnoreHighStanding {
+        synched_by_user_id: u64,
+        source: StandingSource,
+        source_entity_id: u64,
+    },
 }
 
 impl SimpleFilter {
@@ -209,6 +215,9 @@ impl SimpleFilter {
                 max.map_or("any".to_string(), |v| v.to_string())
             ),
             SimpleFilter::TimeRange { start, end } => format!("TimeRange({}:00-{}:00)", start, end),
+            SimpleFilter::IgnoreHighStanding { synched_by_user_id, source, source_entity_id } => {
+                format!("IgnoreHighStanding(synched_by: {}, source: {:?}, source_id: {})", synched_by_user_id, source, source_entity_id)
+            }
         }
     }
 }
@@ -330,12 +339,60 @@ impl Subscription {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Default)]
+pub enum StandingSource {
+    #[default]
+    Character,
+    Corporation,
+    Alliance,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct EveAuthToken {
+    pub character_id: u64,
+    pub character_name: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: u64, // Store as a Unix timestamp
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct StandingContact {
+    pub contact_id: u64,
+    pub standing: f32,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct UserContactLists {
+    // Key: The EVE entity ID (char, corp, or alliance) whose contacts these are
+    pub contacts: HashMap<u64, Vec<StandingContact>>,
+}
+
+// Helper struct for the map value
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct UserStandings {
+    #[serde(default)]
+    pub tokens: Vec<EveAuthToken>,
+    #[serde(default)]
+    pub contact_lists: UserContactLists,
+}
+
+// Helper struct for tracking the SSO state
+pub struct SsoState {
+    pub discord_user_id: UserId,
+    pub subscription_id: String,
+    pub standing_source: StandingSource,
+    pub original_interaction: ApplicationCommandInteraction, // To respond later
+}
+
 // --- App Configuration & State ---
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub discord_bot_token: String,
     pub discord_client_id: u64,
+    pub eve_client_id: String,
+    pub eve_client_secret: String,
 }
 
 pub struct AppState {
@@ -351,6 +408,9 @@ pub struct AppState {
     pub names_file_lock: Mutex<()>,
     pub subscriptions_file_lock: Mutex<()>,
     pub last_ping_times: Mutex<HashMap<u64, Instant>>,
+    pub user_standings: Arc<RwLock<HashMap<UserId, UserStandings>>>,
+    pub user_standings_file_lock: Mutex<()>,
+    pub sso_states: Arc<Mutex<HashMap<String, SsoState>>>, // For tracking the SSO flow
 }
 
 impl AppState {
@@ -360,6 +420,7 @@ impl AppState {
         ships: HashMap<u32, u32>,
         names: HashMap<u64, String>,
         subscriptions: HashMap<GuildId, Vec<Subscription>>,
+        user_standings: HashMap<UserId, UserStandings>,
     ) -> Self {
         AppState {
             systems: Arc::new(RwLock::new(systems)),
@@ -374,6 +435,9 @@ impl AppState {
             names_file_lock: Mutex::new(()),
             subscriptions_file_lock: Mutex::new(()),
             last_ping_times: Mutex::new(HashMap::new()),
+            user_standings: Arc::new(RwLock::new(user_standings)),
+            user_standings_file_lock: Mutex::new(()),
+            sso_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -423,6 +487,10 @@ pub fn save_names(names: &HashMap<u64, String>) {
     save_to_json_file("config/names.json", names);
 }
 
+pub fn save_user_standings(standings: &HashMap<UserId, UserStandings>) {
+    save_to_json_file("config/user_standings.json", standings);
+}
+
 pub fn load_app_config() -> Result<AppConfig, ConfigError> {
     let settings = Config::builder()
         .add_source(Environment::default().separator("__"))
@@ -433,6 +501,14 @@ pub fn load_app_config() -> Result<AppConfig, ConfigError> {
         .set_override(
             "discord_client_id",
             std::env::var("DISCORD_CLIENT_ID").unwrap_or_default(),
+        )?
+        .set_override(
+            "eve_client_id",
+            std::env::var("EVE_CLIENT_ID").unwrap_or_default(),
+        )?
+        .set_override(
+            "eve_client_secret",
+            std::env::var("EVE_CLIENT_SECRET").unwrap_or_default(),
         )?
         .build()?;
     settings.try_deserialize()
@@ -448,6 +524,10 @@ pub fn load_ships() -> Result<HashMap<u32, u32>, ConfigError> {
 
 pub fn load_names() -> Result<HashMap<u64, String>, ConfigError> {
     load_map_from_json_file(Path::new("config/names.json"))
+}
+
+pub fn load_user_standings() -> Result<HashMap<UserId, UserStandings>, ConfigError> {
+    load_map_from_json_file(Path::new("config/user_standings.json"))
 }
 
 pub fn load_all_subscriptions(dir: &str) -> HashMap<GuildId, Vec<Subscription>> {

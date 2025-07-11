@@ -14,6 +14,7 @@ pub mod redis_q;
 
 use commands::diag::DiagCommand;
 use commands::subscribe::SubscribeCommand;
+use commands::sync_standings::SyncStandingsCommand;
 use commands::unsubscribe::UnsubscribeCommand;
 use commands::{Command, PingCommand};
 use discord_bot::CommandMap;
@@ -90,6 +91,14 @@ pub async fn run() {
         HashMap::new()
     });
 
+    let user_standings = config::load_user_standings().unwrap_or_else(|e| {
+        warn!(
+            "Failed to load user_standings.json: {}. Starting with an empty map.",
+            e
+        );
+        HashMap::new()
+    });
+
     let subscriptions = config::load_all_subscriptions("config/");
     // log_loaded_subscriptions(&subscriptions);
 
@@ -100,6 +109,7 @@ pub async fn run() {
         ships,
         names,
         subscriptions,
+        user_standings,
     ));
 
     // --- Initialize Commands ---
@@ -117,12 +127,18 @@ pub async fn run() {
     let diag_command = Box::new(DiagCommand);
     command_map.insert(diag_command.name(), diag_command);
 
+    let sync_standings_command = Box::new(SyncStandingsCommand);
+    command_map.insert(sync_standings_command.name(), sync_standings_command);
+
     let command_map_arc = Arc::new(command_map);
 
     // --- Start Discord Bot ---
     let discord_token = app_config.discord_bot_token.clone();
     let intents = GatewayIntents::non_privileged()
         | GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::DIRECT_MESSAGES
+        | GatewayIntents::MESSAGE_CONTENT
         | GatewayIntents::GUILD_INTEGRATIONS;
     let mut client = Client::builder(&discord_token, intents)
         .event_handler(discord_bot::Handler)

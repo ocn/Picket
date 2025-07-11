@@ -24,4 +24,5 @@ futures = "0.3"
 #rpassword = "7.4"
 #knapsack = "0.1.0"
 #phf = { version = "0.12", features = ["macros"] }
-#url = "2.5"
+url = "2.5"
+urlencoding = "2.1.3"

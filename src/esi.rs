@@ -1,10 +1,13 @@
-use crate::config::System;
-use reqwest::Client;
+use crate::config::{EveAuthToken, StandingContact, System};
+use reqwest::{Client};
 use serde::Deserialize;
 use std::error::Error;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const ESI_URL: &str = "https://esi.evetech.net/latest/";
 const FUZZWORK_URL: &str = "https://www.fuzzwork.co.uk/api/";
+const ESI_AUTH_URL: &str = "https://login.eveonline.com/v2/oauth/token";
+const ESI_VERIFY_URL: &str = "https://login.eveonline.com/oauth/verify";
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -152,6 +155,107 @@ impl EsiClient {
 
         let celestial: Celestial = response.json().await?;
         Ok(celestial)
+    }
+
+    pub async fn get_character_affiliation(
+        &self,
+        character_id: u64,
+    ) -> Result<(u64, Option<u64>), Box<dyn Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        struct AffiliationResponse {
+            corporation_id: u64,
+            alliance_id: Option<u64>,
+        }
+        let url = format!("{}characters/affiliation/", ESI_URL);
+        let response: Vec<AffiliationResponse> = self
+            .client
+            .post(&url)
+            .json(&[character_id])
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let affiliation = response
+            .into_iter()
+            .next()
+            .ok_or("No affiliation found for character")?;
+        Ok((affiliation.corporation_id, affiliation.alliance_id))
+    }
+
+    pub async fn exchange_code_for_token(
+        &self,
+        code: &str,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<EveAuthToken, Box<dyn Error + Send + Sync>> {
+        let params = [("grant_type", "authorization_code"), ("code", code)];
+        let auth_response: serde_json::Value = self
+            .client
+            .post(ESI_AUTH_URL)
+            .basic_auth(client_id, Some(client_secret))
+            .form(&params)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let access_token = auth_response["access_token"]
+            .as_str()
+            .ok_or("Missing access_token")?
+            .to_string();
+        let refresh_token = auth_response["refresh_token"]
+            .as_str()
+            .ok_or("Missing refresh_token")?
+            .to_string();
+        let expires_in = auth_response["expires_in"]
+            .as_u64()
+            .ok_or("Missing expires_in")?;
+
+        let verify_response: serde_json::Value = self
+            .client
+            .get(ESI_VERIFY_URL)
+            .bearer_auth(&access_token)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let character_id = verify_response["CharacterID"]
+            .as_u64()
+            .ok_or("Missing CharacterID")?;
+        let character_name = verify_response["CharacterName"]
+            .as_str()
+            .ok_or("Missing CharacterName")?
+            .to_string();
+
+        let expires_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + expires_in;
+
+        Ok(EveAuthToken {
+            character_id,
+            character_name,
+            access_token,
+            refresh_token,
+            expires_at,
+        })
+    }
+
+    pub async fn get_contacts(
+        &self,
+        entity_id: u64,
+        token: &str,
+        endpoint: &str,
+    ) -> Result<Vec<StandingContact>, Box<dyn Error + Send + Sync>> {
+        let url = format!("{}{}/{}/contacts/", ESI_URL, endpoint, entity_id);
+        let contacts: Vec<StandingContact> = self
+            .client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(contacts)
     }
 }
 
