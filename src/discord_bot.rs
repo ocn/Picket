@@ -165,12 +165,24 @@ impl EventHandler for Handler {
                                                 if let FilterNode::And(ref mut conditions) =
                                                     sub.root_filter
                                                 {
+                                                    // Remove any existing high standing filters before adding the new one.
+                                                    conditions.retain(|c| {
+                                                        !matches!(c, FilterNode::Condition(Filter::Simple(SimpleFilter::IgnoreHighStanding { .. })))
+                                                    });
                                                     conditions.push(new_filter);
                                                 } else {
-                                                    sub.root_filter = FilterNode::And(vec![
-                                                        sub.root_filter.clone(),
-                                                        new_filter,
-                                                    ]);
+                                                    // If it's not an AND node, it might be a single condition.
+                                                    // We'll wrap the old and new filters in an AND node.
+                                                    let old_root = sub.root_filter.clone();
+                                                    // But first, check if the old root is the one we want to replace.
+                                                    if matches!(&old_root, FilterNode::Condition(Filter::Simple(SimpleFilter::IgnoreHighStanding { .. }))) {
+                                                        sub.root_filter = new_filter;
+                                                    } else {
+                                                        sub.root_filter = FilterNode::And(vec![
+                                                            old_root,
+                                                            new_filter,
+                                                        ]);
+                                                    }
                                                 }
 
                                                 if let Err(e) =
@@ -364,11 +376,22 @@ impl EventHandler for Handler {
 
                                         if let FilterNode::And(ref mut conditions) = sub.root_filter
                                         {
+                                            // Remove any existing high standing filters before adding the new one.
+                                            conditions.retain(|c| {
+                                                !matches!(c, FilterNode::Condition(Filter::Simple(SimpleFilter::IgnoreHighStanding { .. })))
+                                            });
                                             conditions.push(new_filter);
                                         } else {
+                                            // If it's not an AND node, it might be a single condition.
+                                            // We'll wrap the old and new filters in an AND node.
                                             let old_root = sub.root_filter.clone();
-                                            sub.root_filter =
-                                                FilterNode::And(vec![old_root, new_filter]);
+                                            // But first, check if the old root is the one we want to replace.
+                                            if matches!(&old_root, FilterNode::Condition(Filter::Simple(SimpleFilter::IgnoreHighStanding { .. }))) {
+                                                sub.root_filter = new_filter;
+                                            } else {
+                                                sub.root_filter =
+                                                    FilterNode::And(vec![old_root, new_filter]);
+                                            }
                                         }
                                         if let Err(e) = crate::config::save_subscriptions_for_guild(
                                             guild_id, guild_subs,

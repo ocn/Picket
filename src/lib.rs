@@ -15,6 +15,8 @@ pub mod redis_q;
 use commands::diag::DiagCommand;
 use commands::subscribe::SubscribeCommand;
 use commands::sync_standings::SyncStandingsCommand;
+use commands::sync_remove::SyncRemoveCommand;
+use commands::sync_clear::SyncClearCommand;
 use commands::unsubscribe::UnsubscribeCommand;
 use commands::{Command, PingCommand};
 use discord_bot::CommandMap;
@@ -129,6 +131,12 @@ pub async fn run() {
 
     let sync_standings_command = Box::new(SyncStandingsCommand);
     command_map.insert(sync_standings_command.name(), sync_standings_command);
+
+    let sync_remove_command = Box::new(SyncRemoveCommand);
+    command_map.insert(sync_remove_command.name(), sync_remove_command);
+
+    let sync_clear_command = Box::new(SyncClearCommand);
+    command_map.insert(sync_clear_command.name(), sync_clear_command);
 
     let command_map_arc = Arc::new(command_map);
 
