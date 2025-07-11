@@ -342,10 +342,15 @@ impl EventHandler for Handler {
                                 let user_standings =
                                     standings_map.entry(sso_state.discord_user_id).or_default();
 
+                                // Add the affiliation to the token before saving
+                                let mut full_token = token;
+                                full_token.corporation_id = corp_id;
+                                full_token.alliance_id = alliance_id;
+
                                 user_standings
                                     .tokens
-                                    .retain(|t| t.character_id != token.character_id);
-                                user_standings.tokens.push(token.clone());
+                                    .retain(|t| t.character_id != full_token.character_id);
+                                user_standings.tokens.push(full_token);
 
                                 user_standings
                                     .contact_lists

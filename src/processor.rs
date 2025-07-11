@@ -322,22 +322,54 @@ async fn evaluate_filter(
                         None
                     }
                 }
-                SimpleFilter::IgnoreHighStanding { synched_by_user_id, source: _, source_entity_id } => {
+                SimpleFilter::IgnoreHighStanding { synched_by_user_id, source, source_entity_id } => {
                     let standings_map = app_state.user_standings.read().unwrap();
                     if let Some(user_standings) = standings_map.get(&serenity::model::id::UserId(*synched_by_user_id)) {
-                        if let Some(contacts) = user_standings.contact_lists.contacts.get(source_entity_id) {
-                            // Check only attackers
-                            for attacker in &killmail.attackers {
-                                let ids_to_check = [attacker.character_id, attacker.corporation_id, attacker.alliance_id];
-                                for id in ids_to_check.iter().flatten() {
-                                    if contacts.iter().any(|c| c.contact_id == *id && c.standing >= 5.0) {
-                                        return None; // Found a blue attacker, so fail the filter
+                        // Determine the full list of implicitly blue IDs based on the sync source and context from stored tokens.
+                        let mut implicit_blues: Vec<u64> = vec![*source_entity_id];
+                        
+                        // Find a token that gives context to the synced entity to discover its parent alliance, if any.
+                        let context_token = user_standings.tokens.iter().find(|t| match source {
+                            crate::config::StandingSource::Character => t.character_id == *source_entity_id,
+                            crate::config::StandingSource::Corporation => t.corporation_id == *source_entity_id,
+                            crate::config::StandingSource::Alliance => t.alliance_id == Some(*source_entity_id),
+                        });
+
+                        if let Some(token) = context_token {
+                            if *source == crate::config::StandingSource::Character {
+                                implicit_blues.push(token.corporation_id);
+                                if let Some(id) = token.alliance_id {
+                                    implicit_blues.push(id);
+                                }
+                            }
+                            if *source == crate::config::StandingSource::Corporation {
+                                if let Some(id) = token.alliance_id {
+                                    implicit_blues.push(id);
+                                }
+                            }
+                        }
+
+                        let contacts = user_standings.contact_lists.contacts.get(source_entity_id);
+
+                        for attacker in &killmail.attackers {
+                            let attacker_ids = [attacker.character_id, attacker.corporation_id, attacker.alliance_id];
+
+                            for id in attacker_ids.iter().flatten() {
+                                // Case 1: Attacker is implicitly blue (self, own corp, own alliance).
+                                if implicit_blues.contains(id) {
+                                    return None;
+                                }
+
+                                // Case 2: Attacker is explicitly blue in the contact list.
+                                if let Some(contact_list) = contacts {
+                                    if contact_list.iter().any(|c| c.contact_id == *id && c.standing >= 5.0) {
+                                        return None;
                                     }
                                 }
                             }
                         }
                     }
-                    // If no high-standing attackers are found, the filter passes.
+                    // If we get here, no blue attackers were found. The filter passes.
                     Some(Default::default())
                 }
             }

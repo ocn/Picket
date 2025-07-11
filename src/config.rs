@@ -351,6 +351,8 @@ pub enum StandingSource {
 pub struct EveAuthToken {
     pub character_id: u64,
     pub character_name: String,
+    pub corporation_id: u64,
+    pub alliance_id: Option<u64>,
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: u64, // Store as a Unix timestamp
