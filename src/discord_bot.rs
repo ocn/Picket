@@ -111,7 +111,7 @@ impl EventHandler for Handler {
                     if let (Some(sso_state), Some(values)) =
                         (sso_state, Some(&component_interaction.data.values))
                     {
-                        if let Some(character_id_str) = values.get(0) {
+                        if let Some(character_id_str) = values.first() {
                             let character_id = character_id_str.parse::<u64>().unwrap();
 
                             let token_clone = {
@@ -284,6 +284,7 @@ impl EventHandler for Handler {
                         .await
                     {
                         Ok(token) => {
+                            let mut full_token = token.clone();
                             let _ = msg
                                 .channel_id
                                 .say(
@@ -343,7 +344,6 @@ impl EventHandler for Handler {
                                     standings_map.entry(sso_state.discord_user_id).or_default();
 
                                 // Add the affiliation to the token before saving
-                                let mut full_token = token;
                                 full_token.corporation_id = corp_id;
                                 full_token.alliance_id = alliance_id;
 

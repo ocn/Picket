@@ -1,5 +1,5 @@
 use crate::config::{EveAuthToken, StandingContact, System};
-use reqwest::{Client};
+use reqwest::Client;
 use serde::Deserialize;
 use std::error::Error;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -220,6 +220,7 @@ impl EsiClient {
             .await?
             .json()
             .await?;
+        tracing::info!("SSO Verify Response: {:?}", verify_response);
 
         let character_id = verify_response["CharacterID"]
             .as_u64()
@@ -229,11 +230,15 @@ impl EsiClient {
             .ok_or("Missing CharacterName")?
             .to_string();
 
+        let (corporation_id, alliance_id) = self.get_character_affiliation(character_id).await?;
+
         let expires_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + expires_in;
 
         Ok(EveAuthToken {
             character_id,
             character_name,
+            corporation_id,
+            alliance_id,
             access_token,
             refresh_token,
             expires_at,
