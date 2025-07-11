@@ -432,7 +432,9 @@ async fn evaluate_filter(
                 false
             };
 
-            let attacker_match = if tf.target.is_attacker() {
+            // TODO: !victim_match prevents color mismatch, however there needs to be a ranking of
+            // ship groups such that supercarrier kills appear rather than a dreadnought death
+            let attacker_match = if tf.target.is_attacker() && !victim_match {
                 match &tf.condition {
                     TargetableCondition::Alliance(alliance_ids) => killmail
                         .attackers
