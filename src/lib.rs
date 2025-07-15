@@ -12,11 +12,12 @@ pub mod models;
 pub mod processor;
 pub mod redis_q;
 
+use crate::commands::find_unsubscribed::FindUnsubscribedChannelsCommand;
 use commands::diag::DiagCommand;
 use commands::subscribe::SubscribeCommand;
-use commands::sync_standings::SyncStandingsCommand;
-use commands::sync_remove::SyncRemoveCommand;
 use commands::sync_clear::SyncClearCommand;
+use commands::sync_remove::SyncRemoveCommand;
+use commands::sync_standings::SyncStandingsCommand;
 use commands::unsubscribe::UnsubscribeCommand;
 use commands::{Command, PingCommand};
 use discord_bot::CommandMap;
@@ -137,6 +138,9 @@ pub async fn run() {
 
     let sync_clear_command = Box::new(SyncClearCommand);
     command_map.insert(sync_clear_command.name(), sync_clear_command);
+
+    let find_unsubscribed_command = Box::new(FindUnsubscribedChannelsCommand);
+    command_map.insert(find_unsubscribed_command.name(), find_unsubscribed_command);
 
     let command_map_arc = Arc::new(command_map);
 

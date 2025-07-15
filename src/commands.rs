@@ -14,6 +14,7 @@ pub mod sync_standings;
 pub mod sync_remove;
 pub mod sync_clear;
 pub mod unsubscribe;
+pub mod find_unsubscribed;
 
 #[async_trait]
 pub trait Command: Send + Sync {
