@@ -32,19 +32,23 @@ impl Command for FindUnsubscribedChannelsCommand {
         command: &ApplicationCommandInteraction,
         app_state: &Arc<AppState>,
     ) {
+        // Step 1: Immediately defer the response to avoid the 3-second timeout.
+        if let Err(why) = command.defer(&ctx.http).await {
+            error!("Cannot defer interaction: {}", why);
+            return;
+        }
+
         let guild_id = match command.guild_id {
             Some(id) => id,
             None => {
+                // This case should ideally not be reached due to guild-only command nature
                 if let Err(why) = command
-                    .create_interaction_response(&ctx.http, |r| {
-                        r.interaction_response_data(|m| {
-                            m.content("This command can only be used in a server.")
-                                .ephemeral(true)
-                        })
+                    .edit_original_interaction_response(&ctx.http, |r| {
+                        r.content("This command can only be used in a server.")
                     })
                     .await
                 {
-                    error!("Cannot respond to slash command: {}", why);
+                    error!("Cannot edit original response: {}", why);
                 }
                 return;
             }
@@ -56,15 +60,12 @@ impl Command for FindUnsubscribedChannelsCommand {
             Err(e) => {
                 error!("Could not fetch channels for guild {}: {}", guild_id, e);
                 if let Err(why) = command
-                    .create_interaction_response(&ctx.http, |r| {
-                        r.interaction_response_data(|m| {
-                            m.content("Error: Could not fetch channel list for this server.")
-                                .ephemeral(true)
-                        })
+                    .edit_original_interaction_response(&ctx.http, |r| {
+                        r.content("Error: Could not fetch channel list for this server.")
                     })
                     .await
                 {
-                    error!("Cannot respond to slash command: {}", why);
+                    error!("Cannot edit original response: {}", why);
                 }
                 return;
             }
@@ -86,7 +87,6 @@ impl Command for FindUnsubscribedChannelsCommand {
 
         let mut unsubscribed_channels = Vec::new();
         for (channel_id, guild_channel) in &channels {
-            // We only care about standard text channels
             if guild_channel.kind != ChannelType::Text {
                 continue;
             }
@@ -95,8 +95,10 @@ impl Command for FindUnsubscribedChannelsCommand {
                 let category_name = guild_channel
                     .parent_id
                     .as_ref()
-                    .and_then(|cat_id| channels.get(cat_id))
-                    .map_or("No Category".to_string(), |cat| cat.name.clone());
+                    .and_then(|cat_id| {
+                        channels.get(cat_id).map(|c| c.name.clone())
+                    })
+                    .unwrap_or_else(|| "No Category".to_string());
 
                 unsubscribed_channels.push(format!(
                     "- **{}** (Category: `{}`)",
@@ -106,7 +108,7 @@ impl Command for FindUnsubscribedChannelsCommand {
         }
 
         let response_content = if unsubscribed_channels.is_empty() {
-            "All channels in this server have at least one subscription.".to_string()
+            "All text channels in this server have at least one subscription.".to_string()
         } else {
             format!(
                 "**Channels with no subscriptions:**\n{}",
@@ -114,25 +116,33 @@ impl Command for FindUnsubscribedChannelsCommand {
             )
         };
 
-        // Discord has a 2000 character limit for messages. We'll send in chunks if needed.
-        for chunk in response_content.chars().collect::<Vec<char>>().chunks(2000) {
-            let chunk_str: String = chunk.iter().collect();
+        // Step 2: Send the first (and possibly only) part of the response by editing the original deferred message.
+        let chunks: Vec<String> = response_content
+            .chars()
+            .collect::<Vec<char>>()
+            .chunks(2000)
+            .map(|c| c.iter().collect())
+            .collect();
+
+        if let Some(first_chunk) = chunks.first() {
             if let Err(why) = command
-                .create_followup_message(&ctx.http, |m| m.content(&chunk_str).ephemeral(true))
+                .edit_original_interaction_response(&ctx.http, |r| r.content(first_chunk))
                 .await
             {
-                error!("Cannot send followup message: {}", why);
+                error!("Cannot edit original response: {}", why);
             }
         }
 
-        // Send initial "thinking" response to prevent timeout
-        if let Err(why) = command
-            .create_interaction_response(&ctx.http, |r| {
-                r.interaction_response_data(|m| m.content("Scanning...").ephemeral(true))
-            })
-            .await
-        {
-            error!("Cannot respond to slash command: {}", why);
+        // Step 3: If there are more parts, send them as followup messages.
+        if chunks.len() > 1 {
+            for chunk in chunks.iter().skip(1) {
+                if let Err(why) = command
+                    .create_followup_message(&ctx.http, |m| m.content(chunk))
+                    .await
+                {
+                    error!("Cannot send followup message: {}", why);
+                }
+            }
         }
     }
 }
