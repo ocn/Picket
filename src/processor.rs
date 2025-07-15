@@ -701,6 +701,22 @@ async fn evaluate_filter(
                                     break;
                                 }
                             }
+                            if let Some(weapon_id) = attacker.weapon_type_id {
+                                if ship_type_ids.contains(&weapon_id) {
+                                    let weapon_name = get_name(app_state, weapon_id as u64)
+                                        .await
+                                        .unwrap_or_default();
+                                    let matched_ship = MatchedShip {
+                                        ship_name: weapon_name,
+                                        type_id: weapon_id,
+                                        corp_id: attacker.corporation_id,
+                                        alliance_id: attacker.alliance_id,
+                                    };
+                                    result.matched_ship = Some(matched_ship);
+                                    let _ = matched.insert(create_attacker_key(attacker));
+                                    break;
+                                }
+                            }
                         }
                         matched
                     }
@@ -730,6 +746,27 @@ async fn evaluate_filter(
                                         let matched_ship = MatchedShip {
                                             ship_name,
                                             type_id: attacker_ship_id,
+                                            corp_id: attacker.corporation_id,
+                                            alliance_id: attacker.alliance_id,
+                                        };
+                                        result.matched_ship = Some(matched_ship);
+                                        let _ = matched.insert(create_attacker_key(attacker));
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(attacker_weapon_id) = attacker.weapon_type_id {
+                                if let Some(attacker_ship_weapon_group_id) =
+                                    get_ship_group_id(app_state, attacker_weapon_id).await
+                                {
+                                    if ship_group_ids.contains(&attacker_ship_weapon_group_id) {
+                                        let ship_weapon_name =
+                                            get_name(app_state, attacker_weapon_id as u64)
+                                                .await
+                                                .unwrap_or_default();
+                                        let matched_ship = MatchedShip {
+                                            ship_name: ship_weapon_name,
+                                            type_id: attacker_weapon_id,
                                             corp_id: attacker.corporation_id,
                                             alliance_id: attacker.alliance_id,
                                         };

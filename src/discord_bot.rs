@@ -147,11 +147,14 @@ impl EventHandler for Handler {
                                         let _lock = app_state.subscriptions_file_lock.lock().await;
                                         let mut subs_map = app_state.subscriptions.write().unwrap();
                                         if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
-                                            let original_channel_id = sso_state.original_interaction.channel_id.to_string();
-                                            if let Some(sub) = guild_subs
-                                                .iter_mut()
-                                                .find(|s| s.id == sso_state.subscription_id && s.action.channel_id == original_channel_id)
-                                            {
+                                            let original_channel_id = sso_state
+                                                .original_interaction
+                                                .channel_id
+                                                .to_string();
+                                            if let Some(sub) = guild_subs.iter_mut().find(|s| {
+                                                s.id == sso_state.subscription_id
+                                                    && s.action.channel_id == original_channel_id
+                                            }) {
                                                 let new_filter =
                                                     FilterNode::Condition(Filter::Simple(
                                                         SimpleFilter::IgnoreHighStanding {
@@ -175,12 +178,16 @@ impl EventHandler for Handler {
                                                     // We'll wrap the old and new filters in an AND node.
                                                     let old_root = sub.root_filter.clone();
                                                     // But first, check if the old root is the one we want to replace.
-                                                    if matches!(&old_root, FilterNode::Condition(Filter::Simple(SimpleFilter::IgnoreHighStanding { .. }))) {
+                                                    if matches!(
+                                                        &old_root,
+                                                        FilterNode::Condition(Filter::Simple(
+                                                            SimpleFilter::IgnoreHighStanding { .. }
+                                                        ))
+                                                    ) {
                                                         sub.root_filter = new_filter;
                                                     } else {
                                                         sub.root_filter = FilterNode::And(vec![
-                                                            old_root,
-                                                            new_filter,
+                                                            old_root, new_filter,
                                                         ]);
                                                     }
                                                 }
@@ -366,11 +373,12 @@ impl EventHandler for Handler {
                                 let _lock = app_state.subscriptions_file_lock.lock().await;
                                 let mut subs_map = app_state.subscriptions.write().unwrap();
                                 if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
-                                    let original_channel_id = sso_state.original_interaction.channel_id.to_string();
-                                    if let Some(sub) = guild_subs
-                                        .iter_mut()
-                                        .find(|s| s.id == sso_state.subscription_id && s.action.channel_id == original_channel_id)
-                                    {
+                                    let original_channel_id =
+                                        sso_state.original_interaction.channel_id.to_string();
+                                    if let Some(sub) = guild_subs.iter_mut().find(|s| {
+                                        s.id == sso_state.subscription_id
+                                            && s.action.channel_id == original_channel_id
+                                    }) {
                                         let new_filter = FilterNode::Condition(Filter::Simple(
                                             SimpleFilter::IgnoreHighStanding {
                                                 synched_by_user_id: sso_state.discord_user_id.0,
@@ -383,7 +391,12 @@ impl EventHandler for Handler {
                                         {
                                             // Remove any existing high standing filters before adding the new one.
                                             conditions.retain(|c| {
-                                                !matches!(c, FilterNode::Condition(Filter::Simple(SimpleFilter::IgnoreHighStanding { .. })))
+                                                !matches!(
+                                                    c,
+                                                    FilterNode::Condition(Filter::Simple(
+                                                        SimpleFilter::IgnoreHighStanding { .. }
+                                                    ))
+                                                )
                                             });
                                             conditions.push(new_filter);
                                         } else {
@@ -391,7 +404,12 @@ impl EventHandler for Handler {
                                             // We'll wrap the old and new filters in an AND node.
                                             let old_root = sub.root_filter.clone();
                                             // But first, check if the old root is the one we want to replace.
-                                            if matches!(&old_root, FilterNode::Condition(Filter::Simple(SimpleFilter::IgnoreHighStanding { .. }))) {
+                                            if matches!(
+                                                &old_root,
+                                                FilterNode::Condition(Filter::Simple(
+                                                    SimpleFilter::IgnoreHighStanding { .. }
+                                                ))
+                                            ) {
                                                 sub.root_filter = new_filter;
                                             } else {
                                                 sub.root_filter =
@@ -401,7 +419,10 @@ impl EventHandler for Handler {
                                         if let Err(e) = crate::config::save_subscriptions_for_guild(
                                             guild_id, guild_subs,
                                         ) {
-                                            error!("Failed to save subscriptions for guild {}: {}", guild_id, e);
+                                            error!(
+                                                "Failed to save subscriptions for guild {}: {}",
+                                                guild_id, e
+                                            );
                                         } else {
                                             subscription_updated = true;
                                         }
