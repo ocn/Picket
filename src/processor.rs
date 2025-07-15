@@ -3,10 +3,11 @@ use crate::config::{
     TargetableCondition,
 };
 use crate::discord_bot::{get_name, get_ship_group_id, get_system};
-use crate::models::ZkData;
+use crate::models::{Attacker, ZkData};
 use chrono::Timelike;
 use futures::future::{BoxFuture, FutureExt};
 use serenity::model::prelude::GuildId;
+use std::collections::HashSet;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -20,6 +21,9 @@ pub struct NamedFilterResult {
 
 #[derive(Debug, Clone, Default)]
 pub struct FilterResult {
+    // Composite attacker_keys, TODO: add struct for this data
+    pub(crate) matched_attackers: HashSet<String>,
+    pub(crate) matched_victim: bool,
     pub(crate) matched_ship: Option<MatchedShip>,
     pub(crate) color: Option<Color>,
     pub(crate) min_pilots: Option<u32>,
@@ -41,33 +45,169 @@ pub(crate) struct MatchedShip {
     pub(crate) alliance_id: Option<u64>,
 }
 
+/// Creates a stable, unique composite key for an attacker on a killmail.
+/// This handles cases where an attacker might not have a character ID (e.g., structures).
+fn create_attacker_key(attacker: &Attacker) -> String {
+    // Using a Vec to build the key handles missing parts gracefully.
+    let mut key_parts = Vec::new();
+
+    // We add available IDs in a specific order to ensure consistency.
+    if let Some(id) = attacker.ship_type_id {
+        key_parts.push(format!("s{}", id)); // 's' for ship
+    }
+    if let Some(id) = attacker.weapon_type_id {
+        key_parts.push(format!("w{}", id)); // 'w' for a weapon
+    }
+    if let Some(id) = attacker.character_id {
+        key_parts.push(format!("c{}", id)); // 'c' for character
+    }
+    if let Some(id) = attacker.corporation_id {
+        key_parts.push(format!("o{}", id)); // 'o' for corp
+    }
+    if let Some(id) = attacker.alliance_id {
+        key_parts.push(format!("a{}", id)); // 'a' for alliance
+    }
+    if let Some(id) = attacker.faction_id {
+        key_parts.push(format!("f{}", id)); // 'f' for faction
+    }
+
+    key_parts.join(":")
+}
+
 pub async fn process_killmail(
     app_state: &Arc<AppState>,
     zk_data: &ZkData,
 ) -> Vec<(GuildId, Subscription, NamedFilterResult)> {
     // Clone the subscriptions to release the lock before the async loop.
-    // We flatten the map of guilds into a single list of all subscriptions.
     let all_subscriptions = {
         let subs_guard = app_state.subscriptions.read().unwrap();
         subs_guard.clone()
     };
-    // The `subs_guard` is dropped here, releasing the lock.
 
     let mut matched_subscriptions = Vec::new();
-    let _kill_id = zk_data.killmail.killmail_id;
 
-    // Iterate over the cloned subscriptions. No lock is held here.
     for (guild_id, subscriptions) in all_subscriptions.iter() {
         for subscription in subscriptions {
-            if let Some(result) =
-                evaluate_filter_node(&subscription.root_filter, zk_data, app_state).await
-            {
-                matched_subscriptions.push((*guild_id, subscription.clone(), result));
+            let (match_tree, veto_tree) = partition_filters(&subscription.root_filter);
+
+            // Step 1: Evaluate the primary match conditions.
+            let Some(match_tree) = match_tree else {
+                continue;
+            };
+            let Some(primary_matches) = evaluate_filter_node(&match_tree, zk_data, app_state).await
+            else {
+                continue;
+            };
+
+            // Step 2: Evaluate the veto conditions.
+            let veto_attackers = if let Some(veto_tree) = veto_tree {
+                evaluate_filter_node(&veto_tree, zk_data, app_state)
+                    .await
+                    .map_or(HashSet::new(), |r| r.filter_result.matched_attackers)
+            } else {
+                HashSet::new()
+            };
+
+            // Step 3: The difference of the matches and vetoes will show non-vetoed matched attackers.
+            let final_attackers: HashSet<_> = primary_matches
+                .filter_result
+                .matched_attackers
+                .difference(&veto_attackers)
+                .collect();
+
+            let final_victim_match = primary_matches.filter_result.matched_victim;
+
+            if !final_attackers.is_empty() || final_victim_match {
+                matched_subscriptions.push((*guild_id, subscription.clone(), primary_matches));
             }
         }
     }
 
     matched_subscriptions
+}
+
+/// Recursively partitions a filter tree into two separate trees:                                                                                                            
+/// one for "match" conditions and one for "veto" (IgnoreHighStanding) conditions.                                                                                           
+fn partition_filters(node: &FilterNode) -> (Option<FilterNode>, Option<FilterNode>) {
+    match node {
+        FilterNode::Condition(Filter::Simple(SimpleFilter::IgnoreHighStanding { .. })) => {
+            // This is a veto condition.
+            (None, Some(node.clone()))
+        }
+        FilterNode::Condition(_) => {
+            // This is a match condition.
+            (Some(node.clone()), None)
+        }
+        FilterNode::And(nodes) => {
+            let (mut match_nodes, mut veto_nodes) = (Vec::new(), Vec::new());
+            for n in nodes {
+                let (m, v) = partition_filters(n);
+                if let Some(match_node) = m {
+                    match_nodes.push(match_node);
+                }
+                if let Some(veto_node) = v {
+                    veto_nodes.push(veto_node);
+                }
+            }
+            let match_tree = if match_nodes.is_empty() {
+                None
+            } else if match_nodes.len() == 1 {
+                match_nodes.pop()
+            } else {
+                Some(FilterNode::And(match_nodes))
+            };
+            let veto_tree = if veto_nodes.is_empty() {
+                None
+            } else if veto_nodes.len() == 1 {
+                veto_nodes.pop()
+            } else {
+                Some(FilterNode::And(veto_nodes))
+            };
+            (match_tree, veto_tree)
+        }
+        FilterNode::Or(nodes) => {
+            let (mut match_nodes, mut veto_nodes) = (Vec::new(), Vec::new());
+            for n in nodes {
+                let (m, v) = partition_filters(n);
+                if let Some(match_node) = m {
+                    match_nodes.push(match_node);
+                }
+                if let Some(veto_node) = v {
+                    veto_nodes.push(veto_node);
+                }
+            }
+            let match_tree = if match_nodes.is_empty() {
+                None
+            } else if match_nodes.len() == 1 {
+                match_nodes.pop()
+            } else {
+                Some(FilterNode::Or(match_nodes))
+            };
+            let veto_tree = if veto_nodes.is_empty() {
+                None
+            } else if veto_nodes.len() == 1 {
+                veto_nodes.pop()
+            } else {
+                Some(FilterNode::Or(veto_nodes))
+            };
+            (match_tree, veto_tree)
+        }
+        FilterNode::Not(inner_node) => {
+            // A NOT node is treated as a match condition, as it's a logical inversion, not a veto.
+            let (match_node, veto_node) = partition_filters(inner_node);
+            if veto_node.is_some() {
+                // This is a complex case: NOT(veto). We'll treat it as a global match for now.
+                (Some(FilterNode::Not(inner_node.clone())), None)
+            } else {
+                (
+                    Some(FilterNode::Not(Box::from(
+                        match_node.unwrap_or(FilterNode::And(vec![])),
+                    ))),
+                    None,
+                )
+            }
+        }
+    }
 }
 
 fn evaluate_filter_node<'a>(
@@ -113,17 +253,38 @@ fn evaluate_filter_node<'a>(
                             .iter()
                             .find(|r| r.filter_result.light_year_range.is_some())
                             .and_then(|r| r.filter_result.light_year_range.clone()),
+                        matched_attackers: results.iter().fold(Default::default(), |acc, b| {
+                            acc.intersection(&b.filter_result.matched_attackers)
+                                .cloned()
+                                .collect()
+                        }),
+                        matched_victim: results
+                            .iter()
+                            .any(|b| b.filter_result.matched_victim),
                     },
                 };
                 Some(final_result)
             }
             FilterNode::Or(nodes) => {
+                let mut final_res: Option<FilterResult> = None;
                 for n in nodes {
                     if let Some(result) = evaluate_filter_node(n, zk_data, app_state).await {
-                        return Some(result); // Return the first match
+                        if let Some(current_res) = &mut final_res {
+                            current_res
+                                .matched_attackers
+                                .extend(result.filter_result.matched_attackers);
+                            current_res.matched_victim |= result.filter_result.matched_victim;
+                        } else {
+                            final_res = Some(result.filter_result);
+                        }
+                        // TODO: consider logic of merging
+                        break;
                     }
                 }
-                None
+                final_res.map(|fr| NamedFilterResult {
+                    name: node.name(),
+                    filter_result: fr,
+                })
             }
             FilterNode::Not(node) => {
                 if evaluate_filter_node(node, zk_data, app_state)
@@ -132,9 +293,19 @@ fn evaluate_filter_node<'a>(
                 {
                     None
                 } else {
+                    let all_attacker_ids = zk_data
+                        .killmail
+                        .attackers
+                        .iter()
+                        .map(create_attacker_key)
+                        .collect();
                     Some(NamedFilterResult {
                         name: format!("Not({})", node.name()),
-                        filter_result: Default::default(), // Default success
+                        filter_result: FilterResult {
+                            matched_attackers: all_attacker_ids,
+                            matched_victim: true,
+                            ..Default::default()
+                        },
                     })
                 }
             }
@@ -257,6 +428,8 @@ async fn evaluate_filter(
                             matched_ranges.sort_by(|a, b| b.range.total_cmp(&a.range));
 
                             Some(FilterResult {
+                                matched_attackers: Default::default(),
+                                matched_victim: false,
                                 matched_ship: None,
                                 color: None,
                                 min_pilots: None,
@@ -291,10 +464,12 @@ async fn evaluate_filter(
                     let num_pilots = (killmail.attackers.len() + 1) as u32;
                     if min.is_none_or(|m| num_pilots >= m) && max.is_none_or(|m| num_pilots <= m) {
                         Some(FilterResult {
+                            matched_attackers: Default::default(),
                             color: None,
                             matched_ship: None,
                             min_pilots: Some(min.unwrap_or(0)),
                             light_year_range: None,
+                            matched_victim: false,
                         })
                     } else {
                         None
@@ -322,17 +497,27 @@ async fn evaluate_filter(
                         None
                     }
                 }
-                SimpleFilter::IgnoreHighStanding { synched_by_user_id, source, source_entity_id } => {
+                SimpleFilter::IgnoreHighStanding {
+                    synched_by_user_id,
+                    source,
+                    source_entity_id,
+                } => {
+                    let mut result: FilterResult = Default::default();
                     let standings_map = app_state.user_standings.read().unwrap();
-                    if let Some(user_standings) = standings_map.get(&serenity::model::id::UserId(*synched_by_user_id)) {
-                        // Determine the full list of implicitly blue IDs based on the sync source and context from stored tokens.
+                    if let Some(user_standings) =
+                        standings_map.get(&serenity::model::id::UserId(*synched_by_user_id))
+                    {
                         let mut implicit_blues: Vec<u64> = vec![*source_entity_id];
-                        
-                        // Find a token that gives context to the synced entity to discover its parent alliance, if any.
                         let context_token = user_standings.tokens.iter().find(|t| match source {
-                            crate::config::StandingSource::Character => t.character_id == *source_entity_id,
-                            crate::config::StandingSource::Corporation => t.corporation_id == *source_entity_id,
-                            crate::config::StandingSource::Alliance => t.alliance_id == Some(*source_entity_id),
+                            crate::config::StandingSource::Character => {
+                                t.character_id == *source_entity_id
+                            }
+                            crate::config::StandingSource::Corporation => {
+                                t.corporation_id == *source_entity_id
+                            }
+                            crate::config::StandingSource::Alliance => {
+                                t.alliance_id == Some(*source_entity_id)
+                            }
                         });
 
                         if let Some(token) = context_token {
@@ -350,32 +535,39 @@ async fn evaluate_filter(
                         }
 
                         let contacts = user_standings.contact_lists.contacts.get(source_entity_id);
-
                         for attacker in &killmail.attackers {
-                            let attacker_ids = [attacker.character_id, attacker.corporation_id, attacker.alliance_id];
+                            let attacker_ids = [
+                                attacker.character_id,
+                                attacker.corporation_id,
+                                attacker.alliance_id,
+                            ];
+                            let is_blue = attacker_ids.iter().flatten().any(|id| {
+                                implicit_blues.contains(id)
+                                    || contacts.map_or(false, |cl| {
+                                        cl.iter().any(|c| c.contact_id == *id && c.standing >= 5.0)
+                                    })
+                            });
 
-                            for id in attacker_ids.iter().flatten() {
-                                // Case 1: Attacker is implicitly blue (self, own corp, own alliance).
-                                if implicit_blues.contains(id) {
-                                    return None;
-                                }
-
-                                // Case 2: Attacker is explicitly blue in the contact list.
-                                if let Some(contact_list) = contacts {
-                                    if contact_list.iter().any(|c| c.contact_id == *id && c.standing >= 5.0) {
-                                        return None;
-                                    }
-                                }
+                            if is_blue {
+                                // Generate the composite key for the blue attacker and insert it.
+                                let key = create_attacker_key(attacker);
+                                result.matched_attackers.insert(key);
                             }
                         }
                     }
-                    // If we get here, no blue attackers were found. The filter passes.
-                    Some(Default::default())
+                    // This filter's purpose is to return the set of vetoed attackers.
+                    // It always returns a result, which might be an empty set if no blues were found.
+                    return Some(NamedFilterResult {
+                        name: filter.name(),
+                        filter_result: result,
+                    });
                 }
             }
         }
         Filter::Targeted(tf) => {
             let mut result = FilterResult {
+                matched_attackers: Default::default(), // TODO: Set this correctly
+                matched_victim: false,                 // TODO: Set this correctly
                 matched_ship: None,
                 color: None,
                 min_pilots: None,
@@ -463,27 +655,35 @@ async fn evaluate_filter(
             } else {
                 false
             };
+            result.matched_victim = victim_match;
 
             // TODO: !victim_match prevents color mismatch, however there needs to be a ranking of
             // ship groups such that supercarrier kills appear rather than a dreadnought death
-            let attacker_match = if tf.target.is_attacker() && !victim_match {
+            let attackers_matched: HashSet<String> = if tf.target.is_attacker() && !victim_match {
                 match &tf.condition {
                     TargetableCondition::Alliance(alliance_ids) => killmail
                         .attackers
                         .iter()
-                        .any(|a| a.alliance_id.is_some_and(|id| alliance_ids.contains(&id))),
-                    TargetableCondition::Corporation(corporation_ids) => {
-                        killmail.attackers.iter().any(|a| {
+                        .filter(|a| a.alliance_id.is_some_and(|id| alliance_ids.contains(&id)))
+                        .map(create_attacker_key)
+                        .collect(),
+                    TargetableCondition::Corporation(corporation_ids) => killmail
+                        .attackers
+                        .iter()
+                        .filter(|a| {
                             a.corporation_id
                                 .is_some_and(|id| corporation_ids.contains(&id))
                         })
-                    }
+                        .map(create_attacker_key)
+                        .collect(),
                     TargetableCondition::Character(character_ids) => killmail
                         .attackers
                         .iter()
-                        .any(|a| a.character_id.is_some_and(|id| character_ids.contains(&id))),
+                        .filter(|a| a.character_id.is_some_and(|id| character_ids.contains(&id)))
+                        .map(create_attacker_key)
+                        .collect(),
                     TargetableCondition::ShipType(ship_type_ids) => {
-                        let mut matched = false;
+                        let mut matched = HashSet::new();
                         for attacker in &killmail.attackers {
                             if let Some(ship_id) = attacker.ship_type_id {
                                 if ship_type_ids.contains(&ship_id) {
@@ -497,7 +697,7 @@ async fn evaluate_filter(
                                         alliance_id: attacker.alliance_id,
                                     };
                                     result.matched_ship = Some(matched_ship);
-                                    matched = true;
+                                    let _ = matched.insert(create_attacker_key(attacker));
                                     break;
                                 }
                             }
@@ -515,7 +715,8 @@ async fn evaluate_filter(
                                 warn!("Failed to get ship group ID for type ID {}", type_id);
                             }
                         }
-                        let mut matched = false;
+
+                        let mut matched = HashSet::new();
                         for attacker in &killmail.attackers {
                             if let Some(attacker_ship_id) = attacker.ship_type_id {
                                 if let Some(attacker_ship_group_id) =
@@ -533,7 +734,7 @@ async fn evaluate_filter(
                                             alliance_id: attacker.alliance_id,
                                         };
                                         result.matched_ship = Some(matched_ship);
-                                        matched = true;
+                                        let _ = matched.insert(create_attacker_key(attacker));
                                         break;
                                     }
                                 }
@@ -543,12 +744,12 @@ async fn evaluate_filter(
                     }
                     TargetableCondition::NameFragment(fragment) => {
                         let lower_fragment = fragment.to_lowercase();
-                        let mut matched = false;
+                        let mut matched = HashSet::new();
                         for attacker in &killmail.attackers {
                             if let Some(ship_id) = attacker.ship_type_id {
                                 if let Some(name) = get_name(app_state, ship_id as u64).await {
                                     if name.to_lowercase().contains(&lower_fragment) {
-                                        matched = true;
+                                        let _ = matched.insert(create_attacker_key(attacker));
                                         break;
                                     }
                                 }
@@ -558,8 +759,10 @@ async fn evaluate_filter(
                     }
                 }
             } else {
-                false
+                Default::default()
             };
+            let attacker_match = !attackers_matched.is_empty();
+            result.matched_attackers = attackers_matched;
 
             let is_match = match tf.target {
                 Target::Any => victim_match || attacker_match,
@@ -588,8 +791,8 @@ async fn evaluate_filter(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::config::TargetedFilter;
-use super::*;
     use crate::config::{AppConfig, Filter, FilterNode, System, SystemRange};
     use crate::models::{Attacker, KillmailData, Position, Victim, ZkData, Zkb};
     use moka::future::Cache;
