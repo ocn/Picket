@@ -6,5 +6,6 @@ dist
 config.json
 config/*.json
 accessToken.json
-scripts/
+scripts/dotlan/
 target/
+config-old/
