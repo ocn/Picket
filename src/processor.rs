@@ -590,17 +590,17 @@ async fn evaluate_filter(
                         attacker.ship_type_id.is_some_and(|id| ids.contains(&id))
                             || attacker.weapon_type_id.is_some_and(|id| ids.contains(&id))
                     }
-                    TargetableCondition::ShipGroup(ship_group_ids_as_type_ids) => {
+                    TargetableCondition::ShipGroup(ids) => {
                         // It is implicit that these "ship group IDs" are actually ship type IDs, and thus
                         // must be converted to the proper ship group IDs before use.
-                        let mut ids = vec![];
-                        for type_id in ship_group_ids_as_type_ids {
-                            if let Some(group_id) = get_ship_group_id(app_state, *type_id).await {
-                                ids.push(group_id);
-                            } else {
-                                warn!("Failed to get ship group ID for type ID {}", type_id);
-                            }
-                        }
+                        // let mut ids = vec![];
+                        // for type_id in ship_group_ids_as_type_ids {
+                        //     if let Some(group_id) = get_ship_group_id(app_state, *type_id).await {
+                        //         ids.push(group_id);
+                        //     } else {
+                        //         warn!("Failed to get ship group ID for type ID {}", type_id);
+                        //     }
+                        // }
 
                         let ship_match = if let Some(id) = attacker.ship_type_id {
                             get_ship_group_id(app_state, id)
