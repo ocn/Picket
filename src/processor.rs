@@ -678,6 +678,7 @@ async fn evaluate_filter(
 mod tests {
     use super::*;
     use crate::config::{AppConfig, Filter, FilterNode, System, SystemRange};
+    use crate::config::{EveAuthToken, StandingSource, UserStandings};
     use crate::config::{Target, TargetedFilter};
     use crate::models::{Attacker, KillmailData, Position, Victim, ZkData, Zkb};
     use moka::future::Cache;
@@ -1572,5 +1573,152 @@ mod tests {
             filter_result.matched_attackers.contains(&expected_key),
             "The matched attacker must be the Nyx."
         );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_veto_logic_with_mixed_attackers() {
+        // SCENARIO:
+        // - A non-blue Dreadnought (Attacker 1) is on a killmail.
+        // - A blue Frigate (Attacker 2) is also on the killmail.
+        // - The victim is also blue.
+        // - The subscription looks for Capitals AND ignores blues.
+        // EXPECTATION:
+        // - The filter should PASS, because the non-blue Dreadnought is a valid match
+        //   that is not vetoed.
+
+        let app_state = mock_app_state();
+        let user_id = 12345;
+        let blue_alliance_id = 99000001;
+        let blue_corp_id = 98000001;
+        let synced_char_id = 11111;
+
+        // 1. Setup Mock Data
+        {
+            let mut ships = app_state.ships.write().unwrap();
+            ships.insert(19720, 485); // Naglfar -> Dreadnought (Group ID 485)
+            ships.insert(587, 25); // Rifter -> Frigate (Group ID 25)
+
+            let mut names = app_state.names.write().unwrap();
+            names.insert(19720, "Naglfar".to_string());
+            names.insert(587, "Rifter".to_string());
+
+            // Setup the user's standings and token for the veto check
+            let mut standings_map = app_state.user_standings.write().unwrap();
+            let mut user_standings = UserStandings::default();
+            user_standings.tokens.push(EveAuthToken {
+                character_id: synced_char_id,
+                character_name: "Blue Pilot".to_string(),
+                corporation_id: blue_corp_id,
+                alliance_id: Some(blue_alliance_id),
+                access_token: "".to_string(),
+                refresh_token: "".to_string(),
+                expires_at: 0,
+            });
+            standings_map.insert(serenity::model::id::UserId(user_id), user_standings);
+        }
+
+        // 2. Construct the Killmail
+        let zk_data = ZkData {
+            kill_id: 99999,
+            killmail: KillmailData {
+                killmail_id: 99999,
+                killmail_time: "2025-07-16T12:00:00Z".to_string(),
+                solar_system_id: 30000142,
+                victim: Victim {
+                    damage_taken: 100,
+                    ship_type_id: 587, // Blue Rifter
+                    character_id: Some(3003),
+                    corporation_id: Some(blue_corp_id),
+                    alliance_id: Some(blue_alliance_id),
+                    position: None,
+                    faction_id: None,
+                    items: vec![],
+                },
+                attackers: vec![
+                    Attacker {
+                        // The Non-Blue Capital we want to match
+                        final_blow: true,
+                        damage_done: 10000,
+                        ship_type_id: Some(19720),
+                        character_id: Some(1001),
+                        corporation_id: Some(101),
+                        alliance_id: Some(11),
+                        weapon_type_id: None,
+                        security_status: -1.0,
+                        faction_id: None,
+                    },
+                    Attacker {
+                        // The Blue Frigate that should be vetoed
+                        final_blow: false,
+                        damage_done: 100,
+                        ship_type_id: Some(587),
+                        character_id: Some(2002),
+                        corporation_id: Some(blue_corp_id),
+                        alliance_id: Some(blue_alliance_id),
+                        weapon_type_id: None,
+                        security_status: 0.5,
+                        faction_id: None,
+                    },
+                ],
+            },
+            zkb: Zkb {
+                total_value: 1_000_000_000.0,
+                ..Default::default()
+            },
+        };
+
+        // 3. Construct the Subscription
+        let subscription = Subscription {
+            id: "capital_and_veto_test".to_string(),
+            description: "".to_string(),
+            action: Default::default(),
+            root_filter: FilterNode::And(vec![
+                FilterNode::Condition(Filter::Targeted(TargetedFilter {
+                    condition: TargetableCondition::ShipGroup(vec![19720]), // Match Dreadnoughts
+                    target: Default::default(),
+                })),
+                FilterNode::Condition(Filter::Simple(SimpleFilter::IgnoreHighStanding {
+                    synched_by_user_id: user_id,
+                    source: StandingSource::Character,
+                    source_entity_id: synced_char_id,
+                })),
+            ]),
+        };
+
+        // Manually add the subscription to the app state
+        app_state
+            .subscriptions
+            .write()
+            .unwrap()
+            .insert(GuildId(1), vec![subscription]);
+
+        // 4. Run the processor
+        let results = process_killmail(&app_state, &zk_data).await;
+
+        // 5. Assert the outcome
+        assert_eq!(
+            results.len(),
+            1,
+            "Expected exactly one subscription to match."
+        );
+
+        let (_guild_id, _sub, named_result) = results.first().unwrap();
+
+        // Check the match result
+        let primary_matches = &named_result.filter_result;
+        assert!(
+            !primary_matches.matched_victim,
+            "The victim (a frigate) should not have matched the capital filter."
+        );
+        assert_eq!(
+            primary_matches.matched_attackers.len(),
+            1,
+            "Only the dreadnought should have matched the primary filter."
+        );
+        let attacker_key = Vec::from_iter(primary_matches.matched_attackers.iter())
+            .first()
+            .cloned()
+            .unwrap();
+        assert!(attacker_key.0.contains("s19720"))
     }
 }

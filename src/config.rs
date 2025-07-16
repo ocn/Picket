@@ -318,7 +318,7 @@ impl PingType {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
 pub struct Action {
     pub channel_id: String,
     pub ping_type: Option<PingType>,

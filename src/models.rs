@@ -24,7 +24,7 @@ pub struct KillmailData {
     pub victim: Victim,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct Zkb {
     #[serde(default, rename = "locationID")]
     pub location_id: Option<i64>,
