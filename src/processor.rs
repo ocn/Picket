@@ -27,20 +27,6 @@ pub struct FilterResult {
     pub light_year_range: Option<SystemRange>,
 }
 
-// impl FilterResult {
-//     pub fn match_all(attackers: Vec<&Attacker>) -> Self {
-//         let matched_attackers: HashSet<AttackerKey> =
-//             attackers.into_iter().map(AttackerKey::new).collect();
-//         FilterResult {
-//             matched_attackers,
-//             matched_victim: true,
-//             color: None,
-//             min_pilots: None,
-//             light_year_range: None,
-//         }
-//     }
-// }
-
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub enum Color {
     Green,
@@ -87,6 +73,24 @@ impl std::fmt::Display for AttackerKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0.as_str())
     }
+}
+
+fn parse_security_range(s: &str) -> Result<RangeInclusive<f64>, ()> {
+    let parts: Vec<&str> = s.split("..=").collect();
+    if parts.len() != 2 {
+        return Err(());
+    }
+    let start = f64::from_str(parts[0]).map_err(|_| ())?;
+    let end = f64::from_str(parts[1]).map_err(|_| ())?;
+    Ok(start..=end)
+}
+
+fn distance(system1: &System, system2: &System) -> f64 {
+    const LY_PER_M: f64 = 1.0 / 9_460_730_472_580_800.0;
+    let dx = system1.x - system2.x;
+    let dy = system1.y - system2.y;
+    let dz = system1.z - system2.z;
+    (dx * dx + dy * dy + dz * dz).sqrt() * LY_PER_M
 }
 
 pub async fn process_killmail(
@@ -330,24 +334,6 @@ fn evaluate_filter_node<'a>(
         }
     }
     .boxed()
-}
-
-fn parse_security_range(s: &str) -> Result<RangeInclusive<f64>, ()> {
-    let parts: Vec<&str> = s.split("..=").collect();
-    if parts.len() != 2 {
-        return Err(());
-    }
-    let start = f64::from_str(parts[0]).map_err(|_| ())?;
-    let end = f64::from_str(parts[1]).map_err(|_| ())?;
-    Ok(start..=end)
-}
-
-fn distance(system1: &System, system2: &System) -> f64 {
-    const LY_PER_M: f64 = 1.0 / 9_460_730_472_580_800.0;
-    let dx = system1.x - system2.x;
-    let dy = system1.y - system2.y;
-    let dz = system1.z - system2.z;
-    (dx * dx + dy * dy + dz * dz).sqrt() * LY_PER_M
 }
 
 async fn evaluate_filter(

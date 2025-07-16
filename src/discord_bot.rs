@@ -866,12 +866,6 @@ fn str_corp_icon(id: u64) -> String {
     )
 }
 
-#[allow(unused)]
-fn str_ship_render(id: u32) -> String {
-    format!("https://images.evetech.net/types/{}/render?size=128", id)
-}
-
-#[allow(unused)]
 fn str_ship_icon(id: u32) -> String {
     format!("https://images.evetech.net/types/{}/icon?size=64", id)
 }
@@ -1092,7 +1086,7 @@ async fn build_killmail_embed(
             } else if let Some(corp_id) = matched_ship.corp_id {
                 str_corp_icon(corp_id)
             } else {
-                str_ship_render(type_id)
+                str_ship_icon(type_id)
             };
             (type_id, url)
         } else if killmail.victim.ship_type_id != 0 {
@@ -1101,7 +1095,7 @@ async fn build_killmail_embed(
             } else if let Some(corporation_id) = killmail.victim.corporation_id {
                 str_corp_icon(corporation_id)
             } else {
-                str_ship_render(killmail.victim.ship_type_id)
+                str_ship_icon(killmail.victim.ship_type_id)
             };
             (killmail.victim.ship_type_id, url)
         } else if let Some(attacker) = last_hit_attacker {
@@ -1111,7 +1105,7 @@ async fn build_killmail_embed(
                 } else if let Some(corporation_id) = attacker.corporation_id {
                     str_corp_icon(corporation_id)
                 } else {
-                    str_ship_render(ship_type_id)
+                    str_ship_icon(ship_type_id)
                 };
                 (ship_type_id, url)
             } else if let Some(weapon_type_id) = attacker.weapon_type_id {
@@ -1120,7 +1114,7 @@ async fn build_killmail_embed(
                 } else if let Some(corporation_id) = attacker.corporation_id {
                     str_corp_icon(corporation_id)
                 } else {
-                    str_ship_render(weapon_type_id)
+                    str_ship_icon(weapon_type_id)
                 };
                 (weapon_type_id, url)
             } else {
@@ -1136,7 +1130,7 @@ async fn build_killmail_embed(
             zk_data.kill_id
         );
     }
-    trace!("Rendering icon: {}", str_ship_render(id_of_icon_to_render));
+    trace!("Rendering icon: {}", str_ship_icon(id_of_icon_to_render));
 
     // --- Attacker Affiliation List ---
 
@@ -1270,7 +1264,7 @@ async fn build_killmail_embed(
             .url(related_br)
             .icon_url(affiliation_icon_url_to_render)
     });
-    embed.thumbnail(str_ship_render(id_of_icon_to_render));
+    embed.thumbnail(str_ship_icon(id_of_icon_to_render));
     embed.color(match best_match.map(|bm| bm.color).unwrap_or_default() {
         Color::Green => Colour::DARK_GREEN,
         Color::Red => Colour::RED,
