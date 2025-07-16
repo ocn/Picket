@@ -21,8 +21,7 @@ pub struct NamedFilterResult {
 
 #[derive(Debug, Clone, Default)]
 pub struct FilterResult {
-    // Composite attacker_keys, TODO: add struct for this data
-    pub(crate) matched_attackers: HashSet<String>,
+    pub(crate) matched_attackers: HashSet<AttackerKey>,
     pub(crate) matched_victim: bool,
     pub(crate) matched_ship: Option<MatchedShip>,
     pub(crate) color: Option<Color>,
@@ -45,33 +44,45 @@ pub(crate) struct MatchedShip {
     pub(crate) alliance_id: Option<u64>,
 }
 
-/// Creates a stable, unique composite key for an attacker on a killmail.
-/// This handles cases where an attacker might not have a character ID (e.g., structures).
-fn create_attacker_key(attacker: &Attacker) -> String {
-    // Using a Vec to build the key handles missing parts gracefully.
-    let mut key_parts = Vec::new();
+// A composite key (string) for an attacker, used to uniquely identify them across different killmails.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AttackerKey(String);
 
-    // We add available IDs in a specific order to ensure consistency.
-    if let Some(id) = attacker.ship_type_id {
-        key_parts.push(format!("s{}", id)); // 's' for ship
-    }
-    if let Some(id) = attacker.weapon_type_id {
-        key_parts.push(format!("w{}", id)); // 'w' for a weapon
-    }
-    if let Some(id) = attacker.character_id {
-        key_parts.push(format!("c{}", id)); // 'c' for character
-    }
-    if let Some(id) = attacker.corporation_id {
-        key_parts.push(format!("o{}", id)); // 'o' for corp
-    }
-    if let Some(id) = attacker.alliance_id {
-        key_parts.push(format!("a{}", id)); // 'a' for alliance
-    }
-    if let Some(id) = attacker.faction_id {
-        key_parts.push(format!("f{}", id)); // 'f' for faction
-    }
+impl AttackerKey {
+    /// Creates a stable, unique composite key for an attacker on a killmail.
+    /// This handles cases where an attacker might not have a character ID (e.g., structures).
+    pub fn new(attacker: &Attacker) -> Self {
+        // Using a Vec to build the key handles missing parts gracefully.
+        let mut key_parts = Vec::new();
 
-    key_parts.join(":")
+        // We add available IDs in a specific order to ensure consistency.
+        if let Some(id) = attacker.ship_type_id {
+            key_parts.push(format!("s{}", id)); // 's' for ship
+        }
+        if let Some(id) = attacker.weapon_type_id {
+            key_parts.push(format!("w{}", id)); // 'w' for a weapon
+        }
+        if let Some(id) = attacker.character_id {
+            key_parts.push(format!("c{}", id)); // 'c' for character
+        }
+        if let Some(id) = attacker.corporation_id {
+            key_parts.push(format!("o{}", id)); // 'o' for corp
+        }
+        if let Some(id) = attacker.alliance_id {
+            key_parts.push(format!("a{}", id)); // 'a' for alliance
+        }
+        if let Some(id) = attacker.faction_id {
+            key_parts.push(format!("f{}", id)); // 'f' for faction
+        }
+
+        AttackerKey(key_parts.join(":"))
+    }
+}
+
+impl std::fmt::Display for AttackerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.as_str())
+    }
 }
 
 pub async fn process_killmail(
@@ -260,14 +271,18 @@ fn evaluate_filter_node<'a>(
                             .iter()
                             .find(|r| r.filter_result.light_year_range.is_some())
                             .and_then(|r| r.filter_result.light_year_range.clone()),
-                        matched_attackers: results.iter().fold(Default::default(), |acc, b| {
-                            acc.intersection(&b.filter_result.matched_attackers)
-                                .cloned()
-                                .collect()
-                        }),
-                        matched_victim: results
-                            .iter()
-                            .any(|b| b.filter_result.matched_victim),
+                        matched_attackers: results.iter().fold(
+                            results
+                                .first()
+                                .map(|nfr| nfr.filter_result.matched_attackers.clone())
+                                .unwrap_or_default(),
+                            |acc, b| {
+                                acc.intersection(&b.filter_result.matched_attackers)
+                                    .cloned()
+                                    .collect()
+                            },
+                        ),
+                        matched_victim: results.iter().all(|b| b.filter_result.matched_victim),
                     },
                 };
                 Some(final_result)
@@ -304,7 +319,7 @@ fn evaluate_filter_node<'a>(
                         .killmail
                         .attackers
                         .iter()
-                        .map(create_attacker_key)
+                        .map(AttackerKey::new)
                         .collect();
                     Some(NamedFilterResult {
                         name: format!("Not({})", node.name()),
@@ -348,7 +363,7 @@ async fn evaluate_filter(
 
     let filter_result = match filter {
         Filter::Simple(sf) => {
-            match sf {
+            let mut res = match sf {
                 SimpleFilter::TotalValue { min, max } => {
                     let total_value = zk_data.zkb.total_value;
                     if min.is_none_or(|m| total_value >= m as f64)
@@ -557,7 +572,7 @@ async fn evaluate_filter(
 
                             if is_blue {
                                 // Generate the composite key for the blue attacker and insert it.
-                                let key = create_attacker_key(attacker);
+                                let key = AttackerKey::new(attacker);
                                 result.matched_attackers.insert(key);
                             }
                         }
@@ -569,7 +584,12 @@ async fn evaluate_filter(
                         filter_result: result,
                     });
                 }
+            };
+            if let Some(res) = &mut res {
+                res.matched_victim = true;
+                res.matched_attackers = killmail.attackers.iter().map(AttackerKey::new).collect();
             }
+            res
         }
         Filter::Targeted(tf) => {
             let mut result = FilterResult {
@@ -666,13 +686,15 @@ async fn evaluate_filter(
 
             // TODO: !victim_match prevents color mismatch, however there needs to be a ranking of
             // ship groups such that supercarrier kills appear rather than a dreadnought death
-            let attackers_matched: HashSet<String> = if tf.target.is_attacker() && !victim_match {
+            let attackers_matched: HashSet<AttackerKey> = if tf.target.is_attacker()
+                && !victim_match
+            {
                 match &tf.condition {
                     TargetableCondition::Alliance(alliance_ids) => killmail
                         .attackers
                         .iter()
                         .filter(|a| a.alliance_id.is_some_and(|id| alliance_ids.contains(&id)))
-                        .map(create_attacker_key)
+                        .map(AttackerKey::new)
                         .collect(),
                     TargetableCondition::Corporation(corporation_ids) => killmail
                         .attackers
@@ -681,13 +703,13 @@ async fn evaluate_filter(
                             a.corporation_id
                                 .is_some_and(|id| corporation_ids.contains(&id))
                         })
-                        .map(create_attacker_key)
+                        .map(AttackerKey::new)
                         .collect(),
                     TargetableCondition::Character(character_ids) => killmail
                         .attackers
                         .iter()
                         .filter(|a| a.character_id.is_some_and(|id| character_ids.contains(&id)))
-                        .map(create_attacker_key)
+                        .map(AttackerKey::new)
                         .collect(),
                     TargetableCondition::ShipType(ship_type_ids) => {
                         let mut matched = HashSet::new();
@@ -704,7 +726,7 @@ async fn evaluate_filter(
                                         alliance_id: attacker.alliance_id,
                                     };
                                     result.matched_ship = Some(matched_ship);
-                                    let _ = matched.insert(create_attacker_key(attacker));
+                                    let _ = matched.insert(AttackerKey::new(attacker));
                                     break;
                                 }
                             }
@@ -720,7 +742,7 @@ async fn evaluate_filter(
                                         alliance_id: attacker.alliance_id,
                                     };
                                     result.matched_ship = Some(matched_ship);
-                                    let _ = matched.insert(create_attacker_key(attacker));
+                                    let _ = matched.insert(AttackerKey::new(attacker));
                                     break;
                                 }
                             }
@@ -757,7 +779,7 @@ async fn evaluate_filter(
                                             alliance_id: attacker.alliance_id,
                                         };
                                         result.matched_ship = Some(matched_ship);
-                                        let _ = matched.insert(create_attacker_key(attacker));
+                                        let _ = matched.insert(AttackerKey::new(attacker));
                                         break;
                                     }
                                 }
@@ -778,7 +800,7 @@ async fn evaluate_filter(
                                             alliance_id: attacker.alliance_id,
                                         };
                                         result.matched_ship = Some(matched_ship);
-                                        let _ = matched.insert(create_attacker_key(attacker));
+                                        let _ = matched.insert(AttackerKey::new(attacker));
                                         break;
                                     }
                                 }
@@ -793,7 +815,7 @@ async fn evaluate_filter(
                             if let Some(ship_id) = attacker.ship_type_id {
                                 if let Some(name) = get_name(app_state, ship_id as u64).await {
                                     if name.to_lowercase().contains(&lower_fragment) {
-                                        let _ = matched.insert(create_attacker_key(attacker));
+                                        let _ = matched.insert(AttackerKey::new(attacker));
                                         break;
                                     }
                                 }
