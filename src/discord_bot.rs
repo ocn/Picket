@@ -6,7 +6,7 @@ use crate::config::{
 };
 use crate::esi::Celestial;
 use crate::models::{Attacker, ZkData};
-use crate::processor::{Color, NamedFilterResult};
+use crate::processor::{AttackerKey, Color, NamedFilterResult};
 use chrono::{DateTime, FixedOffset, Utc};
 use futures::future::join_all;
 use serenity::async_trait;
@@ -19,11 +19,32 @@ use serenity::model::guild::UnavailableGuild;
 use serenity::model::prelude::{ChannelId, Interaction};
 use serenity::prelude::*;
 use serenity::utils::Colour;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{error, info, trace, warn};
+
+const SHIP_GROUP_PRIORITY: &[u32] = &[
+    30,   // Titan
+    659,  // Supercarrier
+    4594, // Lancer
+    485,  // Dreadnought
+    1538, // FAX
+    547,  // Carrier
+    883,  // Capital Industrial Ship
+    902,  // Jump Freighter
+    513,  // Freighter
+];
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct MatchedEntity {
+    pub ship_name: String,
+    pub type_id: u32,
+    pub group_id: u32,
+    pub corp_id: Option<u64>,
+    pub alliance_id: Option<u64>,
+}
 
 #[derive(Debug)]
 pub enum KillmailSendError {
@@ -63,188 +84,6 @@ impl EventHandler for Handler {
                 "Failed to delete subscription file for guild {}: {}",
                 incomplete.id, e
             );
-        }
-    }
-
-    async fn ready(&self, ctx: Context, data_about_bot: Ready) {
-        info!("Discord bot {} is connected!", data_about_bot.user.name);
-
-        let data = ctx.data.read().await;
-        let command_map = data.get::<CommandMap>().unwrap();
-
-        if let Err(e) =
-            serenity::model::application::command::Command::set_global_application_commands(
-                &ctx.http,
-                |commands| {
-                    for cmd in command_map.values() {
-                        commands.create_application_command(|c| cmd.register(c));
-                    }
-                    commands
-                },
-            )
-            .await
-        {
-            error!("Failed to register global commands: {}", e);
-        }
-    }
-
-    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        match interaction {
-            Interaction::ApplicationCommand(command) => {
-                let data = ctx.data.read().await;
-                let command_map = data.get::<CommandMap>().unwrap();
-                let app_state = data.get::<crate::AppStateContainer>().unwrap();
-
-                if let Some(cmd) = command_map.get(&command.data.name) {
-                    cmd.execute(&ctx, &command, app_state).await;
-                }
-            }
-            Interaction::MessageComponent(component_interaction) => {
-                let custom_id = &component_interaction.data.custom_id;
-                let data = ctx.data.read().await;
-                let app_state = data.get::<crate::AppStateContainer>().unwrap();
-
-                if custom_id.starts_with("standings_select_") {
-                    let state = custom_id.strip_prefix("standings_select_").unwrap();
-                    let sso_state = app_state.sso_states.lock().await.remove(state);
-
-                    if let (Some(sso_state), Some(values)) =
-                        (sso_state, Some(&component_interaction.data.values))
-                    {
-                        if let Some(character_id_str) = values.first() {
-                            let character_id = character_id_str.parse::<u64>().unwrap();
-
-                            let token_clone = {
-                                let standings_map = app_state.user_standings.read().unwrap();
-                                if let Some(user_standings) =
-                                    standings_map.get(&sso_state.discord_user_id)
-                                {
-                                    user_standings
-                                        .tokens
-                                        .iter()
-                                        .find(|t| t.character_id == character_id)
-                                        .cloned()
-                                } else {
-                                    None
-                                }
-                            };
-
-                            if let Some(token) = token_clone {
-                                if let Ok((corp_id, alliance_id)) = app_state
-                                    .esi_client
-                                    .get_character_affiliation(token.character_id)
-                                    .await
-                                {
-                                    let source_entity_id = match sso_state.standing_source {
-                                        StandingSource::Character => token.character_id,
-                                        StandingSource::Corporation => corp_id,
-                                        StandingSource::Alliance => alliance_id.unwrap_or(corp_id),
-                                    };
-
-                                    let guild_id = sso_state.original_interaction.guild_id.unwrap();
-                                    let mut subscription_updated = false;
-                                    {
-                                        let _lock = app_state.subscriptions_file_lock.lock().await;
-                                        let mut subs_map = app_state.subscriptions.write().unwrap();
-                                        if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
-                                            let original_channel_id = sso_state
-                                                .original_interaction
-                                                .channel_id
-                                                .to_string();
-                                            if let Some(sub) = guild_subs.iter_mut().find(|s| {
-                                                s.id == sso_state.subscription_id
-                                                    && s.action.channel_id == original_channel_id
-                                            }) {
-                                                let new_filter =
-                                                    FilterNode::Condition(Filter::Simple(
-                                                        SimpleFilter::IgnoreHighStanding {
-                                                            synched_by_user_id: sso_state
-                                                                .discord_user_id
-                                                                .0,
-                                                            source: sso_state.standing_source,
-                                                            source_entity_id,
-                                                        },
-                                                    ));
-                                                if let FilterNode::And(ref mut conditions) =
-                                                    sub.root_filter
-                                                {
-                                                    // Remove any existing high standing filters before adding the new one.
-                                                    conditions.retain(|c| {
-                                                        !matches!(c, FilterNode::Condition(Filter::Simple(SimpleFilter::IgnoreHighStanding { .. })))
-                                                    });
-                                                    conditions.push(new_filter);
-                                                } else {
-                                                    // If it's not an AND node, it might be a single condition.
-                                                    // We'll wrap the old and new filters in an AND node.
-                                                    let old_root = sub.root_filter.clone();
-                                                    // But first, check if the old root is the one we want to replace.
-                                                    if matches!(
-                                                        &old_root,
-                                                        FilterNode::Condition(Filter::Simple(
-                                                            SimpleFilter::IgnoreHighStanding { .. }
-                                                        ))
-                                                    ) {
-                                                        sub.root_filter = new_filter;
-                                                    } else {
-                                                        sub.root_filter = FilterNode::And(vec![
-                                                            old_root, new_filter,
-                                                        ]);
-                                                    }
-                                                }
-
-                                                if let Err(e) =
-                                                    crate::config::save_subscriptions_for_guild(
-                                                        guild_id, guild_subs,
-                                                    )
-                                                {
-                                                    error!("Failed to save subscriptions for guild {}: {}", guild_id, e);
-                                                } else {
-                                                    subscription_updated = true;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if subscription_updated {
-                                        if let Err(why) = component_interaction
-                                            .create_interaction_response(&ctx.http, |r| {
-                                                r.interaction_response_data(|m| {
-                                                    m.content(format!(
-                                                        "Subscription '{}' updated successfully.",
-                                                        sso_state.subscription_id
-                                                    ))
-                                                    .ephemeral(true)
-                                                })
-                                            })
-                                            .await
-                                        {
-                                            error!("Cannot respond to interaction: {}", why);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else if custom_id.starts_with("standings_reauth_") {
-                    let state = custom_id.strip_prefix("standings_reauth_").unwrap();
-                    let sso_states = app_state.sso_states.lock().await;
-                    if let Some(sso_state) = sso_states.get(state) {
-                        let sync_command = SyncStandingsCommand;
-                        sync_command
-                            .initiate_sso(&ctx, &sso_state.original_interaction, app_state, state)
-                            .await;
-                        let _ = component_interaction
-                            .create_interaction_response(&ctx.http, |r| {
-                                r.interaction_response_data(|m| {
-                                    m.content("A new authorization link has been sent to your DMs.")
-                                        .ephemeral(true)
-                                })
-                            })
-                            .await;
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -466,6 +305,188 @@ impl EventHandler for Handler {
             }
         }
     }
+
+    async fn ready(&self, ctx: Context, data_about_bot: Ready) {
+        info!("Discord bot {} is connected!", data_about_bot.user.name);
+
+        let data = ctx.data.read().await;
+        let command_map = data.get::<CommandMap>().unwrap();
+
+        if let Err(e) =
+            serenity::model::application::command::Command::set_global_application_commands(
+                &ctx.http,
+                |commands| {
+                    for cmd in command_map.values() {
+                        commands.create_application_command(|c| cmd.register(c));
+                    }
+                    commands
+                },
+            )
+            .await
+        {
+            error!("Failed to register global commands: {}", e);
+        }
+    }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        match interaction {
+            Interaction::ApplicationCommand(command) => {
+                let data = ctx.data.read().await;
+                let command_map = data.get::<CommandMap>().unwrap();
+                let app_state = data.get::<crate::AppStateContainer>().unwrap();
+
+                if let Some(cmd) = command_map.get(&command.data.name) {
+                    cmd.execute(&ctx, &command, app_state).await;
+                }
+            }
+            Interaction::MessageComponent(component_interaction) => {
+                let custom_id = &component_interaction.data.custom_id;
+                let data = ctx.data.read().await;
+                let app_state = data.get::<crate::AppStateContainer>().unwrap();
+
+                if custom_id.starts_with("standings_select_") {
+                    let state = custom_id.strip_prefix("standings_select_").unwrap();
+                    let sso_state = app_state.sso_states.lock().await.remove(state);
+
+                    if let (Some(sso_state), Some(values)) =
+                        (sso_state, Some(&component_interaction.data.values))
+                    {
+                        if let Some(character_id_str) = values.first() {
+                            let character_id = character_id_str.parse::<u64>().unwrap();
+
+                            let token_clone = {
+                                let standings_map = app_state.user_standings.read().unwrap();
+                                if let Some(user_standings) =
+                                    standings_map.get(&sso_state.discord_user_id)
+                                {
+                                    user_standings
+                                        .tokens
+                                        .iter()
+                                        .find(|t| t.character_id == character_id)
+                                        .cloned()
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some(token) = token_clone {
+                                if let Ok((corp_id, alliance_id)) = app_state
+                                    .esi_client
+                                    .get_character_affiliation(token.character_id)
+                                    .await
+                                {
+                                    let source_entity_id = match sso_state.standing_source {
+                                        StandingSource::Character => token.character_id,
+                                        StandingSource::Corporation => corp_id,
+                                        StandingSource::Alliance => alliance_id.unwrap_or(corp_id),
+                                    };
+
+                                    let guild_id = sso_state.original_interaction.guild_id.unwrap();
+                                    let mut subscription_updated = false;
+                                    {
+                                        let _lock = app_state.subscriptions_file_lock.lock().await;
+                                        let mut subs_map = app_state.subscriptions.write().unwrap();
+                                        if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
+                                            let original_channel_id = sso_state
+                                                .original_interaction
+                                                .channel_id
+                                                .to_string();
+                                            if let Some(sub) = guild_subs.iter_mut().find(|s| {
+                                                s.id == sso_state.subscription_id
+                                                    && s.action.channel_id == original_channel_id
+                                            }) {
+                                                let new_filter =
+                                                    FilterNode::Condition(Filter::Simple(
+                                                        SimpleFilter::IgnoreHighStanding {
+                                                            synched_by_user_id: sso_state
+                                                                .discord_user_id
+                                                                .0,
+                                                            source: sso_state.standing_source,
+                                                            source_entity_id,
+                                                        },
+                                                    ));
+                                                if let FilterNode::And(ref mut conditions) =
+                                                    sub.root_filter
+                                                {
+                                                    // Remove any existing high standing filters before adding the new one.
+                                                    conditions.retain(|c| {
+                                                        !matches!(c, FilterNode::Condition(Filter::Simple(SimpleFilter::IgnoreHighStanding { .. })))
+                                                    });
+                                                    conditions.push(new_filter);
+                                                } else {
+                                                    // If it's not an AND node, it might be a single condition.
+                                                    // We'll wrap the old and new filters in an AND node.
+                                                    let old_root = sub.root_filter.clone();
+                                                    // But first, check if the old root is the one we want to replace.
+                                                    if matches!(
+                                                        &old_root,
+                                                        FilterNode::Condition(Filter::Simple(
+                                                            SimpleFilter::IgnoreHighStanding { .. }
+                                                        ))
+                                                    ) {
+                                                        sub.root_filter = new_filter;
+                                                    } else {
+                                                        sub.root_filter = FilterNode::And(vec![
+                                                            old_root, new_filter,
+                                                        ]);
+                                                    }
+                                                }
+
+                                                if let Err(e) =
+                                                    crate::config::save_subscriptions_for_guild(
+                                                        guild_id, guild_subs,
+                                                    )
+                                                {
+                                                    error!("Failed to save subscriptions for guild {}: {}", guild_id, e);
+                                                } else {
+                                                    subscription_updated = true;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if subscription_updated {
+                                        if let Err(why) = component_interaction
+                                            .create_interaction_response(&ctx.http, |r| {
+                                                r.interaction_response_data(|m| {
+                                                    m.content(format!(
+                                                        "Subscription '{}' updated successfully.",
+                                                        sso_state.subscription_id
+                                                    ))
+                                                    .ephemeral(true)
+                                                })
+                                            })
+                                            .await
+                                        {
+                                            error!("Cannot respond to interaction: {}", why);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if custom_id.starts_with("standings_reauth_") {
+                    let state = custom_id.strip_prefix("standings_reauth_").unwrap();
+                    let sso_states = app_state.sso_states.lock().await;
+                    if let Some(sso_state) = sso_states.get(state) {
+                        let sync_command = SyncStandingsCommand;
+                        sync_command
+                            .initiate_sso(&ctx, &sso_state.original_interaction, app_state, state)
+                            .await;
+                        let _ = component_interaction
+                            .create_interaction_response(&ctx.http, |r| {
+                                r.interaction_response_data(|m| {
+                                    m.content("A new authorization link has been sent to your DMs.")
+                                        .ephemeral(true)
+                                })
+                            })
+                            .await;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 // --- Dynamic Data Fetching and Caching ---
@@ -579,6 +600,66 @@ async fn get_closest_celestial(
             None
         }
     }
+}
+
+async fn select_best_entity_for_display(
+    app_state: &Arc<AppState>,
+    zk_data: &ZkData,
+    matched_attackers: &HashSet<AttackerKey>,
+    victim_matched: bool,
+) -> Option<MatchedEntity> {
+    let mut potential_matches = Vec::new();
+
+    // Find the full Attacker structs corresponding to the matched keys
+    let attacker_map: HashMap<AttackerKey, &Attacker> = zk_data
+        .killmail
+        .attackers
+        .iter()
+        .map(|a| (AttackerKey::new(a), a))
+        .collect();
+
+    for key in matched_attackers {
+        if let Some(attacker) = attacker_map.get(key) {
+            if let Some(type_id) = attacker.ship_type_id.or(attacker.weapon_type_id) {
+                if let Some(group_id) = get_ship_group_id(app_state, type_id).await {
+                    potential_matches.push(MatchedEntity {
+                        ship_name: get_name(app_state, type_id as u64)
+                            .await
+                            .unwrap_or_default(),
+                        type_id,
+                        group_id,
+                        corp_id: attacker.corporation_id,
+                        alliance_id: attacker.alliance_id,
+                    });
+                }
+            }
+        }
+    }
+
+    // If the victim was also a match, add them to the list of potential entities to display
+    if victim_matched {
+        if let Some(group_id) =
+            get_ship_group_id(app_state, zk_data.killmail.victim.ship_type_id).await
+        {
+            potential_matches.push(MatchedEntity {
+                ship_name: get_name(app_state, zk_data.killmail.victim.ship_type_id as u64)
+                    .await
+                    .unwrap_or_default(),
+                type_id: zk_data.killmail.victim.ship_type_id,
+                group_id,
+                corp_id: zk_data.killmail.victim.corporation_id,
+                alliance_id: zk_data.killmail.victim.alliance_id,
+            });
+        }
+    }
+
+    // Prioritize the list and return the best one
+    potential_matches.into_iter().min_by_key(|entity| {
+        SHIP_GROUP_PRIORITY
+            .iter()
+            .position(|&p| p == entity.group_id)
+            .unwrap_or(usize::MAX)
+    })
 }
 
 // --- Message Sending and Embed Building ---
@@ -932,6 +1013,13 @@ async fn build_killmail_embed(
 
     // Title + Author Text
     let most_common_ship = most_common_ship_type(&killmail.attackers);
+    let best_match = select_best_entity_for_display(
+        app_state,
+        zk_data,
+        &filter_result.matched_attackers,
+        filter_result.matched_victim,
+    )
+    .await;
     let title;
     let mut author_text;
     if filter_result.min_pilots.is_some() {
@@ -949,7 +1037,7 @@ async fn build_killmail_embed(
         } else {
             "Missing 0".to_string()
         };
-    } else if let Some(ref matched_ship) = filter_result.matched_ship {
+    } else if let Some(ref matched_ship) = best_match {
         author_text = format!(
             "{} in {} ({})",
             matched_ship.ship_name, system_name, region_name
@@ -994,7 +1082,7 @@ async fn build_killmail_embed(
     // 3. Final blow attacker's ship
     // 4. Final blow attacker's weapon
     let (id_of_icon_to_render, affiliation_icon_url_to_render) = {
-        if let Some(ref matched_ship) = &filter_result.matched_ship {
+        if let Some(ref matched_ship) = &best_match {
             let type_id = matched_ship.type_id;
             let url = if let Some(alliance_id) = matched_ship.alliance_id {
                 str_alliance_icon(alliance_id)
