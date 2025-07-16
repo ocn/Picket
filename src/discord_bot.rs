@@ -973,7 +973,7 @@ async fn build_killmail_embed(
     let mut location_details = String::new();
     if let Some(celestial) = get_closest_celestial(app_state, zk_data).await {
         let distance_km = celestial.distance / 1000.0;
-        let distance_str = if distance_km > 1500.0 {
+        let distance_str = if distance_km > 1_500_000.0 {
             format!("{:.1} AU", distance_km / 149_597_870.7)
         } else {
             format!("{:.1} km", distance_km)
