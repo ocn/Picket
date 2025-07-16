@@ -299,8 +299,6 @@ fn evaluate_filter_node<'a>(
                         } else {
                             final_res = Some(result.filter_result);
                         }
-                        // TODO: consider logic of merging
-                        break;
                     }
                 }
                 final_res.map(|fr| NamedFilterResult {
