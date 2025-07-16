@@ -110,9 +110,10 @@ pub async fn process_killmail(
                 continue;
             };
 
-            tracing::info!(
-                "[Kill: {}] Matches for subscription '{}': {:#?}",
+            tracing::trace!(
+                "[Kill: {}] Matches for subscription '{}' in channel '{}': {:#?}",
                 zk_data.killmail.killmail_id,
+                subscription.action.channel_id,
                 subscription.id,
                 primary_matches.filter_result,
             );
@@ -251,6 +252,7 @@ fn evaluate_filter_node<'a>(
                         return None; // One failure means the whole And block fails
                     }
                 }
+                tracing::trace!("{:#?}", results);
                 // Merge results
                 let final_result = NamedFilterResult {
                     name: results
@@ -406,10 +408,13 @@ async fn evaluate_filter(
                     ) {
                         let rounded_sec = (system.security_status * 10.0).round() / 10.0;
                         if range.contains(&rounded_sec) {
-                            return Some(Default::default());
+                            Some(Default::default())
+                        } else {
+                            None
                         }
+                    } else {
+                        None
                     }
-                    None
                 }
                 SimpleFilter::LyRangeFrom(system_ranges) => {
                     if let Some(killmail_system) =
@@ -684,9 +689,7 @@ async fn evaluate_filter(
 
             // TODO: !victim_match prevents color mismatch, however there needs to be a ranking of
             // ship groups such that supercarrier kills appear rather than a dreadnought death
-            let attackers_matched: HashSet<AttackerKey> = if tf.target.is_attacker()
-                && !victim_match
-            {
+            let attackers_matched: HashSet<AttackerKey> = if tf.target.is_attacker() {
                 match &tf.condition {
                     TargetableCondition::Alliance(alliance_ids) => killmail
                         .attackers
@@ -1018,7 +1021,7 @@ mod tests {
         serde_json::from_str(json_data).expect("Failed to parse ZkData from JSON")
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_ship_group_filter_uses_group_id_of_subscription_type_id_list() {
         let zk_data = user_killmail_data();
         let app_state = mock_app_state();
@@ -1056,7 +1059,7 @@ mod tests {
         assert!(result.is_some(), "Filter should pass because the ShipGroup list contains a TypeID (19720), which has the required GroupID (485) to match the incoming killmail.");
     }
 
-    // #[tokio::test]
+    // #[test_log::test(tokio::test)]
     // async fn test_user_scenario_shipgroup_filter_passes_with_correct_group_id() {
     //     let zk_data = user_killmail_data();
     //     let app_state = mock_app_state();
@@ -1088,7 +1091,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_total_value_filter() {
         let zk_data = default_zk_data();
         test_filter(
@@ -1129,7 +1132,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_region_filter() {
         let zk_data = default_zk_data();
         test_filter(
@@ -1146,7 +1149,7 @@ mod tests {
         .await; // Domain
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_system_filter() {
         let zk_data = default_zk_data();
         test_filter(
@@ -1163,7 +1166,7 @@ mod tests {
         .await; // Amarr
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_security_filter() {
         let zk_data = default_zk_data(); // Jita is 0.9
         test_filter(
@@ -1180,7 +1183,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_alliance_filter() {
         let zk_data = default_zk_data();
         test_filter(
@@ -1212,7 +1215,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_corporation_filter() {
         let zk_data = default_zk_data();
         test_filter(
@@ -1244,7 +1247,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_ship_type_filter() {
         let zk_data = default_zk_data();
         test_filter(
@@ -1276,7 +1279,7 @@ mod tests {
         .await; // Golem
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_ship_group_filter() {
         let zk_data = default_zk_data();
         // Victim is a Rifter (Frigate, group 25)
@@ -1311,7 +1314,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_ly_filter() {
         let mut zk_data = {
             ZkData {
@@ -1379,7 +1382,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_is_npc_filter() {
         let mut zk_data = default_zk_data();
         zk_data.zkb.npc = true;
@@ -1387,7 +1390,7 @@ mod tests {
         test_filter(Filter::Simple(SimpleFilter::IsNpc(false)), &zk_data, false).await;
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_pilots_filter() {
         let zk_data = default_zk_data(); // 2 pilots total
         test_filter(
@@ -1428,7 +1431,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_time_range_filter() {
         let zk_data = default_zk_data(); // Time is 12:00:00
         test_filter(
@@ -1460,7 +1463,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_combined_and_filter_success() {
         // User's case: ShipGroup in a certain Region.
         // Test data: Rifter (Frigate, group 25) in Jita (The Forge, region 10000002)
@@ -1482,7 +1485,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_combined_and_filter_fail_region() {
         // Test data: Rifter (Frigate, group 25) in Jita
         // Filter: Wrong region, correct ship group
@@ -1504,7 +1507,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_combined_and_filter_fail_shipgroup() {
         // Test data: Rifter (Frigate, group 25) in Jita
         // Filter: Correct region, wrong ship group
@@ -1526,7 +1529,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_combined_or_filter_success() {
         // Test data: Rifter (Frigate, group 25) in Jita
         // Filter: Wrong region OR correct ship group
@@ -1548,7 +1551,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_not_filter() {
         let zk_data = default_zk_data();
         let app_state = mock_app_state();
@@ -1577,4 +1580,180 @@ mod tests {
             "NOT filter should pass when inner condition fails"
         );
     }
+
+    fn complex_and_filter_subscription() -> FilterNode {
+        // TODO: replace 23913 with 30
+        serde_json::from_str(
+            r#"
+             {
+               "And": [
+                 {
+                   "Condition": {
+                     "Simple": {
+                       "TotalValue": {
+                         "min": 5000000,
+                         "max": null
+                       }
+                     }
+                   }
+                 },
+                 {
+                   "Condition": {
+                     "Simple": {
+                       "Region": [
+                         10000009
+                       ]
+                     }
+                   }
+                 },
+                 {
+                   "Condition": {
+                     "Targeted": {
+                       "condition": {
+                         "ShipGroup": [
+                           23913
+                         ]
+                       },
+                       "target": "Any"
+                     }
+                   }
+                 },
+                 {
+                   "Condition": {
+                     "Simple": {
+                       "Security": "-1.0000..=0.0000"
+                     }
+                   }
+                 }
+               ]
+             }
+             "#,
+        )
+            .unwrap()
+    }
+
+    fn nyx_killmail() -> ZkData {
+        ZkData {
+            kill_id: 128577810,
+            killmail: KillmailData {
+                killmail_id: 128577810,
+                killmail_time: "2025-07-16T03:39:17Z".to_string(),
+                solar_system_id: 30000706, // A-C5TC
+                victim: Victim {
+                    damage_taken: 50000,
+                    ship_type_id: 670, // Capsule
+                    character_id: Some(90000001),
+                    corporation_id: Some(1000001),
+                    alliance_id: Some(2000001),
+                    position: None,
+                    faction_id: None,
+                    items: vec![],
+                },
+                attackers: vec![
+                    Attacker {
+                        final_blow: true,
+                        damage_done: 50000,
+                        ship_type_id: Some(23913), // Nyx
+                        character_id: Some(987654321),
+                        corporation_id: Some(98657999),
+                        alliance_id: Some(1354830081),
+                        weapon_type_id: Some(23913),
+                        security_status: -10.0,
+                        faction_id: None,
+                    },
+                    Attacker {
+                        final_blow: false,
+                        damage_done: 100,
+                        ship_type_id: Some(621), // Condor
+                        character_id: Some(123456789),
+                        corporation_id: Some(98657999),
+                        alliance_id: Some(1354830081),
+                        weapon_type_id: Some(501),
+                        security_status: 0.5,
+                        faction_id: None,
+                    },
+                ],
+            },
+            zkb: Zkb {
+                total_value: 6_000_000.0,
+                dropped_value: 0.0,
+                npc: false,
+                solo: false,
+                location_id: None,
+                hash: "".to_string(),
+                fitted_value: 0.0,
+                destroyed_value: 0.0,
+                points: 0,
+                awox: false,
+                esi: "".to_string(),
+            },
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_complex_and_filter_with_targeted_ship_group() {
+        // This test simulates the exact scenario that was failing.
+        let app_state = mock_app_state();
+        // Add specific data needed for this test case to the mock state
+        {
+            let mut systems = app_state.systems.write().unwrap();
+            systems.insert(
+                30000706,
+                System {
+                    id: 30000706,
+                    name: "A-C5TC".to_string(),
+                    region_id: 10000009,
+                    region: "Vale of the Silent".to_string(),
+                    security_status: -0.5,
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            );
+
+            let mut ships = app_state.ships.write().unwrap();
+            ships.insert(23913, 30); // Nyx -> Supercarrier (Group ID 30)
+            ships.insert(621, 25); // Condor -> Frigate (Group ID 25)
+
+            let mut names = app_state.names.write().unwrap();
+            names.insert(23913, "Nyx".to_string());
+            names.insert(621, "Condor".to_string());
+        }
+
+        let filter_node = complex_and_filter_subscription();
+        let zk_data = nyx_killmail();
+
+        let result = evaluate_filter_node(&filter_node, &zk_data, &app_state).await;
+
+        // The filter should pass because the Nyx matches all conditions.
+        assert!(result.is_some(), "The filter node should have passed.");
+
+        let filter_result = result.unwrap().filter_result;
+
+        // The victim should not have matched.
+        assert_eq!(
+            filter_result.matched_victim, false,
+            "Victim should not have matched the ShipGroup filter."
+        );
+
+        // The matched_attackers set should contain exactly one key: the Nyx pilot's.
+        assert_eq!(
+            filter_result.matched_attackers.len(),
+            1,
+            "There should be exactly one matched attacker."
+        );
+
+        let nyx_attacker = zk_data
+            .killmail
+            .attackers
+            .iter()
+            .find(|a| a.ship_type_id == Some(23913))
+            .unwrap();
+        let expected_key = AttackerKey::new(nyx_attacker);
+        assert!(
+            filter_result.matched_attackers.contains(&expected_key),
+            "The matched attacker must be the Nyx."
+        );
+    }
+
 }
