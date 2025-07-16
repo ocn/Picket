@@ -99,6 +99,13 @@ pub async fn process_killmail(
                 continue;
             };
 
+            tracing::info!(
+                "[Kill: {}] Matches for subscription '{}': {:#?}",
+                zk_data.killmail.killmail_id,
+                subscription.id,
+                primary_matches.filter_result,
+            );
+
             // Step 2: Evaluate the veto conditions.
             let veto_attackers = if let Some(veto_tree) = veto_tree {
                 evaluate_filter_node(&veto_tree, zk_data, app_state)
