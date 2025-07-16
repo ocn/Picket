@@ -591,17 +591,6 @@ async fn evaluate_filter(
                             || attacker.weapon_type_id.is_some_and(|id| ids.contains(&id))
                     }
                     TargetableCondition::ShipGroup(ids) => {
-                        // It is implicit that these "ship group IDs" are actually ship type IDs, and thus
-                        // must be converted to the proper ship group IDs before use.
-                        // let mut ids = vec![];
-                        // for type_id in ship_group_ids_as_type_ids {
-                        //     if let Some(group_id) = get_ship_group_id(app_state, *type_id).await {
-                        //         ids.push(group_id);
-                        //     } else {
-                        //         warn!("Failed to get ship group ID for type ID {}", type_id);
-                        //     }
-                        // }
-
                         let ship_match = if let Some(id) = attacker.ship_type_id {
                             get_ship_group_id(app_state, id)
                                 .await
@@ -854,7 +843,7 @@ mod tests {
             // A list of type IDs of which we want to match based on their group ID
             FilterNode::Condition(Filter::Targeted(TargetedFilter {
                 condition: TargetableCondition::ShipGroup(vec![
-                    28352, 23919, 23757, 77283, 19722, 37604, 20183, 28850, 11567,
+                    883, 659, 547, 4594, 485, 1538, 513, 902, 30,
                 ]),
                 target: Default::default(),
             })),
@@ -1105,7 +1094,7 @@ mod tests {
         test_filter(
             Filter::Targeted(TargetedFilter {
                 target: Target::Any,
-                condition: TargetableCondition::ShipGroup(vec![587]),
+                condition: TargetableCondition::ShipGroup(vec![25]),
             }),
             &zk_data,
             true,
@@ -1115,7 +1104,7 @@ mod tests {
         test_filter(
             Filter::Targeted(TargetedFilter {
                 target: Target::Any,
-                condition: TargetableCondition::ShipGroup(vec![671]),
+                condition: TargetableCondition::ShipGroup(vec![27]),
             }),
             &zk_data,
             true,
@@ -1125,7 +1114,7 @@ mod tests {
         test_filter(
             Filter::Targeted(TargetedFilter {
                 target: Target::Any,
-                condition: TargetableCondition::ShipGroup(vec![28661]),
+                condition: TargetableCondition::ShipGroup(vec![419]),
             }),
             &zk_data,
             false,
@@ -1293,7 +1282,7 @@ mod tests {
             FilterNode::Condition(Filter::Simple(SimpleFilter::Region(vec![10000002]))), // The Forge
             FilterNode::Condition(Filter::Targeted(TargetedFilter {
                 target: Target::Any,
-                condition: TargetableCondition::ShipGroup(vec![587]), // group 25 for frigate
+                condition: TargetableCondition::ShipGroup(vec![25]), // group 25 for frigate
             })), // Frigate
         ]);
 
@@ -1359,7 +1348,7 @@ mod tests {
             FilterNode::Condition(Filter::Simple(SimpleFilter::Region(vec![10000043]))), // Domain (Wrong)
             FilterNode::Condition(Filter::Targeted(TargetedFilter {
                 target: Target::Any,
-                condition: TargetableCondition::ShipGroup(vec![587]), // group 25 for frigate
+                condition: TargetableCondition::ShipGroup(vec![25]), // group 25 for frigate
             })), // Frigate (Correct)
         ]);
 
@@ -1401,7 +1390,6 @@ mod tests {
     }
 
     fn complex_and_filter_subscription() -> FilterNode {
-        // TODO: replace 23913 with 30
         serde_json::from_str(
             r#"
              {
@@ -1430,7 +1418,7 @@ mod tests {
                      "Targeted": {
                        "condition": {
                          "ShipGroup": [
-                           23913
+                           30
                          ]
                        },
                        "target": "Any"
@@ -1674,7 +1662,7 @@ mod tests {
             action: Default::default(),
             root_filter: FilterNode::And(vec![
                 FilterNode::Condition(Filter::Targeted(TargetedFilter {
-                    condition: TargetableCondition::ShipGroup(vec![19720]), // Match Dreadnoughts
+                    condition: TargetableCondition::ShipGroup(vec![485]), // Match Dreadnoughts
                     target: Default::default(),
                 })),
                 FilterNode::Condition(Filter::Simple(SimpleFilter::IgnoreHighStanding {

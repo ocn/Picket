@@ -69,8 +69,6 @@ impl std::fmt::Display for Target {
     }
 }
 
-
-
 // Filter conditions that can be targeted to either a victim or attacker
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase")]
@@ -155,16 +153,28 @@ impl TargetedFilter {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 pub enum SimpleFilter {
-    TotalValue { min: Option<u64>, max: Option<u64> },
-    DroppedValue { min: Option<u64>, max: Option<u64> },
+    TotalValue {
+        min: Option<u64>,
+        max: Option<u64>,
+    },
+    DroppedValue {
+        min: Option<u64>,
+        max: Option<u64>,
+    },
     Region(Vec<u32>),
     System(Vec<u32>),
     Security(String),
     LyRangeFrom(Vec<SystemRange>),
     IsNpc(bool),
     IsSolo(bool),
-    Pilots { min: Option<u32>, max: Option<u32> },
-    TimeRange { start: u32, end: u32 },
+    Pilots {
+        min: Option<u32>,
+        max: Option<u32>,
+    },
+    TimeRange {
+        start: u32,
+        end: u32,
+    },
     IgnoreHighStanding {
         synched_by_user_id: u64,
         source: StandingSource,
@@ -215,8 +225,15 @@ impl SimpleFilter {
                 max.map_or("any".to_string(), |v| v.to_string())
             ),
             SimpleFilter::TimeRange { start, end } => format!("TimeRange({}:00-{}:00)", start, end),
-            SimpleFilter::IgnoreHighStanding { synched_by_user_id, source, source_entity_id } => {
-                format!("IgnoreHighStanding(synched_by: {}, source: {:?}, source_id: {})", synched_by_user_id, source, source_entity_id)
+            SimpleFilter::IgnoreHighStanding {
+                synched_by_user_id,
+                source,
+                source_entity_id,
+            } => {
+                format!(
+                    "IgnoreHighStanding(synched_by: {}, source: {:?}, source_id: {})",
+                    synched_by_user_id, source, source_entity_id
+                )
             }
         }
     }
@@ -237,8 +254,6 @@ impl Filter {
         }
     }
 }
-
-
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase")]
@@ -584,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_load_subscription_file() {
-        let path = Path::new("config/888224317991706685.new.json");
+        let path = Path::new("config/888224317991706685.json");
         assert!(
             path.exists(),
             "Subscription file does not exist at {:?}",
@@ -602,11 +617,11 @@ mod tests {
         let subscriptions = result.unwrap();
         assert_eq!(
             subscriptions.len(),
-            192,
+            187,
             "Incorrect number of subscriptions loaded"
         );
-        assert_eq!(subscriptions[0].id, "1");
-        assert_eq!(subscriptions[0].action.channel_id, "1090110979083354183");
+        assert_eq!(subscriptions[0].id, "8128");
+        assert_eq!(subscriptions[0].action.channel_id, "1115072714340827167");
         println!("{:#?}", subscriptions);
     }
 
