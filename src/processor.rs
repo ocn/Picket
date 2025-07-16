@@ -23,7 +23,6 @@ pub struct NamedFilterResult {
 pub struct FilterResult {
     pub matched_attackers: HashSet<AttackerKey>,
     pub matched_victim: bool,
-    pub color: Option<Color>,
     pub min_pilots: Option<u32>,
     pub light_year_range: Option<SystemRange>,
 }
@@ -42,7 +41,7 @@ pub struct FilterResult {
 //     }
 // }
 
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub enum Color {
     Green,
     #[default]
@@ -264,10 +263,6 @@ fn evaluate_filter_node<'a>(
                         .iter()
                         .fold(String::new(), |acc, b| format!("{} + {}", acc, b.name)),
                     filter_result: FilterResult {
-                        color: results
-                            .iter()
-                            .find(|r| r.filter_result.color.is_some())
-                            .map_or(results[0].filter_result.color, |r| r.filter_result.color),
                         min_pilots: results.iter().find_map(|r| r.filter_result.min_pilots),
                         // TODO: fold/accumulate here
                         light_year_range: results
@@ -679,11 +674,7 @@ async fn evaluate_filter(
                 }
             };
 
-            if result.matched_victim {
-                result.color = Some(Color::Red);
-                Some(result)
-            } else if !result.matched_attackers.is_empty() {
-                result.color = Some(Color::Green);
+            if result.matched_victim || !result.matched_attackers.is_empty() {
                 Some(result)
             } else {
                 None

@@ -44,6 +44,7 @@ pub(crate) struct MatchedEntity {
     pub group_id: u32,
     pub corp_id: Option<u64>,
     pub alliance_id: Option<u64>,
+    pub color: Color,
 }
 
 #[derive(Debug)]
@@ -630,6 +631,7 @@ async fn select_best_entity_for_display(
                         group_id,
                         corp_id: attacker.corporation_id,
                         alliance_id: attacker.alliance_id,
+                        color: Color::Green,
                     });
                 }
             }
@@ -649,6 +651,7 @@ async fn select_best_entity_for_display(
                 group_id,
                 corp_id: zk_data.killmail.victim.corporation_id,
                 alliance_id: zk_data.killmail.victim.alliance_id,
+                color: Color::Red,
             });
         }
     }
@@ -951,6 +954,14 @@ async fn build_killmail_embed(
     let system_id = system_info.as_ref().map_or(0, |s| s.id);
     let region_name = system_info.as_ref().map_or("Unknown Region", |s| &s.region);
     let region_id = system_info.as_ref().map_or(0, |s| s.region_id);
+    let most_common_ship = most_common_ship_type(&killmail.attackers);
+    let best_match = select_best_entity_for_display(
+        app_state,
+        zk_data,
+        &filter_result.matched_attackers,
+        filter_result.matched_victim,
+    )
+        .await;
 
     let total_value_str = abbreviate_number(zk_data.zkb.total_value);
     let relative_time = get_relative_time(&killmail.killmail_time);
@@ -1012,14 +1023,6 @@ async fn build_killmail_embed(
     }
 
     // Title + Author Text
-    let most_common_ship = most_common_ship_type(&killmail.attackers);
-    let best_match = select_best_entity_for_display(
-        app_state,
-        zk_data,
-        &filter_result.matched_attackers,
-        filter_result.matched_victim,
-    )
-    .await;
     let title;
     let mut author_text;
     if filter_result.min_pilots.is_some() {
@@ -1043,7 +1046,7 @@ async fn build_killmail_embed(
             matched_ship.ship_name, system_name, region_name
         );
         if let Some((type_id, count)) = most_common_ship {
-            match filter_result.color.unwrap_or_default() {
+            match matched_ship.color {
                 Color::Green => {
                     title = format!("`{}` destroyed", victim_ship_name);
                 }
@@ -1268,7 +1271,7 @@ async fn build_killmail_embed(
             .icon_url(affiliation_icon_url_to_render)
     });
     embed.thumbnail(str_ship_render(id_of_icon_to_render));
-    embed.color(match filter_result.color.unwrap_or_default() {
+    embed.color(match best_match.map(|bm| bm.color).unwrap_or_default() {
         Color::Green => Colour::DARK_GREEN,
         Color::Red => Colour::RED,
     });
