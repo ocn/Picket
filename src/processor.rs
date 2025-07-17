@@ -273,17 +273,27 @@ fn evaluate_filter_node<'a>(
                             .iter()
                             .find(|r| r.filter_result.light_year_range.is_some())
                             .and_then(|r| r.filter_result.light_year_range.clone()),
-                        matched_attackers: results.iter().fold(
-                            results
-                                .first()
-                                .map(|nfr| nfr.filter_result.matched_attackers.clone())
-                                .unwrap_or_default(),
-                            |acc, b| {
-                                acc.intersection(&b.filter_result.matched_attackers)
-                                    .cloned()
-                                    .collect()
-                            },
-                        ),
+                        matched_attackers: {
+                            // Find the first non-empty set of matched_attackers to ensure we're
+                            // always starting with a non-empty set to intersect with.
+                            let init = results
+                                .iter()
+                                .find(|r| !r.filter_result.matched_attackers.is_empty())
+                                .cloned()
+                                .unwrap_or_default()
+                                .filter_result
+                                .matched_attackers;
+                            results.iter().fold(init, |acc, b| {
+                                // Exclude any sets where there were no matched attackers.
+                                if b.filter_result.matched_attackers.is_empty() {
+                                    acc
+                                } else {
+                                    acc.intersection(&b.filter_result.matched_attackers)
+                                        .cloned()
+                                        .collect()
+                                }
+                            })
+                        },
                         matched_victim: results.iter().all(|b| b.filter_result.matched_victim),
                     },
                 };
@@ -566,8 +576,6 @@ async fn evaluate_filter(
                 // TODO: Handle this better? For all veto filters?
                 if !matches!(sf, SimpleFilter::IgnoreHighStanding { .. }) {
                     res.matched_victim = true;
-                    res.matched_attackers =
-                        killmail.attackers.iter().map(AttackerKey::new).collect();
                 }
             }
             res
@@ -1547,7 +1555,8 @@ mod tests {
         assert_eq!(
             filter_result.matched_attackers.len(),
             1,
-            "There should be exactly one matched attacker."
+            "There should be exactly one matched attacker: {:#?}",
+            filter_result
         );
 
         let nyx_attacker = zk_data
