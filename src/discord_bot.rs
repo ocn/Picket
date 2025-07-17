@@ -1217,14 +1217,13 @@ async fn build_killmail_embed(
 
     attacker_alliances = format!("{}```", attacker_alliances);
 
-    let mut range_details = String::new();
-    if let Some(matched_system_range) = &filter_result.light_year_range {
+    let range_details = if let Some(matched_system_range) = &filter_result.light_year_range {
         let matched_base_system_name = get_system(app_state, matched_system_range.system_id)
             .await
             .map_or_else(|| "Unknown System".to_string(), |s| s.name);
         if matched_system_range.range > 0.0 {
-            range_details = format!(
-                "\n\nRange: {:.2} LY from {}\nDotlan: [Supers]({}), [FAX]({}), [Blops]({})",
+            format!(
+                "{:.1} LY from {} ([Supers]({})|[FAX]({})|[Blops]({}))",
                 matched_system_range.range,
                 matched_base_system_name,
                 str_jump_dotlan(
@@ -1238,22 +1237,24 @@ async fn build_killmail_embed(
                     system_name,
                     DotlanJumpType::Blops
                 )
-            );
+            )
+        } else {
+            String::new()
         }
-    }
-
-    // console.log('attackerparams.dataDone');
+    } else {
+        String::new()
+    };
 
     let affiliation = format!(
-        "{}victim: {}\nin: [{}]({}) ([{}]({}))\n{}{}",
+        "{}victim: {}\nin: [{}]({}) ([{}]({})){}\n{}",
         attacker_alliances,
         victim_details,
         system_name,
         str_system_dotlan(system_id),
         region_name,
         str_region_dotlan(region_id),
+        range_details,
         location_details,
-        range_details
     );
 
     // Build the embed
