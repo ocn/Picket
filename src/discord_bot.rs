@@ -1246,7 +1246,7 @@ async fn build_killmail_embed(
     };
 
     let affiliation = format!(
-        "{}victim: {}\nin: [{}]({}) ([{}]({})){}\n{}",
+        "{}victim: {}\nin: [{}]({}) ([{}]({}))\nrange: {}\n{}",
         attacker_alliances,
         victim_details,
         system_name,
