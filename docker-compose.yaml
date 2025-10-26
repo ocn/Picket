@@ -2,7 +2,7 @@ services:
   discordbot:
     container_name: discordbot
     image: ocn-killbot-rust:latest
-    restart: unless-stopped
+    restart: always
     build:
       context: .
       dockerfile: ./Dockerfile
