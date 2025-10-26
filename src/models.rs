@@ -4,7 +4,14 @@ use serde::Deserialize;
 /// The `package` field can be null if there's no new killmail.
 #[derive(Debug, Deserialize)]
 pub struct RedisQResponse {
-    pub package: Option<ZkData>,
+    pub package: Option<ZkDataNoEsi>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ZkDataNoEsi {
+    #[serde(rename = "killID")]
+    pub kill_id: i64,
+    pub zkb: Zkb,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -41,6 +48,8 @@ pub struct Zkb {
     pub npc: bool,
     pub solo: bool,
     pub awox: bool,
+    #[serde(default)]
+    pub labels: Vec<String>,
     #[serde(rename = "href")]
     pub esi: String,
 }

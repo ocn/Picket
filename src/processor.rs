@@ -792,6 +792,7 @@ mod tests {
                 destroyed_value: 0.0,
                 points: 0,
                 awox: false,
+                labels: vec![],
                 esi: "".to_string(),
             },
         }
@@ -1176,6 +1177,7 @@ mod tests {
                     destroyed_value: 0.0,
                     points: 0,
                     awox: false,
+                    labels: vec![],
                     esi: "".to_string(),
                 },
             }
@@ -1500,6 +1502,7 @@ mod tests {
                 destroyed_value: 0.0,
                 points: 0,
                 awox: false,
+                labels: vec![],
                 esi: "".to_string(),
             },
         }

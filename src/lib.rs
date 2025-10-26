@@ -178,9 +178,27 @@ pub async fn run() {
 
     loop {
         match listener.listen().await {
-            Ok(Some(zk_data)) => {
-                let kill_id = zk_data.killmail.killmail_id;
+            Ok(Some(zk_data_no_esi)) => {
+                let kill_id = zk_data_no_esi.kill_id;
                 info!("[Kill: {}] Received", kill_id);
+
+                // Step 0: Load ESI data containing killmail information
+                let zk_data = match app_state
+                    .esi_client
+                    .load_killmail(zk_data_no_esi.zkb.esi.clone())
+                    .await
+                {
+                    Ok(killmail) => models::ZkData {
+                        kill_id: zk_data_no_esi.kill_id,
+                        killmail,
+                        zkb: zk_data_no_esi.zkb,
+                    },
+                    Err(e) => {
+                        error!("Error loading killmail data from ESI: {}", e);
+                        continue;
+                    }
+                };
+
                 let matched = processor::process_killmail(&app_state, &zk_data).await;
 
                 if !matched.is_empty() {
@@ -228,9 +246,12 @@ pub async fn run() {
                         }
                     }
                 }
+                
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
             Ok(None) => {
                 // No new data, continue loop
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
             Err(e) => {
                 error!("Error listening for killmails: {}", e);

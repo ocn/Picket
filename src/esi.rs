@@ -1,4 +1,5 @@
 use crate::config::{EveAuthToken, StandingContact, System};
+use crate::models::KillmailData;
 use reqwest::Client;
 use serde::Deserialize;
 use std::error::Error;
@@ -37,6 +38,15 @@ impl EsiClient {
         EsiClient {
             client: Client::new(),
         }
+    }
+
+    pub async fn load_killmail(&self, url: String) -> Result<KillmailData, Box<dyn Error + Send + Sync>> {
+        let response = self.client.get(url).send().await?;
+        if !response.status().is_success() {
+            return Err(format!("ESI API returned status for killmail query: {}", response.status()).into());
+        }
+        let data: KillmailData = response.json().await?;
+        Ok(data)
     }
 
     async fn fetch<T: for<'de> Deserialize<'de>>(

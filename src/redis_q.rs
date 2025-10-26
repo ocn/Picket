@@ -1,5 +1,5 @@
 use reqwest::Client;
-use crate::models::{ZkData, RedisQResponse};
+use crate::models::{ZkDataNoEsi, RedisQResponse};
 use std::time::Duration;
 use tracing::info;
 
@@ -20,7 +20,7 @@ impl RedisQListener {
         }
     }
 
-    pub async fn listen(&self) -> Result<Option<ZkData>, Box<dyn std::error::Error>> {
+    pub async fn listen(&self) -> Result<Option<ZkDataNoEsi>, Box<dyn std::error::Error>> {
         let response = self.client.get(&self.url)
             .timeout(Duration::from_secs(60)) // Add a timeout to prevent indefinite hangs
             .send()
