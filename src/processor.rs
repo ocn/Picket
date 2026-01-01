@@ -129,7 +129,7 @@ pub async fn process_killmail(
             };
             let Some(primary_matches) = evaluate_filter_node(&match_tree, zk_data, app_state).await
             else {
-                tracing::info!(
+                tracing::trace!(
                     "[Kill: {}] No matches for subscription '{}' in channel '{}'",
                     zk_data.killmail.killmail_id,
                     subscription.id,
@@ -138,7 +138,7 @@ pub async fn process_killmail(
                 continue;
             };
 
-            tracing::info!(
+            tracing::trace!(
                 "[Kill: {}] Matches for subscription '{}' in channel '{}': {:#?}",
                 zk_data.killmail.killmail_id,
                 subscription.action.channel_id,
@@ -274,7 +274,6 @@ fn partition_filters(node: &FilterNode) -> (Option<FilterNode>, Option<FilterNod
     }
 }
 
-#[tracing::instrument(skip(app_state))]
 fn evaluate_filter_node<'a>(
     node: &'a FilterNode,
     zk_data: &'a ZkData,
@@ -288,14 +287,14 @@ fn evaluate_filter_node<'a>(
                 let mut results = Vec::new();
                 for n in nodes {
                     if let Some(result) = evaluate_filter_node(n, zk_data, app_state).await {
-                        tracing::info!(
+                        tracing::trace!(
                             "[Kill: {}] Filter condition passed for node: {}",
                             kill_id,
                             n.name()
                         );
                         results.push(result);
                     } else {
-                        tracing::info!(
+                        tracing::trace!(
                             "[Kill: {}] Filter condition failed for node: {}",
                             kill_id,
                             n.name()
@@ -303,7 +302,7 @@ fn evaluate_filter_node<'a>(
                         return None; // One failure means the whole And block fails
                     }
                 }
-                tracing::info!("evaluate_filter_node results: {:#?}", results);
+                tracing::trace!("evaluate_filter_node results: {:#?}", results);
                 // Merge results
                 let final_filter_result = FilterResult {
                     min_pilots: results.iter().find_map(|r| r.filter_result.min_pilots),
@@ -335,7 +334,7 @@ fn evaluate_filter_node<'a>(
                     matched_victim: results.iter().all(|b| b.filter_result.matched_victim),
                 };
 
-                tracing::info!("final: {:#?}", final_filter_result);
+                tracing::trace!("final: {:#?}", final_filter_result);
                 if final_filter_result.matched_victim
                     || !final_filter_result.matched_attackers.is_empty()
                 {
@@ -476,7 +475,7 @@ async fn evaluate_filter(
                                         range: distance,
                                     })
                                 }
-                                tracing::info!(
+                                tracing::trace!(
                                     "[Kill: {}] Distance between {} and {}: {} ly",
                                     killmail.killmail_id,
                                     killmail_system.name,
