@@ -50,7 +50,7 @@ pub struct Zkb {
     pub awox: bool,
     #[serde(default)]
     pub labels: Vec<String>,
-    #[serde(rename = "href")]
+    #[serde(default, rename = "href")]
     pub esi: String,
 }
 

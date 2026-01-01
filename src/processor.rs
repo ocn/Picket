@@ -27,6 +27,20 @@ pub struct FilterResult {
     pub light_year_range: Option<SystemRange>,
 }
 
+impl FilterResult {
+    pub fn match_all(attackers: Vec<&Attacker>) -> Self {
+        let matched_attackers = attackers
+            .iter()
+            .map(|attacker| AttackerKey::new(attacker))
+            .collect();
+        FilterResult {
+            matched_attackers,
+            matched_victim: true,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub enum Color {
     Green,
@@ -115,10 +129,16 @@ pub async fn process_killmail(
             };
             let Some(primary_matches) = evaluate_filter_node(&match_tree, zk_data, app_state).await
             else {
+                tracing::info!(
+                    "[Kill: {}] No matches for subscription '{}' in channel '{}'",
+                    zk_data.killmail.killmail_id,
+                    subscription.id,
+                    subscription.action.channel_id
+                );
                 continue;
             };
 
-            tracing::trace!(
+            tracing::info!(
                 "[Kill: {}] Matches for subscription '{}' in channel '{}': {:#?}",
                 zk_data.killmail.killmail_id,
                 subscription.action.channel_id,
@@ -145,7 +165,24 @@ pub async fn process_killmail(
             let final_victim_match = primary_matches.filter_result.matched_victim;
 
             if !final_attackers.is_empty() || final_victim_match {
-                matched_subscriptions.push((*guild_id, subscription.clone(), primary_matches));
+                // Create a new, clean FilterResult with only the surviving entities.
+                let final_filter_result = FilterResult {
+                    // Use the collected HashSet of references to create a new owned HashSet
+                    matched_attackers: final_attackers.into_iter().cloned().collect(),
+                    matched_victim: final_victim_match,
+                    // Carry over the other metadata from the primary match for display purposes.
+                    min_pilots: primary_matches.filter_result.min_pilots,
+                    light_year_range: primary_matches.filter_result.light_year_range,
+                };
+
+                // Wrap it in a NamedFilterResult
+                let final_named_result = NamedFilterResult {
+                    name: primary_matches.name,
+                    filter_result: final_filter_result,
+                };
+
+                // Push the CORRECT, final result.
+                matched_subscriptions.push((*guild_id, subscription.clone(), final_named_result));
             }
         }
     }
@@ -237,6 +274,7 @@ fn partition_filters(node: &FilterNode) -> (Option<FilterNode>, Option<FilterNod
     }
 }
 
+#[tracing::instrument(skip(app_state))]
 fn evaluate_filter_node<'a>(
     node: &'a FilterNode,
     zk_data: &'a ZkData,
@@ -250,9 +288,14 @@ fn evaluate_filter_node<'a>(
                 let mut results = Vec::new();
                 for n in nodes {
                     if let Some(result) = evaluate_filter_node(n, zk_data, app_state).await {
+                        tracing::info!(
+                            "[Kill: {}] Filter condition passed for node: {}",
+                            kill_id,
+                            n.name()
+                        );
                         results.push(result);
                     } else {
-                        tracing::trace!(
+                        tracing::info!(
                             "[Kill: {}] Filter condition failed for node: {}",
                             kill_id,
                             n.name()
@@ -260,44 +303,53 @@ fn evaluate_filter_node<'a>(
                         return None; // One failure means the whole And block fails
                     }
                 }
-                tracing::trace!("{:#?}", results);
+                tracing::info!("evaluate_filter_node results: {:#?}", results);
                 // Merge results
-                let final_result = NamedFilterResult {
-                    name: results
+                let final_filter_result = FilterResult {
+                    min_pilots: results.iter().find_map(|r| r.filter_result.min_pilots),
+                    light_year_range: results
                         .iter()
-                        .fold(String::new(), |acc, b| format!("{} + {}", acc, b.name)),
-                    filter_result: FilterResult {
-                        min_pilots: results.iter().find_map(|r| r.filter_result.min_pilots),
-                        // TODO: fold/accumulate here
-                        light_year_range: results
+                        .find(|r| r.filter_result.light_year_range.is_some())
+                        .and_then(|r| r.filter_result.light_year_range.clone()),
+                    // For matched_attackers: start with first non-empty set, then intersect
+                    // with other non-empty sets. Empty sets mean "don't care" (global filters).
+                    matched_attackers: {
+                        let init = results
                             .iter()
-                            .find(|r| r.filter_result.light_year_range.is_some())
-                            .and_then(|r| r.filter_result.light_year_range.clone()),
-                        matched_attackers: {
-                            // Find the first non-empty set of matched_attackers to ensure we're
-                            // always starting with a non-empty set to intersect with.
-                            let init = results
-                                .iter()
-                                .find(|r| !r.filter_result.matched_attackers.is_empty())
-                                .cloned()
-                                .unwrap_or_default()
-                                .filter_result
-                                .matched_attackers;
-                            results.iter().fold(init, |acc, b| {
-                                // Exclude any sets where there were no matched attackers.
-                                if b.filter_result.matched_attackers.is_empty() {
-                                    acc
-                                } else {
-                                    acc.intersection(&b.filter_result.matched_attackers)
-                                        .cloned()
-                                        .collect()
-                                }
-                            })
-                        },
-                        matched_victim: results.iter().all(|b| b.filter_result.matched_victim),
+                            .find(|r| !r.filter_result.matched_attackers.is_empty())
+                            .cloned()
+                            .unwrap_or_default()
+                            .filter_result
+                            .matched_attackers;
+                        results.iter().fold(init, |acc, b| {
+                            if b.filter_result.matched_attackers.is_empty() {
+                                acc // Skip empty sets (global filters that don't track attackers)
+                            } else {
+                                acc.intersection(&b.filter_result.matched_attackers)
+                                    .cloned()
+                                    .collect()
+                            }
+                        })
                     },
+                    // All filters must agree on victim match
+                    matched_victim: results.iter().all(|b| b.filter_result.matched_victim),
                 };
-                Some(final_result)
+
+                tracing::info!("final: {:#?}", final_filter_result);
+                if final_filter_result.matched_victim
+                    || !final_filter_result.matched_attackers.is_empty()
+                {
+                    Some(NamedFilterResult {
+                        name: results
+                            .iter()
+                            .map(|r| r.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" + "),
+                        filter_result: final_filter_result,
+                    })
+                } else {
+                    None
+                }
             }
             FilterNode::Or(nodes) => {
                 let mut final_res: Option<FilterResult> = None;
@@ -1720,5 +1772,220 @@ mod tests {
             .cloned()
             .unwrap();
         assert!(attacker_key.0.contains("s19720"))
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_attacker_only_filter_ignores_victim() {
+        // SCENARIO:
+        // - A non-blue Dreadnought is the VICTIM.
+        // - A blue Dreadnought is the ATTACKER.
+        // - The subscription looks for Capital ATTACKERS and ignores blues.
+        // EXPECTATION:
+        // - The filter should FAIL. The only matching capital is the victim, but the filter
+        //   is for attackers only. The only attacker is a capital, but it's blue and should be vetoed.
+
+        let app_state = mock_app_state();
+        let user_id = 12345;
+        let blue_alliance_id = 99009927; // From your killmail data
+        let blue_corp_id = 98478883;
+        let synced_char_id = 11111;
+
+        // 1. Setup Mock Data
+        {
+            let mut ships = app_state.ships.write().unwrap();
+            ships.insert(19726, 485); // Revelation -> Dreadnought (Group ID 485)
+            ships.insert(52907, 485); // "Capsule - Genolution 'Auroral' 197-variant" is not a dread, let's use a real one for the blue attacker
+                                      // For the purpose of this test, let's say the blue attacker is also in a Naglfar
+            ships.insert(19720, 485); // Naglfar -> Dreadnought
+
+            // Setup the user's standings for the veto check
+            let mut standings_map = app_state.user_standings.write().unwrap();
+            let mut user_standings = UserStandings::default();
+            user_standings.tokens.push(EveAuthToken {
+                character_id: synced_char_id,
+                character_name: "Blue Pilot".to_string(),
+                corporation_id: blue_corp_id,
+                alliance_id: Some(blue_alliance_id),
+                access_token: "".to_string(),
+                refresh_token: "".to_string(),
+                expires_at: 0,
+            });
+            standings_map.insert(serenity::model::id::UserId(user_id), user_standings);
+        }
+
+        // 2. Construct the Killmail from your data
+        let zk_data = ZkData {
+             kill_id: 128637593,
+             killmail: serde_json::from_str(r#"{"attackers":[{"alliance_id":99009927,"character_id":2121351054,"corporation_id":98478883,"damage_done":249421,"final_blow":false,"security_status":-9.6,"ship_type_id":52907,"weapon_type_id":52907},{"alliance_id":99009927,"character_id":2121351026,"corporation_id":98478883,"damage_done":207718,"final_blow":false,"security_status":-9.6,"ship_type_id":52907,"weapon_type_id":52907},{"alliance_id":99009927,"character_id":2122219865,"corporation_id":98478883,"damage_done":147451,"final_blow":true,"security_status":-1.8,"ship_type_id":73790,"weapon_type_id":37298},{"alliance_id":99009927,"character_id":95679911,"corporation_id":98478883,"damage_done":9668,"final_blow":false,"security_status":-10.0,"ship_type_id":22428,"weapon_type_id":22428},{"alliance_id":99009927,"character_id":2118965168,"corporation_id":98478883,"damage_done":6678,"final_blow":false,"security_status":-9.9,"ship_type_id":22436,"weapon_type_id":24509},{"alliance_id":99009927,"character_id":1800487696,"corporation_id":590940989,"damage_done":4703,"final_blow":false,"security_status":-9.9,"ship_type_id":22428,"weapon_type_id":22428},{"alliance_id":99009927,"character_id":2121752432,"corporation_id":98478883,"damage_done":3524,"faction_id":500010,"final_blow":false,"security_status":-7.3,"ship_type_id":22440,"weapon_type_id":2953},{"alliance_id":99009927,"character_id":1210978935,"corporation_id":98478883,"damage_done":3059,"final_blow":false,"security_status":-9.9,"ship_type_id":22428,"weapon_type_id":2446},{"alliance_id":99009927,"character_id":2119958707,"corporation_id":98478883,"damage_done":2690,"final_blow":false,"security_status":-10.0,"ship_type_id":22428,"weapon_type_id":15887},{"alliance_id":99009927,"character_id":2119722210,"corporation_id":98478883,"damage_done":2688,"final_blow":false,"security_status":-10.0,"ship_type_id":22440,"weapon_type_id":22440},{"alliance_id":99009927,"character_id":1113404550,"corporation_id":590940989,"damage_done":2403,"final_blow":false,"security_status":-9.7,"ship_type_id":22428,"weapon_type_id":22428},{"alliance_id":99009927,"character_id":1658503065,"corporation_id":590940989,"damage_done":151,"final_blow":false,"security_status":-10.0,"ship_type_id":22428,"weapon_type_id":4147},{"character_id":2121332622,"corporation_id":98615046,"damage_done":0,"final_blow":false,"security_status":-2.8,"ship_type_id":670,"weapon_type_id":3244},{"alliance_id":99013187,"character_id":96143629,"corporation_id":98713865,"damage_done":0,"final_blow":false,"security_status":-10.0,"ship_type_id":33151,"weapon_type_id":3146}],"killmail_id":128637593,"killmail_time":"2025-07-19T04:56:47Z","solar_system_id":30002719,"victim":{"alliance_id":99014140,"character_id":2113230779,"corporation_id":98802264,"damage_taken":640154,"items":[{"flag":14,"item_type_id":2048,"quantity_dropped":1,"singleton":0},{"flag":94,"item_type_id":31820,"quantity_destroyed":1,"singleton":0},{"flag":5,"item_type_id":2811,"quantity_dropped":1500,"singleton":0},{"flag":24,"item_type_id":41489,"quantity_destroyed":1,"singleton":0},{"flag":28,"item_type_id":4292,"quantity_destroyed":1,"singleton":0},{"flag":5,"item_type_id":24521,"quantity_dropped":1500,"singleton":0},{"flag":133,"item_type_id":16275,"quantity_dropped":375,"singleton":0},{"flag":13,"item_type_id":49738,"quantity_dropped":1,"singleton":0},{"flag":155,"item_type_id":41489,"quantity_destroyed":78,"singleton":0},{"flag":30,"item_type_id":27345,"quantity_dropped":7,"singleton":0},{"flag":11,"item_type_id":1541,"quantity_dropped":1,"singleton":0},{"flag":25,"item_type_id":41492,"quantity_destroyed":1,"singleton":0},{"flag":27,"item_type_id":37292,"quantity_dropped":1,"singleton":0},{"flag":5,"item_type_id":41489,"quantity_dropped":1,"singleton":0},{"flag":133,"item_type_id":17888,"quantity_dropped":193009,"singleton":0},{"flag":23,"item_type_id":2281,"quantity_destroyed":1,"singleton":0},{"flag":19,"item_type_id":47702,"quantity_destroyed":1,"singleton":0},{"flag":29,"item_type_id":37292,"quantity_destroyed":1,"singleton":0},{"flag":5,"item_type_id":24519,"quantity_destroyed":1500,"singleton":0},{"flag":29,"item_type_id":27345,"quantity_destroyed":7,"singleton":0},{"flag":15,"item_type_id":49738,"quantity_dropped":1,"singleton":0},{"flag":5,"item_type_id":27359,"quantity_destroyed":1500,"singleton":0},{"flag":31,"item_type_id":14168,"quantity_destroyed":1,"singleton":0},{"flag":22,"item_type_id":47736,"quantity_destroyed":1,"singleton":0},{"flag":27,"item_type_id":27345,"quantity_dropped":7,"singleton":0},{"flag":93,"item_type_id":31820,"quantity_destroyed":1,"singleton":0},{"flag":30,"item_type_id":37292,"quantity_dropped":1,"singleton":0},{"flag":5,"item_type_id":27345,"quantity_destroyed":1308,"singleton":0},{"flag":92,"item_type_id":31720,"quantity_destroyed":1,"singleton":0},{"flag":12,"item_type_id":49738,"quantity_destroyed":1,"singleton":0},{"flag":5,"item_type_id":27351,"quantity_dropped":1500,"singleton":0},{"flag":5,"item_type_id":24523,"quantity_dropped":1500,"singleton":0},{"flag":25,"item_type_id":41489,"quantity_dropped":2,"singleton":0},{"flag":21,"item_type_id":24443,"quantity_dropped":1,"singleton":0},{"flag":20,"item_type_id":41507,"quantity_destroyed":1,"singleton":0},{"flag":24,"item_type_id":41492,"quantity_dropped":1,"singleton":0}],"position":{"x":1886548484863.2898,"y":-243470362632.75974,"z":-2231950897505.0303},"ship_type_id":19726}}"#).unwrap(),
+             zkb: Zkb { total_value: 5978380820.02, ..Default::default() },
+         };
+
+        // 3. Construct the Subscription
+        let subscription = Subscription {
+            id: "attacker_only_capital_test".to_string(),
+            description: "".to_string(),
+            action: Default::default(),
+            root_filter: FilterNode::And(vec![
+                FilterNode::Condition(Filter::Targeted(TargetedFilter {
+                    condition: TargetableCondition::ShipGroup(vec![485]), // Match Dreadnoughts
+                    target: crate::config::Target::Attacker, // IMPORTANT: Target is Attacker only
+                })),
+                FilterNode::Condition(Filter::Simple(SimpleFilter::IgnoreHighStanding {
+                    synched_by_user_id: user_id,
+                    source: StandingSource::Alliance,
+                    source_entity_id: blue_alliance_id,
+                })),
+            ]),
+        };
+
+        app_state
+            .subscriptions
+            .write()
+            .unwrap()
+            .insert(GuildId(1), vec![subscription]);
+
+        // 4. Run the processor
+        let results = process_killmail(&app_state, &zk_data).await;
+
+        // 5. Assert the outcome
+        assert!(results.is_empty(), "Expected zero matches, found {}. The only matching capital attacker was blue and should have been vetoed, and the non-blue capital victim
+should have been ignored by the attacker-only filter: {:#?}", results.len(), results);
+    }
+
+    /// Helper to load a killmail fixture from the resources directory
+    fn load_fixture(name: &str) -> ZkData {
+        let path = format!("resources/{}", name);
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("Failed to read fixture {}: {}", path, e));
+        serde_json::from_str(&contents)
+            .unwrap_or_else(|e| panic!("Failed to parse fixture {}: {}", path, e))
+    }
+
+    /// Test that a "capital attacker" filter does NOT match a capital LOSS
+    /// where the victim is a capital but all attackers are subcaps.
+    ///
+    /// This test verifies the fix for the is_victim() bug where Target::Attacker
+    /// was incorrectly matching victims.
+    #[test_log::test(tokio::test)]
+    async fn test_capital_attacker_filter_ignores_capital_victim() {
+        // Load the Naglfar loss killmail - victim is a Dreadnought, attackers are all subcaps
+        let zk_data = load_fixture("132249213_naglfar_loss.json");
+
+        // Verify fixture data is as expected
+        assert_eq!(zk_data.killmail.victim.ship_type_id, 19722, "Victim should be a Naglfar");
+
+        let app_state = mock_app_state();
+
+        // Add ship group mappings for this killmail
+        {
+            let mut ships = app_state.ships.write().unwrap();
+            // Naglfar (victim) - Dreadnought group 485
+            ships.insert(19722, 485);
+            // Attacker ships - all subcaps (not group 485)
+            ships.insert(624, 28);    // Badger - Industrial
+            ships.insert(22428, 906); // Maulus Navy Issue - Combat Recon
+            ships.insert(22430, 906); // Exequror Navy Issue - Combat Recon
+            ships.insert(22440, 906); // Osprey Navy Issue - Combat Recon
+            ships.insert(44996, 1527); // Kikimora - Destroyer
+            ships.insert(73796, 1527); // Draugur - Destroyer
+        }
+
+        // Create a subscription that looks for capital ATTACKERS only
+        let subscription = Subscription {
+            id: "capital_attacker_test".to_string(),
+            description: "Track capital attacker activity".to_string(),
+            action: Default::default(),
+            root_filter: FilterNode::Condition(Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::ShipGroup(vec![485]), // Dreadnought group
+                target: Target::Attacker, // ONLY match attackers, not victims
+            })),
+        };
+
+        app_state
+            .subscriptions
+            .write()
+            .unwrap()
+            .insert(GuildId(1), vec![subscription]);
+
+        // Run the processor
+        let results = process_killmail(&app_state, &zk_data).await;
+
+        // The filter should NOT match because:
+        // - The Naglfar (capital) is the VICTIM
+        // - All ATTACKERS are subcaps
+        // - The filter targets Attacker only
+        assert!(
+            results.is_empty(),
+            "Capital attacker filter should NOT match a capital loss. \
+             The victim is a Naglfar (capital) but all attackers are subcaps. \
+             Found {} matches: {:#?}",
+            results.len(),
+            results
+        );
+    }
+
+    /// Test that a "capital attacker" filter DOES match when a capital is attacking.
+    /// This is the positive case - a Thanatos (carrier) killing a Drill should match.
+    #[test_log::test(tokio::test)]
+    async fn test_capital_attacker_filter_matches_capital_attacker() {
+        // Load the Drill kill - attackers include a Thanatos (carrier) and Nyx (supercarrier)
+        let zk_data = load_fixture("132253134_drill_kill_by_thanatos.json");
+
+        // Verify fixture data is as expected
+        assert_eq!(zk_data.killmail.victim.ship_type_id, 81826, "Victim should be a Drill");
+
+        let app_state = mock_app_state();
+
+        // Add ship group mappings for this killmail
+        {
+            let mut ships = app_state.ships.write().unwrap();
+            // Victim - Drill (Upwell structure, not a capital)
+            ships.insert(81826, 1404); // Upwell structure group
+            // Attacker ships
+            ships.insert(23911, 547);  // Thanatos - Carrier (capital!)
+            ships.insert(23913, 659);  // Nyx - Supercarrier (capital!)
+            ships.insert(22428, 906);  // Maulus Navy Issue - Combat Recon (subcap)
+        }
+
+        // Create a subscription that looks for capital ATTACKERS
+        // Include common capital groups: Dread (485), Carrier (547), Super (659), FAX (1538)
+        let subscription = Subscription {
+            id: "capital_attacker_test".to_string(),
+            description: "Track capital attacker activity".to_string(),
+            action: Default::default(),
+            root_filter: FilterNode::Condition(Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::ShipGroup(vec![485, 547, 659, 1538]),
+                target: Target::Attacker, // ONLY match attackers
+            })),
+        };
+
+        app_state
+            .subscriptions
+            .write()
+            .unwrap()
+            .insert(GuildId(1), vec![subscription]);
+
+        // Run the processor
+        let results = process_killmail(&app_state, &zk_data).await;
+
+        // The filter SHOULD match because:
+        // - The attackers include a Thanatos (carrier, group 547) and Nyx (super, group 659)
+        // - The filter targets capital Attackers
+        assert!(
+            !results.is_empty(),
+            "Capital attacker filter SHOULD match when capitals are attacking. \
+             Attackers include Thanatos (carrier) and Nyx (supercarrier)."
+        );
+
+        // Verify the matched attackers are the capitals
+        let matched = &results[0].2.filter_result;
+        assert!(
+            !matched.matched_attackers.is_empty(),
+            "Should have matched the capital attackers"
+        );
+        assert!(
+            !matched.matched_victim,
+            "Should NOT have matched the victim (Drill is not a capital)"
+        );
     }
 }

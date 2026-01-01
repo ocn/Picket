@@ -54,7 +54,7 @@ impl Target {
     }
 
     pub fn is_victim(&self) -> bool {
-        matches!(self, Target::Attacker | Target::Any)
+        matches!(self, Target::Victim | Target::Any)
     }
 }
 

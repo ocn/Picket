@@ -870,6 +870,10 @@ fn str_ship_icon(id: u32) -> String {
     format!("https://images.evetech.net/types/{}/icon?size=64", id)
 }
 
+fn str_ship_render(id: u32) -> String {
+    format!("https://images.evetech.net/types/{}/render?size=128", id)
+}
+
 #[allow(unused)]
 fn str_pilot_zk(id: u64) -> String {
     format!("https://zkillboard.com/character/{}/", id)
@@ -1257,6 +1261,23 @@ async fn build_killmail_embed(
         location_details,
     );
 
+    // Determine the "other" ship to show in the large image slot
+    // Green = we tracked attackers, show victim | Red = we tracked victim, show attackers
+    let other_ship_type_id: Option<u32> = match best_match.as_ref().map(|bm| bm.color) {
+        Some(Color::Green) => {
+            // We tracked an attacker who got a kill - show what they killed
+            Some(killmail.victim.ship_type_id)
+        }
+        Some(Color::Red) => {
+            // We tracked a victim who died - show what killed them
+            most_common_ship.map(|(type_id, _)| type_id as u32)
+        }
+        None => {
+            // No specific match context - default to showing victim
+            Some(killmail.victim.ship_type_id)
+        }
+    };
+
     // Build the embed
     embed.title(title);
     embed.url(killmail_url.clone());
@@ -1266,6 +1287,9 @@ async fn build_killmail_embed(
             .icon_url(affiliation_icon_url_to_render)
     });
     embed.thumbnail(str_ship_icon(id_of_icon_to_render));
+    if let Some(type_id) = other_ship_type_id {
+        embed.image(str_ship_render(type_id));
+    }
     embed.color(match best_match.map(|bm| bm.color).unwrap_or_default() {
         Color::Green => Colour::DARK_GREEN,
         Color::Red => Colour::RED,

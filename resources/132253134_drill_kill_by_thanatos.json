@@ -1,0 +1,106 @@
+{
+  "killID": 132253134,
+  "killmail": {
+    "attackers": [
+      {
+        "character_id": 152291184,
+        "corporation_id": 98704863,
+        "damage_done": 22657681,
+        "final_blow": false,
+        "security_status": -10,
+        "ship_type_id": 23913,
+        "weapon_type_id": 40563
+      },
+      {
+        "character_id": 199908824,
+        "corporation_id": 98704863,
+        "damage_done": 1769654,
+        "final_blow": true,
+        "security_status": -5.3,
+        "ship_type_id": 23911,
+        "weapon_type_id": 40558
+      },
+      {
+        "character_id": 2114013859,
+        "corporation_id": 98704863,
+        "damage_done": 1338599,
+        "final_blow": false,
+        "security_status": -10,
+        "ship_type_id": 22428,
+        "weapon_type_id": 22428
+      }
+    ],
+    "killmail_id": 132253134,
+    "killmail_time": "2025-12-29T09:45:09Z",
+    "solar_system_id": 30002580,
+    "victim": {
+      "alliance_id": 99007281,
+      "corporation_id": 98472859,
+      "damage_taken": 25765934,
+      "items": [
+        {
+          "flag": 172,
+          "item_type_id": 81143,
+          "quantity_destroyed": 49400,
+          "singleton": 0
+        },
+        {
+          "flag": 186,
+          "item_type_id": 16639,
+          "quantity_destroyed": 48791,
+          "singleton": 0
+        },
+        {
+          "flag": 164,
+          "item_type_id": 82941,
+          "quantity_destroyed": 1,
+          "singleton": 0
+        },
+        {
+          "flag": 186,
+          "item_type_id": 16633,
+          "quantity_dropped": 157942,
+          "singleton": 0
+        },
+        {
+          "flag": 186,
+          "item_type_id": 16641,
+          "quantity_destroyed": 26659,
+          "singleton": 0
+        },
+        {
+          "flag": 180,
+          "item_type_id": 81920,
+          "quantity_dropped": 1,
+          "singleton": 0
+        }
+      ],
+      "position": {
+        "x": -39860181906.00071,
+        "y": 3052404607.648652,
+        "z": 226846875159.1042
+      },
+      "ship_type_id": 81826
+    }
+  },
+  "zkb": {
+    "locationID": 40164371,
+    "hash": "bd7ab3df41654e571c24d34eb697299852b78342",
+    "fittedValue": 730176892.42,
+    "droppedValue": 372036144.9,
+    "destroyedValue": 1004268795.59,
+    "totalValue": 1376304940.49,
+    "points": 1,
+    "npc": false,
+    "solo": false,
+    "awox": false,
+    "labels": [
+      "tz:au",
+      "cat:65",
+      "#:2+",
+      "pvp",
+      "loc:lowsec",
+      "isk:1b+"
+    ]
+  }
+}
