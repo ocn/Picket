@@ -1,0 +1,214 @@
+{
+    "version": "1.0",
+    "description": "Skill activation triggers for zk-activity (killbot) - EVE Online killmail Discord bot",
+    "skills": {
+        "rust-dev-guidelines": {
+            "type": "domain",
+            "enforcement": "suggest",
+            "priority": "high",
+            "description": "Idiomatic Rust patterns, error handling, async/await, and best practices",
+            "promptTriggers": {
+                "keywords": [
+                    "rust",
+                    "cargo",
+                    "idiomatic",
+                    "borrow checker",
+                    "ownership",
+                    "lifetime",
+                    "trait",
+                    "impl",
+                    "async",
+                    "tokio",
+                    "Result",
+                    "Option",
+                    "unwrap",
+                    "expect",
+                    "match",
+                    "enum",
+                    "struct",
+                    "derive",
+                    "serde",
+                    "Arc",
+                    "Mutex",
+                    "RwLock",
+                    "refactor rust",
+                    "rust error",
+                    "clippy"
+                ],
+                "intentPatterns": [
+                    "(create|add|implement|write|fix).*?rust",
+                    "(how to|best practice|idiomatic).*?(rust|cargo)",
+                    "(error handling|Result|Option).*?rust",
+                    "(async|await|tokio|future).*?(rust|pattern)",
+                    "(trait|impl|generic).*?(rust|pattern)",
+                    "(refactor|optimize|improve).*?rust"
+                ]
+            },
+            "fileTriggers": {
+                "pathPatterns": [
+                    "src/**/*.rs",
+                    "**/*.rs"
+                ],
+                "pathExclusions": [
+                    "target/**"
+                ],
+                "contentPatterns": [
+                    "^use ",
+                    "^pub ",
+                    "^fn ",
+                    "^impl ",
+                    "^struct ",
+                    "^enum ",
+                    "#\\[derive",
+                    "async fn",
+                    "-> Result<"
+                ]
+            }
+        },
+        "serenity-discord-bot": {
+            "type": "domain",
+            "enforcement": "suggest",
+            "priority": "high",
+            "description": "Discord bot patterns using Serenity framework - event handlers, slash commands, embeds",
+            "promptTriggers": {
+                "keywords": [
+                    "discord",
+                    "serenity",
+                    "discord bot",
+                    "slash command",
+                    "discord command",
+                    "embed",
+                    "discord embed",
+                    "channel",
+                    "guild",
+                    "GatewayIntents",
+                    "event handler",
+                    "interaction",
+                    "ApplicationCommand",
+                    "CreateEmbed",
+                    "discord message",
+                    "bot token"
+                ],
+                "intentPatterns": [
+                    "(create|add|implement|fix).*?(discord|serenity|bot|command)",
+                    "(how to|best practice).*?(discord|serenity|bot)",
+                    "(send|post|create).*?(message|embed|channel)",
+                    "(slash|application).*?command",
+                    "(handle|respond).*?(interaction|event)"
+                ]
+            },
+            "fileTriggers": {
+                "pathPatterns": [
+                    "src/discord_bot.rs",
+                    "src/commands/**/*.rs",
+                    "src/commands.rs"
+                ],
+                "contentPatterns": [
+                    "serenity::",
+                    "EventHandler",
+                    "ApplicationCommandInteraction",
+                    "CreateEmbed",
+                    "GatewayIntents",
+                    "interaction_create"
+                ]
+            }
+        },
+        "eve-esi-api": {
+            "type": "domain",
+            "enforcement": "suggest",
+            "priority": "high",
+            "description": "EVE Online ESI API patterns - authentication, endpoints, rate limiting, data models",
+            "promptTriggers": {
+                "keywords": [
+                    "esi",
+                    "eve online",
+                    "eve api",
+                    "zkillboard",
+                    "zkb",
+                    "killmail",
+                    "killboard",
+                    "character",
+                    "corporation",
+                    "alliance",
+                    "solar system",
+                    "region",
+                    "ship type",
+                    "type id",
+                    "redisq"
+                ],
+                "intentPatterns": [
+                    "(fetch|get|load|query).*?(esi|eve|killmail|character|corp|alliance)",
+                    "(eve|esi).*?(api|endpoint|data)",
+                    "(zkillboard|zkb|redisq).*?(data|feed|killmail)",
+                    "(ship|system|region|character|corp|alliance).*?(id|name|info)"
+                ]
+            },
+            "fileTriggers": {
+                "pathPatterns": [
+                    "src/esi.rs",
+                    "src/models.rs",
+                    "src/redis_q.rs",
+                    "src/processor.rs"
+                ],
+                "contentPatterns": [
+                    "esi\\.evetech\\.net",
+                    "zkillboard\\.com",
+                    "redisq\\.zkillboard",
+                    "killmail",
+                    "solar_system",
+                    "type_id",
+                    "alliance_id",
+                    "corporation_id"
+                ]
+            }
+        },
+        "killbot-architecture": {
+            "type": "domain",
+            "enforcement": "suggest",
+            "priority": "medium",
+            "description": "zk-activity project architecture - subscription system, filters, config management",
+            "promptTriggers": {
+                "keywords": [
+                    "subscription",
+                    "filter",
+                    "killbot",
+                    "zk-activity",
+                    "config",
+                    "guild config",
+                    "channel subscription"
+                ],
+                "intentPatterns": [
+                    "(add|create|modify).*?(subscription|filter)",
+                    "(how does|explain).*?(filter|subscription|config)",
+                    "(architecture|structure|design).*?(killbot|project)"
+                ]
+            },
+            "fileTriggers": {
+                "pathPatterns": [
+                    "src/config.rs",
+                    "src/processor.rs",
+                    "src/lib.rs",
+                    "config/**/*.json"
+                ]
+            }
+        }
+    },
+    "notes": {
+        "project": "zk-activity (killbot-rust) - EVE Online killmail Discord bot",
+        "tech_stack": {
+            "language": "Rust",
+            "async_runtime": "Tokio",
+            "discord_library": "Serenity 0.11",
+            "http_client": "Reqwest",
+            "serialization": "Serde/serde_json",
+            "caching": "Moka"
+        },
+        "key_components": {
+            "redis_q": "Listens to zkillboard RedisQ for killmail feed",
+            "esi": "Fetches additional data from EVE Online ESI API",
+            "processor": "Matches killmails against subscription filters",
+            "discord_bot": "Handles Discord interactions and message sending",
+            "commands": "Slash commands for subscription management"
+        }
+    }
+}
