@@ -1000,21 +1000,25 @@ fn most_common_ship_type(attackers: &[Attacker]) -> Option<(u64, u64)> {
 }
 
 /// Get the most common attacker ship group for title display
+/// Only considers known groups (excludes GROUP_UNKNOWN)
 async fn get_most_common_attacker_group(
     app_state: &Arc<AppState>,
     attackers: &[Attacker],
 ) -> (u64, String) {
-    // Count attackers by ship group
+    // Count attackers by ship group (only known groups)
     let mut group_counts: HashMap<u32, u64> = HashMap::new();
     for attacker in attackers {
         if let Some(ship_type_id) = attacker.ship_type_id {
             if let Some(group_id) = get_ship_group_id(app_state, ship_type_id).await {
-                *group_counts.entry(group_id).or_insert(0) += 1;
+                // Only count known groups for title display
+                if is_known_group(group_id) {
+                    *group_counts.entry(group_id).or_insert(0) += 1;
+                }
             }
         }
     }
 
-    // Find the most common group
+    // Find the most common known group
     if let Some((group_id, count)) = group_counts.into_iter().max_by_key(|(_, c)| *c) {
         let group_name = get_group_name(group_id, count as u32)
             .unwrap_or("ships")
@@ -1354,9 +1358,9 @@ impl FleetComposition {
             category_lines.push(line);
         }
 
-        // Subcaps line (everything else that's known)
+        // Subcaps line (everything else including unknown - unknown goes into +N overflow)
         if let Some(line) = Self::format_category_line_plain(&self.overall, |gid| {
-            gid != GROUP_UNKNOWN && !SUPER_GROUPS.contains(&gid) && !CAP_GROUPS.contains(&gid)
+            !SUPER_GROUPS.contains(&gid) && !CAP_GROUPS.contains(&gid)
         }) {
             category_lines.push(line);
         }
@@ -1500,9 +1504,9 @@ impl FleetComposition {
                 lines.push(line);
             }
 
-            // Subcaps line (everything else that's not unknown)
+            // Subcaps line (everything else including unknown - unknown goes into +N overflow)
             if let Some(line) = Self::format_category_line(groups, |gid| {
-                gid != GROUP_UNKNOWN && !SUPER_GROUPS.contains(&gid) && !CAP_GROUPS.contains(&gid)
+                !SUPER_GROUPS.contains(&gid) && !CAP_GROUPS.contains(&gid)
             }) {
                 lines.push(line);
             }

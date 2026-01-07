@@ -1,6 +1,6 @@
 # Useful Embeds - Context Document
 
-**Last Updated**: 2026-01-06
+**Last Updated**: 2026-01-07
 
 ---
 
@@ -8,10 +8,10 @@
 
 | File | Purpose | Key Functions |
 |------|---------|---------------|
-| `src/discord_bot.rs` | Embed building | `build_killmail_embed()`, `select_best_entity_for_display()`, `compute_fleet_composition()`, `FleetComposition`, `get_ticker()` |
+| `src/discord_bot.rs` | Embed building | `build_killmail_embed()`, `select_best_entity_for_display()`, `compute_fleet_composition()`, `FleetComposition`, `get_ticker()`, `get_most_common_attacker_group()`, `is_known_group()` |
 | `src/models.rs` | Data structures | `Killmail`, `Victim`, `Attacker`, `ZkData` |
 | `src/esi.rs` | ESI client | `get_name()`, `get_system()`, `get_ticker()` |
-| `src/config.rs` | Subscription config | `Subscription`, `FilterNode`, `AppState` (with tickers cache) |
+| `src/config.rs` | Subscription config | `Subscription`, `FilterNode`, `AppState` (with tickers cache), `FilterNode::contains_ship_filter()` |
 | `tests/common/mod.rs` | Test helpers | `load_fixture()`, `create_app_state_with_subscriptions()` |
 | `tests/test_tracking_embeds.rs` | Tracking embed tests | `send_tracking_embeds()` |
 | `tests/test_killfeed_embeds.rs` | Killfeed embed tests | `send_killfeed_embeds()` |

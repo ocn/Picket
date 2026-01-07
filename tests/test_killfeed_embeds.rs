@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 /// Test fixtures for killfeed mode
 const KILLFEED_FIXTURES: &[(&str, &str)] = &[
+    ("132461133_ceptor_npc_test.json", "Ceptor + NPC attacker - tests unknown ship groups"),
     ("132235921_supers_involved.json", "Naglfar FI - high value kill"),
     ("131501165_drill_kill.json", "Metenox drill - 1B+ ISK"),
     ("132249213_naglfar_loss.json", "Naglfar loss - dread kill"),
@@ -54,6 +55,19 @@ fn create_killfeed_subscriptions() -> Vec<Subscription> {
                     target: Target::Any, // Match as attacker OR victim
                 })),
             ]),
+            action: Action {
+                channel_id: TEST_CHANNEL_ID.to_string(),
+                ping_type: None,
+            },
+        },
+        // BIGAB killfeed: all kills (no value filter) - for testing low-value kills
+        Subscription {
+            id: "bigab-all".to_string(),
+            description: "BIGAB all kills & losses".to_string(),
+            root_filter: FilterNode::Condition(Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::Alliance(vec![BIGAB_ALLIANCE_ID]),
+                target: Target::Any,
+            })),
             action: Action {
                 channel_id: TEST_CHANNEL_ID.to_string(),
                 ping_type: None,

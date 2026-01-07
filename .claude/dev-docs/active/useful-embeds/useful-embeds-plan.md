@@ -1,7 +1,7 @@
 # Useful Embeds - Implementation Plan
 
-**Last Updated**: 2026-01-06
-**Status**: Complete (Phase 1 + Layout Redesign)
+**Last Updated**: 2026-01-07
+**Status**: Complete (Phase 1 + Layout Redesign + Title Logic + NPC Handling Fixes)
 **Estimated Effort**: M (Medium)
 
 ---
@@ -103,13 +103,16 @@ const CAP_GROUPS: &[u32] = &[4594, 485, 1538, 547, 883, 902, 513]; // Lancers, D
 |----------|----------|---------|
 | `GROUP_NAMES` | `discord_bot.rs` | Static mapping of group_id → (singular, plural) |
 | `get_group_name()` | `discord_bot.rs` | Resolve group_id to display name |
+| `is_known_group()` | `discord_bot.rs` | Check if group_id is in GROUP_NAMES |
 | `FleetComposition` | `discord_bot.rs` | Struct holding fleet aggregation data |
 | `compute_fleet_composition()` | `discord_bot.rs` | Aggregate attackers by ship group |
 | `format_overall()` | `discord_bot.rs` | Format overall fleet comp line |
 | `format_category_line()` | `discord_bot.rs` | Format a category (supers/caps/subcaps) |
 | `format_alliance_breakdown()` | `discord_bot.rs` | Format per-alliance breakdown |
+| `get_most_common_attacker_group()` | `discord_bot.rs` | Find most numerous known ship group in attackers |
 | `get_ticker()` | `esi.rs` | Fetch alliance/corp ticker from ESI |
 | `get_ticker()` | `discord_bot.rs` | Wrapper with cache lookup |
+| `contains_ship_filter()` | `config.rs` | Check if FilterNode contains ShipType/ShipGroup filters |
 
 ### Caching
 
@@ -150,4 +153,27 @@ This task is functionally complete. The embed layout has been redesigned with:
 - Ticker-based alliance/corp display
 - New victim field showing character name
 
+### Bug Fixes (2026-01-07)
+
+1. **Title Ship Count Logic**: Fixed to count by ship GROUP not individual TYPE
+   - Title now shows correct group count (e.g., "1028x BS" not "539x BS")
+
+2. **Ship Tracking vs Entity Tracking**: Added `FilterNode::contains_ship_filter()` helper
+   - Ship filters (ShipType/ShipGroup): Use matched ship group in title
+   - Entity filters (Alliance/Corp): Use most common attacker group in title
+
+3. **Category Line Sorting**: Fixed to select top 2 by count, display by GROUP_NAMES priority
+   - BS now correctly appears before BC when both have high counts
+
+4. **NPC/Unknown Ship Handling**: Fixed to include GROUP_UNKNOWN in subcaps
+   - Unknown groups now display in alliance breakdown instead of being silently excluded
+
+5. **Author Icon for Red Embeds**: Kept `most_common_ship_type()` for red (loss) embeds
+   - Green: tracked ship icon
+   - Red: most common attacker ship type icon
+
+6. **`get_most_common_attacker_group()` Fix**: Now only counts known groups
+   - Prevents "1x ships" title when unknown groups tie with known groups
+
 Integration tests exist in `tests/test_tracking_embeds.rs` and `tests/test_killfeed_embeds.rs`.
+Test fixture `resources/132461133_ceptor_npc_test.json` added for NPC ship testing.

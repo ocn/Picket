@@ -1,0 +1,143 @@
+{
+  "killID": 132461133,
+  "killmail": {
+    "attackers": [
+      {
+        "alliance_id": 99009927,
+        "character_id": 2120430224,
+        "corporation_id": 98798876,
+        "damage_done": 1520,
+        "final_blow": true,
+        "security_status": -5.3,
+        "ship_type_id": 11196,
+        "weapon_type_id": 2889
+      },
+      {
+        "corporation_id": 1000134,
+        "damage_done": 0,
+        "final_blow": false,
+        "security_status": 0,
+        "ship_type_id": 45056
+      }
+    ],
+    "killmail_id": 132461133,
+    "killmail_time": "2026-01-07T03:33:33Z",
+    "solar_system_id": 30003088,
+    "victim": {
+      "character_id": 2123678097,
+      "corporation_id": 98811532,
+      "damage_taken": 1520,
+      "items": [
+        {
+          "flag": 13,
+          "item_type_id": 4405,
+          "quantity_destroyed": 1,
+          "singleton": 0
+        },
+        {
+          "flag": 27,
+          "item_type_id": 486,
+          "quantity_destroyed": 1,
+          "singleton": 0
+        },
+        {
+          "flag": 27,
+          "item_type_id": 185,
+          "quantity_dropped": 91,
+          "singleton": 0
+        },
+        {
+          "flag": 5,
+          "item_type_id": 185,
+          "quantity_dropped": 880,
+          "singleton": 0
+        },
+        {
+          "flag": 11,
+          "item_type_id": 41034,
+          "quantity_dropped": 1,
+          "singleton": 0
+        },
+        {
+          "flag": 21,
+          "item_type_id": 4787,
+          "quantity_dropped": 1,
+          "singleton": 0
+        },
+        {
+          "flag": 12,
+          "item_type_id": 4405,
+          "quantity_destroyed": 1,
+          "singleton": 0
+        },
+        {
+          "flag": 92,
+          "item_type_id": 31105,
+          "quantity_destroyed": 1,
+          "singleton": 0
+        },
+        {
+          "flag": 94,
+          "item_type_id": 31105,
+          "quantity_destroyed": 1,
+          "singleton": 0
+        },
+        {
+          "flag": 93,
+          "item_type_id": 31105,
+          "quantity_destroyed": 1,
+          "singleton": 0
+        },
+        {
+          "flag": 19,
+          "item_type_id": 5971,
+          "quantity_dropped": 1,
+          "singleton": 0
+        },
+        {
+          "flag": 20,
+          "item_type_id": 4787,
+          "quantity_destroyed": 1,
+          "singleton": 0
+        },
+        {
+          "flag": 87,
+          "item_type_id": 2456,
+          "quantity_destroyed": 3,
+          "singleton": 0
+        },
+        {
+          "flag": 87,
+          "item_type_id": 2456,
+          "quantity_dropped": 5,
+          "singleton": 0
+        }
+      ],
+      "position": {
+        "x": 284479283435.53937,
+        "y": -6324609814.753327,
+        "z": -331731324672.6699
+      },
+      "ship_type_id": 593
+    }
+  },
+  "zkb": {
+    "locationID": 40196212,
+    "hash": "ec99cf589e889c380f3d659e4a879d8e5179598f",
+    "fittedValue": 3082647.63,
+    "droppedValue": 1946539.67,
+    "destroyedValue": 4065970.92,
+    "totalValue": 6012510.59,
+    "points": 7,
+    "npc": false,
+    "solo": true,
+    "awox": false,
+    "labels": [
+      "tz:use",
+      "cat:6",
+      "solo",
+      "pvp",
+      "loc:lowsec"
+    ]
+  }
+}
