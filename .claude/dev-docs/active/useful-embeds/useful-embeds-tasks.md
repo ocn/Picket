@@ -1,6 +1,6 @@
 # Useful Embeds - Task Checklist
 
-**Last Updated**: 2026-01-06
+**Last Updated**: 2026-01-07
 
 ---
 
@@ -50,6 +50,25 @@
 - [x] Added T3D group ID (1305)
 - [x] Added Pod group ID (29)
 - [x] Unknown groups count in +N instead of "Others"
+
+### 1.6 Title Logic Fixes ✅
+- [x] Fixed title to count by ship GROUP, not individual TYPE
+- [x] Added `get_most_common_attacker_group()` function
+- [x] Added `is_known_group()` helper
+- [x] Fixed category line sorting (select by count, display by priority)
+- [x] Added `FilterNode::contains_ship_filter()` helper in config.rs
+- [x] Ship tracking filters use matched ship group in title
+- [x] Entity tracking filters use most common attacker group in title
+- **Acceptance**: ✅ Title shows correct group count and type
+- **Effort**: S
+
+### 1.7 NPC/Unknown Ship Handling ✅
+- [x] Include GROUP_UNKNOWN in subcaps for alliance breakdown
+- [x] Exclude unknown groups from title count calculations
+- [x] Added test fixture `132461133_ceptor_npc_test.json`
+- [x] Author icon for red embeds uses most common attacker TYPE
+- **Acceptance**: ✅ NPC ships appear in fleet comp, don't affect title
+- **Effort**: S
 
 ---
 
@@ -149,6 +168,24 @@ Originally planned separate modes for Tracking vs Killfeed. Decision made to use
 - Decision: Same layout for Tracking and Killfeed (cancelled separate modes)
 - Verified implementation matches plan file requirements
 
+### 2026-01-07
+- **Fixed title ship count logic**: Changed from counting ship TYPE to counting by GROUP
+  - "Keepstar died to 539x BS" → "Keepstar died to 1028x BS" (correct count)
+- **Fixed category line sorting**: Select top 2 by count, display by GROUP_NAMES priority
+  - BS now correctly appears before BC when both are numerous
+- **Added ship tracking vs entity tracking distinction**:
+  - Added `FilterNode::contains_ship_filter()` helper in config.rs
+  - Ship filters use matched ship group in title
+  - Entity filters use most common attacker group in title
+- **Fixed NPC/unknown ship handling**:
+  - Unknown groups (GROUP_UNKNOWN) now included in subcaps for alliance breakdown
+  - Unknown groups excluded from `get_most_common_attacker_group()` to prevent "1x ships" title
+- **Added author icon logic for red embeds**:
+  - Green (kill): tracked ship icon
+  - Red (loss): most common attacker TYPE icon
+- **Added test fixture**: `resources/132461133_ceptor_npc_test.json` for NPC ship testing
+- Updated killfeed tests with BIGAB alliance (Target::Any for kills AND losses)
+
 ---
 
 ## Completed
@@ -163,3 +200,7 @@ Originally planned separate modes for Tracking vs Killfeed. Decision made to use
 - [x] Dynamic title based on color (2026-01-06)
 - [x] Category-based alliance breakdown (2026-01-06)
 - [x] Dev-docs update to reflect current state (2026-01-06)
+- [x] **Title logic fixes** (2026-01-07)
+- [x] **NPC/unknown ship handling** (2026-01-07)
+- [x] **Ship tracking vs entity tracking distinction** (2026-01-07)
+- [x] Dev-docs update with 2026-01-07 fixes

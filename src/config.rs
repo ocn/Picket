@@ -435,6 +435,7 @@ pub struct AppState {
     pub ships: Arc<RwLock<HashMap<u32, u32>>>,
     pub names: Arc<RwLock<HashMap<u64, String>>>,
     pub tickers: Arc<RwLock<HashMap<u64, String>>>,
+    pub group_names: Arc<RwLock<HashMap<u32, String>>>,
     pub subscriptions: Arc<RwLock<HashMap<GuildId, Vec<Subscription>>>>,
     pub app_config: Arc<AppConfig>,
     pub esi_client: EsiClient,
@@ -443,6 +444,7 @@ pub struct AppState {
     pub ships_file_lock: Mutex<()>,
     pub names_file_lock: Mutex<()>,
     pub tickers_file_lock: Mutex<()>,
+    pub group_names_file_lock: Mutex<()>,
     pub subscriptions_file_lock: Mutex<()>,
     pub last_ping_times: Mutex<HashMap<u64, Instant>>,
     pub user_standings: Arc<RwLock<HashMap<UserId, UserStandings>>>,
@@ -457,6 +459,7 @@ impl AppState {
         ships: HashMap<u32, u32>,
         names: HashMap<u64, String>,
         tickers: HashMap<u64, String>,
+        group_names: HashMap<u32, String>,
         subscriptions: HashMap<GuildId, Vec<Subscription>>,
         user_standings: HashMap<UserId, UserStandings>,
     ) -> Self {
@@ -465,6 +468,7 @@ impl AppState {
             ships: Arc::new(RwLock::new(ships)),
             names: Arc::new(RwLock::new(names)),
             tickers: Arc::new(RwLock::new(tickers)),
+            group_names: Arc::new(RwLock::new(group_names)),
             subscriptions: Arc::new(RwLock::new(subscriptions)),
             app_config: Arc::new(app_config),
             esi_client: EsiClient::new(),
@@ -473,6 +477,7 @@ impl AppState {
             ships_file_lock: Mutex::new(()),
             names_file_lock: Mutex::new(()),
             tickers_file_lock: Mutex::new(()),
+            group_names_file_lock: Mutex::new(()),
             subscriptions_file_lock: Mutex::new(()),
             last_ping_times: Mutex::new(HashMap::new()),
             user_standings: Arc::new(RwLock::new(user_standings)),
@@ -573,6 +578,14 @@ pub fn load_names() -> Result<HashMap<u64, String>, ConfigError> {
 
 pub fn load_tickers() -> Result<HashMap<u64, String>, ConfigError> {
     load_map_from_json_file(Path::new("config/tickers.json"))
+}
+
+pub fn save_group_names(group_names: &HashMap<u32, String>) {
+    save_to_json_file("config/group_names.json", group_names);
+}
+
+pub fn load_group_names() -> Result<HashMap<u32, String>, ConfigError> {
+    load_map_from_json_file(Path::new("config/group_names.json"))
 }
 
 pub fn load_user_standings() -> Result<HashMap<UserId, UserStandings>, ConfigError> {

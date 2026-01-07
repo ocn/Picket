@@ -44,6 +44,7 @@ pub async fn create_app_state_with_subscriptions(subscriptions: Vec<Subscription
     let ships = killbot_rust::config::load_ships().unwrap_or_default();
     let names = killbot_rust::config::load_names().unwrap_or_default();
     let tickers = killbot_rust::config::load_tickers().unwrap_or_default();
+    let group_names = killbot_rust::config::load_group_names().unwrap_or_default();
 
     // Create subscription map with a fake guild ID
     let fake_guild_id = GuildId(123456789);
@@ -56,12 +57,14 @@ pub async fn create_app_state_with_subscriptions(subscriptions: Vec<Subscription
         ships: Arc::new(std::sync::RwLock::new(ships)),
         names: Arc::new(std::sync::RwLock::new(names)),
         tickers: Arc::new(std::sync::RwLock::new(tickers)),
+        group_names: Arc::new(std::sync::RwLock::new(group_names)),
         celestial_cache: Cache::new(10_000),
         esi_client: Default::default(),
         systems_file_lock: Mutex::new(()),
         ships_file_lock: Mutex::new(()),
         names_file_lock: Mutex::new(()),
         tickers_file_lock: Mutex::new(()),
+        group_names_file_lock: Mutex::new(()),
         subscriptions_file_lock: Mutex::new(()),
         app_config: Arc::new(app_config),
         last_ping_times: Mutex::new(HashMap::new()),

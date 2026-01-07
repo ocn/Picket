@@ -127,6 +127,20 @@ impl EsiClient {
         Ok(type_info.group_id)
     }
 
+    /// Fetch the name for a ship group from ESI
+    /// e.g., group_id 26 returns "Cruiser", group_id 485 returns "Dreadnought"
+    pub async fn get_group_name(
+        &self,
+        group_id: u32,
+    ) -> Result<String, Box<dyn Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        struct EsiGroup {
+            name: String,
+        }
+        let group_info: EsiGroup = self.fetch(&format!("universe/groups/{}/", group_id)).await?;
+        Ok(group_info.name)
+    }
+
     pub async fn get_name(&self, id: u64) -> Result<String, Box<dyn Error + Send + Sync>> {
         #[derive(Deserialize)]
         struct EsiName {

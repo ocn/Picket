@@ -32,6 +32,8 @@ const KILLFEED_FIXTURES: &[(&str, &str)] = &[
     ("132249213_naglfar_loss.json", "Naglfar loss - dread kill"),
     ("132302304_caps_attacking.json", "Revelation - cap fight"),
     ("131126432_keepstar_kill.json", "Keepstar - massive battle"),
+    ("130734446_unknown_group_test.json", "Revelation killed by Infested Carrier - tests ESI group name lookup"),
+    ("132462203_global_feed_test.json", "Astero killed by Astrahus - tests global feed (no entity match)"),
 ];
 
 /// Deepwater Hooligans alliance ID
@@ -67,6 +69,32 @@ fn create_killfeed_subscriptions() -> Vec<Subscription> {
             root_filter: FilterNode::Condition(Filter::Targeted(TargetedFilter {
                 condition: TargetableCondition::Alliance(vec![BIGAB_ALLIANCE_ID]),
                 target: Target::Any,
+            })),
+            action: Action {
+                channel_id: TEST_CHANNEL_ID.to_string(),
+                ping_type: None,
+            },
+        },
+        // Dread tracking: for testing unknown attacker group names (ESI lookup)
+        Subscription {
+            id: "dread-deaths".to_string(),
+            description: "Dread deaths - tests ESI group name lookup".to_string(),
+            root_filter: FilterNode::Condition(Filter::Targeted(TargetedFilter {
+                condition: TargetableCondition::ShipGroup(vec![485]), // Dreadnought
+                target: Target::Victim,
+            })),
+            action: Action {
+                channel_id: TEST_CHANNEL_ID.to_string(),
+                ping_type: None,
+            },
+        },
+        // Global feed: value-only filter (no entity match) - tests default green color
+        Subscription {
+            id: "global-100m".to_string(),
+            description: "Global kills >100M ISK".to_string(),
+            root_filter: FilterNode::Condition(Filter::Simple(SimpleFilter::TotalValue {
+                min: Some(100_000_000),
+                max: None,
             })),
             action: Action {
                 channel_id: TEST_CHANNEL_ID.to_string(),

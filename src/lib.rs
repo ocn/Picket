@@ -100,6 +100,13 @@ pub async fn run() {
         );
         HashMap::new()
     });
+    let group_names = config::load_group_names().unwrap_or_else(|e| {
+        warn!(
+            "Failed to load group_names.json: {}. Starting with an empty map.",
+            e
+        );
+        HashMap::new()
+    });
 
     let user_standings = config::load_user_standings().unwrap_or_else(|e| {
         warn!(
@@ -119,6 +126,7 @@ pub async fn run() {
         ships,
         names,
         tickers,
+        group_names,
         subscriptions,
         user_standings,
     ));

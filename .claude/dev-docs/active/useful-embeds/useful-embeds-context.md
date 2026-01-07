@@ -126,7 +126,7 @@ const CAP_GROUPS: &[u32] = &[4594, 485, 1538, 547, 883, 902, 513];
 // Lancers, Dreads, FAX, Carriers, Cap Industrial, Jump Freighters, Freighters
 ```
 
-All other known groups are treated as subcaps. Unknown groups count toward the `+N` overflow.
+All other known groups are treated as subcaps. Unknown groups (GROUP_UNKNOWN = 0) are included in subcaps category but excluded from title count calculations.
 
 ---
 
@@ -178,6 +178,39 @@ All other known groups are treated as subcaps. Unknown groups count toward the `
 - **Decision**: Ticker-based alliance display with ESI caching
 - **Rationale**: Tickers are more recognizable than full names, fit better in compact format
 - **Implementation**: `get_ticker()` in esi.rs with `AppState.tickers` cache
+
+### 2026-01-07
+- **Decision**: Title counts by ship GROUP, not individual ship TYPE
+- **Rationale**: "539x Apocalypse" vs "1028x BS" - group count is more meaningful for fleet size
+- **Implementation**: `get_most_common_attacker_group()` aggregates by group_id
+
+### 2026-01-07
+- **Decision**: Ship tracking vs entity tracking determines title format
+- **Rationale**: Ship filters should show the tracked ship, entity filters should show fleet composition
+- **Implementation**: `FilterNode::contains_ship_filter()` checks for ShipType/ShipGroup conditions
+- **Behavior**:
+  - Ship filters: Title uses matched ship group (e.g., "3x Titans killed a Nyx")
+  - Entity filters: Title uses most common attacker group (e.g., "15x BS killed a Nyx")
+
+### 2026-01-07
+- **Decision**: Category line sorting: select by count, display by priority
+- **Rationale**: Show the most numerous ships, but maintain priority ordering (BS before BC)
+- **Implementation**: Take top 2 by count, then re-sort by GROUP_NAMES index
+
+### 2026-01-07
+- **Decision**: Include unknown groups in subcaps category for alliance breakdown
+- **Rationale**: NPC ships (like ♦ Apocalypse) should still appear in fleet composition
+- **Implementation**: Removed `gid != GROUP_UNKNOWN` from subcaps filter
+
+### 2026-01-07
+- **Decision**: Exclude unknown groups from title count calculations
+- **Rationale**: Prevents "1x ships" when unknown groups tie with known groups
+- **Implementation**: `get_most_common_attacker_group()` uses `is_known_group()` filter
+
+### 2026-01-07
+- **Decision**: Author icon for red embeds uses most common attacker ship type
+- **Rationale**: Red embeds (losses) should show what killed the victim
+- **Implementation**: Green = tracked ship icon, Red = most common attacker TYPE icon
 
 ---
 
