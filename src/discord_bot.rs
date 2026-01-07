@@ -1061,7 +1061,18 @@ async fn get_most_common_attacker_group(
     }
 
     // Prefer known groups (they have nice abbreviated names like "BS")
-    if let Some((group_id, count)) = known_group_counts.into_iter().max_by_key(|(_, c)| *c) {
+    // When counts tie, use GROUP_NAMES priority so title matches fleet comp ordering
+    if let Some((group_id, count)) = known_group_counts.into_iter().max_by(|(g1, c1), (g2, c2)| {
+        match c1.cmp(c2) {
+            std::cmp::Ordering::Equal => {
+                // Tie-break by GROUP_NAMES priority (lower index = higher priority)
+                let p1 = GROUP_NAMES.iter().position(|(id, _, _)| id == g1).unwrap_or(usize::MAX);
+                let p2 = GROUP_NAMES.iter().position(|(id, _, _)| id == g2).unwrap_or(usize::MAX);
+                p2.cmp(&p1) // Reverse: lower index should win
+            }
+            other => other,
+        }
+    }) {
         let group_name = get_group_name(group_id, count as u32)
             .unwrap_or("ships")
             .to_string();
@@ -1070,7 +1081,17 @@ async fn get_most_common_attacker_group(
     }
 
     // Fall back to any group and use ESI name
-    if let Some((group_id, count)) = all_group_counts.into_iter().max_by_key(|(_, c)| *c) {
+    // When counts tie, use GROUP_NAMES priority for consistency
+    if let Some((group_id, count)) = all_group_counts.into_iter().max_by(|(g1, c1), (g2, c2)| {
+        match c1.cmp(c2) {
+            std::cmp::Ordering::Equal => {
+                let p1 = GROUP_NAMES.iter().position(|(id, _, _)| id == g1).unwrap_or(usize::MAX);
+                let p2 = GROUP_NAMES.iter().position(|(id, _, _)| id == g2).unwrap_or(usize::MAX);
+                p2.cmp(&p1)
+            }
+            other => other,
+        }
+    }) {
         let group_name = get_dynamic_group_name(app_state, group_id, count as u32).await;
         let ship_type_id = group_ship_type.get(&group_id).copied();
         return (count, group_name, ship_type_id);
