@@ -1,156 +1,153 @@
 # Useful Embeds - Implementation Plan
 
-**Last Updated**: 2026-01-01
-**Status**: Planning
+**Last Updated**: 2026-01-06
+**Status**: Complete (Phase 1 + Layout Redesign)
 **Estimated Effort**: M (Medium)
 
 ---
 
 ## Executive Summary
 
-Enhance the killmail embed to show **fleet composition by ship group** (Heavy Assault Cruisers, Interdictors, etc.) rather than just alliance counts. The goal is high information density that helps understand what happened at a glance.
+Enhance the killmail embed with **fleet composition by ship group** and a **redesigned layout** that provides better information density. The embed now shows dynamic titles based on kill/loss perspective, category-based ship breakdowns (supers/caps/subcaps), ticker-based alliance display, and victim information.
 
 ---
 
-## Current State
+## Completed Work
 
-### What Works Well
-- Alliance/corp grouping with counts
-- Tracked entity ship in thumbnail
-- "Other" ship in image slot
-- Color coding (green=kill, red=loss)
-- Range/jump links
+### Phase 1: Fleet Composition by Ship Group ✅
 
-### What's Missing
-- **Ship group composition**: "30x HACs, 10x Dictors" instead of just "40 attackers"
-- **Layout flexibility**: Different emphasis for kills vs losses
-- Better visual density without clutter
+**Goal**: Show attacker fleet broken down by ship group with category-based formatting.
+
+**Implemented Format**:
+```
+151x Titans, 188x Supers, 84x Dreads, 49x Carriers, 1028x BS, 383x HICs, +1373
+```
+
+**Per-Alliance Breakdown**:
+```
+[CONDI] 2761
+ └ 139 Titans, 169 Supers
+ └ 77 Dreads, 37 Carriers
+ └ 796 BS, 338 HICs, +836
+[INIT] 500
+ └ 12 Titans, 23 Supers
+ └ 15 Dreads, 8 FAX
+ └ 142 BS, 45 HICs, +255
+others 492
+```
+
+**Key Features**:
+- Ship groups organized into categories: Supers (Titans, Supercarriers), Caps (Dreads, FAX, Carriers, etc.), Subcaps (everything else)
+- Up to 3 ship types per category line with `+N` overflow
+- Up to 8 alliances shown, then "others N"
+- Ticker-based alliance display with ESI fetch + caching
+
+### Phase 1.5: Embed Layout Redesign ✅
+
+**Goal**: Redesign entire embed structure for better information presentation.
+
+**New Layout**:
+```
+┌─────────────────────────────────────────────────────┐
+│ [Ship Icon] Battle Report: Titan in X-7OMU (Deklein)│
+│             Killmail posted 5 minutes ago           │
+│             URL → Battle Report                     │
+├─────────────────────────────────────────────────────┤
+│ Title: "15x Titans killed a Nyx"                    │
+│    or: "Nyx died to 15x Titans"     [Thumbnail: Nyx]│
+│ URL → zkillboard                                    │
+├─────────────────────────────────────────────────────┤
+│ (3753) Attackers Involved                           │
+│ 151x Titans, 188x Supers, 84x Dreads...             │
+│ ```                                                 │
+│ [CONDI] 2761                                        │
+│  └ 139 Titans, 169 Supers                           │
+│  └ 77 Dreads, 37 Carriers                           │
+│  └ 796 BS, 338 HICs, +836                           │
+│ others 492                                          │
+│ ```                                                 │
+├─────────────────────────────────────────────────────┤
+│ Victim                                              │
+│ [RAZOR] Player Name                                 │
+├─────────────────────────────────────────────────────┤
+│ in: System (Region)                                 │
+│ on: Celestial, 150km away                           │
+│ range: 5.2 LY from Turnur (Supers|FAX|Blops)        │
+├─────────────────────────────────────────────────────┤
+│ Value: 2.5B • EVETime: 01/06/2026, 14:30 [timestamp]│
+└─────────────────────────────────────────────────────┘
+```
+
+**Key Changes from Original**:
+1. **Dynamic Title**: Green (kill) = `"Nx Group killed a Victim"`, Red (loss) = `"Victim died to Nx Group"`
+2. **Author Section**: Now shows `"Battle Report: {ship} in {system} ({region})\nKillmail posted {relative_time}"`
+3. **Thumbnail**: Always victim ship
+4. **New Victim Field**: Shows `[TICKER] Character Name`
+5. **Attackers Field**: Combined overall fleet comp + category-based alliance breakdown
 
 ---
 
-## Proposed Changes
+## Technical Implementation
 
-### Phase 1: Fleet Composition by Ship Group (Priority: HIGH)
+### Ship Group Categories
 
-**Goal**: Show attacker fleet broken down by ship group (not individual ship types)
-
-**Current**:
-```
-BIGAB                  x25
-Pandemic Horde         x15
-...others              x5
+```rust
+const SUPER_GROUPS: &[u32] = &[30, 659]; // Titans, Supercarriers
+const CAP_GROUPS: &[u32] = &[4594, 485, 1538, 547, 883, 902, 513]; // Lancers, Dreads, FAX, Carriers, Cap Indy, JF, Freighters
+// Subcaps = everything else not in SUPER_GROUPS or CAP_GROUPS
 ```
 
-**Proposed (Option B - Selected)**:
-```
-BIGAB x25 (15 HAC, 5 Dictor, 5 Logi)
-Pandemic Horde x15 (10 HAC, 5 Dictor)
-...others x5
-```
+### Key Functions Added
 
-**Alternative formats (for future consideration)**:
-- Option A: Fleet summary separate from alliance counts
-  ```
-  Fleet: 25x HAC, 10x Dictor, 5x Logi
-  BIGAB x25 | Pandemic Horde x15 | others x5
-  ```
-- Option C: Ship groups only, no alliance breakdown
-  ```
-  25x Heavy Assault Cruiser
-  10x Interdictor
-  5x Logistics
-  ```
+| Function | Location | Purpose |
+|----------|----------|---------|
+| `GROUP_NAMES` | `discord_bot.rs` | Static mapping of group_id → (singular, plural) |
+| `get_group_name()` | `discord_bot.rs` | Resolve group_id to display name |
+| `FleetComposition` | `discord_bot.rs` | Struct holding fleet aggregation data |
+| `compute_fleet_composition()` | `discord_bot.rs` | Aggregate attackers by ship group |
+| `format_overall()` | `discord_bot.rs` | Format overall fleet comp line |
+| `format_category_line()` | `discord_bot.rs` | Format a category (supers/caps/subcaps) |
+| `format_alliance_breakdown()` | `discord_bot.rs` | Format per-alliance breakdown |
+| `get_ticker()` | `esi.rs` | Fetch alliance/corp ticker from ESI |
+| `get_ticker()` | `discord_bot.rs` | Wrapper with cache lookup |
 
-**Implementation**:
-1. Already have `get_ship_group_id()` to map ship → group
-2. Need group ID → group name mapping (ESI or static)
-3. Aggregate attackers by (alliance, ship_group)
-4. Format compactly
+### Caching
 
-### Phase 2: Layout Modes (Priority: MEDIUM)
-
-Defer detailed planning until Phase 1 is complete and we can see what information density looks like. The modes will likely be:
-
-- **Standard**: Current layout with fleet comp added
-- **Kill-focused**: Emphasize what tracked entity used
-- **Loss-focused**: Emphasize what killed tracked entity
-
-### Phase 3: Future Ideas (Backlog)
-
-- Fitting anomaly detection (unusual fits)
-- Compact mode for high-volume
-- Battle grouping (multiple kills in same system/time)
+- **Tickers**: `AppState.tickers` - HashMap<u64, String> persisted to `config/tickers.json`
+- **Ships**: Existing `AppState.ships` cache for group_id lookups
 
 ---
 
-## Technical Notes
+## Phase 2: Layout Modes (Deferred/Cancelled)
 
-### Ship Group ID → Name
+Originally planned different modes (Tracking vs Killfeed). Decision made to use **same layout for both** - no separate modes needed.
 
-EVE ship groups we care about:
-| Group ID | Name |
-|----------|------|
-| 26 | Cruiser |
-| 27 | Battleship |
-| 28 | Industrial |
-| 30 | Titan |
-| 324 | Assault Frigate |
-| 358 | Heavy Assault Cruiser |
-| 419 | Combat Battlecruiser |
-| 485 | Dreadnought |
-| 513 | Freighter |
-| 540 | Command Ship |
-| 541 | Interdictor |
-| 547 | Carrier |
-| 659 | Supercarrier |
-| 830 | Covert Ops |
-| 831 | Interceptor |
-| 832 | Logistics |
-| 833 | Force Recon |
-| 834 | Stealth Bomber |
-| 893 | Electronic Attack Ship |
-| 894 | Heavy Interdiction Cruiser |
-| 898 | Black Ops |
-| 900 | Marauder |
-| 906 | Combat Recon |
-| 1022 | Strategic Cruiser |
-| 1201 | Attack Battlecruiser |
-| 1527 | Logistics Frigate |
-| 1534 | Command Destroyer |
-| 1538 | Force Auxiliary |
-| 1972 | Flag Cruiser |
-| 4594 | Lancer Dreadnought |
+---
 
-Options:
-1. **Static map**: Hardcode common group names
-2. **ESI fetch**: `universe/groups/{id}/` (cacheable)
-3. **Hybrid**: Static for common, ESI fallback
+## Phase 3: Future Ideas (Backlog)
 
-### Data Flow
-
-```
-attackers[]
-  → ship_type_id
-  → get_ship_group_id() [cached]
-  → group_name [new: cached]
-  → aggregate by (alliance, group)
-  → format
-```
+- [ ] Fitting anomaly detection (unusual fits)
+- [ ] Compact mode for high-volume feeds
+- [ ] Battle grouping (multiple kills in same system/time)
 
 ---
 
 ## Success Metrics
 
-1. Fleet composition visible at a glance
-2. No significant latency increase (caching)
-3. Embed remains readable on mobile
+1. ✅ Fleet composition visible at a glance
+2. ✅ No significant latency increase (caching)
+3. ✅ Embed remains readable on mobile
+4. ✅ Dynamic title provides context (kill vs loss)
+5. ✅ Victim information displayed
 
 ---
 
-## Removed from Scope
+## Completion Notes
 
-- ~~Victim character name~~ (not needed)
-- ~~Final blow info~~ (not needed)
-- ~~Footer icon~~ (defer)
-- ~~Damage breakdown~~ (not useful)
-- ~~Ship fitting preview~~ (maybe later for anomaly detection)
+This task is functionally complete. The embed layout has been redesigned with:
+- Fleet composition by ship group with category-based formatting
+- Dynamic titles based on kill/loss perspective
+- Ticker-based alliance/corp display
+- New victim field showing character name
+
+Integration tests exist in `tests/test_tracking_embeds.rs` and `tests/test_killfeed_embeds.rs`.

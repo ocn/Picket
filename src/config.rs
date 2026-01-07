@@ -416,6 +416,7 @@ pub struct AppState {
     pub systems: Arc<RwLock<HashMap<u32, System>>>,
     pub ships: Arc<RwLock<HashMap<u32, u32>>>,
     pub names: Arc<RwLock<HashMap<u64, String>>>,
+    pub tickers: Arc<RwLock<HashMap<u64, String>>>,
     pub subscriptions: Arc<RwLock<HashMap<GuildId, Vec<Subscription>>>>,
     pub app_config: Arc<AppConfig>,
     pub esi_client: EsiClient,
@@ -423,6 +424,7 @@ pub struct AppState {
     pub systems_file_lock: Mutex<()>,
     pub ships_file_lock: Mutex<()>,
     pub names_file_lock: Mutex<()>,
+    pub tickers_file_lock: Mutex<()>,
     pub subscriptions_file_lock: Mutex<()>,
     pub last_ping_times: Mutex<HashMap<u64, Instant>>,
     pub user_standings: Arc<RwLock<HashMap<UserId, UserStandings>>>,
@@ -436,6 +438,7 @@ impl AppState {
         systems: HashMap<u32, System>,
         ships: HashMap<u32, u32>,
         names: HashMap<u64, String>,
+        tickers: HashMap<u64, String>,
         subscriptions: HashMap<GuildId, Vec<Subscription>>,
         user_standings: HashMap<UserId, UserStandings>,
     ) -> Self {
@@ -443,6 +446,7 @@ impl AppState {
             systems: Arc::new(RwLock::new(systems)),
             ships: Arc::new(RwLock::new(ships)),
             names: Arc::new(RwLock::new(names)),
+            tickers: Arc::new(RwLock::new(tickers)),
             subscriptions: Arc::new(RwLock::new(subscriptions)),
             app_config: Arc::new(app_config),
             esi_client: EsiClient::new(),
@@ -450,6 +454,7 @@ impl AppState {
             systems_file_lock: Mutex::new(()),
             ships_file_lock: Mutex::new(()),
             names_file_lock: Mutex::new(()),
+            tickers_file_lock: Mutex::new(()),
             subscriptions_file_lock: Mutex::new(()),
             last_ping_times: Mutex::new(HashMap::new()),
             user_standings: Arc::new(RwLock::new(user_standings)),
@@ -504,6 +509,10 @@ pub fn save_names(names: &HashMap<u64, String>) {
     save_to_json_file("config/names.json", names);
 }
 
+pub fn save_tickers(tickers: &HashMap<u64, String>) {
+    save_to_json_file("config/tickers.json", tickers);
+}
+
 pub fn save_user_standings(standings: &HashMap<UserId, UserStandings>) {
     save_to_json_file("config/user_standings.json", standings);
 }
@@ -542,6 +551,10 @@ pub fn load_ships() -> Result<HashMap<u32, u32>, ConfigError> {
 
 pub fn load_names() -> Result<HashMap<u64, String>, ConfigError> {
     load_map_from_json_file(Path::new("config/names.json"))
+}
+
+pub fn load_tickers() -> Result<HashMap<u64, String>, ConfigError> {
+    load_map_from_json_file(Path::new("config/tickers.json"))
 }
 
 pub fn load_user_standings() -> Result<HashMap<UserId, UserStandings>, ConfigError> {

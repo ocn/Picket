@@ -145,6 +145,26 @@ impl EsiClient {
         Ok(name_info.name)
     }
 
+    /// Fetch the ticker for an alliance or corporation
+    /// Alliance tickers look like "B B C", corporation tickers look like "DRG"
+    pub async fn get_ticker(
+        &self,
+        id: u64,
+        is_alliance: bool,
+    ) -> Result<String, Box<dyn Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        struct EsiEntity {
+            ticker: String,
+        }
+        let endpoint = if is_alliance {
+            format!("alliances/{}/", id)
+        } else {
+            format!("corporations/{}/", id)
+        };
+        let entity: EsiEntity = self.fetch(&endpoint).await?;
+        Ok(entity.ticker)
+    }
+
     pub async fn get_celestial(
         &self,
         system_id: u32,

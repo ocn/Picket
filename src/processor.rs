@@ -784,6 +784,7 @@ mod tests {
             systems_file_lock: Mutex::new(()),
             ships_file_lock: Mutex::new(()),
             names_file_lock: Mutex::new(()),
+            tickers_file_lock: Mutex::new(()),
             subscriptions_file_lock: Mutex::new(()),
             app_config: Arc::new(AppConfig {
                 discord_bot_token: "".to_string(),
@@ -795,6 +796,7 @@ mod tests {
             user_standings: Arc::new(Default::default()),
             user_standings_file_lock: Default::default(),
             sso_states: Arc::new(Default::default()),
+            tickers: Arc::new(Default::default())
         })
     }
 

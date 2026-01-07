@@ -9,3 +9,5 @@ accessToken.json
 scripts/dotlan/
 target/
 config-old/
+.claude/cache
+.claude/settings.local.json

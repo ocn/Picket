@@ -8,7 +8,6 @@ use crate::esi::Celestial;
 use crate::models::{Attacker, ZkData};
 use crate::processor::{AttackerKey, Color, NamedFilterResult};
 use chrono::{DateTime, FixedOffset, Utc};
-use futures::future::join_all;
 use serenity::async_trait;
 use serenity::builder::CreateEmbed;
 use serenity::http::error::Error;
@@ -36,6 +35,79 @@ const SHIP_GROUP_PRIORITY: &[u32] = &[
     902,  // Jump Freighter
     513,  // Freighter
 ];
+
+/// Ship group ID to display name mapping (group_id, singular, plural)
+/// Priority order: capitals first, then subcaps by importance
+const GROUP_NAMES: &[(u32, &str, &str)] = &[
+    // Capitals
+    (30, "Titan", "Titans"),
+    (659, "Super", "Supers"),
+    (4594, "Lancer", "Lancers"),
+    (485, "Dread", "Dreads"),
+    (1538, "FAX", "FAX"),
+    (547, "Carrier", "Carriers"),
+    (883, "Cap Indy", "Cap Indys"),
+    (902, "JF", "JFs"),
+    (513, "Freighter", "Freighters"),
+    // Battleships
+    (898, "Blops", "Blops"),
+    (900, "Marauder", "Marauders"),
+    (27, "BS", "BS"),
+    // Battlecruisers
+    (419, "BC", "BCs"),
+    (540, "CS", "CS"),
+    (1201, "ABC", "ABCs"),
+    // Cruisers
+    (963, "T3C", "T3Cs"),
+    (894, "HIC", "HICs"),
+    (832, "Logi", "Logi"),
+    (358, "HAC", "HACs"),
+    (906, "C Recon", "C Recons"),
+    (833, "F Recon", "F Recons"),
+    (1972, "Flag", "Flags"),
+    (26, "Cruiser", "Cruisers"),
+    // Destroyers
+    (541, "Dictor", "Dictors"),
+    (1305, "T3D", "T3Ds"),
+    (1534, "Cmd Dessie", "Cmd Dessies"),
+    (420, "Destroyer", "Destroyers"),
+    // Frigates
+    (834, "Bomber", "Bombers"),
+    (324, "AF", "AFs"),
+    (831, "Ceptor", "Ceptors"),
+    (830, "CovOps", "CovOps"),
+    (1527, "Logi Frig", "Logi Frigs"),
+    (893, "EAS", "EAS"),
+    (25, "Frigate", "Frigates"),
+    // Misc
+    (28, "T1 Indy", "T1 Indys"),
+    (380, "T2 Indy", "T2 Indys"),
+    (1283, "Mining Barge", "Mining Barges"),
+    (463, "Mining Frig", "Mining Frigs"),
+    (29, "Pod", "Pods"),
+];
+
+/// Sentinel value for unknown ship groups (counted in +N)
+const GROUP_UNKNOWN: u32 = 0;
+
+/// Get the display name for a ship group, using singular or plural form based on count
+fn get_group_name(group_id: u32, count: u32) -> Option<&'static str> {
+    GROUP_NAMES
+        .iter()
+        .find(|(id, _, _)| *id == group_id)
+        .map(|(_, singular, plural)| {
+            if count == 1 {
+                *singular
+            } else {
+                *plural
+            }
+        })
+}
+
+/// Check if a group ID has a known display name
+fn is_known_group(group_id: u32) -> bool {
+    GROUP_NAMES.iter().any(|(id, _, _)| *id == group_id)
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MatchedEntity {
@@ -874,9 +946,11 @@ fn str_ship_icon(id: u32) -> String {
 fn str_pilot_zk(id: u64) -> String {
     format!("https://zkillboard.com/character/{}/", id)
 }
+#[allow(unused)]
 fn str_corp_zk(id: u64) -> String {
     format!("https://zkillboard.com/corporation/{}/", id)
 }
+#[allow(unused)]
 fn str_alliance_zk(id: u64) -> String {
     format!("https://zkillboard.com/alliance/{}/", id)
 }
@@ -925,6 +999,32 @@ fn most_common_ship_type(attackers: &[Attacker]) -> Option<(u64, u64)> {
         .map(|(k, v)| (*k, *v))
 }
 
+/// Get the most common attacker ship group for title display
+async fn get_most_common_attacker_group(
+    app_state: &Arc<AppState>,
+    attackers: &[Attacker],
+) -> (u64, String) {
+    // Count attackers by ship group
+    let mut group_counts: HashMap<u32, u64> = HashMap::new();
+    for attacker in attackers {
+        if let Some(ship_type_id) = attacker.ship_type_id {
+            if let Some(group_id) = get_ship_group_id(app_state, ship_type_id).await {
+                *group_counts.entry(group_id).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Find the most common group
+    if let Some((group_id, count)) = group_counts.into_iter().max_by_key(|(_, c)| *c) {
+        let group_name = get_group_name(group_id, count as u32)
+            .unwrap_or("ships")
+            .to_string();
+        (count, group_name)
+    } else {
+        (attackers.len() as u64, "ships".to_string())
+    }
+}
+
 /// Formats a DateTime object into a YYYYMMDDHH00 string, suitable for battle report URLs.
 /// This function effectively rounds the time down to the nearest hour.
 fn format_datetime_to_timestamp(date: &DateTime<FixedOffset>) -> String {
@@ -943,19 +1043,20 @@ async fn build_killmail_embed(
     let filter_result = &named_filter_result.filter_result;
     let killmail = &zk_data.killmail;
 
+    // --- Basic Data Fetching ---
     let system_info = get_system(app_state, killmail.solar_system_id).await;
     let system_name = system_info.as_ref().map_or("Unknown System", |s| &s.name);
     let system_id = system_info.as_ref().map_or(0, |s| s.id);
     let region_name = system_info.as_ref().map_or("Unknown Region", |s| &s.region);
     let region_id = system_info.as_ref().map_or(0, |s| s.region_id);
-    let most_common_ship = most_common_ship_type(&killmail.attackers);
+
     let best_match = select_best_entity_for_display(
         app_state,
         zk_data,
         &filter_result.matched_attackers,
         filter_result.matched_victim,
     )
-        .await;
+    .await;
 
     let total_value_str = abbreviate_number(zk_data.zkb.total_value);
     let relative_time = get_relative_time(&killmail.killmail_time);
@@ -969,274 +1070,163 @@ async fn build_killmail_embed(
         format_datetime_to_timestamp(&killmail_time)
     );
 
-    // Location details
-    let mut location_details = String::new();
-    if let Some(celestial) = get_closest_celestial(app_state, zk_data).await {
+    // --- Victim Info ---
+    let victim_ship_name = get_name(app_state, killmail.victim.ship_type_id as u64)
+        .await
+        .unwrap_or_else(|| "Unknown Ship".to_string());
+
+    // Get victim character name and zkillboard link
+    // For structures (no character_id), use the structure/ship name instead
+    let (victim_char_name, victim_char_link) = if let Some(char_id) = killmail.victim.character_id {
+        let name = get_name(app_state, char_id)
+            .await
+            .unwrap_or_else(|| "Unknown".to_string());
+        let link = format!("https://zkillboard.com/character/{}/", char_id);
+        (name, Some(link))
+    } else {
+        // No character = structure kill, use the structure name
+        (victim_ship_name.clone(), None)
+    };
+
+    // Get victim ticker and zkillboard link (alliance preferred, corp fallback)
+    let (victim_ticker, victim_affiliation_link) = if let Some(alliance_id) = killmail.victim.alliance_id {
+        let ticker = get_ticker(app_state, alliance_id, true).await;
+        let link = format!("https://zkillboard.com/alliance/{}/", alliance_id);
+        (ticker, Some(link))
+    } else if let Some(corp_id) = killmail.victim.corporation_id {
+        let ticker = get_ticker(app_state, corp_id, false).await;
+        let link = format!("https://zkillboard.com/corporation/{}/", corp_id);
+        (ticker, Some(link))
+    } else {
+        (None, None)
+    };
+
+    // --- Fleet Composition ---
+    let fleet_comp = compute_fleet_composition(app_state, &killmail.attackers).await;
+
+    // --- Determine Display Ship Type for Title ---
+    // For attacker matches (Green): use matched ship group
+    // For victim matches (Red) or min_pilots: use most common attacker type
+    let (title_ship_count, title_ship_group_name) = if filter_result.min_pilots.is_some() {
+        // Min pilots filter: use most common ship type's group
+        get_most_common_attacker_group(app_state, &killmail.attackers).await
+    } else if let Some(ref matched) = best_match {
+        if matched.color == Color::Green {
+            // Attacker match: count attackers with this ship group
+            let mut count = 0u64;
+            for attacker in &killmail.attackers {
+                if let Some(ship_id) = attacker.ship_type_id {
+                    if let Some(gid) = get_ship_group_id(app_state, ship_id).await {
+                        if gid == matched.group_id {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            let plural_name = get_group_name(matched.group_id, count as u32)
+                .unwrap_or("ships")
+                .to_string();
+            (count.max(1), plural_name)
+        } else {
+            // Victim match (Red): show most common attacker type
+            get_most_common_attacker_group(app_state, &killmail.attackers).await
+        }
+    } else {
+        // No match: show most common attacker type
+        get_most_common_attacker_group(app_state, &killmail.attackers).await
+    };
+
+    // --- Title (dynamic based on color) with backticks around ship names ---
+    let title = match best_match.as_ref().map(|m| m.color) {
+        Some(Color::Green) => {
+            // Kill: "{count}x `{group}` killed a `{victim_ship}`"
+            format!(
+                "{}x `{}` killed a `{}`",
+                title_ship_count, title_ship_group_name, victim_ship_name
+            )
+        }
+        Some(Color::Red) => {
+            // Loss: "`{victim_ship}` died to {count}x `{group}`"
+            format!(
+                "`{}` died to {}x `{}`",
+                victim_ship_name, title_ship_count, title_ship_group_name
+            )
+        }
+        None => {
+            // Default: show what killed them
+            format!(
+                "`{}` died to {}x `{}`",
+                victim_ship_name, title_ship_count, title_ship_group_name
+            )
+        }
+    };
+
+    // --- Author (Battle Report link) ---
+    let author_ship_name = if let Some(ref matched) = best_match {
+        get_group_name(matched.group_id, title_ship_count as u32)
+            .unwrap_or(&matched.ship_name)
+            .to_string()
+    } else {
+        title_ship_group_name.clone()
+    };
+
+    let author_text = format!(
+        "BR: {} in {} ({})\nKillmail posted {}",
+        author_ship_name, system_name, region_name, relative_time
+    );
+
+    // Author icon: green = tracked ship, red = most common attacker ship
+    let author_icon = if let Some(ref matched) = best_match {
+        if matched.color == Color::Green {
+            str_ship_icon(matched.type_id)
+        } else {
+            // Red (loss): show most common attacker ship type
+            most_common_ship_type(&killmail.attackers)
+                .map(|(type_id, _)| str_ship_icon(type_id as u32))
+                .unwrap_or_else(|| str_ship_icon(killmail.victim.ship_type_id))
+        }
+    } else {
+        str_ship_icon(killmail.victim.ship_type_id)
+    };
+
+    // --- Location Details ---
+    let location_line = format!(
+        "**in:** [{}]({}) ([{}]({}))",
+        system_name,
+        str_system_dotlan(system_id),
+        region_name,
+        str_region_dotlan(region_id)
+    );
+
+    let celestial_line = if let Some(celestial) = get_closest_celestial(app_state, zk_data).await {
         let distance_km = celestial.distance / 1000.0;
         let distance_str = if distance_km > 1_500_000.0 {
             format!("{:.1} AU", distance_km / 149_597_870.7)
         } else {
             format!("{:.1} km", distance_km)
         };
-        location_details = format!(
-            "on: [{}]({}), {} away",
+        format!(
+            "**on:** [{}]({}), {} away",
             celestial.item_name,
             str_location(celestial.item_id),
-            distance_str,
-        );
-    }
-
-    // Victim details
-    let victim_ship_name = get_name(app_state, killmail.victim.ship_type_id as u64)
-        .await
-        .unwrap_or_else(|| "Unknown Ship".to_string());
-    let victim_corp_id = killmail.victim.corporation_id.unwrap_or(0);
-    // let victim_char_id = killmail.victim.character_id.unwrap_or(0);
-    // let victim_name = get_name(app_state, victim_char_id)
-    //     .await
-    //     .or_else(|| futures::executor::block_on(get_name(app_state, victim_corp_id)))
-    //     .unwrap_or_else(|| "N/A".to_string());
-    let mut victim_details = String::new();
-    if let Some(alliance_id) = killmail.victim.alliance_id {
-        if let Some(name) = get_name(app_state, alliance_id).await {
-            victim_details.push_str(&format!(
-                "[{}]({})",
-                &name[0..name.len().min(40)],
-                str_alliance_zk(alliance_id)
-            ));
-        }
-    }
-    if victim_corp_id != 0 && victim_details.is_empty() {
-        if let Some(name) = get_name(app_state, victim_corp_id).await {
-            victim_details.push_str(&format!(
-                "[{}]({})",
-                &name[0..name.len().min(40)],
-                str_corp_zk(victim_corp_id)
-            ));
-        }
-    }
-
-    // Title + Author Text
-    let title;
-    let mut author_text;
-    if filter_result.min_pilots.is_some() {
-        author_text = format!(
-            "{}+ ships in {} ({})",
-            killmail.attackers.len(),
-            system_name,
-            region_name
-        );
-        title = if let Some((type_id, count)) = &most_common_ship {
-            let ship_name = get_name(app_state, *type_id)
-                .await
-                .unwrap_or_else(|| "Unknown Ship".to_string());
-            format!("`{}` died to {}x `{}`", victim_ship_name, count, ship_name)
-        } else {
-            "Missing 0".to_string()
-        };
-    } else if let Some(ref matched_ship) = best_match {
-        author_text = format!(
-            "{} in {} ({})",
-            matched_ship.ship_name, system_name, region_name
-        );
-        if let Some((type_id, count)) = most_common_ship {
-            match matched_ship.color {
-                Color::Green => {
-                    title = format!("`{}` destroyed", victim_ship_name);
-                }
-                Color::Red => {
-                    let ship_name = get_name(app_state, type_id)
-                        .await
-                        .unwrap_or_else(|| "Unknown Ship".to_string());
-                    title = format!("`{}` died to {}x `{}`", victim_ship_name, count, ship_name)
-                }
-            }
-        } else {
-            title = relative_time.clone();
-        }
+            distance_str
+        )
     } else {
-        title = if let Some((type_id, count)) = &most_common_ship {
-            let ship_name = get_name(app_state, *type_id)
-                .await
-                .unwrap_or_else(|| "Unknown Ship".to_string());
-            format!("`{}` died to {}x `{}`", victim_ship_name, count, ship_name)
-        } else {
-            format!("`{}` died", victim_ship_name)
-        };
-        author_text = format!("Killmail in {} ({})", system_name, region_name);
-    }
-    author_text += &format!("\nPosted {}", relative_time);
-
-    // console.log('attackerparams.data');
-
-    // Find the attacker who made the final blow
-    let last_hit_attacker: Option<&Attacker> = killmail.attackers.iter().find(|a| a.final_blow);
-
-    // Determine the primary icon to render for the embed thumbnail and the affiliation icon for the author field.
-    // The logic follows a specific priority:
-    // 1. Matched ship from the filter
-    // 2. Victim's ship
-    // 3. Final blow attacker's ship
-    // 4. Final blow attacker's weapon
-    let (id_of_icon_to_render, affiliation_icon_url_to_render) = {
-        if let Some(ref matched_ship) = &best_match {
-            let type_id = matched_ship.type_id;
-            let url = if let Some(alliance_id) = matched_ship.alliance_id {
-                str_alliance_icon(alliance_id)
-            } else if let Some(corp_id) = matched_ship.corp_id {
-                str_corp_icon(corp_id)
-            } else {
-                str_ship_icon(type_id)
-            };
-            (type_id, url)
-        } else if killmail.victim.ship_type_id != 0 {
-            let url = if let Some(alliance_id) = killmail.victim.alliance_id {
-                str_alliance_icon(alliance_id)
-            } else if let Some(corporation_id) = killmail.victim.corporation_id {
-                str_corp_icon(corporation_id)
-            } else {
-                str_ship_icon(killmail.victim.ship_type_id)
-            };
-            (killmail.victim.ship_type_id, url)
-        } else if let Some(attacker) = last_hit_attacker {
-            if let Some(ship_type_id) = attacker.ship_type_id {
-                let url = if let Some(alliance_id) = attacker.alliance_id {
-                    str_alliance_icon(alliance_id)
-                } else if let Some(corporation_id) = attacker.corporation_id {
-                    str_corp_icon(corporation_id)
-                } else {
-                    str_ship_icon(ship_type_id)
-                };
-                (ship_type_id, url)
-            } else if let Some(weapon_type_id) = attacker.weapon_type_id {
-                let url = if let Some(alliance_id) = attacker.alliance_id {
-                    str_alliance_icon(alliance_id)
-                } else if let Some(corporation_id) = attacker.corporation_id {
-                    str_corp_icon(corporation_id)
-                } else {
-                    str_ship_icon(weapon_type_id)
-                };
-                (weapon_type_id, url)
-            } else {
-                (0, String::new()) // Fallback
-            }
-        } else {
-            (0, String::new()) // Fallback
-        }
+        String::new()
     };
-    if id_of_icon_to_render == 0 {
-        warn!(
-            "Could not determine an icon to render for killmail {}",
-            zk_data.kill_id
-        );
-    }
-    trace!("Rendering icon: {}", str_ship_icon(id_of_icon_to_render));
 
-    // --- Attacker Affiliation List ---
-
-    // Concurrently, fetch names for all unique alliance and corporation IDs involved.
-    let mut ids_to_fetch: Vec<u64> = killmail
-        .attackers
-        .iter()
-        .filter_map(|a| a.alliance_id.or(a.corporation_id))
-        .collect();
-    ids_to_fetch.sort_unstable();
-    ids_to_fetch.dedup();
-
-    let name_futures = ids_to_fetch.iter().map(|id| get_name(app_state, *id));
-    let name_results = join_all(name_futures).await;
-
-    let id_to_name: HashMap<u64, String> = ids_to_fetch
-        .into_iter()
-        .zip(name_results)
-        .filter_map(|(id, name_opt)| name_opt.map(|name| (id, name)))
-        .collect();
-
-    // Count attackers by their affiliation name.
-    let mut alliance_counts: HashMap<String, u32> = HashMap::new();
-    for attacker in &killmail.attackers {
-        if let Some(id) = attacker.alliance_id.or(attacker.corporation_id) {
-            let name = id_to_name
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| "Unknown".to_string());
-            *alliance_counts.entry(name).or_insert(0) += 1;
-        }
-    }
-
-    // Sort affiliations by the number of attackers.
-    let mut sorted_attackers: Vec<(String, u32)> = alliance_counts.into_iter().collect();
-    sorted_attackers.sort_by(|a, b| b.1.cmp(&a.1));
-
-    // --- Format Attacker List for Embed ---
-
-    let mut attacker_alliances = "```\n".to_string();
-    let mut displayed_entries: Vec<(String, u32)> = Vec::new();
-    let mut others_count = 0;
-    const DISPLAY_THRESHOLD: u32 = 10;
-
-    // Separate entries into "displayed" and "others".
-    for (i, (name, count)) in sorted_attackers.into_iter().enumerate() {
-        if count >= DISPLAY_THRESHOLD || i == 0 {
-            displayed_entries.push((name[0..name.len().min(26)].to_string(), count));
-        } else {
-            others_count += count;
-        }
-    }
-
-    // Calculate padding for alignment.
-    let mut max_name_length = 0;
-    const OTHERS_STR: &str = "...others";
-    for (name, _) in &displayed_entries {
-        max_name_length = max_name_length.max(name.len());
-    }
-    if others_count > 0 {
-        max_name_length = max_name_length.max(OTHERS_STR.len());
-    }
-    max_name_length = max_name_length.min(26);
-    const PADDING: usize = 3;
-
-    // Build the formatted string.
-    for (key, value) in displayed_entries {
-        let spaces = " ".repeat(max_name_length - key.len().min(26) + PADDING);
-        let formatted_key = if key.len() > 26 {
-            format!("{}-\n{}", &key[..26], &key[26..])
-        } else {
-            key
-        };
-        attacker_alliances.push_str(&format!("{}{}{}{}\n", formatted_key, spaces, "x", value));
-    }
-
-    if others_count > 0 {
-        let spaces = " ".repeat(max_name_length - OTHERS_STR.len() + PADDING);
-        attacker_alliances.push_str(&format!(
-            "{}{}{}{}\n",
-            OTHERS_STR, spaces, "x", others_count
-        ));
-    }
-
-    attacker_alliances = format!("{}```", attacker_alliances);
-
-    let range_details = if let Some(matched_system_range) = &filter_result.light_year_range {
-        let matched_base_system_name = get_system(app_state, matched_system_range.system_id)
-            .await
-            .map_or_else(|| "Unknown System".to_string(), |s| s.name);
+    let range_line = if let Some(matched_system_range) = &filter_result.light_year_range {
         if matched_system_range.range > 0.0 {
+            let matched_base_system_name = get_system(app_state, matched_system_range.system_id)
+                .await
+                .map_or_else(|| "Unknown System".to_string(), |s| s.name);
             format!(
-                "{:.1} LY from {} ([Supers]({})|[FAX]({})|[Blops]({}))",
+                "**range:** {:.1} LY from {} ([Supers]({})|[FAX]({})|[Blops]({}))",
                 matched_system_range.range,
                 matched_base_system_name,
-                str_jump_dotlan(
-                    &matched_base_system_name,
-                    system_name,
-                    DotlanJumpType::Super
-                ),
+                str_jump_dotlan(&matched_base_system_name, system_name, DotlanJumpType::Super),
                 str_jump_dotlan(&matched_base_system_name, system_name, DotlanJumpType::Fax),
-                str_jump_dotlan(
-                    &matched_base_system_name,
-                    system_name,
-                    DotlanJumpType::Blops
-                )
+                str_jump_dotlan(&matched_base_system_name, system_name, DotlanJumpType::Blops)
             )
         } else {
             String::new()
@@ -1245,65 +1235,391 @@ async fn build_killmail_embed(
         String::new()
     };
 
-    let affiliation = format!(
-        "{}victim: {}\nin: [{}]({}) ([{}]({}))\nrange: {}\n{}",
-        attacker_alliances,
-        victim_details,
-        system_name,
-        str_system_dotlan(system_id),
-        region_name,
-        str_region_dotlan(region_id),
-        range_details,
-        location_details,
-    );
+    // --- Attackers Field with Fleet Composition ---
+    let overall_fleet_comp = fleet_comp.format_overall();
+    let alliance_breakdown = fleet_comp.format_alliance_breakdown(app_state).await;
 
-    // Determine thumbnail ship based on context:
-    // - Kill (Green): Show tracked entity's ship (what they used to get the kill)
-    // - Loss (Red): Show top attacker's ship (what killed the tracked entity)
-    let thumbnail_ship_id: u32 = match best_match.as_ref().map(|bm| bm.color) {
-        Some(Color::Green) => {
-            // Kill - show tracked attacker's ship
-            id_of_icon_to_render
+    let attackers_content = format!("{}\n```\n{}```", overall_fleet_comp, alliance_breakdown);
+
+    // --- Victim Field with zkillboard links ---
+    let victim_display = {
+        // Format character name with link if available
+        let char_display = match victim_char_link {
+            Some(link) => format!("[{}]({})", victim_char_name, link),
+            None => victim_char_name,
+        };
+
+        // Format ticker with link if available
+        match (victim_ticker, victim_affiliation_link) {
+            (Some(ticker), Some(link)) => format!("[[{}]]({}) {}", ticker, link, char_display),
+            (Some(ticker), None) => format!("[{}] {}", ticker, char_display),
+            (None, _) => char_display,
         }
-        Some(Color::Red) => {
-            // Loss - show what killed them (top attacker), fall back to tracked ship
-            most_common_ship
-                .map(|(type_id, _)| type_id as u32)
-                .unwrap_or(id_of_icon_to_render)
-        }
-        None => id_of_icon_to_render,
     };
 
-    // Build the embed
+    // --- Footer (alliance logo of matched entity) ---
+    let footer_icon = match best_match.as_ref() {
+        Some(matched) => {
+            if let Some(alliance_id) = matched.alliance_id {
+                str_alliance_icon(alliance_id)
+            } else if let Some(corp_id) = matched.corp_id {
+                str_corp_icon(corp_id)
+            } else {
+                str_ship_icon(killmail.victim.ship_type_id)
+            }
+        }
+        None => {
+            // Fallback to victim's alliance/corp
+            if let Some(alliance_id) = killmail.victim.alliance_id {
+                str_alliance_icon(alliance_id)
+            } else if let Some(corp_id) = killmail.victim.corporation_id {
+                str_corp_icon(corp_id)
+            } else {
+                str_ship_icon(killmail.victim.ship_type_id)
+            }
+        }
+    };
+
+    // --- Build the Embed ---
     embed.title(title);
-    embed.url(killmail_url.clone());
-    embed.author(|a| {
-        a.name(author_text)
-            .url(related_br)
-            .icon_url(affiliation_icon_url_to_render)
-    });
-    embed.thumbnail(str_ship_icon(thumbnail_ship_id));
-    embed.color(match best_match.map(|bm| bm.color).unwrap_or_default() {
+    embed.url(killmail_url);
+    embed.author(|a| a.name(author_text).url(related_br).icon_url(author_icon));
+    embed.thumbnail(str_ship_icon(killmail.victim.ship_type_id)); // Always victim ship
+    embed.color(match best_match.as_ref().map(|bm| bm.color).unwrap_or_default() {
         Color::Green => Colour::DARK_GREEN,
         Color::Red => Colour::RED,
     });
+
+    // Location fields
+    let mut location_content = location_line;
+    if !celestial_line.is_empty() {
+        location_content.push_str(&format!("\n{}", celestial_line));
+    }
+    if !range_line.is_empty() {
+        location_content.push_str(&format!("\n{}", range_line));
+    }
+    embed.description(location_content);
+
+    // Attackers field
     embed.field(
         format!("({}) Attackers Involved", killmail.attackers.len()),
-        affiliation,
+        attackers_content,
         false,
     );
-    // Footer icon always shows victim ship (matches the ISK value displayed)
+
+    // Victim field
+    embed.field("Victim", victim_display, false);
+
+    // Footer
     embed.footer(|f| {
         f.text(format!(
-            "Value: {} • EVETime: {}",
+            "Value: {} \u{2022} EVETime: {}",
             total_value_str,
             killmail_time.format("%d/%m/%Y, %H:%M"),
         ))
-        .icon_url(str_ship_icon(killmail.victim.ship_type_id))
+        .icon_url(footer_icon)
     });
+
     if let Ok(timestamp) = DateTime::parse_from_rfc3339(&killmail.killmail_time) {
         embed.timestamp(timestamp.to_rfc3339());
     }
 
     embed
+}
+
+/// Ship category groups for fleet composition display
+const SUPER_GROUPS: &[u32] = &[30, 659]; // Titans, Supercarriers
+const CAP_GROUPS: &[u32] = &[4594, 485, 1538, 547, 883, 902, 513]; // Lancers, Dreads, FAX, Carriers, Cap Indy, JF, Freighters
+
+/// Fleet composition data for attackers
+struct FleetComposition {
+    /// Overall counts by group_id, sorted by priority
+    overall: Vec<(u32, u32)>,
+    /// Per-affiliation counts: affiliation_id -> Vec<(group_id, count)>
+    by_affiliation: Vec<(u64, u32, Vec<(u32, u32)>)>, // (affiliation_id, total_count, groups)
+}
+
+impl FleetComposition {
+    /// Format overall fleet composition by category (supers, caps, subcaps):
+    /// Single line if ≤43 chars, otherwise multi-line
+    fn format_overall(&self) -> String {
+        let mut category_lines = Vec::new();
+
+        // Supers line (Titans, Supercarriers)
+        if let Some(line) = Self::format_category_line_plain(&self.overall, |gid| SUPER_GROUPS.contains(&gid)) {
+            category_lines.push(line);
+        }
+
+        // Caps line (Dreads, FAX, Carriers, etc.)
+        if let Some(line) = Self::format_category_line_plain(&self.overall, |gid| CAP_GROUPS.contains(&gid)) {
+            category_lines.push(line);
+        }
+
+        // Subcaps line (everything else that's known)
+        if let Some(line) = Self::format_category_line_plain(&self.overall, |gid| {
+            gid != GROUP_UNKNOWN && !SUPER_GROUPS.contains(&gid) && !CAP_GROUPS.contains(&gid)
+        }) {
+            category_lines.push(line);
+        }
+
+        // Try single line first (join all with ", ")
+        let single_line = category_lines.join(", ");
+        if single_line.len() <= 43 {
+            single_line
+        } else {
+            // Multi-line format
+            category_lines.join("\n")
+        }
+    }
+
+    /// Format a category line for overall (no └ prefix), up to 2 types + overflow
+    /// Selects top 2 by count, displays in GROUP_NAMES priority order
+    fn format_category_line_plain(groups: &[(u32, u32)], category_filter: impl Fn(u32) -> bool) -> Option<String> {
+        let mut filtered: Vec<_> = groups
+            .iter()
+            .filter(|(gid, _)| category_filter(*gid))
+            .cloned()
+            .collect();
+
+        if filtered.is_empty() {
+            return None;
+        }
+
+        let total: u32 = filtered.iter().map(|(_, c)| c).sum();
+
+        // Sort by count DESC to select top 2 most numerous
+        filtered.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Take top 2, then re-sort by GROUP_NAMES priority for display
+        let mut top2: Vec<_> = filtered.into_iter().take(2).collect();
+        top2.sort_by_key(|(gid, _)| {
+            GROUP_NAMES.iter().position(|(id, _, _)| id == gid).unwrap_or(usize::MAX)
+        });
+
+        let mut parts = Vec::new();
+        let mut shown_count = 0u32;
+
+        for (group_id, count) in top2.iter() {
+            if let Some(name) = get_group_name(*group_id, *count) {
+                parts.push(format!("{}x {}", count, name));
+                shown_count += count;
+            }
+        }
+
+        let remaining = total.saturating_sub(shown_count);
+        if remaining > 0 {
+            parts.push(format!("+{}", remaining));
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(", "))
+        }
+    }
+
+    /// Format a category line (supers, caps, or subcaps) with up to 2 types + overflow
+    /// Selects top 2 by count, displays in GROUP_NAMES priority order
+    fn format_category_line(groups: &[(u32, u32)], category_filter: impl Fn(u32) -> bool) -> Option<String> {
+        let mut filtered: Vec<_> = groups
+            .iter()
+            .filter(|(gid, _)| category_filter(*gid))
+            .cloned()
+            .collect();
+
+        if filtered.is_empty() {
+            return None;
+        }
+
+        let total: u32 = filtered.iter().map(|(_, c)| c).sum();
+
+        // Sort by count DESC to select top 2 most numerous
+        filtered.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Take top 2, then re-sort by GROUP_NAMES priority for display
+        let mut top2: Vec<_> = filtered.into_iter().take(2).collect();
+        top2.sort_by_key(|(gid, _)| {
+            GROUP_NAMES.iter().position(|(id, _, _)| id == gid).unwrap_or(usize::MAX)
+        });
+
+        let mut parts = Vec::new();
+        let mut shown_count = 0u32;
+
+        for (group_id, count) in top2.iter() {
+            if let Some(name) = get_group_name(*group_id, *count) {
+                parts.push(format!("{} {}", count, name));
+                shown_count += count;
+            }
+        }
+
+        let remaining = total.saturating_sub(shown_count);
+        if remaining > 0 {
+            parts.push(format!("+{}", remaining));
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(format!(" \u{2514} {}", parts.join(", ")))
+        }
+    }
+
+    /// Format alliance breakdown with ship categories (supers, caps, subcaps)
+    /// Only shows affiliations with >10 participants (except the first), max 8 affiliations
+    async fn format_alliance_breakdown(&self, app_state: &Arc<AppState>) -> String {
+        let mut lines = Vec::new();
+        let max_affiliations = 8;
+        let min_participants = 10;
+        let mut shown_count = 0;
+        let mut others_total: u32 = 0;
+
+        for (i, (affiliation_id, total_count, groups)) in self.by_affiliation.iter().enumerate() {
+            // Skip affiliations with ≤10 participants (except the first one)
+            // Also stop after showing max_affiliations
+            if shown_count >= max_affiliations || (i > 0 && *total_count <= min_participants) {
+                others_total += total_count;
+                continue;
+            }
+
+            // Get ticker for this affiliation - try alliance first, then corp
+            let ticker = match get_ticker(app_state, *affiliation_id, true).await {
+                Some(t) => t,
+                None => get_ticker(app_state, *affiliation_id, false)
+                    .await
+                    .unwrap_or_else(|| "???".to_string()),
+            };
+
+            lines.push(format!("[{}] {}", ticker, total_count));
+
+            // Supers line (Titans, Supercarriers)
+            if let Some(line) = Self::format_category_line(groups, |gid| SUPER_GROUPS.contains(&gid)) {
+                lines.push(line);
+            }
+
+            // Caps line (Dreads, FAX, Carriers, etc.)
+            if let Some(line) = Self::format_category_line(groups, |gid| CAP_GROUPS.contains(&gid)) {
+                lines.push(line);
+            }
+
+            // Subcaps line (everything else that's not unknown)
+            if let Some(line) = Self::format_category_line(groups, |gid| {
+                gid != GROUP_UNKNOWN && !SUPER_GROUPS.contains(&gid) && !CAP_GROUPS.contains(&gid)
+            }) {
+                lines.push(line);
+            }
+
+            shown_count += 1;
+        }
+
+        // Add "others" line if there are aggregated affiliations
+        if others_total > 0 {
+            lines.push(format!("others {}", others_total));
+        }
+
+        lines.join("\n")
+    }
+}
+
+/// Compute fleet composition by aggregating attackers by ship group
+async fn compute_fleet_composition(
+    app_state: &Arc<AppState>,
+    attackers: &[Attacker],
+) -> FleetComposition {
+    // Count by group overall
+    let mut group_counts: HashMap<u32, u32> = HashMap::new();
+    // Count by (affiliation, group) - for ship breakdown
+    let mut affiliation_groups: HashMap<u64, HashMap<u32, u32>> = HashMap::new();
+    // Count total attackers per affiliation (including those without ships)
+    let mut affiliation_totals: HashMap<u64, u32> = HashMap::new();
+    // Track unknown groups for debugging
+    let mut unknown_groups: HashMap<u32, u32> = HashMap::new();
+
+    for attacker in attackers {
+        let affiliation_id = attacker.alliance_id.or(attacker.corporation_id).unwrap_or(0);
+
+        // Count ALL attackers for affiliation totals
+        *affiliation_totals.entry(affiliation_id).or_insert(0) += 1;
+
+        // Only count ships for group breakdown
+        if let Some(ship_id) = attacker.ship_type_id {
+            let group_id = get_ship_group_id(app_state, ship_id).await.unwrap_or(0);
+
+            let effective_group_id = if is_known_group(group_id) {
+                group_id
+            } else {
+                *unknown_groups.entry(group_id).or_insert(0) += 1;
+                GROUP_UNKNOWN
+            };
+
+            *group_counts.entry(effective_group_id).or_insert(0) += 1;
+            *affiliation_groups
+                .entry(affiliation_id)
+                .or_default()
+                .entry(effective_group_id)
+                .or_insert(0) += 1;
+        }
+    }
+
+    // Log unknown groups for debugging
+    if !unknown_groups.is_empty() {
+        trace!("Unknown ship groups encountered: {:?}", unknown_groups);
+    }
+
+    // Sort overall by GROUP_NAMES order (priority)
+    let mut overall: Vec<(u32, u32)> = group_counts.into_iter().collect();
+    overall.sort_by_key(|(group_id, _)| {
+        GROUP_NAMES
+            .iter()
+            .position(|(id, _, _)| id == group_id)
+            .unwrap_or(usize::MAX)
+    });
+
+    // Sort affiliations by total count (using affiliation_totals which includes ALL attackers)
+    let mut by_affiliation: Vec<(u64, u32, Vec<(u32, u32)>)> = affiliation_totals
+        .into_iter()
+        .map(|(aff_id, total)| {
+            // Get ship groups for this affiliation (may be empty if all attackers had no ship)
+            let groups = affiliation_groups.remove(&aff_id).unwrap_or_default();
+            let mut group_vec: Vec<(u32, u32)> = groups.into_iter().collect();
+            group_vec.sort_by_key(|(group_id, _)| {
+                GROUP_NAMES
+                    .iter()
+                    .position(|(id, _, _)| id == group_id)
+                    .unwrap_or(usize::MAX)
+            });
+            (aff_id, total, group_vec)
+        })
+        .collect();
+    by_affiliation.sort_by(|a, b| b.1.cmp(&a.1));
+
+    FleetComposition {
+        overall,
+        by_affiliation,
+    }
+}
+
+/// Get ticker for an entity (alliance or corporation)
+async fn get_ticker(app_state: &Arc<AppState>, id: u64, is_alliance: bool) -> Option<String> {
+    // Check tickers cache first
+    {
+        let tickers = app_state.tickers.read().unwrap();
+        if let Some(ticker) = tickers.get(&id) {
+            return Some(ticker.clone());
+        }
+    }
+
+    // Fetch from ESI
+    match app_state.esi_client.get_ticker(id, is_alliance).await {
+        Ok(ticker) => {
+            let _lock = app_state.tickers_file_lock.lock().await;
+            let mut tickers = app_state.tickers.write().unwrap();
+            tickers.insert(id, ticker.clone());
+            crate::config::save_tickers(&tickers);
+            Some(ticker)
+        }
+        Err(e) => {
+            trace!("Failed to fetch ticker for {}: {}", id, e);
+            None
+        }
+    }
 }

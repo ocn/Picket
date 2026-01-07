@@ -93,6 +93,13 @@ pub async fn run() {
         );
         HashMap::new()
     });
+    let tickers = config::load_tickers().unwrap_or_else(|e| {
+        warn!(
+            "Failed to load tickers.json: {}. Starting with an empty map.",
+            e
+        );
+        HashMap::new()
+    });
 
     let user_standings = config::load_user_standings().unwrap_or_else(|e| {
         warn!(
@@ -111,6 +118,7 @@ pub async fn run() {
         systems,
         ships,
         names,
+        tickers,
         subscriptions,
         user_standings,
     ));
