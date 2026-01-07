@@ -756,7 +756,7 @@ pub async fn send_killmail_message(
             return Err(KillmailSendError::Other("Invalid channel ID".into()));
         }
     };
-    let embed = build_killmail_embed(app_state, zk_data, &filter_result).await; // Pass it here
+    let embed = build_killmail_embed(app_state, zk_data, &filter_result, subscription).await;
 
     let content = match &subscription.action.ping_type {
         None => None,
@@ -1038,6 +1038,7 @@ async fn build_killmail_embed(
     app_state: &Arc<AppState>,
     zk_data: &ZkData,
     named_filter_result: &NamedFilterResult,
+    subscription: &Subscription,
 ) -> CreateEmbed {
     let mut embed = CreateEmbed::default();
     let filter_result = &named_filter_result.filter_result;
@@ -1105,34 +1106,32 @@ async fn build_killmail_embed(
     let fleet_comp = compute_fleet_composition(app_state, &killmail.attackers).await;
 
     // --- Determine Display Ship Type for Title ---
-    // For attacker matches (Green): use matched ship group
-    // For victim matches (Red) or min_pilots: use most common attacker type
-    let (title_ship_count, title_ship_group_name) = if filter_result.min_pilots.is_some() {
-        // Min pilots filter: use most common ship type's group
-        get_most_common_attacker_group(app_state, &killmail.attackers).await
-    } else if let Some(ref matched) = best_match {
-        if matched.color == Color::Green {
-            // Attacker match: count attackers with this ship group
+    // For ship type/group tracking (Green): use matched ship group count
+    // For entity tracking (alliance/corp) or victim matches: use most common attacker group
+    let (title_ship_count, title_ship_group_name) = if let Some(ref matched) = best_match {
+        if matched.color == Color::Green && subscription.root_filter.contains_ship_filter() {
+            // Ship tracking: count all attackers with the matched ship group
+            let tracked_group = matched.group_id;
             let mut count = 0u64;
             for attacker in &killmail.attackers {
                 if let Some(ship_id) = attacker.ship_type_id {
                     if let Some(gid) = get_ship_group_id(app_state, ship_id).await {
-                        if gid == matched.group_id {
+                        if gid == tracked_group {
                             count += 1;
                         }
                     }
                 }
             }
-            let plural_name = get_group_name(matched.group_id, count as u32)
+            let plural_name = get_group_name(tracked_group, count as u32)
                 .unwrap_or("ships")
                 .to_string();
             (count.max(1), plural_name)
         } else {
-            // Victim match (Red): show most common attacker type
+            // Entity tracking (alliance/corp) or victim match: use most common attacker group
             get_most_common_attacker_group(app_state, &killmail.attackers).await
         }
     } else {
-        // No match: show most common attacker type
+        // No match: show most common attacker group
         get_most_common_attacker_group(app_state, &killmail.attackers).await
     };
 

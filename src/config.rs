@@ -290,6 +290,24 @@ impl FilterNode {
             }
         }
     }
+
+    /// Checks if this filter tree contains any ShipType or ShipGroup conditions.
+    /// Used to determine if we're tracking specific ships vs entities (alliance/corp).
+    pub fn contains_ship_filter(&self) -> bool {
+        match self {
+            FilterNode::Condition(filter) => match filter {
+                Filter::Targeted(tf) => matches!(
+                    tf.condition,
+                    TargetableCondition::ShipType(_) | TargetableCondition::ShipGroup(_)
+                ),
+                Filter::Simple(_) => false,
+            },
+            FilterNode::And(nodes) | FilterNode::Or(nodes) => {
+                nodes.iter().any(|n| n.contains_ship_filter())
+            }
+            FilterNode::Not(node) => node.contains_ship_filter(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
