@@ -109,6 +109,37 @@ fn is_known_group(group_id: u32) -> bool {
     GROUP_NAMES.iter().any(|(id, _, _)| *id == group_id)
 }
 
+/// Select top N groups, preferring known groups over unknown ones.
+/// Known groups fill slots first (sorted by count DESC, then GROUP_NAMES priority, then group_id).
+/// Unknown groups fill remaining slots. Final output is sorted by GROUP_NAMES display priority.
+fn select_top_groups(filtered: Vec<(u32, u32)>, limit: usize) -> Vec<(u32, u32)> {
+    let (mut known, mut unknown): (Vec<_>, Vec<_>) =
+        filtered.into_iter().partition(|(gid, _)| is_known_group(*gid));
+
+    // Sort by count DESC, tie-break by GROUP_NAMES priority (lower = better), then group_id
+    let sort_fn = |a: &(u32, u32), b: &(u32, u32)| {
+        b.1.cmp(&a.1)
+            .then_with(|| {
+                let pa = GROUP_NAMES.iter().position(|(id, _, _)| id == &a.0).unwrap_or(usize::MAX);
+                let pb = GROUP_NAMES.iter().position(|(id, _, _)| id == &b.0).unwrap_or(usize::MAX);
+                pa.cmp(&pb)
+            })
+            .then_with(|| a.0.cmp(&b.0))
+    };
+    known.sort_by(sort_fn);
+    unknown.sort_by(sort_fn);
+
+    let mut selected: Vec<(u32, u32)> = known.into_iter().take(limit).collect();
+    let remaining_slots = limit.saturating_sub(selected.len());
+    selected.extend(unknown.into_iter().take(remaining_slots));
+
+    // Final display sort by GROUP_NAMES priority
+    selected.sort_by_key(|(gid, _)| {
+        GROUP_NAMES.iter().position(|(id, _, _)| id == gid).unwrap_or(usize::MAX)
+    });
+    selected
+}
+
 /// Get a group name dynamically - checks GROUP_NAMES first, then ESI cache
 /// Returns the ESI name (e.g., "Cruiser") if not in our custom GROUP_NAMES
 async fn get_dynamic_group_name(app_state: &Arc<AppState>, group_id: u32, count: u32) -> String {
@@ -1459,7 +1490,7 @@ impl FleetComposition {
         category_filter: impl Fn(u32) -> bool,
         app_state: &Arc<AppState>,
     ) -> Option<String> {
-        let mut filtered: Vec<_> = groups
+        let filtered: Vec<_> = groups
             .iter()
             .filter(|(gid, _)| category_filter(*gid))
             .cloned()
@@ -1471,14 +1502,8 @@ impl FleetComposition {
 
         let total: u32 = filtered.iter().map(|(_, c)| c).sum();
 
-        // Sort by count DESC to select top 2 most numerous
-        filtered.sort_by(|a, b| b.1.cmp(&a.1));
-
-        // Take top 2, then re-sort by GROUP_NAMES priority for display
-        let mut top2: Vec<_> = filtered.into_iter().take(2).collect();
-        top2.sort_by_key(|(gid, _)| {
-            GROUP_NAMES.iter().position(|(id, _, _)| id == gid).unwrap_or(usize::MAX)
-        });
+        // Select top 2, preferring known groups over unknown
+        let top2 = select_top_groups(filtered, 2);
 
         let mut parts = Vec::new();
         let mut shown_count = 0u32;
@@ -1502,13 +1527,13 @@ impl FleetComposition {
     }
 
     /// Format a category line (supers, caps, or subcaps) with up to 2 types + overflow
-    /// Selects top 2 by count, displays in GROUP_NAMES priority order
+    /// Selects top 2, preferring known groups. Displays in GROUP_NAMES priority order.
     async fn format_category_line(
         groups: &[(u32, u32)],
         category_filter: impl Fn(u32) -> bool,
         app_state: &Arc<AppState>,
     ) -> Option<String> {
-        let mut filtered: Vec<_> = groups
+        let filtered: Vec<_> = groups
             .iter()
             .filter(|(gid, _)| category_filter(*gid))
             .cloned()
@@ -1520,14 +1545,8 @@ impl FleetComposition {
 
         let total: u32 = filtered.iter().map(|(_, c)| c).sum();
 
-        // Sort by count DESC to select top 2 most numerous
-        filtered.sort_by(|a, b| b.1.cmp(&a.1));
-
-        // Take top 2, then re-sort by GROUP_NAMES priority for display
-        let mut top2: Vec<_> = filtered.into_iter().take(2).collect();
-        top2.sort_by_key(|(gid, _)| {
-            GROUP_NAMES.iter().position(|(id, _, _)| id == gid).unwrap_or(usize::MAX)
-        });
+        // Select top 2, preferring known groups over unknown
+        let top2 = select_top_groups(filtered, 2);
 
         let mut parts = Vec::new();
         let mut shown_count = 0u32;
@@ -1682,7 +1701,19 @@ async fn compute_fleet_composition(
             (aff_id, total, group_vec)
         })
         .collect();
-    by_affiliation.sort_by(|a, b| b.1.cmp(&a.1));
+    by_affiliation.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| {
+                // Prefer affiliations with known ship groups over NPC-only groups
+                let a_known = a.2.iter().any(|(gid, _)| is_known_group(*gid));
+                let b_known = b.2.iter().any(|(gid, _)| is_known_group(*gid));
+                b_known.cmp(&a_known)
+            })
+            .then_with(|| {
+                // Prefer real entities (non-zero ID) over unaffiliated NPCs
+                (b.0 != 0).cmp(&(a.0 != 0))
+            })
+    });
 
     FleetComposition {
         overall,
@@ -1713,5 +1744,58 @@ async fn get_ticker(app_state: &Arc<AppState>, id: u64, is_alliance: bool) -> Op
             trace!("Failed to fetch ticker for {}: {}", id, e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_groups_preferred_over_unknown() {
+        // 2 unknown with high counts + 2 known with low counts
+        let input = vec![(9990, 50), (9991, 30), (358, 10), (832, 5)];
+        let result = select_top_groups(input, 2);
+        // Known groups selected; Logi(832) before HAC(358) per GROUP_NAMES priority
+        assert_eq!(result, vec![(832, 5), (358, 10)]);
+    }
+
+    #[test]
+    fn falls_back_to_unknown_when_no_known() {
+        let input = vec![(9990, 50), (9991, 30)];
+        let result = select_top_groups(input, 2);
+        // Both selected, sorted by group_id (both have usize::MAX priority)
+        assert_eq!(result, vec![(9990, 50), (9991, 30)]);
+    }
+
+    #[test]
+    fn mixed_fill_when_one_known() {
+        // 1 known + 2 unknown
+        let input = vec![(358, 10), (9990, 50), (9991, 30)];
+        let result = select_top_groups(input, 2);
+        // HAC first (has GROUP_NAMES entry), then highest-count unknown
+        assert_eq!(result, vec![(358, 10), (9990, 50)]);
+    }
+
+    #[test]
+    fn deterministic_on_count_ties() {
+        // 3 known groups all count=5: BS(27), Logi(832), HAC(358)
+        let input = vec![(27, 5), (832, 5), (358, 5)];
+        let result = select_top_groups(input, 2);
+        // Top 2 by GROUP_NAMES priority: BS pos 11, Logi pos 12 (HAC pos 13 excluded)
+        assert_eq!(result, vec![(27, 5), (832, 5)]);
+    }
+
+    #[test]
+    fn empty_input() {
+        let result = select_top_groups(vec![], 2);
+        assert_eq!(result, Vec::<(u32, u32)>::new());
+    }
+
+    #[test]
+    fn single_group() {
+        let input = vec![(358, 7)];
+        let result = select_top_groups(input, 2);
+        assert_eq!(result, vec![(358, 7)]);
     }
 }

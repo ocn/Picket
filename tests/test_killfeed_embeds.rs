@@ -35,6 +35,7 @@ const KILLFEED_FIXTURES: &[(&str, &str)] = &[
     ("130734446_unknown_group_test.json", "Revelation killed by Infested Carrier - tests ESI group name lookup"),
     ("132462203_global_feed_test.json", "Astero killed by Astrahus - tests global feed (no entity match)"),
     ("132467594_dictor_af_tie.json", "Squall killed by 2x Dictors + 2x AFs - tests tie-breaking by GROUP_NAMES priority"),
+    ("132817097_npc_priority_test.json", "NPC-heavy kill - tests known group priority in fleet comp"),
 ];
 
 /// Deepwater Hooligans alliance ID
