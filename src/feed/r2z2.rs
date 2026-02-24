@@ -40,6 +40,7 @@ impl R2z2Feed {
         let initial_sequence = Self::load_checkpoint(&checkpoint_path);
 
         let client = Client::builder()
+            .user_agent("killbot-rust R2Z2 feed consumer")
             .connect_timeout(Duration::from_secs(config.r2z2_connect_timeout_secs))
             .timeout(Duration::from_secs(config.r2z2_request_timeout_secs))
             .build()

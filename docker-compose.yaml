@@ -11,6 +11,7 @@ services:
       DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID}
       EVE_CLIENT_ID: ${EVE_CLIENT_ID}
       EVE_CLIENT_SECRET: ${EVE_CLIENT_SECRET}
+      KILLMAIL_FEED_PROVIDER: r2z2
     volumes:
       - ./config:/app/config:delegated
 
