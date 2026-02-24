@@ -1,16 +1,18 @@
 use rand::{distributions::Alphanumeric, Rng};
+use serenity::http::Http;
 use serenity::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info, warn, Level};
 
 pub mod commands;
 pub mod config;
 pub mod discord_bot;
 pub mod esi;
+pub mod feed;
 pub mod models;
 pub mod processor;
-pub mod redis_q;
 
 use crate::commands::find_unsubscribed::FindUnsubscribedChannelsCommand;
 use commands::diag::DiagCommand;
@@ -20,7 +22,10 @@ use commands::sync_remove::SyncRemoveCommand;
 use commands::sync_standings::SyncStandingsCommand;
 use commands::unsubscribe::UnsubscribeCommand;
 use commands::{Command, PingCommand};
+use config::FeedProvider;
 use discord_bot::CommandMap;
+use feed::KillmailFeed;
+use models::ZkDataNoEsi;
 
 pub struct AppStateContainer;
 
@@ -36,27 +41,77 @@ fn generate_queue_id() -> String {
         .collect()
 }
 
-// fn log_loaded_subscriptions(subscriptions: &HashMap<serenity::model::id::GuildId, Vec<Subscription>>) {
-//     info!("--- Loaded Subscriptions ---");
-//     if subscriptions.is_empty() {
-//         info!("No subscriptions found.");
-//     } else {
-//         for (guild_id, subs) in subscriptions {
-//             info!("Guild: {}", guild_id);
-//             let mut subs_by_channel: HashMap<u64, Vec<&Subscription>> = HashMap::new();
-//             for sub in subs {
-//                 subs_by_channel.entry(sub.action.channel_id).or_default().push(sub);
-//             }
-//             for (channel_id, channel_subs) in subs_by_channel {
-//                 info!("  Channel: {}", channel_id);
-//                 for sub in channel_subs {
-//                     info!("    - ID: '{}', Description: '{}'", sub.id, sub.description);
-//                 }
-//             }
-//         }
-//     }
-//     info!("--------------------------");
-// }
+async fn process_single_killmail(
+    kill_id: i64,
+    zk_data_no_esi: ZkDataNoEsi,
+    app_state: &Arc<config::AppState>,
+    http_client: &Arc<Http>,
+) {
+    // Load ESI data containing killmail information
+    let zk_data = match app_state
+        .esi_client
+        .load_killmail(zk_data_no_esi.zkb.esi.clone())
+        .await
+    {
+        Ok(killmail) => models::ZkData {
+            kill_id: zk_data_no_esi.kill_id,
+            killmail,
+            zkb: zk_data_no_esi.zkb,
+        },
+        Err(e) => {
+            error!("Error loading killmail data from ESI: {}", e);
+            return;
+        }
+    };
+
+    let matched = processor::process_killmail(app_state, &zk_data).await;
+
+    if !matched.is_empty() {
+        for (guild_id, subscription, filter_result) in matched {
+            info!(
+                "[Kill: {}] Matched subscription '{}' for channel {}, this filter was a match: {}",
+                kill_id, subscription.description, subscription.action.channel_id, filter_result.name
+            );
+            if let Err(e) = discord_bot::send_killmail_message(
+                http_client,
+                app_state,
+                &subscription,
+                &zk_data,
+                filter_result,
+            )
+            .await
+            {
+                match e {
+                    discord_bot::KillmailSendError::CleanupChannel(e) => {
+                        warn!(
+                            "Cleaning up subscriptions for channel {} due to error: {:#?}",
+                            subscription.action.channel_id, e
+                        );
+                        let _lock = app_state.subscriptions_file_lock.lock().await;
+                        let mut subs_map = app_state.subscriptions.write().unwrap();
+
+                        if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
+                            guild_subs.retain(|s| {
+                                s.action.channel_id != subscription.action.channel_id
+                            });
+                            if let Err(save_err) = config::save_subscriptions_for_guild(
+                                guild_id, guild_subs,
+                            ) {
+                                error!("Failed to save subscriptions after cleanup for guild {}: {}", guild_id, save_err);
+                            }
+                        }
+                    }
+                    discord_bot::KillmailSendError::Other(err) => {
+                        error!(
+                            "Error sending message for subscription {}: {}",
+                            subscription.id, err
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
 
 pub async fn run() {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
@@ -71,6 +126,20 @@ pub async fn run() {
             return;
         }
     };
+
+    info!("Feed provider: {}", app_config.killmail_feed_provider);
+    info!("ESI HTTP timeout: {}s", app_config.esi_http_timeout_secs);
+    info!("Killmail process timeout: {}s", app_config.killmail_process_timeout_secs);
+    info!(
+        "RedisQ connect timeout: {}s / request timeout: {}s",
+        app_config.redisq_connect_timeout_secs, app_config.redisq_request_timeout_secs
+    );
+    info!(
+        "R2Z2 connect timeout: {}s / request timeout: {}s / poll interval: {}s",
+        app_config.r2z2_connect_timeout_secs,
+        app_config.r2z2_request_timeout_secs,
+        app_config.r2z2_poll_interval_secs
+    );
 
     let systems = config::load_systems().unwrap_or_else(|e| {
         warn!(
@@ -117,7 +186,6 @@ pub async fn run() {
     });
 
     let subscriptions = config::load_all_subscriptions("config/");
-    // log_loaded_subscriptions(&subscriptions);
 
     // --- Initialize application state ---
     let app_state = Arc::new(config::AppState::new(
@@ -187,92 +255,50 @@ pub async fn run() {
         }
     });
 
-    // --- Main killmail processing loop ---
-    let queue_id = generate_queue_id();
-    let listener = redis_q::RedisQListener::new(&queue_id);
-    info!("Listening for killmails from RedisQ...");
+    // --- Initialize killmail feed ---
+    let feed: Box<dyn KillmailFeed> = match app_config.killmail_feed_provider {
+        FeedProvider::R2z2 => Box::new(feed::r2z2::R2z2Feed::new(&app_state.app_config)),
+        FeedProvider::Redisq => {
+            let queue_id = generate_queue_id();
+            Box::new(feed::redisq::RedisQFeed::new(
+                &queue_id,
+                Duration::from_secs(app_config.redisq_connect_timeout_secs),
+                Duration::from_secs(app_config.redisq_request_timeout_secs),
+            ))
+        }
+    };
 
+    info!("Listening for killmails...");
+
+    // --- Main killmail processing loop ---
     loop {
-        match listener.listen().await {
+        match feed.next().await {
             Ok(Some(zk_data_no_esi)) => {
                 let kill_id = zk_data_no_esi.kill_id;
                 info!("[Kill: {}] Received", kill_id);
 
-                // Step 0: Load ESI data containing killmail information
-                let zk_data = match app_state
-                    .esi_client
-                    .load_killmail(zk_data_no_esi.zkb.esi.clone())
-                    .await
+                let timeout_secs = app_state.app_config.killmail_process_timeout_secs;
+                match tokio::time::timeout(
+                    Duration::from_secs(timeout_secs),
+                    process_single_killmail(kill_id, zk_data_no_esi, &app_state, &http_client),
+                )
+                .await
                 {
-                    Ok(killmail) => models::ZkData {
-                        kill_id: zk_data_no_esi.kill_id,
-                        killmail,
-                        zkb: zk_data_no_esi.zkb,
-                    },
-                    Err(e) => {
-                        error!("Error loading killmail data from ESI: {}", e);
-                        continue;
-                    }
-                };
-
-                let matched = processor::process_killmail(&app_state, &zk_data).await;
-
-                if !matched.is_empty() {
-                    for (guild_id, subscription, filter_result) in matched {
-                        info!(
-                            "[Kill: {}] Matched subscription '{}' for channel {}, this filter was a match: {}",
-                            kill_id, subscription.description, subscription.action.channel_id, filter_result.name
-                        );
-                        if let Err(e) = discord_bot::send_killmail_message(
-                            &http_client,
-                            &app_state,
-                            &subscription,
-                            &zk_data,
-                            filter_result,
-                        )
-                        .await
-                        {
-                            match e {
-                                discord_bot::KillmailSendError::CleanupChannel(e) => {
-                                    warn!(
-                                        "Cleaning up subscriptions for channel {} due to error: {:#?}",
-                                        subscription.action.channel_id, e
-                                    );
-                                    let _lock = app_state.subscriptions_file_lock.lock().await;
-                                    let mut subs_map = app_state.subscriptions.write().unwrap();
-
-                                    if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
-                                        guild_subs.retain(|s| {
-                                            s.action.channel_id != subscription.action.channel_id
-                                        });
-                                        if let Err(save_err) = config::save_subscriptions_for_guild(
-                                            guild_id, guild_subs,
-                                        ) {
-                                            error!("Failed to save subscriptions after cleanup for guild {}: {}", guild_id, save_err);
-                                        }
-                                    }
-                                }
-                                discord_bot::KillmailSendError::Other(err) => {
-                                    error!(
-                                        "Error sending message for subscription {}: {}",
-                                        subscription.id, err
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    Ok(()) => {}
+                    Err(_) => error!(
+                        "[Kill: {}] Processing timed out after {}s, skipping",
+                        kill_id, timeout_secs
+                    ),
                 }
-                
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
             Ok(None) => {
-                // No new data, continue loop
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                // Feed already handled its own wait/backoff — no extra sleep
             }
             Err(e) => {
-                error!("Error listening for killmails: {}", e);
-                // Wait a bit before retrying to avoid spamming logs on persistent errors
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                error!("Feed error: {}", e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
     }

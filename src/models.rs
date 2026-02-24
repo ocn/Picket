@@ -1,5 +1,19 @@
 use serde::Deserialize;
 
+// --- R2Z2 response models ---
+
+#[derive(Debug, Deserialize)]
+pub struct R2z2SequenceResponse {
+    pub sequence: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct R2z2KillmailResponse {
+    pub killmail_id: i64,
+    pub hash: String,
+    pub zkb: Zkb,
+}
+
 /// Represents the top-level JSON object from the zKillboard RedisQ stream.
 /// The `package` field can be null if there's no new killmail.
 #[derive(Debug, Deserialize)]
@@ -93,4 +107,78 @@ pub struct Position {
     pub x: f64,
     pub y: f64,
     pub z: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_r2z2_sequence_response_parse() {
+        let json = r#"{"sequence": 96128620}"#;
+        let resp: R2z2SequenceResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.sequence, 96128620);
+    }
+
+    #[test]
+    fn test_r2z2_killmail_response_parse() {
+        let json = r#"{
+            "killmail_id": 123456789,
+            "hash": "abc123def456",
+            "zkb": {
+                "locationID": 40000001,
+                "hash": "abc123def456",
+                "fittedValue": 1000000.0,
+                "droppedValue": 500000.0,
+                "destroyedValue": 500000.0,
+                "totalValue": 1000000.0,
+                "points": 10,
+                "npc": false,
+                "solo": false,
+                "awox": false,
+                "href": "https://esi.evetech.net/latest/killmails/123456789/abc123def456/"
+            }
+        }"#;
+
+        let resp: R2z2KillmailResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.killmail_id, 123456789);
+        assert_eq!(resp.hash, "abc123def456");
+        assert_eq!(
+            resp.zkb.esi,
+            "https://esi.evetech.net/latest/killmails/123456789/abc123def456/"
+        );
+        assert!(!resp.zkb.npc);
+
+        // Verify it converts to ZkDataNoEsi correctly
+        let zk = ZkDataNoEsi {
+            kill_id: resp.killmail_id,
+            zkb: resp.zkb,
+        };
+        assert_eq!(zk.kill_id, 123456789);
+    }
+
+    #[test]
+    fn test_r2z2_killmail_extra_fields_ignored() {
+        // R2Z2 has extra fields like attackerCount that should be silently ignored
+        let json = r#"{
+            "killmail_id": 999,
+            "hash": "xyz",
+            "attackerCount": 5,
+            "zkb": {
+                "hash": "xyz",
+                "fittedValue": 0.0,
+                "droppedValue": 0.0,
+                "destroyedValue": 0.0,
+                "totalValue": 0.0,
+                "points": 0,
+                "npc": true,
+                "solo": true,
+                "awox": false,
+                "href": "https://esi.evetech.net/latest/killmails/999/xyz/"
+            }
+        }"#;
+
+        let resp: R2z2KillmailResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.killmail_id, 999);
+    }
 }

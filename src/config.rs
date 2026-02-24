@@ -5,10 +5,12 @@ use serde::{Deserialize, Serialize};
 use serenity::model::id::{GuildId, UserId};
 use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
 use std::collections::HashMap;
+use std::fmt;
 use std::fmt::Formatter;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
@@ -422,12 +424,58 @@ pub struct SsoState {
 
 // --- App Configuration & State ---
 
+#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum FeedProvider {
+    #[default]
+    Redisq,
+    R2z2,
+}
+
+impl fmt::Display for FeedProvider {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            FeedProvider::Redisq => write!(f, "redisq"),
+            FeedProvider::R2z2 => write!(f, "r2z2"),
+        }
+    }
+}
+
+fn default_6() -> u64 { 6 }
+fn default_10() -> u64 { 10 }
+fn default_15() -> u64 { 15 }
+fn default_60() -> u64 { 60 }
+fn default_300() -> u64 { 300 }
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub discord_bot_token: String,
     pub discord_client_id: u64,
     pub eve_client_id: String,
     pub eve_client_secret: String,
+
+    #[serde(default = "default_15")]
+    pub esi_http_timeout_secs: u64,
+    #[serde(default = "default_60")]
+    pub killmail_process_timeout_secs: u64,
+    #[serde(default = "default_10")]
+    pub redisq_connect_timeout_secs: u64,
+    #[serde(default = "default_60")]
+    pub redisq_request_timeout_secs: u64,
+
+    #[serde(default = "default_10")]
+    pub r2z2_connect_timeout_secs: u64,
+    #[serde(default = "default_15")]
+    pub r2z2_request_timeout_secs: u64,
+    #[serde(default = "default_6")]
+    pub r2z2_poll_interval_secs: u64,
+    #[serde(default = "default_10")]
+    pub r2z2_max_consecutive_404s: u64,
+    #[serde(default = "default_300")]
+    pub r2z2_resync_timeout_secs: u64,
+
+    #[serde(default)]
+    pub killmail_feed_provider: FeedProvider,
 }
 
 pub struct AppState {
@@ -470,8 +518,8 @@ impl AppState {
             tickers: Arc::new(RwLock::new(tickers)),
             group_names: Arc::new(RwLock::new(group_names)),
             subscriptions: Arc::new(RwLock::new(subscriptions)),
+            esi_client: EsiClient::new(Duration::from_secs(app_config.esi_http_timeout_secs)),
             app_config: Arc::new(app_config),
-            esi_client: EsiClient::new(),
             celestial_cache: Cache::new(10_000),
             systems_file_lock: Mutex::new(()),
             ships_file_lock: Mutex::new(()),

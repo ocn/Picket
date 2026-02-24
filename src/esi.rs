@@ -3,7 +3,9 @@ use crate::models::KillmailData;
 use reqwest::Client;
 use serde::Deserialize;
 use std::error::Error;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const DEFAULT_ESI_TIMEOUT: Duration = Duration::from_secs(15);
 
 const ESI_URL: &str = "https://esi.evetech.net/latest/";
 const FUZZWORK_URL: &str = "https://www.fuzzwork.co.uk/api/";
@@ -29,14 +31,17 @@ pub struct EsiClient {
 
 impl Default for EsiClient {
     fn default() -> Self {
-        Self::new()
+        Self::new(DEFAULT_ESI_TIMEOUT)
     }
 }
 
 impl EsiClient {
-    pub fn new() -> Self {
+    pub fn new(timeout: Duration) -> Self {
         EsiClient {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(timeout)
+                .build()
+                .expect("Failed to build ESI HTTP client"),
         }
     }
 
@@ -305,6 +310,52 @@ impl EsiClient {
             .json()
             .await?;
         Ok(contacts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[tokio::test]
+    async fn test_esi_timeout_is_configured() {
+        // Verify that a client with a short timeout produces a bounded error
+        // (timeout or connect error) rather than hanging indefinitely.
+        // Uses a local TCP listener that accepts but never responds.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept();
+            }
+        });
+
+        let client = EsiClient::new(Duration::from_millis(200));
+        let url = format!("http://{}/killmails/1/abc/", addr);
+        let result = client.load_killmail(url).await;
+
+        // The request must fail (not hang). Whether it's a timeout or connect
+        // error depends on the OS networking stack, but either confirms the
+        // client has bounded behavior.
+        assert!(result.is_err(), "Expected error, got Ok — client may be hanging");
+    }
+
+    #[tokio::test]
+    async fn test_watchdog_timeout() {
+        let result = tokio::time::timeout(Duration::from_millis(50), async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        })
+        .await;
+        assert!(result.is_err(), "Expected Elapsed timeout error");
+    }
+
+    #[test]
+    fn test_esi_client_builder_accepts_timeout() {
+        // Verify construction with various timeouts doesn't panic
+        let _short = EsiClient::new(Duration::from_millis(1));
+        let _default = EsiClient::default();
+        let _long = EsiClient::new(Duration::from_secs(120));
     }
 }
 
