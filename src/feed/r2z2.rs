@@ -27,6 +27,22 @@ struct R2z2State {
     backoff_exp: u32,
 }
 
+#[derive(serde::Deserialize)]
+struct R2z2SequenceProbe {
+    #[serde(default)]
+    killmail_id: Option<i64>,
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
+    zkb: Option<R2z2SequenceProbeZkb>,
+}
+
+#[derive(serde::Deserialize)]
+struct R2z2SequenceProbeZkb {
+    #[serde(default, rename = "href")]
+    href: Option<String>,
+}
+
 pub struct R2z2Feed {
     client: Client,
     state: Mutex<R2z2State>,
@@ -164,6 +180,26 @@ impl R2z2Feed {
         }
         false
     }
+
+    /// Some R2Z2 sequences can temporarily contain a null placeholder object.
+    /// These are not valid killmails and should be skipped so the feed does not stall.
+    fn is_null_placeholder_sequence(body: &str) -> bool {
+        let parsed = match serde_json::from_str::<R2z2SequenceProbe>(body) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        let missing_killmail_id = parsed.killmail_id.is_none();
+        let missing_hash = parsed.hash.is_none();
+        let invalid_href = parsed
+            .zkb
+            .as_ref()
+            .and_then(|z| z.href.as_deref())
+            .map(|href| href.ends_with("/killmails///"))
+            .unwrap_or(true);
+
+        missing_killmail_id && missing_hash && invalid_href
+    }
 }
 
 #[async_trait]
@@ -239,6 +275,16 @@ impl KillmailFeed for R2z2Feed {
                     .text()
                     .await
                     .map_err(|e| FeedError::Transport(e.to_string()))?;
+
+                if Self::is_null_placeholder_sequence(&body) {
+                    warn!(
+                        "R2Z2: sequence {} is a null placeholder, skipping",
+                        state.sequence
+                    );
+                    state.sequence += 1;
+                    self.save_checkpoint(state.sequence);
+                    return Ok(None);
+                }
 
                 let km: R2z2KillmailResponse = serde_json::from_str(&body)
                     .map_err(|e| FeedError::Parse(format!(
@@ -343,6 +389,43 @@ mod tests {
             assert!(d.as_secs_f64() >= 10.0);
             assert!(d.as_secs_f64() <= 20.0);
         }
+    }
+
+    #[test]
+    fn test_null_placeholder_sequence_detected() {
+        let json = r#"{
+            "killmail_id": null,
+            "hash": null,
+            "esi": null,
+            "zkb": {
+                "npc": null,
+                "solo": null,
+                "awox": null,
+                "labels": null,
+                "attackerCount": null,
+                "href": "https://esi.evetech.net/killmails///"
+            },
+            "uploaded_at": 1772304311,
+            "sequence_id": 96203634
+        }"#;
+
+        assert!(R2z2Feed::is_null_placeholder_sequence(json));
+    }
+
+    #[test]
+    fn test_valid_sequence_not_treated_as_placeholder() {
+        let json = r#"{
+            "killmail_id": 133603559,
+            "hash": "718e0749c0d17ddee62b2b0e5b290891665b40c8",
+            "esi": {},
+            "zkb": {
+                "href": "https://esi.evetech.net/killmails/133603559/718e0749c0d17ddee62b2b0e5b290891665b40c8/"
+            },
+            "uploaded_at": 1772304311,
+            "sequence_id": 96203634
+        }"#;
+
+        assert!(!R2z2Feed::is_null_placeholder_sequence(json));
     }
 }
 
