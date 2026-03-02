@@ -10,11 +10,11 @@ use crate::processor::{AttackerKey, Color, NamedFilterResult};
 use chrono::{DateTime, FixedOffset, Utc};
 use serenity::async_trait;
 use serenity::builder::CreateEmbed;
-use serenity::http::error::Error;
-use serenity::http::Http;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::model::guild::UnavailableGuild;
+use serenity::model::id::GuildId;
+use serenity::http::Http;
 use serenity::model::prelude::{ChannelId, Interaction};
 use serenity::prelude::*;
 use serenity::utils::Colour;
@@ -184,21 +184,13 @@ pub(crate) struct MatchedEntity {
 }
 
 #[derive(Debug)]
-pub enum KillmailSendError {
-    CleanupChannel(serenity::Error),
-    Other(Box<dyn std::error::Error + Send + Sync>),
+pub struct PreparedDispatch {
+    pub guild_id: GuildId,
+    pub subscription: Subscription,
+    pub zk_data: ZkData,
+    pub embed: CreateEmbed,
+    pub filter_result: NamedFilterResult,
 }
-
-impl std::fmt::Display for KillmailSendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            KillmailSendError::CleanupChannel(e) => write!(f, "Channel cleanup required: {}", e),
-            KillmailSendError::Other(e) => write!(f, "{}", e),
-        }
-    }
-}
-
-impl std::error::Error for KillmailSendError {}
 
 pub struct CommandMap;
 impl TypeMapKey for CommandMap {
@@ -803,6 +795,27 @@ async fn select_best_entity_for_display(
 
 // --- Message Sending and Embed Building ---
 
+/// Send error type for killmail messages.
+/// Used by integration tests to distinguish channel cleanup errors from other failures.
+#[derive(Debug)]
+pub enum KillmailSendError {
+    CleanupChannel(serenity::Error),
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Display for KillmailSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KillmailSendError::CleanupChannel(e) => write!(f, "Channel cleanup required: {e}"),
+            KillmailSendError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for KillmailSendError {}
+
+/// Standalone send function used by integration embed tests.
+/// Production code uses `pipeline::send_prepared_dispatch` instead.
 pub async fn send_killmail_message(
     http: &Arc<Http>,
     app_state: &Arc<AppState>,
@@ -867,43 +880,17 @@ pub async fn send_killmail_message(
 
     if let Err(e) = result {
         if let serenity::Error::Http(http_err) = &e {
-            match &**http_err {
-                Error::UnsuccessfulRequest(resp) => match resp.status_code {
-                    serenity::http::StatusCode::FORBIDDEN => {
-                        error!(
-                            "[Kill: {}] Forbidden to send message to channel {}. Removing subscriptions.",
-                            zk_data.kill_id, channel
-                        );
-                        return Err(KillmailSendError::CleanupChannel(e));
-                    }
-                    serenity::http::StatusCode::NOT_FOUND => {
-                        error!(
-                            "[Kill: {}] Channel {} not found. Removing subscriptions.",
-                            zk_data.kill_id, channel
-                        );
-                        return Err(KillmailSendError::CleanupChannel(e));
-                    }
-                    _ => {}
-                },
-                _ => {
-                    error!(
-                        "[Kill: {}] HTTP error while sending message to channel {}: {:#?}",
-                        zk_data.kill_id, channel, e
-                    );
-                    return Err(KillmailSendError::Other(Box::new(e)));
+            if let serenity::http::error::Error::UnsuccessfulRequest(resp) = &**http_err {
+                if matches!(
+                    resp.status_code,
+                    serenity::http::StatusCode::FORBIDDEN | serenity::http::StatusCode::NOT_FOUND
+                ) {
+                    return Err(KillmailSendError::CleanupChannel(e));
                 }
             }
         }
-        error!(
-            "[Kill: {}] Failed to send message to channel {}: {:#?}",
-            zk_data.kill_id, channel, e
-        );
         return Err(KillmailSendError::Other(Box::new(e)));
     }
-    info!(
-        "[Kill: {}] Sent message to channel {}",
-        zk_data.kill_id, channel
-    );
     Ok(())
 }
 
@@ -1141,7 +1128,7 @@ fn format_datetime_to_timestamp(date: &DateTime<FixedOffset>) -> String {
     format!("{}00", date_utc.format("%Y%m%d%H"))
 }
 
-async fn build_killmail_embed(
+pub async fn build_killmail_embed(
     app_state: &Arc<AppState>,
     zk_data: &ZkData,
     named_filter_result: &NamedFilterResult,

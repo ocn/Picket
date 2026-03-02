@@ -296,10 +296,10 @@ impl KillmailFeed for R2z2Feed {
                 state.sequence += 1;
                 self.save_checkpoint(state.sequence);
 
-                // Build the ESI URL from the zkb href field
                 let zk_data = ZkDataNoEsi {
                     kill_id: km.killmail_id,
                     zkb: km.zkb,
+                    inline_killmail: km.esi,
                 };
 
                 Ok(Some(zk_data))

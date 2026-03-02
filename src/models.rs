@@ -1,4 +1,5 @@
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use tracing::warn;
 
 // --- R2Z2 response models ---
 
@@ -12,6 +13,30 @@ pub struct R2z2KillmailResponse {
     pub killmail_id: i64,
     pub hash: String,
     pub zkb: Zkb,
+    #[serde(default, deserialize_with = "deserialize_optional_killmail")]
+    pub esi: Option<KillmailData>,
+}
+
+fn deserialize_optional_killmail<'de, D>(deserializer: D) -> Result<Option<KillmailData>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(v) => {
+            if v.is_null() {
+                return Ok(None);
+            }
+            match serde_json::from_value::<KillmailData>(v) {
+                Ok(km) => Ok(Some(km)),
+                Err(e) => {
+                    warn!("R2Z2: failed to parse inline ESI killmail data: {}", e);
+                    Ok(None)
+                }
+            }
+        }
+    }
 }
 
 /// Represents the top-level JSON object from the zKillboard RedisQ stream.
@@ -26,6 +51,8 @@ pub struct ZkDataNoEsi {
     #[serde(rename = "killID")]
     pub kill_id: i64,
     pub zkb: Zkb,
+    #[serde(skip)]
+    pub inline_killmail: Option<KillmailData>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -153,6 +180,7 @@ mod tests {
         let zk = ZkDataNoEsi {
             kill_id: resp.killmail_id,
             zkb: resp.zkb,
+            inline_killmail: resp.esi,
         };
         assert_eq!(zk.kill_id, 123456789);
     }

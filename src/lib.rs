@@ -1,9 +1,9 @@
 use rand::{distributions::Alphanumeric, Rng};
-use serenity::http::Http;
 use serenity::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn, Level};
 
 pub mod commands;
@@ -12,6 +12,7 @@ pub mod discord_bot;
 pub mod esi;
 pub mod feed;
 pub mod models;
+pub mod pipeline;
 pub mod processor;
 
 use crate::commands::find_unsubscribed::FindUnsubscribedChannelsCommand;
@@ -25,7 +26,6 @@ use commands::{Command, PingCommand};
 use config::FeedProvider;
 use discord_bot::CommandMap;
 use feed::KillmailFeed;
-use models::ZkDataNoEsi;
 
 pub struct AppStateContainer;
 
@@ -39,78 +39,6 @@ fn generate_queue_id() -> String {
         .take(12)
         .map(char::from)
         .collect()
-}
-
-async fn process_single_killmail(
-    kill_id: i64,
-    zk_data_no_esi: ZkDataNoEsi,
-    app_state: &Arc<config::AppState>,
-    http_client: &Arc<Http>,
-) {
-    // Load ESI data containing killmail information
-    let zk_data = match app_state
-        .esi_client
-        .load_killmail(zk_data_no_esi.zkb.esi.clone())
-        .await
-    {
-        Ok(killmail) => models::ZkData {
-            kill_id: zk_data_no_esi.kill_id,
-            killmail,
-            zkb: zk_data_no_esi.zkb,
-        },
-        Err(e) => {
-            error!("Error loading killmail data from ESI: {}", e);
-            return;
-        }
-    };
-
-    let matched = processor::process_killmail(app_state, &zk_data).await;
-
-    if !matched.is_empty() {
-        for (guild_id, subscription, filter_result) in matched {
-            info!(
-                "[Kill: {}] Matched subscription '{}' for channel {}, this filter was a match: {}",
-                kill_id, subscription.description, subscription.action.channel_id, filter_result.name
-            );
-            if let Err(e) = discord_bot::send_killmail_message(
-                http_client,
-                app_state,
-                &subscription,
-                &zk_data,
-                filter_result,
-            )
-            .await
-            {
-                match e {
-                    discord_bot::KillmailSendError::CleanupChannel(e) => {
-                        warn!(
-                            "Cleaning up subscriptions for channel {} due to error: {:#?}",
-                            subscription.action.channel_id, e
-                        );
-                        let _lock = app_state.subscriptions_file_lock.lock().await;
-                        let mut subs_map = app_state.subscriptions.write().unwrap();
-
-                        if let Some(guild_subs) = subs_map.get_mut(&guild_id) {
-                            guild_subs.retain(|s| {
-                                s.action.channel_id != subscription.action.channel_id
-                            });
-                            if let Err(save_err) = config::save_subscriptions_for_guild(
-                                guild_id, guild_subs,
-                            ) {
-                                error!("Failed to save subscriptions after cleanup for guild {}: {}", guild_id, save_err);
-                            }
-                        }
-                    }
-                    discord_bot::KillmailSendError::Other(err) => {
-                        error!(
-                            "Error sending message for subscription {}: {}",
-                            subscription.id, err
-                        );
-                    }
-                }
-            }
-        }
-    }
 }
 
 pub async fn run() {
@@ -268,38 +196,34 @@ pub async fn run() {
         }
     };
 
+    // --- Validate pipeline config ---
+    if app_config.killmail_workers < 1 {
+        error!("KILLMAIL_WORKERS must be >= 1 (got {})", app_config.killmail_workers);
+        return;
+    }
+    if app_config.killmail_queue_size < 1 || app_config.killmail_queue_size > 4096 {
+        error!("KILLMAIL_QUEUE_SIZE must be 1..=4096 (got {})", app_config.killmail_queue_size);
+        return;
+    }
+
+    info!(
+        "Pipeline: workers={}, queue_size={}, post_process_sleep_ms={}",
+        app_config.killmail_workers, app_config.killmail_queue_size, app_config.killmail_post_process_sleep_ms
+    );
+
+    // --- Start concurrent pipeline ---
+    let (result_tx, result_rx) = mpsc::channel(app_config.killmail_queue_size);
+    let semaphore = Arc::new(Semaphore::new(app_config.killmail_workers));
+
     info!("Listening for killmails...");
 
-    // --- Main killmail processing loop ---
-    loop {
-        match feed.next().await {
-            Ok(Some(zk_data_no_esi)) => {
-                let kill_id = zk_data_no_esi.kill_id;
-                info!("[Kill: {}] Received", kill_id);
+    // Spawn dispatcher task
+    let dispatcher_state = app_state.clone();
+    let dispatcher_http = http_client.clone();
+    tokio::spawn(async move {
+        pipeline::run_dispatcher(result_rx, dispatcher_state, dispatcher_http).await;
+    });
 
-                let timeout_secs = app_state.app_config.killmail_process_timeout_secs;
-                match tokio::time::timeout(
-                    Duration::from_secs(timeout_secs),
-                    process_single_killmail(kill_id, zk_data_no_esi, &app_state, &http_client),
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(_) => error!(
-                        "[Kill: {}] Processing timed out after {}s, skipping",
-                        kill_id, timeout_secs
-                    ),
-                }
-
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Ok(None) => {
-                // Feed already handled its own wait/backoff — no extra sleep
-            }
-            Err(e) => {
-                error!("Feed error: {}", e);
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    }
+    // Run producer on current task (main loop)
+    pipeline::run_producer(feed, app_state, result_tx, semaphore).await;
 }
