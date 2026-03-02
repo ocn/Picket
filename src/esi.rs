@@ -269,7 +269,7 @@ impl EsiClient {
             .await?
             .json()
             .await?;
-        tracing::info!("SSO Verify Response: {:?}", verify_response);
+        tracing::debug!("SSO Verify Response: {:?}", verify_response);
 
         let character_id = verify_response["CharacterID"]
             .as_u64()

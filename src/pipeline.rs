@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct WorkItem {
     pub dispatch_sequence: u64,
@@ -58,7 +58,7 @@ async fn process_work_item(
 
     // Use inline killmail if available, otherwise fetch from ESI
     let killmail_data = if let Some(km) = zk_data_no_esi.inline_killmail.clone() {
-        info!("[Kill: {}] Using inline ESI data (skipping fetch)", kill_id);
+        debug!("[Kill: {}] Using inline ESI data (skipping fetch)", kill_id);
         km
     } else {
         match app_state.esi_client.load_killmail(zk_data_no_esi.zkb.esi.clone()).await {
@@ -130,7 +130,7 @@ pub async fn run_producer(
         match feed.next().await {
             Ok(Some(zk_data_no_esi)) => {
                 let kill_id = zk_data_no_esi.kill_id;
-                info!("[Kill: {}] Received (seq: {})", kill_id, dispatch_sequence);
+                debug!("[Kill: {}] Received (seq: {})", kill_id, dispatch_sequence);
 
                 let permit = semaphore.clone().acquire_owned().await.expect("semaphore closed");
 
@@ -264,10 +264,10 @@ async fn dispatch_single(
             for dispatch in dispatches {
                 send_prepared_dispatch(dispatch, app_state, http_client).await;
             }
-            info!("[Kill: {}] Dispatched (seq: {})", kill_id, dispatch_sequence);
+            debug!("[Kill: {}] Dispatched (seq: {})", kill_id, dispatch_sequence);
         }
         ProcessedResult::NoMatch { dispatch_sequence, kill_id } => {
-            info!("[Kill: {}] No match (seq: {})", kill_id, dispatch_sequence);
+            debug!("[Kill: {}] No match (seq: {})", kill_id, dispatch_sequence);
         }
         ProcessedResult::Failed { dispatch_sequence, kill_id, error } => {
             if kill_id >= 0 {

@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 const R2Z2_BASE_URL: &str = "https://r2z2.zkillboard.com";
 const MAX_BACKOFF_SECS: f64 = 60.0;
 const FIXED_429_BASE_SECS: f64 = 10.0;
+const SUCCESS_SLEEP_MS: u64 = 100;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct R2z2Checkpoint {
@@ -283,6 +284,8 @@ impl KillmailFeed for R2z2Feed {
                     );
                     state.sequence += 1;
                     self.save_checkpoint(state.sequence);
+                    // Rate-limit per R2Z2 docs: sleep 100ms between successful fetches (max 10 req/s)
+                    tokio::time::sleep(Duration::from_millis(SUCCESS_SLEEP_MS)).await;
                     return Ok(None);
                 }
 
@@ -301,6 +304,9 @@ impl KillmailFeed for R2z2Feed {
                     zkb: km.zkb,
                     inline_killmail: km.esi,
                 };
+
+                // Rate-limit per R2Z2 docs: sleep 100ms between successful fetches (max 10 req/s)
+                tokio::time::sleep(Duration::from_millis(SUCCESS_SLEEP_MS)).await;
 
                 Ok(Some(zk_data))
             }
