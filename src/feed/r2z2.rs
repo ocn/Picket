@@ -236,7 +236,24 @@ impl KillmailFeed for R2z2Feed {
                 }
 
                 if status == StatusCode::NOT_FOUND {
-                    // 404 — not yet available
+                    let missing_sequence = state.sequence;
+                    let latest_sequence = self.fetch_sequence(&mut state).await;
+
+                    if missing_sequence < latest_sequence {
+                        warn!(
+                            "R2Z2: sequence {} returned 404 while latest is {}, skipping missing historical sequence",
+                            missing_sequence, latest_sequence
+                        );
+                        state.sequence = missing_sequence + 1;
+                        state.consecutive_404s = 0;
+                        state.first_404_at = None;
+                        state.backoff_exp = 0;
+                        self.save_checkpoint(state.sequence);
+                        tokio::time::sleep(Duration::from_millis(SUCCESS_SLEEP_MS)).await;
+                        return Ok(None);
+                    }
+
+                    // 404 at or ahead of the current head — not yet available.
                     state.backoff_exp = 0;
                     state.consecutive_404s += 1;
                     if state.first_404_at.is_none() {
