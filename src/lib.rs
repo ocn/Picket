@@ -8,6 +8,7 @@ use tracing::{error, info, warn, Level};
 
 pub mod commands;
 pub mod config;
+pub mod contract_intelligence;
 pub mod discord_bot;
 pub mod esi;
 pub mod feed;
@@ -176,6 +177,21 @@ pub async fn run() {
     }
 
     let http_client = client.cache_and_http.http.clone();
+
+    if let Ok(database_url) = std::env::var("CONTRACT_DATABASE_URL") {
+        let interval = std::env::var("CONTRACT_COLLECTION_INTERVAL_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(300);
+        let timeout = Duration::from_secs(app_config.esi_http_timeout_secs);
+        tokio::spawn(contract_intelligence::run_contract_collection_loop(
+            database_url,
+            Duration::from_secs(interval),
+            timeout,
+        ));
+    } else {
+        info!("Contract collection disabled: CONTRACT_DATABASE_URL is not configured");
+    }
 
     tokio::spawn(async move {
         if let Err(why) = client.start().await {
