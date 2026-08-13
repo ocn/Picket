@@ -16,6 +16,8 @@ pub mod models;
 pub mod pipeline;
 pub mod processor;
 
+use crate::commands::contract_subscribe::ContractSubscribeCommand;
+use crate::commands::contract_unsubscribe::ContractUnsubscribeCommand;
 use crate::commands::find_unsubscribed::FindUnsubscribedChannelsCommand;
 use commands::diag::DiagCommand;
 use commands::subscribe::SubscribeCommand;
@@ -155,6 +157,18 @@ pub async fn run() {
     let find_unsubscribed_command = Box::new(FindUnsubscribedChannelsCommand);
     command_map.insert(find_unsubscribed_command.name(), find_unsubscribed_command);
 
+    let contract_subscribe_command = Box::new(ContractSubscribeCommand);
+    command_map.insert(
+        contract_subscribe_command.name(),
+        contract_subscribe_command,
+    );
+
+    let contract_unsubscribe_command = Box::new(ContractUnsubscribeCommand);
+    command_map.insert(
+        contract_unsubscribe_command.name(),
+        contract_unsubscribe_command,
+    );
+
     let command_map_arc = Arc::new(command_map);
 
     // --- Start Discord Bot ---
@@ -184,11 +198,21 @@ pub async fn run() {
             .and_then(|value| value.parse().ok())
             .unwrap_or(300);
         let timeout = Duration::from_secs(app_config.esi_http_timeout_secs);
-        tokio::spawn(contract_intelligence::run_contract_collection_loop(
-            database_url,
-            Duration::from_secs(interval),
-            timeout,
+        let ship_groups = Arc::new(discord_bot::DiscordShipGroupResolver::new(
+            app_state.clone(),
         ));
+        let delivery = Arc::new(discord_bot::DiscordContractDelivery::new(
+            http_client.clone(),
+        ));
+        tokio::spawn(
+            contract_intelligence::run_contract_collection_loop_with_notifications(
+                database_url,
+                Duration::from_secs(interval),
+                timeout,
+                ship_groups,
+                delivery,
+            ),
+        );
     } else {
         info!("Contract collection disabled: CONTRACT_DATABASE_URL is not configured");
     }

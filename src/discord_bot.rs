@@ -4,12 +4,16 @@ use crate::config::{
     save_names, save_ships, save_systems, save_user_standings, AppState, Filter, FilterNode,
     PingType, SimpleFilter, StandingSource, Subscription, System,
 };
+use crate::contract_intelligence::{
+    ContractDelivery, ContractDeliveryError, ContractNotificationMessage, PreparedContractDelivery,
+    ShipGroupResolver,
+};
 use crate::esi::Celestial;
 use crate::models::{Attacker, ZkData};
 use crate::processor::{AttackerKey, Color, NamedFilterResult};
 use chrono::{DateTime, FixedOffset, Utc};
 use serenity::async_trait;
-use serenity::builder::CreateEmbed;
+use serenity::builder::{CreateEmbed, ParseValue};
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::model::guild::UnavailableGuild;
@@ -190,6 +194,76 @@ pub struct PreparedDispatch {
     pub zk_data: ZkData,
     pub embed: CreateEmbed,
     pub filter_result: NamedFilterResult,
+}
+
+pub struct DiscordContractDelivery {
+    http: Arc<Http>,
+}
+
+impl DiscordContractDelivery {
+    pub fn new(http: Arc<Http>) -> Self {
+        Self { http }
+    }
+}
+
+#[async_trait]
+impl ContractDelivery for DiscordContractDelivery {
+    async fn send(
+        &self,
+        delivery: PreparedContractDelivery,
+    ) -> Result<String, ContractDeliveryError> {
+        let message = ChannelId(delivery.channel_id)
+            .send_message(&self.http, |builder| {
+                if delivery.ping {
+                    builder.content("@here");
+                }
+                builder
+                    .allowed_mentions(|mentions| {
+                        let mentions = mentions.empty_parse();
+                        if delivery.ping {
+                            mentions.parse(ParseValue::Everyone)
+                        } else {
+                            mentions
+                        }
+                    })
+                    .set_embed(contract_notification_embed(&delivery.message))
+            })
+            .await
+            .map_err(|error| ContractDeliveryError(error.to_string()))?;
+        Ok(message.id.to_string())
+    }
+}
+
+pub struct DiscordShipGroupResolver {
+    app_state: Arc<AppState>,
+}
+
+impl DiscordShipGroupResolver {
+    pub fn new(app_state: Arc<AppState>) -> Self {
+        Self { app_state }
+    }
+}
+
+#[async_trait]
+impl ShipGroupResolver for DiscordShipGroupResolver {
+    async fn group_for_type(&self, type_id: i64) -> Option<i64> {
+        let type_id = u32::try_from(type_id).ok()?;
+        get_ship_group_id(&self.app_state, type_id)
+            .await
+            .map(i64::from)
+    }
+}
+
+pub fn contract_notification_embed(message: &ContractNotificationMessage) -> CreateEmbed {
+    let mut embed = CreateEmbed::default();
+    embed.title(&message.title);
+    if let Some(description) = &message.description {
+        embed.description(description);
+    }
+    for field in &message.fields {
+        embed.field(&field.name, &field.value, field.inline);
+    }
+    embed
 }
 
 pub struct CommandMap;
@@ -1784,5 +1858,27 @@ mod tests {
         let input = vec![(358, 7)];
         let result = select_top_groups(input, 2);
         assert_eq!(result, vec![(358, 7)]);
+    }
+
+    #[test]
+    fn contract_embed_keeps_the_contract_address_as_its_own_field() {
+        let embed = contract_notification_embed(&ContractNotificationMessage {
+            title: "Public contract listed".to_string(),
+            description: Some("@\u{200b}everyone cannot ping".to_string()),
+            fields: vec![crate::contract_intelligence::ContractEmbedField {
+                name: "Contract Address".to_string(),
+                value: "contract:0//45".to_string(),
+                inline: false,
+            }],
+        });
+
+        assert_eq!(embed.0["title"].as_str(), Some("Public contract listed"));
+        assert_eq!(
+            embed.0["description"].as_str(),
+            Some("@\u{200b}everyone cannot ping")
+        );
+        let fields = embed.0["fields"].as_array().expect("embed fields");
+        assert_eq!(fields[0]["name"].as_str(), Some("Contract Address"));
+        assert_eq!(fields[0]["value"].as_str(), Some("contract:0//45"));
     }
 }

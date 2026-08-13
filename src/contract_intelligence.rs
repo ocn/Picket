@@ -429,6 +429,145 @@ pub struct StorageCounts {
     pub presence_intervals: i64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractEventKind {
+    Listed,
+}
+
+impl ContractEventKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Listed => "listed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractItemDirection {
+    Offered,
+    Requested,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractEventAction {
+    Ignore,
+    Post,
+    PostAndPing,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContractEventActions {
+    pub listed: ContractEventAction,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContractFilter {
+    pub events: Vec<ContractEventKind>,
+    pub item_direction: ContractItemDirection,
+    pub type_ids: Vec<i64>,
+    pub ship_group_ids: Vec<i64>,
+}
+
+impl ContractFilter {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.events.contains(&ContractEventKind::Listed) {
+            return Err("the initial contract filter must include the Listed event".to_string());
+        }
+        if self.type_ids.is_empty() && self.ship_group_ids.is_empty() {
+            return Err("provide at least one ship type ID or ship group ID".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContractSubscription {
+    pub guild_id: u64,
+    pub channel_id: u64,
+    pub id: String,
+    pub description: String,
+    pub filter: ContractFilter,
+    pub event_actions: ContractEventActions,
+}
+
+impl ContractSubscription {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.trim().is_empty() {
+            return Err("subscription ID cannot be empty".to_string());
+        }
+        if self.description.trim().is_empty() {
+            return Err("subscription description cannot be empty".to_string());
+        }
+        self.filter.validate()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContractEmbedField {
+    pub name: String,
+    pub value: String,
+    pub inline: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContractNotificationMessage {
+    pub title: String,
+    pub description: Option<String>,
+    pub fields: Vec<ContractEmbedField>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedContractDelivery {
+    pub delivery_id: i64,
+    pub guild_id: u64,
+    pub channel_id: u64,
+    pub subscription_id: String,
+    pub contract_id: i64,
+    pub event_kind: ContractEventKind,
+    pub ping: bool,
+    pub message: ContractNotificationMessage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeliveryStatus {
+    Prepared,
+    Sent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliveryRecord {
+    pub id: i64,
+    pub status: DeliveryStatus,
+    pub discord_message_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContractDeliveryError(pub String);
+
+impl Display for ContractDeliveryError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ContractDeliveryError {}
+
+#[async_trait]
+pub trait ContractDelivery: Send + Sync {
+    async fn send(
+        &self,
+        delivery: PreparedContractDelivery,
+    ) -> Result<String, ContractDeliveryError>;
+}
+
+#[async_trait]
+pub trait ShipGroupResolver: Send + Sync {
+    async fn group_for_type(&self, type_id: i64) -> Option<i64>;
+}
+
 #[derive(Clone, Debug)]
 struct CachedResponse {
     response: Value,
@@ -483,6 +622,131 @@ impl ContractCollectionStore {
             manifests: row.get("manifests"),
             presence_intervals: row.get("presence_intervals"),
         })
+    }
+
+    pub async fn upsert_contract_subscription(
+        &self,
+        subscription: &ContractSubscription,
+    ) -> Result<(), sqlx::Error> {
+        subscription
+            .validate()
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        sqlx::query("INSERT INTO contract_subscriptions (guild_id, channel_id, subscription_id, description, filter, event_actions) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (guild_id, channel_id, subscription_id) DO UPDATE SET description = EXCLUDED.description, filter = EXCLUDED.filter, event_actions = EXCLUDED.event_actions, updated_at = now()")
+            .bind(subscription.guild_id as i64)
+            .bind(subscription.channel_id as i64)
+            .bind(&subscription.id)
+            .bind(&subscription.description)
+            .bind(serde_json::to_value(&subscription.filter).map_err(json_to_sqlx)?)
+            .bind(serde_json::to_value(&subscription.event_actions).map_err(json_to_sqlx)?)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn contract_subscriptions_for_channel(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+    ) -> Result<Vec<ContractSubscription>, sqlx::Error> {
+        sqlx::query("SELECT guild_id, channel_id, subscription_id, description, filter, event_actions FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 ORDER BY subscription_id")
+            .bind(guild_id as i64)
+            .bind(channel_id as i64)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(contract_subscription_from_row)
+            .collect()
+    }
+
+    pub async fn remove_contract_subscription(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+        id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3")
+            .bind(guild_id as i64)
+            .bind(channel_id as i64)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delivery_record(
+        &self,
+        delivery_id: i64,
+    ) -> Result<Option<DeliveryRecord>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT id, status, discord_message_id FROM contract_outbound_deliveries WHERE id = $1",
+        )
+        .bind(delivery_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(delivery_record_from_row).transpose()
+    }
+
+    pub async fn delivery_records(&self) -> Result<Vec<DeliveryRecord>, sqlx::Error> {
+        sqlx::query(
+            "SELECT id, status, discord_message_id FROM contract_outbound_deliveries ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(delivery_record_from_row)
+        .collect()
+    }
+
+    async fn all_contract_subscriptions(&self) -> Result<Vec<ContractSubscription>, sqlx::Error> {
+        sqlx::query("SELECT guild_id, channel_id, subscription_id, description, filter, event_actions FROM contract_subscriptions ORDER BY guild_id, channel_id, subscription_id")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(contract_subscription_from_row)
+            .collect()
+    }
+
+    async fn prepare_delivery(
+        &self,
+        subscription: &ContractSubscription,
+        event: &ContractEvent,
+        message: &ContractNotificationMessage,
+        ping: bool,
+    ) -> Result<Option<PreparedContractDelivery>, sqlx::Error> {
+        let delivery_id = sqlx::query_scalar::<_, i64>("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'prepared') ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind) DO NOTHING RETURNING id")
+            .bind(subscription.guild_id as i64)
+            .bind(subscription.channel_id as i64)
+            .bind(&subscription.id)
+            .bind(event.contract.contract_id)
+            .bind(event.kind.as_str())
+            .bind(serde_json::to_value(event).map_err(json_to_sqlx)?)
+            .bind(serde_json::to_value(message).map_err(json_to_sqlx)?)
+            .bind(ping)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(delivery_id.map(|delivery_id| PreparedContractDelivery {
+            delivery_id,
+            guild_id: subscription.guild_id,
+            channel_id: subscription.channel_id,
+            subscription_id: subscription.id.clone(),
+            contract_id: event.contract.contract_id,
+            event_kind: event.kind.clone(),
+            ping,
+            message: message.clone(),
+        }))
+    }
+
+    async fn mark_delivery_sent(
+        &self,
+        delivery_id: i64,
+        discord_message_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE contract_outbound_deliveries SET status = 'sent', discord_message_id = $2, sent_at = now() WHERE id = $1 AND status = 'prepared'")
+            .bind(delivery_id)
+            .bind(discord_message_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     async fn cache(&self, resource_key: &str) -> Result<Option<CachedResponse>, sqlx::Error> {
@@ -550,7 +814,7 @@ impl ContractCollectionStore {
         region_id: i64,
         expected_pages: u32,
         contracts: &[ObservedContract],
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<RecordComplete, sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
         let now = Utc::now();
         sqlx::query("INSERT INTO regional_collection_metadata (region_id) VALUES ($1) ON CONFLICT (region_id) DO NOTHING").bind(region_id).execute(&mut *transaction).await?;
@@ -561,7 +825,16 @@ impl ContractCollectionStore {
         .fetch_one(&mut *transaction)
         .await?
         .get("baseline_at");
+        let mut newly_observed = Vec::new();
         for observed in contracts {
+            let previously_observed = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM presence_intervals WHERE region_id = $1 AND contract_id = $2)")
+                .bind(region_id)
+                .bind(observed.contract.contract_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+            if baseline_at.is_some() && !previously_observed {
+                newly_observed.push(observed.clone());
+            }
             let facts = serde_json::to_value(&observed.contract).map_err(json_to_sqlx)?;
             let manifest = serde_json::to_value(&observed.manifest).map_err(json_to_sqlx)?;
             sqlx::query("INSERT INTO public_contract_facts (fact_hash, contract_id, facts) VALUES ($1,$2,$3) ON CONFLICT (fact_hash) DO NOTHING").bind(&observed.fact_hash).bind(observed.contract.contract_id).bind(facts).execute(&mut *transaction).await?;
@@ -571,7 +844,11 @@ impl ContractCollectionStore {
         sqlx::query("INSERT INTO regional_observations (region_id, observed_at, outcome, expected_pages) VALUES ($1,$2,'complete',$3)").bind(region_id).bind(now).bind(expected_pages as i32).execute(&mut *transaction).await?;
         sqlx::query("UPDATE regional_collection_metadata SET baseline_at = COALESCE(baseline_at, $2), complete_observations = complete_observations + 1, last_complete_at = $2 WHERE region_id = $1").bind(region_id).bind(now).execute(&mut *transaction).await?;
         transaction.commit().await?;
-        Ok(baseline_at.is_none())
+        Ok(RecordComplete {
+            baseline_established: baseline_at.is_none(),
+            observed_contracts: contracts.len(),
+            newly_observed,
+        })
     }
 
     async fn record_inconclusive(
@@ -604,6 +881,36 @@ impl ContractCollectionStore {
     }
 }
 
+fn contract_subscription_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<ContractSubscription, sqlx::Error> {
+    Ok(ContractSubscription {
+        guild_id: row.get::<i64, _>("guild_id") as u64,
+        channel_id: row.get::<i64, _>("channel_id") as u64,
+        id: row.get("subscription_id"),
+        description: row.get("description"),
+        filter: serde_json::from_value(row.get("filter")).map_err(json_to_sqlx)?,
+        event_actions: serde_json::from_value(row.get("event_actions")).map_err(json_to_sqlx)?,
+    })
+}
+
+fn delivery_record_from_row(row: sqlx::postgres::PgRow) -> Result<DeliveryRecord, sqlx::Error> {
+    let status = match row.get::<String, _>("status").as_str() {
+        "prepared" => DeliveryStatus::Prepared,
+        "sent" => DeliveryStatus::Sent,
+        value => {
+            return Err(sqlx::Error::Protocol(format!(
+                "unknown delivery status: {value}"
+            )))
+        }
+    };
+    Ok(DeliveryRecord {
+        id: row.get("id"),
+        status,
+        discord_message_id: row.get("discord_message_id"),
+    })
+}
+
 fn json_to_sqlx(error: serde_json::Error) -> sqlx::Error {
     sqlx::Error::Protocol(error.to_string())
 }
@@ -620,6 +927,13 @@ struct ObservedContract {
     manifest: ItemManifest,
     fact_hash: String,
     manifest_hash: String,
+}
+
+#[derive(Clone, Debug)]
+struct RecordComplete {
+    baseline_established: bool,
+    observed_contracts: usize,
+    newly_observed: Vec<ObservedContract>,
 }
 
 #[derive(Debug)]
@@ -674,8 +988,14 @@ pub enum CollectionOutcome {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ContractEvent;
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ContractEvent {
+    pub region_id: i64,
+    pub kind: ContractEventKind,
+    pub contract: PublicContract,
+    pub offered_items: Vec<PublicContractItem>,
+    pub requested_items: Vec<PublicContractItem>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CollectionReport {
@@ -687,11 +1007,33 @@ pub struct CollectionReport {
 pub struct ContractCollector {
     store: ContractCollectionStore,
     esi: Arc<dyn PublicContractEsi>,
+    notifications: Option<ContractNotifications>,
+}
+
+struct ContractNotifications {
+    ship_groups: Arc<dyn ShipGroupResolver>,
+    delivery: Arc<dyn ContractDelivery>,
 }
 
 impl ContractCollector {
     pub fn new(store: ContractCollectionStore, esi: Arc<dyn PublicContractEsi>) -> Self {
-        Self { store, esi }
+        Self {
+            store,
+            esi,
+            notifications: None,
+        }
+    }
+
+    pub fn with_notifications(
+        mut self,
+        ship_groups: Arc<dyn ShipGroupResolver>,
+        delivery: Arc<dyn ContractDelivery>,
+    ) -> Self {
+        self.notifications = Some(ContractNotifications {
+            ship_groups,
+            delivery,
+        });
+        self
     }
 
     pub async fn collect_cycle(&self) -> Result<CollectionReport, ContractCollectionError> {
@@ -711,17 +1053,30 @@ impl ContractCollector {
             }
         };
         let mut outcomes = Vec::with_capacity(regions.len());
+        let mut events = Vec::new();
         let mut retry_after = None;
         for region_id in regions {
             match self.collect_region(region_id).await {
-                Ok((baseline, contracts)) => outcomes.push(if baseline {
-                    CollectionOutcome::BaselineEstablished { region_id }
-                } else {
-                    CollectionOutcome::Complete {
-                        region_id,
-                        observed_contracts: contracts,
-                    }
-                }),
+                Ok(recorded) => {
+                    let observed_contracts = recorded.observed_contracts;
+                    events.extend(recorded.newly_observed.into_iter().map(|observed| {
+                        ContractEvent {
+                            region_id,
+                            kind: ContractEventKind::Listed,
+                            contract: observed.contract,
+                            offered_items: observed.manifest.offered_items,
+                            requested_items: observed.manifest.requested_items,
+                        }
+                    }));
+                    outcomes.push(if recorded.baseline_established {
+                        CollectionOutcome::BaselineEstablished { region_id }
+                    } else {
+                        CollectionOutcome::Complete {
+                            region_id,
+                            observed_contracts,
+                        }
+                    });
+                }
                 Err(error) => {
                     let detail = error.to_string();
                     let regional_retry_after = error.retry_after();
@@ -739,9 +1094,10 @@ impl ContractCollector {
                 }
             }
         }
+        self.notify(&events).await?;
         Ok(CollectionReport {
             regions: outcomes,
-            events: Vec::new(),
+            events,
             retry_after,
         })
     }
@@ -749,7 +1105,7 @@ impl ContractCollector {
     async fn collect_region(
         &self,
         region_id: i64,
-    ) -> Result<(bool, usize), ContractCollectionError> {
+    ) -> Result<RecordComplete, ContractCollectionError> {
         let first_page = self.contract_page(region_id, 1).await?;
         let expected_pages = first_page
             .1
@@ -814,13 +1170,53 @@ impl ContractCollector {
                 manifest_hash,
             });
         }
-        let count = observed.len();
-        Ok((
-            self.store
-                .record_complete(region_id, expected_pages, &observed)
-                .await?,
-            count,
-        ))
+        Ok(self
+            .store
+            .record_complete(region_id, expected_pages, &observed)
+            .await?)
+    }
+
+    async fn notify(&self, events: &[ContractEvent]) -> Result<(), ContractCollectionError> {
+        let Some(notifications) = &self.notifications else {
+            return Ok(());
+        };
+        let subscriptions = self.store.all_contract_subscriptions().await?;
+        for event in events {
+            for subscription in &subscriptions {
+                let action = contract_event_action(subscription, &event.kind);
+                if matches!(action, ContractEventAction::Ignore) {
+                    continue;
+                }
+                let matched_items =
+                    matching_items(subscription, event, &*notifications.ship_groups).await;
+                if matched_items.is_empty() {
+                    continue;
+                }
+                let message =
+                    contract_notification_message(event, &subscription.filter, &matched_items);
+                let ping = matches!(action, ContractEventAction::PostAndPing);
+                let Some(prepared) = self
+                    .store
+                    .prepare_delivery(subscription, event, &message, ping)
+                    .await?
+                else {
+                    continue;
+                };
+                match notifications.delivery.send(prepared.clone()).await {
+                    Ok(message_id) => {
+                        self.store
+                            .mark_delivery_sent(prepared.delivery_id, &message_id)
+                            .await?
+                    }
+                    Err(error) => warn!(
+                        subscription_id = %subscription.id,
+                        contract_id = event.contract.contract_id,
+                        "contract delivery remains prepared after Discord failure: {error}"
+                    ),
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn regions(&self) -> Result<Vec<i64>, ContractCollectionError> {
@@ -973,6 +1369,117 @@ impl ContractCollector {
     }
 }
 
+fn contract_event_action(
+    subscription: &ContractSubscription,
+    event_kind: &ContractEventKind,
+) -> ContractEventAction {
+    match event_kind {
+        ContractEventKind::Listed => subscription.event_actions.listed,
+    }
+}
+
+async fn matching_items(
+    subscription: &ContractSubscription,
+    event: &ContractEvent,
+    ship_groups: &dyn ShipGroupResolver,
+) -> Vec<PublicContractItem> {
+    if !subscription.filter.events.contains(&event.kind) {
+        return Vec::new();
+    }
+    let items = match subscription.filter.item_direction {
+        ContractItemDirection::Offered => &event.offered_items,
+        ContractItemDirection::Requested => &event.requested_items,
+    };
+    let mut matches = Vec::new();
+    for item in items {
+        let type_matches = subscription.filter.type_ids.contains(&item.type_id);
+        let group_matches = if subscription.filter.ship_group_ids.is_empty() {
+            false
+        } else {
+            ship_groups
+                .group_for_type(item.type_id)
+                .await
+                .map(|group_id| subscription.filter.ship_group_ids.contains(&group_id))
+                .unwrap_or(false)
+        };
+        if type_matches || group_matches {
+            matches.push(item.clone());
+        }
+    }
+    matches
+}
+
+fn contract_notification_message(
+    event: &ContractEvent,
+    filter: &ContractFilter,
+    matched_items: &[PublicContractItem],
+) -> ContractNotificationMessage {
+    let item_label = matched_items
+        .iter()
+        .map(|item| format!("Type {} ×{}", item.type_id, item.quantity))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (isk_label, isk) = match filter.item_direction {
+        ContractItemDirection::Offered => ("Requested ISK", event.contract.price),
+        ContractItemDirection::Requested => ("Offered ISK", event.contract.reward),
+    };
+    let direction = match filter.item_direction {
+        ContractItemDirection::Offered => "Offered Item",
+        ContractItemDirection::Requested => "Requested Item",
+    };
+    let location_id = event.contract.start_location_id;
+    ContractNotificationMessage {
+        title: "Public contract listed".to_string(),
+        description: event
+            .contract
+            .title
+            .as_deref()
+            .filter(|title| !title.is_empty())
+            .map(sanitize_discord_text),
+        fields: vec![
+            ContractEmbedField {
+                name: "Event".to_string(),
+                value: "Listed".to_string(),
+                inline: true,
+            },
+            ContractEmbedField {
+                name: direction.to_string(),
+                value: item_label,
+                inline: false,
+            },
+            ContractEmbedField {
+                name: isk_label.to_string(),
+                value: format!("{isk:.2} ISK"),
+                inline: true,
+            },
+            ContractEmbedField {
+                name: "Observed Location".to_string(),
+                value: format!("Location ID {location_id}"),
+                inline: true,
+            },
+            ContractEmbedField {
+                name: "Issuer".to_string(),
+                value: event.contract.issuer_id.to_string(),
+                inline: true,
+            },
+            ContractEmbedField {
+                name: "Contract ID".to_string(),
+                value: event.contract.contract_id.to_string(),
+                inline: true,
+            },
+            ContractEmbedField {
+                name: "Contract Address".to_string(),
+                value: format!("contract:0//{}", event.contract.contract_id),
+                inline: false,
+            },
+        ],
+    }
+}
+
+pub fn sanitize_discord_text(value: &str) -> String {
+    value.replace('@', "@\u{200b}")
+}
+
 fn merge_cache_metadata(cached: &CacheMetadata, response: CacheMetadata) -> CacheMetadata {
     CacheMetadata {
         etag: response.etag.or_else(|| cached.etag.clone()),
@@ -1006,12 +1513,46 @@ pub async fn run_contract_collection_loop(
     interval: Duration,
     esi_timeout: Duration,
 ) {
+    run_contract_collection_loop_inner(database_url, interval, esi_timeout, None).await;
+}
+
+pub async fn run_contract_collection_loop_with_notifications(
+    database_url: String,
+    interval: Duration,
+    esi_timeout: Duration,
+    ship_groups: Arc<dyn ShipGroupResolver>,
+    delivery: Arc<dyn ContractDelivery>,
+) {
+    run_contract_collection_loop_inner(
+        database_url,
+        interval,
+        esi_timeout,
+        Some(ContractNotifications {
+            ship_groups,
+            delivery,
+        }),
+    )
+    .await;
+}
+
+async fn run_contract_collection_loop_inner(
+    database_url: String,
+    interval: Duration,
+    esi_timeout: Duration,
+    notifications: Option<ContractNotifications>,
+) {
     loop {
         let mut delay = interval;
         match ContractCollectionStore::connect(&database_url).await {
             Ok(store) => {
                 let esi = match HttpPublicContractEsi::new(esi_timeout) { Ok(esi) => Arc::new(esi), Err(error) => { warn!("contract collection HTTP client unavailable: {error}"); tokio::time::sleep(interval).await; continue; } };
-                let collector = ContractCollector::new(store, esi);
+                let mut collector = ContractCollector::new(store, esi);
+                if let Some(notifications) = &notifications {
+                    collector = collector.with_notifications(
+                        notifications.ship_groups.clone(),
+                        notifications.delivery.clone(),
+                    );
+                }
                 match collector.collect_cycle().await {
                     Ok(report) => {
                         delay = collection_retry_delay(interval, report.retry_after);
