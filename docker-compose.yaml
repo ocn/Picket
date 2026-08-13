@@ -34,9 +34,6 @@ services:
       CONTRACT_COLLECTION_INTERVAL_SECS: ${CONTRACT_COLLECTION_INTERVAL_SECS:-300}
     volumes:
       - ./config:/app/config:delegated
-    depends_on:
-      postgres:
-        condition: service_healthy
 
 volumes:
   contract-postgres:

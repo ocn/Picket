@@ -2,17 +2,116 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use killbot_rust::contract_intelligence::{
     CacheMetadata, CollectionOutcome, ContractCollectionStore, ContractCollector, EsiError,
-    EsiResponse, PublicContract, PublicContractEsi, PublicContractItem,
+    EsiResponse, HttpPublicContractEsi, PublicContract, PublicContractEsi, PublicContractItem,
 };
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::thread::JoinHandle;
 use std::time::Duration;
 use url::Url;
 
 static DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct OneShotHttpServer {
+    base_url: String,
+    handle: JoinHandle<()>,
+}
+
+struct WireReply {
+    status: u16,
+    headers: Vec<(&'static str, &'static str)>,
+    body: &'static str,
+}
+
+struct SequenceHttpServer {
+    base_url: String,
+    requests: Arc<StdMutex<Vec<String>>>,
+    handle: JoinHandle<()>,
+}
+
+impl SequenceHttpServer {
+    fn start(replies: Vec<WireReply>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ESI HTTP listener");
+        let address = listener.local_addr().expect("fake ESI listener address");
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let recorded_requests = requests.clone();
+        let handle = std::thread::spawn(move || {
+            for reply in replies {
+                let (mut stream, _) = listener.accept().expect("accept fake ESI HTTP request");
+                let mut request = [0_u8; 4096];
+                let length = stream
+                    .read(&mut request)
+                    .expect("read fake ESI HTTP request");
+                recorded_requests
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request[..length]).into_owned());
+                let response = format!(
+                    "HTTP/1.1 {} test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
+                    reply.status,
+                    reply.body.len(),
+                    reply
+                        .headers
+                        .iter()
+                        .map(|(name, value)| format!("{name}: {value}\r\n"))
+                        .collect::<String>(),
+                    reply.body,
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write fake ESI HTTP response");
+            }
+        });
+        Self {
+            base_url: format!("http://{address}/"),
+            requests,
+            handle,
+        }
+    }
+
+    fn finish(self) {
+        self.handle.join().expect("join fake ESI HTTP listener");
+    }
+}
+
+impl OneShotHttpServer {
+    fn start(status: u16, headers: &[(&str, &str)], body: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ESI HTTP listener");
+        let address = listener.local_addr().expect("fake ESI listener address");
+        let response = format!(
+            "HTTP/1.1 {status} test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
+            body.len(),
+            headers
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}\r\n"))
+                .collect::<String>(),
+            body,
+        );
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fake ESI HTTP request");
+            let mut request = [0_u8; 4096];
+            let _ = stream
+                .read(&mut request)
+                .expect("read fake ESI HTTP request");
+            stream
+                .write_all(response.as_bytes())
+                .expect("write fake ESI HTTP response");
+        });
+        Self {
+            base_url: format!("http://{address}/"),
+            handle,
+        }
+    }
+
+    fn finish(self) {
+        self.handle.join().expect("join fake ESI HTTP listener");
+    }
+}
 
 struct TemporaryDatabase {
     admin_url: String,
@@ -23,7 +122,7 @@ struct TemporaryDatabase {
 impl TemporaryDatabase {
     async fn new() -> Self {
         let admin_url =
-            std::env::var("CONTRACT_TEST_DATABASE_URL").expect("test database URL is present");
+            std::env::var("CONTRACT_TEST_DATABASE_URL").expect("CONTRACT_TEST_DATABASE_URL must point to a PostgreSQL instance for contract integration tests (for example postgres://killbot_contracts:killbot_contracts@127.0.0.1:5433/killbot_contracts)");
         let sequence = DATABASE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let database_name = format!(
             "contract_intelligence_test_{}_{}",
@@ -85,13 +184,23 @@ struct ConditionalEsi {
     received_etags: StdMutex<Vec<Option<String>>>,
 }
 
+struct StopsAfterRateBoundaryEsi {
+    retry_after: chrono::DateTime<Utc>,
+    calls: StdMutex<Vec<String>>,
+}
+
 fn expiring_metadata(etag: &str, expected_pages: Option<u32>) -> CacheMetadata {
     CacheMetadata {
         etag: Some(etag.to_string()),
         expires_at: Some(Utc::now()),
+        last_modified: None,
         expected_pages,
         error_limit_remain: None,
         error_limit_reset: None,
+        rate_limit_group: None,
+        rate_limit_limit: None,
+        rate_limit_remaining: None,
+        rate_limit_used: None,
         retry_after: None,
     }
 }
@@ -177,10 +286,48 @@ impl PublicContractEsi for FakeEsi {
     }
 }
 
+#[async_trait]
+impl PublicContractEsi for StopsAfterRateBoundaryEsi {
+    async fn regions(&self, _etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.calls.lock().unwrap().push("regions".to_string());
+        Ok(EsiResponse::fresh(
+            vec![10_000_002, 10_000_003],
+            CacheMetadata::cached_for_seconds(0),
+        ))
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        _page: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.calls.lock().unwrap().push(format!("page:{region_id}"));
+        Ok(EsiResponse::fresh(
+            vec![item_exchange_contract(region_id)],
+            CacheMetadata::page_cached_for_seconds(1, 0),
+        ))
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("items:{contract_id}"));
+        Err(EsiError::retryable("rate limited", Some(self.retry_after)))
+    }
+}
+
 fn item_exchange_contract(contract_id: i64) -> PublicContract {
     PublicContract {
         contract_id,
         availability: Some("public".to_string()),
+        buyout: None,
+        collateral: Some(0.0),
         contract_type: "item_exchange".to_string(),
         date_expired: Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0).unwrap(),
         date_issued: Utc.with_ymd_and_hms(2026, 8, 13, 12, 0, 0).unwrap(),
@@ -197,10 +344,6 @@ fn item_exchange_contract(contract_id: i64) -> PublicContract {
     }
 }
 
-fn contract_test_database_is_configured() -> bool {
-    std::env::var("CONTRACT_TEST_DATABASE_URL").is_ok()
-}
-
 fn expiring_page(expected_pages: u32) -> CacheMetadata {
     CacheMetadata::page_cached_for_seconds(expected_pages, 0)
 }
@@ -210,11 +353,260 @@ fn expiring_cache() -> CacheMetadata {
 }
 
 #[tokio::test]
+async fn http_esi_accepts_a_public_contract_when_false_for_corporation_is_omitted() {
+    let server = OneShotHttpServer::start(
+        200,
+        &[("X-Pages", "1"), ("Cache-Control", "max-age=60")],
+        r#"[{"availability":"public","buyout":2500000000.0,"collateral":750000000.0,"contract_id":44,"date_expired":"2026-08-14T12:00:00Z","date_issued":"2026-08-13T12:00:00Z","days_to_complete":0,"issuer_corporation_id":98000001,"issuer_id":90000001,"price":1500000000.0,"reward":0.0,"start_location_id":60003760,"type":"item_exchange","volume":115000.0}]"#,
+    );
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("construct HTTP ESI client");
+
+    let response = esi
+        .public_contracts_page(10_000_002, 1, None)
+        .await
+        .expect("decode public contract HTTP response");
+
+    let contract = response.value.expect("response body").remove(0);
+    assert!(!contract.for_corporation);
+    assert_eq!(contract.buyout, Some(2_500_000_000.0));
+    assert_eq!(contract.collateral, Some(750_000_000.0));
+    server.finish();
+}
+
+#[tokio::test]
+async fn http_esi_preserves_public_blueprint_item_facts() {
+    let server = OneShotHttpServer::start(
+        200,
+        &[("Cache-Control", "max-age=60")],
+        r#"[{"is_blueprint_copy":true,"is_included":true,"item_id":1001,"material_efficiency":10,"quantity":1,"record_id":1,"runs":3,"time_efficiency":20,"type_id":587}]"#,
+    );
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("construct HTTP ESI client");
+
+    let response = esi
+        .public_contract_items(44, None)
+        .await
+        .expect("decode public contract item HTTP response");
+
+    let item = response.value.expect("response body").remove(0);
+    assert_eq!(item.is_blueprint_copy, Some(true));
+    assert_eq!(item.material_efficiency, Some(10));
+    assert_eq!(item.runs, Some(3));
+    assert_eq!(item.time_efficiency, Some(20));
+    server.finish();
+}
+
+#[tokio::test]
+async fn wire_304_responses_preserve_last_modified_for_paginated_snapshot_validation() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let page_one = r#"[{"collateral":0.0,"contract_id":44,"date_expired":"2026-08-14T12:00:00Z","date_issued":"2026-08-13T12:00:00Z","days_to_complete":0,"issuer_corporation_id":98000001,"issuer_id":90000001,"price":1500000000.0,"reward":0.0,"start_location_id":60003760,"type":"item_exchange","volume":115000.0}]"#;
+    let page_two = r#"[{"collateral":0.0,"contract_id":45,"date_expired":"2026-08-14T12:00:00Z","date_issued":"2026-08-13T12:00:00Z","days_to_complete":0,"issuer_corporation_id":98000001,"issuer_id":90000001,"price":1500000000.0,"reward":0.0,"start_location_id":60003760,"type":"item_exchange","volume":115000.0}]"#;
+    let server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=0"), ("ETag", "\"regions-v1\"")],
+            body: "[10000002]",
+        },
+        WireReply {
+            status: 200,
+            headers: vec![
+                ("Cache-Control", "max-age=0"),
+                ("ETag", "\"page-one-v1\""),
+                ("Last-Modified", "Thu, 13 Aug 2026 12:00:00 GMT"),
+                ("X-Pages", "2"),
+            ],
+            body: page_one,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![
+                ("Cache-Control", "max-age=0"),
+                ("ETag", "\"page-two-v1\""),
+                ("Last-Modified", "Thu, 13 Aug 2026 12:00:00 GMT"),
+                ("X-Pages", "2"),
+            ],
+            body: page_two,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=0"), ("ETag", "\"items-44-v1\"")],
+            body: "[]",
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=0"), ("ETag", "\"items-45-v1\"")],
+            body: "[]",
+        },
+        WireReply {
+            status: 304,
+            headers: vec![("Cache-Control", "max-age=0")],
+            body: "",
+        },
+        WireReply {
+            status: 304,
+            headers: vec![("Cache-Control", "max-age=0")],
+            body: "",
+        },
+        WireReply {
+            status: 200,
+            headers: vec![
+                ("Cache-Control", "max-age=0"),
+                ("ETag", "\"page-two-v2\""),
+                ("Last-Modified", "Thu, 13 Aug 2026 12:00:00 GMT"),
+                ("X-Pages", "2"),
+            ],
+            body: page_two,
+        },
+        WireReply {
+            status: 304,
+            headers: vec![("Cache-Control", "max-age=0")],
+            body: "",
+        },
+        WireReply {
+            status: 304,
+            headers: vec![("Cache-Control", "max-age=0")],
+            body: "",
+        },
+    ]);
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("construct HTTP ESI client");
+    let collector = ContractCollector::new(store, Arc::new(esi));
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("first baseline cycle");
+    let report = collector
+        .collect_cycle()
+        .await
+        .expect("304 revalidation cycle");
+
+    assert_eq!(
+        report.regions,
+        vec![CollectionOutcome::Complete {
+            region_id: 10_000_002,
+            observed_contracts: 2,
+        }]
+    );
+    assert!(server.requests.lock().unwrap()[5]
+        .to_ascii_lowercase()
+        .contains("if-none-match: \"regions-v1\""));
+    server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn wire_rate_limit_headers_stop_the_collector_before_the_next_request() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let server = SequenceHttpServer::start(vec![WireReply {
+        status: 200,
+        headers: vec![
+            ("Cache-Control", "max-age=0"),
+            ("X-Ratelimit-Group", "public-contracts"),
+            ("X-Ratelimit-Limit", "150/15m"),
+            ("X-Ratelimit-Remaining", "0"),
+            ("X-Ratelimit-Used", "150"),
+        ],
+        body: "[10000002]",
+    }]);
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("construct HTTP ESI client");
+    let collector = ContractCollector::new(store, Arc::new(esi));
+
+    let report = collector
+        .collect_cycle()
+        .await
+        .expect("rate boundary creates an inconclusive regional observation");
+
+    assert!(report.retry_after.is_some());
+    assert!(matches!(
+        report.regions.as_slice(),
+        [CollectionOutcome::Inconclusive {
+            region_id: 10_000_002,
+            ..
+        }]
+    ));
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn wire_retry_after_and_esi_error_headers_pause_a_restarted_collector() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let server = SequenceHttpServer::start(vec![WireReply {
+        status: 429,
+        headers: vec![
+            ("Retry-After", "60"),
+            ("X-ESI-Error-Limit-Remain", "0"),
+            ("X-ESI-Error-Limit-Reset", "120"),
+        ],
+        body: "[]",
+    }]);
+    let esi = Arc::new(
+        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+            .expect("construct HTTP ESI client"),
+    );
+    let collector = ContractCollector::new(store, esi.clone());
+
+    let error = collector
+        .collect_cycle()
+        .await
+        .expect_err("retry-after response pauses the collector");
+    assert!(error.to_string().contains("429"));
+
+    let restarted_collector = ContractCollector::new(database.store().await, esi);
+    let error = restarted_collector
+        .collect_cycle()
+        .await
+        .expect_err("retry-after pause survives restart");
+    assert!(error.to_string().contains("persisted global ESI limiter"));
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn wire_420_error_limit_boundary_pauses_a_restarted_collector() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let server = SequenceHttpServer::start(vec![WireReply {
+        status: 420,
+        headers: vec![
+            ("X-ESI-Error-Limit-Remain", "0"),
+            ("X-ESI-Error-Limit-Reset", "60"),
+        ],
+        body: "[]",
+    }]);
+    let esi = Arc::new(
+        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+            .expect("construct HTTP ESI client"),
+    );
+    let collector = ContractCollector::new(store, esi.clone());
+
+    let error = collector
+        .collect_cycle()
+        .await
+        .expect_err("420 response pauses the collector");
+    assert!(error.to_string().contains("420"));
+
+    let restarted_collector = ContractCollector::new(database.store().await, esi);
+    let error = restarted_collector
+        .collect_cycle()
+        .await
+        .expect_err("420 error limit pause survives restart");
+    assert!(error.to_string().contains("persisted global ESI limiter"));
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn complete_first_observation_establishes_a_silent_regional_baseline() {
-    if !contract_test_database_is_configured() {
-        eprintln!("skipping: CONTRACT_TEST_DATABASE_URL is not configured");
-        return;
-    }
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let public_contract = item_exchange_contract(44);
@@ -244,6 +636,10 @@ async fn complete_first_observation_establishes_a_silent_regional_baseline() {
                         item_id: Some(1_001),
                         raw_quantity: None,
                         is_singleton: None,
+                        is_blueprint_copy: None,
+                        material_efficiency: None,
+                        runs: None,
+                        time_efficiency: None,
                     },
                     PublicContractItem {
                         record_id: 2,
@@ -253,6 +649,10 @@ async fn complete_first_observation_establishes_a_silent_regional_baseline() {
                         item_id: Some(1_002),
                         raw_quantity: None,
                         is_singleton: None,
+                        is_blueprint_copy: None,
+                        material_efficiency: None,
+                        runs: None,
+                        time_efficiency: None,
                     },
                 ],
                 CacheMetadata::cached_for_seconds(60),
@@ -294,10 +694,6 @@ async fn complete_first_observation_establishes_a_silent_regional_baseline() {
 
 #[tokio::test]
 async fn inconsistent_pagination_is_inconclusive_and_creates_no_presence_or_baseline() {
-    if !contract_test_database_is_configured() {
-        eprintln!("skipping: CONTRACT_TEST_DATABASE_URL is not configured");
-        return;
-    }
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let fake_esi = FakeEsi {
@@ -352,11 +748,65 @@ async fn inconsistent_pagination_is_inconclusive_and_creates_no_presence_or_base
 }
 
 #[tokio::test]
+async fn differing_last_modified_values_across_pages_are_inconclusive() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let first_page_metadata = CacheMetadata {
+        last_modified: Some(Utc.with_ymd_and_hms(2026, 8, 13, 12, 0, 0).unwrap()),
+        ..expiring_page(2)
+    };
+    let second_page_metadata = CacheMetadata {
+        last_modified: Some(Utc.with_ymd_and_hms(2026, 8, 13, 12, 1, 0).unwrap()),
+        ..expiring_page(2)
+    };
+    let fake_esi = FakeEsi {
+        regions: vec![10_000_002],
+        pages: HashMap::from([
+            (
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![item_exchange_contract(44)],
+                    first_page_metadata,
+                )),
+            ),
+            (
+                (10_000_002, 2),
+                Ok(EsiResponse::fresh(
+                    vec![item_exchange_contract(45)],
+                    second_page_metadata,
+                )),
+            ),
+        ]),
+        items: HashMap::new(),
+    };
+    let collector = ContractCollector::new(store.clone(), Arc::new(fake_esi));
+
+    let report = collector
+        .collect_cycle()
+        .await
+        .expect("inconclusive observation is retained");
+
+    assert!(matches!(
+        report.regions.as_slice(),
+        [CollectionOutcome::Inconclusive {
+            region_id: 10_000_002,
+            ..
+        }]
+    ));
+    assert_eq!(
+        store
+            .storage_counts()
+            .await
+            .expect("storage counts")
+            .presence_intervals,
+        0
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn duplicated_contract_ids_across_pages_are_inconclusive() {
-    if !contract_test_database_is_configured() {
-        eprintln!("skipping: CONTRACT_TEST_DATABASE_URL is not configured");
-        return;
-    }
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let fake_esi = FakeEsi {
@@ -407,10 +857,6 @@ async fn duplicated_contract_ids_across_pages_are_inconclusive() {
 
 #[tokio::test]
 async fn missing_manifest_is_inconclusive_and_does_not_create_a_presence_interval() {
-    if !contract_test_database_is_configured() {
-        eprintln!("skipping: CONTRACT_TEST_DATABASE_URL is not configured");
-        return;
-    }
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let fake_esi = FakeEsi {
@@ -452,10 +898,6 @@ async fn missing_manifest_is_inconclusive_and_does_not_create_a_presence_interva
 
 #[tokio::test]
 async fn esi_retry_boundaries_are_reported_for_the_next_contract_collection_cycle() {
-    if !contract_test_database_is_configured() {
-        eprintln!("skipping: CONTRACT_TEST_DATABASE_URL is not configured");
-        return;
-    }
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let retry_after = Utc::now() + chrono::Duration::seconds(30);
@@ -485,11 +927,43 @@ async fn esi_retry_boundaries_are_reported_for_the_next_contract_collection_cycl
 }
 
 #[tokio::test]
+async fn a_rate_boundary_stops_follow_on_requests_and_persists_the_pause() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let retry_after = Utc::now() + chrono::Duration::seconds(30);
+    let esi = Arc::new(StopsAfterRateBoundaryEsi {
+        retry_after,
+        calls: StdMutex::new(Vec::new()),
+    });
+    let collector = ContractCollector::new(store, esi.clone());
+
+    let report = collector
+        .collect_cycle()
+        .await
+        .expect("first region is retained as inconclusive");
+
+    assert_eq!(report.retry_after, Some(retry_after));
+    assert_eq!(
+        esi.calls.lock().unwrap().as_slice(),
+        ["regions", "page:10000002", "items:10000002"]
+    );
+
+    let restarted_collector = ContractCollector::new(database.store().await, esi.clone());
+    let error = restarted_collector
+        .collect_cycle()
+        .await
+        .expect_err("persisted limiter boundary blocks a restarted collector");
+    assert!(error.to_string().contains("persisted global ESI limiter"));
+    assert_eq!(
+        esi.calls.lock().unwrap().as_slice(),
+        ["regions", "page:10000002", "items:10000002"]
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn unchanged_contracts_reuse_facts_and_manifests_while_extending_one_presence_interval() {
-    if !contract_test_database_is_configured() {
-        eprintln!("skipping: CONTRACT_TEST_DATABASE_URL is not configured");
-        return;
-    }
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let fake_esi = FakeEsi {
@@ -512,6 +986,10 @@ async fn unchanged_contracts_reuse_facts_and_manifests_while_extending_one_prese
                     item_id: Some(1_001),
                     raw_quantity: None,
                     is_singleton: None,
+                    is_blueprint_copy: None,
+                    material_efficiency: None,
+                    runs: None,
+                    time_efficiency: None,
                 }],
                 expiring_cache(),
             )),
@@ -523,7 +1001,12 @@ async fn unchanged_contracts_reuse_facts_and_manifests_while_extending_one_prese
         .collect_cycle()
         .await
         .expect("first complete cycle");
-    tokio::time::sleep(Duration::from_millis(2)).await;
+    let first_last_observed_at = store
+        .region_contracts(10_000_002)
+        .await
+        .expect("first stored contract")[0]
+        .last_observed_at;
+    tokio::time::sleep(Duration::from_millis(5)).await;
     let report = collector
         .collect_cycle()
         .await
@@ -553,16 +1036,20 @@ async fn unchanged_contracts_reuse_facts_and_manifests_while_extending_one_prese
             presence_intervals: 1
         }
     );
+    assert!(
+        store
+            .region_contracts(10_000_002)
+            .await
+            .expect("second stored contract")[0]
+            .last_observed_at
+            > first_last_observed_at
+    );
 
     database.destroy().await;
 }
 
 #[tokio::test]
 async fn stale_cached_responses_are_conditionally_revalidated_without_losing_pagination_metadata() {
-    if !contract_test_database_is_configured() {
-        eprintln!("skipping: CONTRACT_TEST_DATABASE_URL is not configured");
-        return;
-    }
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let fake_esi = Arc::new(ConditionalEsi::default());

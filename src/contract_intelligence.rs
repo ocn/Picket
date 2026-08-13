@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use reqwest::header::{HeaderMap, ETAG, EXPIRES, IF_NONE_MATCH, RETRY_AFTER};
+use reqwest::header::{HeaderMap, ETAG, EXPIRES, IF_NONE_MATCH, LAST_MODIFIED, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,10 @@ pub struct PublicContract {
     pub contract_id: i64,
     #[serde(default)]
     pub availability: Option<String>,
+    #[serde(default)]
+    pub buyout: Option<f64>,
+    #[serde(default)]
+    pub collateral: Option<f64>,
     #[serde(rename = "type")]
     pub contract_type: String,
     pub date_expired: DateTime<Utc>,
@@ -28,6 +32,7 @@ pub struct PublicContract {
     pub days_to_complete: i32,
     #[serde(default)]
     pub end_location_id: Option<i64>,
+    #[serde(default)]
     pub for_corporation: bool,
     pub issuer_corporation_id: i64,
     pub issuer_id: i64,
@@ -62,15 +67,28 @@ pub struct PublicContractItem {
     pub raw_quantity: Option<i64>,
     #[serde(default)]
     pub is_singleton: Option<bool>,
+    #[serde(default)]
+    pub is_blueprint_copy: Option<bool>,
+    #[serde(default)]
+    pub material_efficiency: Option<i64>,
+    #[serde(default)]
+    pub runs: Option<i64>,
+    #[serde(default)]
+    pub time_efficiency: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CacheMetadata {
     pub etag: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
+    pub last_modified: Option<DateTime<Utc>>,
     pub expected_pages: Option<u32>,
     pub error_limit_remain: Option<i64>,
     pub error_limit_reset: Option<i64>,
+    pub rate_limit_group: Option<String>,
+    pub rate_limit_limit: Option<String>,
+    pub rate_limit_remaining: Option<i64>,
+    pub rate_limit_used: Option<i64>,
     pub retry_after: Option<DateTime<Utc>>,
 }
 
@@ -79,9 +97,14 @@ impl CacheMetadata {
         Self {
             etag: None,
             expires_at: Some(Utc::now() + ChronoDuration::seconds(seconds)),
+            last_modified: None,
             expected_pages: None,
             error_limit_remain: None,
             error_limit_reset: None,
+            rate_limit_group: None,
+            rate_limit_limit: None,
+            rate_limit_remaining: None,
+            rate_limit_used: None,
             retry_after: None,
         }
     }
@@ -103,6 +126,19 @@ impl CacheMetadata {
         self.retry_after
             .map(|retry_after| retry_after > Utc::now())
             .unwrap_or(false)
+    }
+
+    fn collection_pause_until(&self) -> Option<DateTime<Utc>> {
+        self.retry_after.or_else(|| {
+            (self.rate_limit_remaining.unwrap_or(1) <= 0)
+                .then(|| {
+                    self.rate_limit_limit
+                        .as_deref()
+                        .and_then(rate_limit_window_seconds)
+                })
+                .flatten()
+                .map(|seconds| Utc::now() + ChronoDuration::seconds(seconds))
+        })
     }
 }
 
@@ -135,6 +171,7 @@ impl<T> EsiResponse<T> {
 pub struct EsiError {
     message: String,
     retry_after: Option<DateTime<Utc>>,
+    metadata: CacheMetadata,
 }
 
 impl EsiError {
@@ -142,6 +179,18 @@ impl EsiError {
         Self {
             message: message.into(),
             retry_after,
+            metadata: CacheMetadata {
+                retry_after,
+                ..CacheMetadata::cached_for_seconds(0)
+            },
+        }
+    }
+
+    fn from_metadata(message: impl Into<String>, metadata: CacheMetadata) -> Self {
+        Self {
+            message: message.into(),
+            retry_after: metadata.retry_after,
+            metadata,
         }
     }
 }
@@ -223,9 +272,11 @@ impl HttpPublicContractEsi {
                     None
                 }
             });
-            return Err(EsiError::retryable(
+            let mut metadata = metadata;
+            metadata.retry_after = retry_after;
+            return Err(EsiError::from_metadata(
                 format!("ESI returned {}", response.status()),
-                retry_after,
+                metadata,
             ));
         }
         let value = response
@@ -272,9 +323,23 @@ fn cache_metadata(headers: &HeaderMap) -> CacheMetadata {
             .get(EXPIRES)
             .and_then(|value| value.to_str().ok())
             .and_then(parse_http_time),
+        last_modified: headers
+            .get(LAST_MODIFIED)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_http_time),
         expected_pages: header_number(headers, "x-pages").and_then(|value| value.try_into().ok()),
         error_limit_remain: header_number(headers, "x-esi-error-limit-remain"),
         error_limit_reset: header_number(headers, "x-esi-error-limit-reset"),
+        rate_limit_group: headers
+            .get("x-ratelimit-group")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        rate_limit_limit: headers
+            .get("x-ratelimit-limit")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        rate_limit_remaining: header_number(headers, "x-ratelimit-remaining"),
+        rate_limit_used: header_number(headers, "x-ratelimit-used"),
         retry_after: headers
             .get(RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
@@ -324,6 +389,19 @@ fn cache_max_age(value: &str) -> Option<i64> {
     })
 }
 
+fn rate_limit_window_seconds(value: &str) -> Option<i64> {
+    let (_, window) = value.split_once('/')?;
+    let (number, unit) = window.split_at(window.len().checked_sub(1)?);
+    let count = number.parse::<i64>().ok()?;
+    match unit {
+        "s" => Some(count),
+        "m" => count.checked_mul(60),
+        "h" => count.checked_mul(60 * 60),
+        "d" => count.checked_mul(60 * 60 * 24),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub struct ContractCollectionStore {
     pool: PgPool,
@@ -340,6 +418,8 @@ pub struct StoredContract {
     pub contract_id: i64,
     pub offered_items: Vec<PublicContractItem>,
     pub requested_items: Vec<PublicContractItem>,
+    pub first_observed_at: DateTime<Utc>,
+    pub last_observed_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -378,7 +458,7 @@ impl ContractCollectionStore {
         &self,
         region_id: i64,
     ) -> Result<Vec<StoredContract>, sqlx::Error> {
-        let rows = sqlx::query("SELECT presence_intervals.contract_id, contract_item_manifests.manifest FROM presence_intervals JOIN contract_item_manifests ON presence_intervals.manifest_hash = contract_item_manifests.manifest_hash WHERE presence_intervals.region_id = $1 ORDER BY presence_intervals.contract_id")
+        let rows = sqlx::query("SELECT presence_intervals.contract_id, presence_intervals.first_observed_at, presence_intervals.last_observed_at, contract_item_manifests.manifest FROM presence_intervals JOIN contract_item_manifests ON presence_intervals.manifest_hash = contract_item_manifests.manifest_hash WHERE presence_intervals.region_id = $1 ORDER BY presence_intervals.contract_id")
             .bind(region_id).fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|row| {
@@ -388,6 +468,8 @@ impl ContractCollectionStore {
                     contract_id: row.get("contract_id"),
                     offered_items: manifest.offered_items,
                     requested_items: manifest.requested_items,
+                    first_observed_at: row.get("first_observed_at"),
+                    last_observed_at: row.get("last_observed_at"),
                 })
             })
             .collect()
@@ -404,7 +486,7 @@ impl ContractCollectionStore {
     }
 
     async fn cache(&self, resource_key: &str) -> Result<Option<CachedResponse>, sqlx::Error> {
-        let row = sqlx::query("SELECT etag, expires_at, expected_pages, error_limit_remain, error_limit_reset, retry_after, response FROM esi_cache_metadata WHERE resource_key = $1")
+        let row = sqlx::query("SELECT etag, expires_at, last_modified, expected_pages, error_limit_remain, error_limit_reset, retry_after, response FROM esi_cache_metadata WHERE resource_key = $1")
             .bind(resource_key).fetch_optional(&self.pool).await?;
         Ok(row.and_then(|row| {
             row.get::<Option<Value>, _>("response")
@@ -413,11 +495,16 @@ impl ContractCollectionStore {
                     metadata: CacheMetadata {
                         etag: row.get("etag"),
                         expires_at: row.get("expires_at"),
+                        last_modified: row.get("last_modified"),
                         expected_pages: row
                             .get::<Option<i32>, _>("expected_pages")
                             .map(|value| value as u32),
                         error_limit_remain: row.get("error_limit_remain"),
                         error_limit_reset: row.get("error_limit_reset"),
+                        rate_limit_group: None,
+                        rate_limit_limit: None,
+                        rate_limit_remaining: None,
+                        rate_limit_used: None,
                         retry_after: row.get("retry_after"),
                     },
                 })
@@ -430,8 +517,31 @@ impl ContractCollectionStore {
         response: &Value,
         metadata: &CacheMetadata,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("INSERT INTO esi_cache_metadata (resource_key, etag, expires_at, expected_pages, error_limit_remain, error_limit_reset, retry_after, response, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now()) ON CONFLICT (resource_key) DO UPDATE SET etag = EXCLUDED.etag, expires_at = EXCLUDED.expires_at, expected_pages = EXCLUDED.expected_pages, error_limit_remain = EXCLUDED.error_limit_remain, error_limit_reset = EXCLUDED.error_limit_reset, retry_after = EXCLUDED.retry_after, response = EXCLUDED.response, updated_at = now()")
-            .bind(resource_key).bind(&metadata.etag).bind(metadata.expires_at).bind(metadata.expected_pages.map(|value| value as i32)).bind(metadata.error_limit_remain).bind(metadata.error_limit_reset).bind(metadata.retry_after).bind(response).execute(&self.pool).await?;
+        sqlx::query("INSERT INTO esi_cache_metadata (resource_key, etag, expires_at, last_modified, expected_pages, error_limit_remain, error_limit_reset, retry_after, response, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now()) ON CONFLICT (resource_key) DO UPDATE SET etag = EXCLUDED.etag, expires_at = EXCLUDED.expires_at, last_modified = EXCLUDED.last_modified, expected_pages = EXCLUDED.expected_pages, error_limit_remain = EXCLUDED.error_limit_remain, error_limit_reset = EXCLUDED.error_limit_reset, retry_after = EXCLUDED.retry_after, response = EXCLUDED.response, updated_at = now()")
+            .bind(resource_key).bind(&metadata.etag).bind(metadata.expires_at).bind(metadata.last_modified).bind(metadata.expected_pages.map(|value| value as i32)).bind(metadata.error_limit_remain).bind(metadata.error_limit_reset).bind(metadata.retry_after).bind(response).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn active_esi_limiter_deadline(&self) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT pause_until FROM esi_collection_limiter_state WHERE limiter_scope = TRUE AND pause_until > now()",
+        )
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    async fn record_esi_limiter(&self, metadata: &CacheMetadata) -> Result<(), sqlx::Error> {
+        let pause_until = metadata.collection_pause_until();
+        sqlx::query("INSERT INTO esi_collection_limiter_state (limiter_scope, pause_until, error_limit_remain, error_limit_reset, rate_limit_group, rate_limit_limit, rate_limit_remaining, rate_limit_used, updated_at) VALUES (TRUE,$1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT (limiter_scope) DO UPDATE SET pause_until = CASE WHEN EXCLUDED.pause_until IS NULL THEN esi_collection_limiter_state.pause_until WHEN esi_collection_limiter_state.pause_until IS NULL OR esi_collection_limiter_state.pause_until < EXCLUDED.pause_until THEN EXCLUDED.pause_until ELSE esi_collection_limiter_state.pause_until END, error_limit_remain = EXCLUDED.error_limit_remain, error_limit_reset = EXCLUDED.error_limit_reset, rate_limit_group = EXCLUDED.rate_limit_group, rate_limit_limit = EXCLUDED.rate_limit_limit, rate_limit_remaining = EXCLUDED.rate_limit_remaining, rate_limit_used = EXCLUDED.rate_limit_used, updated_at = now()")
+            .bind(pause_until)
+            .bind(metadata.error_limit_remain)
+            .bind(metadata.error_limit_reset)
+            .bind(&metadata.rate_limit_group)
+            .bind(&metadata.rate_limit_limit)
+            .bind(metadata.rate_limit_remaining)
+            .bind(metadata.rate_limit_used)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -585,6 +695,7 @@ impl ContractCollector {
     }
 
     pub async fn collect_cycle(&self) -> Result<CollectionReport, ContractCollectionError> {
+        self.ensure_esi_limiter_allows_requests().await?;
         let regions = match self.regions().await {
             Ok(regions) => regions,
             Err(error) => {
@@ -622,6 +733,9 @@ impl ContractCollector {
                         region_id,
                         reason: detail,
                     });
+                    if self.store.active_esi_limiter_deadline().await?.is_some() {
+                        break;
+                    }
                 }
             }
         }
@@ -647,11 +761,17 @@ impl ContractCollector {
             ));
         }
         let mut contracts = first_page.0;
+        let first_page_last_modified = first_page.1.last_modified;
         for page in 2..=expected_pages {
             let (mut page_contracts, metadata) = self.contract_page(region_id, page).await?;
             if metadata.expected_pages != Some(expected_pages) {
                 return Err(ContractCollectionError::Cache(format!(
                     "page {page} reported inconsistent X-Pages"
+                )));
+            }
+            if metadata.last_modified != first_page_last_modified {
+                return Err(ContractCollectionError::Cache(format!(
+                    "page {page} reported inconsistent Last-Modified"
                 )));
             }
             contracts.append(&mut page_contracts);
@@ -711,7 +831,10 @@ impl ContractCollector {
         let etag = cached
             .as_ref()
             .and_then(|cached| cached.metadata.etag.clone());
-        let response = self.esi.regions(etag.as_deref()).await?;
+        self.ensure_esi_limiter_allows_requests().await?;
+        let response = self
+            .record_esi_result(self.esi.regions(etag.as_deref()).await)
+            .await?;
         Ok(self.resolve_response("regions", cached, response).await?.0)
     }
 
@@ -728,9 +851,13 @@ impl ContractCollector {
         let etag = cached
             .as_ref()
             .and_then(|cached| cached.metadata.etag.clone());
+        self.ensure_esi_limiter_allows_requests().await?;
         let response = self
-            .esi
-            .public_contracts_page(region_id, page, etag.as_deref())
+            .record_esi_result(
+                self.esi
+                    .public_contracts_page(region_id, page, etag.as_deref())
+                    .await,
+            )
             .await?;
         self.resolve_response(&key, cached, response).await
     }
@@ -747,11 +874,42 @@ impl ContractCollector {
         let etag = cached
             .as_ref()
             .and_then(|cached| cached.metadata.etag.clone());
+        self.ensure_esi_limiter_allows_requests().await?;
         let response = self
-            .esi
-            .public_contract_items(contract_id, etag.as_deref())
+            .record_esi_result(
+                self.esi
+                    .public_contract_items(contract_id, etag.as_deref())
+                    .await,
+            )
             .await?;
         Ok(self.resolve_response(&key, cached, response).await?.0)
+    }
+
+    async fn ensure_esi_limiter_allows_requests(&self) -> Result<(), ContractCollectionError> {
+        if let Some(retry_after) = self.store.active_esi_limiter_deadline().await? {
+            return Err(EsiError::retryable(
+                "persisted global ESI limiter boundary remains active",
+                Some(retry_after),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn record_esi_result<T>(
+        &self,
+        result: Result<EsiResponse<T>, EsiError>,
+    ) -> Result<EsiResponse<T>, ContractCollectionError> {
+        match result {
+            Ok(response) => {
+                self.store.record_esi_limiter(&response.metadata).await?;
+                Ok(response)
+            }
+            Err(error) => {
+                self.store.record_esi_limiter(&error.metadata).await?;
+                Err(error.into())
+            }
+        }
     }
 
     fn fresh_cached<T>(
@@ -819,9 +977,20 @@ fn merge_cache_metadata(cached: &CacheMetadata, response: CacheMetadata) -> Cach
     CacheMetadata {
         etag: response.etag.or_else(|| cached.etag.clone()),
         expires_at: response.expires_at.or(cached.expires_at),
+        last_modified: response.last_modified.or(cached.last_modified),
         expected_pages: response.expected_pages.or(cached.expected_pages),
         error_limit_remain: response.error_limit_remain.or(cached.error_limit_remain),
         error_limit_reset: response.error_limit_reset.or(cached.error_limit_reset),
+        rate_limit_group: response
+            .rate_limit_group
+            .or_else(|| cached.rate_limit_group.clone()),
+        rate_limit_limit: response
+            .rate_limit_limit
+            .or_else(|| cached.rate_limit_limit.clone()),
+        rate_limit_remaining: response
+            .rate_limit_remaining
+            .or(cached.rate_limit_remaining),
+        rate_limit_used: response.rate_limit_used.or(cached.rate_limit_used),
         retry_after: response.retry_after.or(cached.retry_after),
     }
 }
