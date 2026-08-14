@@ -156,7 +156,7 @@ The contract feed follows the same category model as the kill feeds: global feed
 
 These feeds do not show every contract listing. They monitor public `item_exchange` contracts whose offered or requested ship items match the configured ship groups, lifecycle action, and, where configured, location and light-year range. The source is the public [EVE Swagger Interface (ESI)](https://developers.eveonline.com/docs/services/esi/overview/).
 
-They do not monitor private personal, corporation, or alliance contracts, wormhole regions, or contract types other than public item exchanges. Public ESI does not provide a counterparty for these records, so the feed does not infer or display one.
+They do not monitor private personal, corporation, or alliance contracts, or contract types other than public item exchanges. The collector scans the 114 region IDs returned by ESI and does not exclude wormhole regions. Public ESI does not provide a counterparty for these records, so the feed does not infer or display one.
 
 The lifecycle actions are:
 
@@ -176,7 +176,7 @@ The following are the three active feeds. The JSON is the current deployed confi
 
 #### Global supercaps
 
-Posts all lifecycle actions for public titan and supercarrier contracts in every monitored region. It does not ping.
+Posts all lifecycle actions for public titan and supercarrier contracts in every ESI region the collector scans. It does not ping.
 
 ```text
 /contract_subscribe id:supercap-global description:Global public titan and supercarrier contracts filter:{"root":{"and":[{"condition":{"event_kinds":["listed","sale_confirmed","purchase_confirmed","expired","closed_outcome_unknown"]}},{"or":[{"condition":{"ship_groups":{"ids":[30,659],"direction":"offered"}}},{"condition":{"ship_groups":{"ids":[30,659],"direction":"requested"}}}]}]}} event_actions:{"listed":"post","sale_confirmed":"post","purchase_confirmed":"post","expired":"post","closed_outcome_unknown":"post"}
@@ -184,7 +184,7 @@ Posts all lifecycle actions for public titan and supercarrier contracts in every
 
 #### Global capitals
 
-Posts all lifecycle actions for public contracts containing the configured capital ship groups in every monitored region. It does not ping.
+Posts all lifecycle actions for public contracts containing the configured capital ship groups in every ESI region the collector scans. It does not ping.
 
 ```text
 /contract_subscribe id:capital-global description:Global public capital contracts filter:{"root":{"and":[{"condition":{"event_kinds":["listed","sale_confirmed","purchase_confirmed","expired","closed_outcome_unknown"]}},{"or":[{"condition":{"ship_groups":{"ids":[4594,485,1538,547,883,902,513],"direction":"offered"}}},{"condition":{"ship_groups":{"ids":[4594,485,1538,547,883,902,513],"direction":"requested"}}}]}]}} event_actions:{"listed":"post","sale_confirmed":"post","purchase_confirmed":"post","expired":"post","closed_outcome_unknown":"post"}
