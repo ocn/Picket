@@ -28,7 +28,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{error, info, trace, warn};
 
-const SHIP_GROUP_PRIORITY: &[u32] = &[
+pub(crate) const SHIP_GROUP_PRIORITY: &[u32] = &[
     30,   // Titan
     659,  // Supercarrier
     4594, // Lancer
