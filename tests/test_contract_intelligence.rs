@@ -261,6 +261,13 @@ struct CountingContextEsi {
     context_calls: StdMutex<usize>,
 }
 
+struct ExhaustedWireManifestEsi {
+    http: HttpPublicContractEsi,
+    contracts: Vec<PublicContract>,
+    manifests: HashMap<i64, EsiResponse<Vec<PublicContractItem>>>,
+    unavailable_contract_id: i64,
+}
+
 #[derive(Default)]
 struct ConditionalEsi {
     received_etags: StdMutex<Vec<Option<String>>>,
@@ -383,6 +390,44 @@ impl PublicContractEsi for FakeEsi {
             .get(&contract_id)
             .expect("fake ESI manifest configured")
             .clone()
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for ExhaustedWireManifestEsi {
+    async fn regions(&self, _etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        Ok(EsiResponse::fresh(
+            vec![10_000_002],
+            CacheMetadata::cached_for_seconds(0),
+        ))
+    }
+
+    async fn public_contracts_page(
+        &self,
+        _region_id: i64,
+        _page: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        Ok(EsiResponse::fresh(
+            self.contracts.clone(),
+            CacheMetadata::page_cached_for_seconds(1, 0),
+        ))
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        if contract_id == self.unavailable_contract_id {
+            self.http.public_contract_items(contract_id, etag).await
+        } else {
+            Ok(self
+                .manifests
+                .get(&contract_id)
+                .expect("successful manifest configured")
+                .clone())
+        }
     }
 }
 
@@ -983,6 +1028,20 @@ fn cached_item_metadata(etag: &str, seconds: i64) -> CacheMetadata {
     CacheMetadata {
         etag: Some(etag.to_string()),
         ..CacheMetadata::cached_for_seconds(seconds)
+    }
+}
+
+fn regional_esi(
+    contracts: Vec<PublicContract>,
+    items: HashMap<i64, Result<EsiResponse<Vec<PublicContractItem>>, EsiError>>,
+) -> FakeEsi {
+    FakeEsi {
+        regions: vec![10_000_002],
+        pages: HashMap::from([(
+            (10_000_002, 1),
+            Ok(EsiResponse::fresh(contracts, expiring_page(1))),
+        )]),
+        items,
     }
 }
 
@@ -2962,6 +3021,325 @@ async fn wire_420_error_limit_boundary_pauses_a_restarted_collector() {
 }
 
 #[tokio::test]
+async fn exhausted_manifest_retries_defer_only_that_contract_and_preserve_the_baseline() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let first_contract = item_exchange_contract(44);
+    let pending_contract = item_exchange_contract(45);
+    let server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![("X-ESI-Error-Limit-Remain", "100")],
+            body: "",
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("X-ESI-Error-Limit-Remain", "100")],
+            body: "",
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("X-ESI-Error-Limit-Remain", "100")],
+            body: "",
+        },
+    ]);
+    let esi = ExhaustedWireManifestEsi {
+        http: HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+            .expect("construct HTTP ESI client"),
+        contracts: vec![first_contract.clone(), pending_contract.clone()],
+        manifests: HashMap::from([(
+            44,
+            EsiResponse::fresh(vec![offered_ship(1)], expiring_cache()),
+        )]),
+        unavailable_contract_id: 45,
+    };
+
+    let baseline = ContractCollector::new(store.clone(), Arc::new(esi))
+        .collect_cycle()
+        .await
+        .expect("one unavailable manifest does not invalidate a conclusive summary");
+    assert_eq!(
+        baseline.regions,
+        vec![CollectionOutcome::BaselineEstablished {
+            region_id: 10_000_002,
+        }]
+    );
+    assert!(baseline.events.is_empty());
+    assert_eq!(server.requests.lock().unwrap().len(), 3);
+    server.finish();
+    assert_eq!(
+        store
+            .region_contracts(10_000_002)
+            .await
+            .expect("resolved regional contracts")
+            .iter()
+            .map(|contract| contract.contract_id)
+            .collect::<Vec<_>>(),
+        vec![44]
+    );
+    let failures = store
+        .unresolved_collection_failures()
+        .await
+        .expect("scoped manifest failure");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].region_id, Some(10_000_002));
+    assert_eq!(failures[0].contract_id, Some(45));
+    assert_eq!(
+        failures[0].resource_key.as_deref(),
+        Some("contracts/public/items/45")
+    );
+    let validation_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect durable pending state");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM contract_manifest_pending")
+            .fetch_one(&validation_pool)
+            .await
+            .expect("count pending manifests"),
+        1
+    );
+
+    let recovered = ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(
+            vec![first_contract, pending_contract],
+            HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    45,
+                    Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                ),
+            ]),
+        )),
+    )
+    .collect_cycle()
+    .await
+    .expect("a restarted collector backfills the pending baseline manifest");
+    assert!(recovered.events.is_empty());
+    assert_eq!(
+        store
+            .region_contracts(10_000_002)
+            .await
+            .expect("backfilled regional contracts")
+            .iter()
+            .map(|contract| contract.contract_id)
+            .collect::<Vec<_>>(),
+        vec![44, 45]
+    );
+    assert!(store
+        .unresolved_collection_failures()
+        .await
+        .expect("resolved manifest failure")
+        .is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM contract_manifest_pending")
+            .fetch_one(&validation_pool)
+            .await
+            .expect("count recovered pending manifests"),
+        0
+    );
+    validation_pool.close().await;
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn new_contract_with_a_deferred_manifest_delivers_once_after_recovery() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let baseline_contract = item_exchange_contract(44);
+    let new_contract = item_exchange_contract(45);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(
+            vec![baseline_contract.clone()],
+            HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        )),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "deferred-listing",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist listing subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+
+    let deferred = ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(
+            vec![baseline_contract.clone(), new_contract.clone()],
+            HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (45, Err(EsiError::retryable("manifest unavailable", None))),
+            ]),
+        )),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .collect_cycle()
+    .await
+    .expect("new contract presence is complete while its manifest is deferred");
+    assert_eq!(
+        deferred.regions,
+        vec![CollectionOutcome::Complete {
+            region_id: 10_000_002,
+            observed_contracts: 2,
+        }]
+    );
+    assert!(deferred.events.is_empty());
+    assert!(delivery.sent.lock().unwrap().is_empty());
+    let failures = store
+        .unresolved_collection_failures()
+        .await
+        .expect("contract-scoped manifest failure");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].contract_id, Some(45));
+
+    let recovered = ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(
+            vec![baseline_contract.clone(), new_contract.clone()],
+            HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    45,
+                    Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                ),
+            ]),
+        )),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .collect_cycle()
+    .await
+    .expect("resolved manifest creates the deferred listing");
+    assert_eq!(recovered.events.len(), 1);
+    assert_eq!(recovered.events[0].contract.contract_id, 45);
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+
+    let repeated = ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(
+            vec![baseline_contract, new_contract],
+            HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    45,
+                    Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                ),
+            ]),
+        )),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .collect_cycle()
+    .await
+    .expect("resolved listing remains idempotent");
+    assert!(repeated.events.is_empty());
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn disappearing_pending_manifest_creates_no_event_or_resolution_case() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let baseline_contract = item_exchange_contract(44);
+    let disappearing_contract = item_exchange_contract(45);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(
+            vec![baseline_contract.clone()],
+            HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        )),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+
+    let deferred = ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(
+            vec![baseline_contract.clone(), disappearing_contract],
+            HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (45, Err(EsiError::retryable("manifest unavailable", None))),
+            ]),
+        )),
+    )
+    .collect_cycle()
+    .await
+    .expect("persist the pending manifest without an event");
+    assert_eq!(
+        deferred.regions,
+        vec![CollectionOutcome::Complete {
+            region_id: 10_000_002,
+            observed_contracts: 2,
+        }]
+    );
+    assert!(deferred.events.is_empty());
+
+    let disappeared = ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(
+            vec![baseline_contract],
+            HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        )),
+    )
+    .collect_cycle()
+    .await
+    .expect("disappearance without a manifest remains unclassified");
+    assert!(disappeared.events.is_empty());
+    assert!(store
+        .contract_resolution_records()
+        .await
+        .expect("resolution records")
+        .iter()
+        .all(|resolution| resolution.contract_id != 45));
+    assert!(store
+        .unresolved_collection_failures()
+        .await
+        .expect("resolved disappeared manifest failure")
+        .is_empty());
+
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn complete_first_observation_establishes_a_silent_regional_baseline() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
@@ -3212,7 +3590,7 @@ async fn duplicated_contract_ids_across_pages_are_inconclusive() {
 }
 
 #[tokio::test]
-async fn missing_manifest_is_inconclusive_and_does_not_create_a_presence_interval() {
+async fn missing_manifest_establishes_the_summary_baseline_without_a_manifest_presence() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let fake_esi = FakeEsi {
@@ -3231,23 +3609,29 @@ async fn missing_manifest_is_inconclusive_and_does_not_create_a_presence_interva
     let report = collector
         .collect_cycle()
         .await
-        .expect("inconclusive observation is retained");
+        .expect("summary observation remains conclusive");
 
-    assert!(matches!(
-        report.regions.as_slice(),
-        [CollectionOutcome::Inconclusive {
-            region_id: 10_000_002,
-            ..
-        }]
-    ));
     assert_eq!(
-        store
-            .storage_counts()
-            .await
-            .expect("storage counts")
-            .presence_intervals,
-        0
+        report.regions,
+        vec![CollectionOutcome::BaselineEstablished {
+            region_id: 10_000_002,
+        }]
     );
+    assert_eq!(
+        store.storage_counts().await.expect("storage counts"),
+        killbot_rust::contract_intelligence::StorageCounts {
+            contract_facts: 1,
+            manifests: 0,
+            presence_intervals: 0,
+        }
+    );
+    let failures = store
+        .unresolved_collection_failures()
+        .await
+        .expect("manifest failure");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].contract_id, Some(44));
+    assert_eq!(failures[0].failure_kind, "manifest_collection");
 
     database.destroy().await;
 }
@@ -3529,6 +3913,7 @@ async fn contract_migrations_apply_to_clean_and_already_current_databases() {
         .expect("connect to clean migrated database");
     for table in [
         "regional_collection_metadata",
+        "contract_manifest_pending",
         "contract_subscriptions",
         "contract_outbound_deliveries",
         "contract_resolution_cases",
@@ -5888,15 +6273,9 @@ async fn a_successful_regional_scan_resolves_its_prior_inconclusive_failure() {
             regions: vec![10_000_002],
             pages: HashMap::from([(
                 (10_000_002, 1),
-                Ok(EsiResponse::fresh(
-                    vec![item_exchange_contract(44)],
-                    expiring_page(1),
-                )),
+                Err(EsiError::retryable("temporary summary outage", None)),
             )]),
-            items: HashMap::from([(
-                44,
-                Err(EsiError::retryable("temporary manifest outage", None)),
-            )]),
+            items: HashMap::new(),
         }),
     )
     .collect_cycle()

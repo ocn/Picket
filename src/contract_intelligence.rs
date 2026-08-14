@@ -2680,7 +2680,9 @@ impl ContractCollectionStore {
         &self,
         region_id: i64,
         expected_pages: u32,
-        contracts: &[ObservedContract],
+        summaries: &[SummaryObservedContract],
+        resolved_contracts: &[ObservedContract],
+        manifest_failures: &[ManifestCollectionFailure],
         recovery_gap: ChronoDuration,
     ) -> Result<RecordComplete, sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
@@ -2698,23 +2700,119 @@ impl ContractCollectionStore {
             && last_complete_at.is_some_and(|last_complete_at| {
                 now.signed_duration_since(last_complete_at) > recovery_gap
             });
+        let resolved_by_id = resolved_contracts
+            .iter()
+            .map(|observed| (observed.contract.contract_id, observed))
+            .collect::<HashMap<_, _>>();
+        let previously_observed = sqlx::query_scalar::<_, i64>(
+            "SELECT DISTINCT contract_id FROM presence_intervals WHERE region_id = $1",
+        )
+        .bind(region_id)
+        .fetch_all(&mut *transaction)
+        .await?
+        .into_iter()
+        .collect::<HashSet<_>>();
+        let pending_by_id = sqlx::query("SELECT contract_id, first_observed_at, notify_listed_on_resolution FROM contract_manifest_pending WHERE region_id = $1")
+            .bind(region_id)
+            .fetch_all(&mut *transaction)
+            .await?
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<i64, _>("contract_id"),
+                    (
+                        row.get::<DateTime<Utc>, _>("first_observed_at"),
+                        row.get::<bool, _>("notify_listed_on_resolution"),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let mut newly_observed = Vec::new();
-        for observed in contracts {
-            let previously_observed = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM presence_intervals WHERE region_id = $1 AND contract_id = $2)")
-                .bind(region_id)
-                .bind(observed.contract.contract_id)
-                .fetch_one(&mut *transaction)
+        for summary in summaries {
+            let pending = pending_by_id.get(&summary.contract.contract_id);
+            let pending_first_observed_at = pending.map(|pending| pending.0);
+            let pending_notification = pending.is_some_and(|pending| pending.1);
+            let had_manifest = previously_observed.contains(&summary.contract.contract_id);
+            let was_observed = had_manifest || pending.is_some();
+            let facts = serde_json::to_value(&summary.contract).map_err(json_to_sqlx)?;
+            sqlx::query("INSERT INTO public_contract_facts (fact_hash, contract_id, facts) VALUES ($1,$2,$3) ON CONFLICT (fact_hash) DO NOTHING")
+                .bind(&summary.fact_hash)
+                .bind(summary.contract.contract_id)
+                .bind(facts)
+                .execute(&mut *transaction)
                 .await?;
-            if baseline_at.is_some() && !recovery_baseline && !previously_observed {
-                newly_observed.push(observed.clone());
+            if let Some(observed) = resolved_by_id.get(&summary.contract.contract_id) {
+                if baseline_at.is_some()
+                    && !recovery_baseline
+                    && (pending_notification || !was_observed)
+                {
+                    newly_observed.push((*observed).clone());
+                }
+                let manifest = serde_json::to_value(&observed.manifest).map_err(json_to_sqlx)?;
+                sqlx::query("INSERT INTO contract_item_manifests (manifest_hash, manifest) VALUES ($1,$2) ON CONFLICT (manifest_hash) DO NOTHING")
+                    .bind(&observed.manifest_hash)
+                    .bind(manifest)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query("INSERT INTO presence_intervals (region_id, contract_id, fact_hash, manifest_hash, first_observed_at, last_observed_at) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (region_id, contract_id, fact_hash, manifest_hash) DO UPDATE SET last_observed_at = EXCLUDED.last_observed_at")
+                    .bind(region_id)
+                    .bind(observed.contract.contract_id)
+                    .bind(&observed.fact_hash)
+                    .bind(&observed.manifest_hash)
+                    .bind(pending_first_observed_at.unwrap_or(now))
+                    .bind(now)
+                    .execute(&mut *transaction)
+                    .await?;
+                if pending.is_some() {
+                    sqlx::query("DELETE FROM contract_manifest_pending WHERE region_id = $1 AND contract_id = $2")
+                        .bind(region_id)
+                        .bind(observed.contract.contract_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    sqlx::query("UPDATE contract_collection_failures SET resolved_at = $3 WHERE region_id = $1 AND contract_id = $2 AND resource_key = $4 AND failure_kind = 'manifest_collection' AND resolved_at IS NULL AND classification IS NULL")
+                        .bind(region_id)
+                        .bind(observed.contract.contract_id)
+                        .bind(now)
+                        .bind(format!(
+                            "contracts/public/items/{}",
+                            observed.contract.contract_id
+                        ))
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+            } else {
+                let notify_listed_on_resolution = !recovery_baseline
+                    && (pending_notification || (baseline_at.is_some() && !was_observed));
+                sqlx::query("INSERT INTO contract_manifest_pending (region_id, contract_id, fact_hash, first_observed_at, last_observed_at, notify_listed_on_resolution) VALUES ($1,$2,$3,$4,$4,$5) ON CONFLICT (region_id, contract_id) DO UPDATE SET fact_hash = EXCLUDED.fact_hash, last_observed_at = EXCLUDED.last_observed_at, notify_listed_on_resolution = EXCLUDED.notify_listed_on_resolution")
+                    .bind(region_id)
+                    .bind(summary.contract.contract_id)
+                    .bind(&summary.fact_hash)
+                    .bind(now)
+                    .bind(notify_listed_on_resolution)
+                    .execute(&mut *transaction)
+                    .await?;
+                if had_manifest {
+                    sqlx::query("UPDATE presence_intervals SET last_observed_at = $3 WHERE ctid = (SELECT ctid FROM presence_intervals WHERE region_id = $1 AND contract_id = $2 ORDER BY last_observed_at DESC LIMIT 1)")
+                        .bind(region_id)
+                        .bind(summary.contract.contract_id)
+                        .bind(now)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
             }
-            let facts = serde_json::to_value(&observed.contract).map_err(json_to_sqlx)?;
-            let manifest = serde_json::to_value(&observed.manifest).map_err(json_to_sqlx)?;
-            sqlx::query("INSERT INTO public_contract_facts (fact_hash, contract_id, facts) VALUES ($1,$2,$3) ON CONFLICT (fact_hash) DO NOTHING").bind(&observed.fact_hash).bind(observed.contract.contract_id).bind(facts).execute(&mut *transaction).await?;
-            sqlx::query("INSERT INTO contract_item_manifests (manifest_hash, manifest) VALUES ($1,$2) ON CONFLICT (manifest_hash) DO NOTHING").bind(&observed.manifest_hash).bind(manifest).execute(&mut *transaction).await?;
-            sqlx::query("INSERT INTO presence_intervals (region_id, contract_id, fact_hash, manifest_hash, first_observed_at, last_observed_at) VALUES ($1,$2,$3,$4,$5,$5) ON CONFLICT (region_id, contract_id, fact_hash, manifest_hash) DO UPDATE SET last_observed_at = EXCLUDED.last_observed_at").bind(region_id).bind(observed.contract.contract_id).bind(&observed.fact_hash).bind(&observed.manifest_hash).bind(now).execute(&mut *transaction).await?;
         }
-        let observed_ids: Vec<_> = contracts
+        for failure in manifest_failures {
+            sqlx::query("INSERT INTO contract_collection_failures (region_id, contract_id, resource_key, observed_at, failure_kind, detail, retry_after) VALUES ($1,$2,$3,$4,'manifest_collection',$5,$6)")
+                .bind(region_id)
+                .bind(failure.contract_id)
+                .bind(format!("contracts/public/items/{}", failure.contract_id))
+                .bind(now)
+                .bind(sanitize_contract_failure_detail(&failure.detail))
+                .bind(failure.retry_after)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        let observed_ids: Vec<_> = summaries
             .iter()
             .map(|observed| observed.contract.contract_id)
             .collect();
@@ -2723,6 +2821,20 @@ impl ContractCollectionStore {
             .bind(&observed_ids)
             .execute(&mut *transaction)
             .await?;
+        let disappeared_pending = sqlx::query_scalar::<_, i64>("DELETE FROM contract_manifest_pending WHERE region_id = $1 AND NOT (contract_id = ANY($2)) RETURNING contract_id")
+            .bind(region_id)
+            .bind(&observed_ids)
+            .fetch_all(&mut *transaction)
+            .await?;
+        for contract_id in disappeared_pending {
+            sqlx::query("UPDATE contract_collection_failures SET resolved_at = $3 WHERE region_id = $1 AND contract_id = $2 AND resource_key = $4 AND failure_kind = 'manifest_collection' AND resolved_at IS NULL AND classification IS NULL")
+                .bind(region_id)
+                .bind(contract_id)
+                .bind(now)
+                .bind(format!("contracts/public/items/{contract_id}"))
+                .execute(&mut *transaction)
+                .await?;
+        }
         let last_observed = sqlx::query("SELECT DISTINCT ON (presence_intervals.contract_id) presence_intervals.contract_id, presence_intervals.last_observed_at, public_contract_facts.facts, contract_item_manifests.manifest FROM presence_intervals JOIN public_contract_facts ON public_contract_facts.fact_hash = presence_intervals.fact_hash JOIN contract_item_manifests ON contract_item_manifests.manifest_hash = presence_intervals.manifest_hash WHERE presence_intervals.region_id = $1 ORDER BY presence_intervals.contract_id, presence_intervals.last_observed_at DESC")
             .bind(region_id)
             .fetch_all(&mut *transaction)
@@ -2791,9 +2903,13 @@ impl ContractCollectionStore {
         Ok(RecordComplete {
             baseline_established: baseline_at.is_none(),
             recovery_baseline,
-            observed_contracts: contracts.len(),
+            observed_contracts: summaries.len(),
             newly_observed,
-            observed: contracts.to_vec(),
+            observed: resolved_contracts.to_vec(),
+            retry_after: manifest_failures
+                .iter()
+                .filter_map(|failure| failure.retry_after)
+                .max(),
         })
     }
 
@@ -3170,6 +3286,19 @@ struct ObservedContract {
 }
 
 #[derive(Clone, Debug)]
+struct SummaryObservedContract {
+    contract: PublicContract,
+    fact_hash: String,
+}
+
+#[derive(Clone, Debug)]
+struct ManifestCollectionFailure {
+    contract_id: i64,
+    detail: String,
+    retry_after: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug)]
 struct AwaitingContractResolution {
     region_id: i64,
     contract_id: i64,
@@ -3205,6 +3334,7 @@ struct RecordComplete {
     observed_contracts: usize,
     newly_observed: Vec<ObservedContract>,
     observed: Vec<ObservedContract>,
+    retry_after: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug)]
@@ -3425,6 +3555,7 @@ impl ContractCollector {
             match self.collect_region(region_id).await {
                 Ok(recorded) => {
                     let observed_contracts = recorded.observed_contracts;
+                    retry_after = std::cmp::max(retry_after, recorded.retry_after);
                     let consumed = self
                         .snapshot_observed_contracts(
                             region_id,
@@ -3456,6 +3587,9 @@ impl ContractCollector {
                             observed_contracts,
                         }
                     });
+                    if self.store.active_esi_limiter_deadline().await?.is_some() {
+                        break;
+                    }
                 }
                 Err(error) => {
                     let detail = error.to_string();
@@ -3533,34 +3667,66 @@ impl ContractCollector {
             .into_iter()
             .filter(PublicContract::is_public_item_exchange)
             .collect();
-        let mut observed = Vec::with_capacity(public_contracts.len());
-        for contract in public_contracts {
-            let mut items = self.contract_items(contract.contract_id).await?;
-            items.sort_by_key(|item| item.record_id);
-            let manifest = ItemManifest {
-                offered_items: items
-                    .iter()
-                    .filter(|item| item.is_included)
-                    .cloned()
-                    .collect(),
-                requested_items: items
-                    .iter()
-                    .filter(|item| !item.is_included)
-                    .cloned()
-                    .collect(),
-            };
-            let fact_hash = content_hash(&contract)?;
-            let manifest_hash = content_hash(&manifest)?;
-            observed.push(ObservedContract {
-                contract,
-                manifest,
-                fact_hash,
-                manifest_hash,
-            });
+        let summaries = public_contracts
+            .into_iter()
+            .map(|contract| {
+                Ok(SummaryObservedContract {
+                    fact_hash: content_hash(&contract)?,
+                    contract,
+                })
+            })
+            .collect::<Result<Vec<_>, ContractCollectionError>>()?;
+        let mut observed = Vec::with_capacity(summaries.len());
+        let mut manifest_failures = Vec::new();
+        let mut limiter_active = false;
+        for summary in &summaries {
+            if limiter_active {
+                continue;
+            }
+            match self.contract_items(summary.contract.contract_id).await {
+                Ok(mut items) => {
+                    items.sort_by_key(|item| item.record_id);
+                    let manifest = ItemManifest {
+                        offered_items: items
+                            .iter()
+                            .filter(|item| item.is_included)
+                            .cloned()
+                            .collect(),
+                        requested_items: items
+                            .iter()
+                            .filter(|item| !item.is_included)
+                            .cloned()
+                            .collect(),
+                    };
+                    let manifest_hash = content_hash(&manifest)?;
+                    observed.push(ObservedContract {
+                        contract: summary.contract.clone(),
+                        manifest,
+                        fact_hash: summary.fact_hash.clone(),
+                        manifest_hash,
+                    });
+                }
+                Err(error @ ContractCollectionError::Database(_)) => return Err(error),
+                Err(error) => {
+                    manifest_failures.push(ManifestCollectionFailure {
+                        contract_id: summary.contract.contract_id,
+                        detail: error.to_string(),
+                        retry_after: error.retry_after(),
+                    });
+                    limiter_active = self.store.active_esi_limiter_deadline().await?.is_some();
+                }
+            }
         }
         Ok(self
             .store
-            .record_complete(region_id, expected_pages, &observed, self.recovery_gap)
+            .record_complete(
+                region_id,
+                expected_pages,
+                &summaries,
+                &observed,
+                &manifest_failures,
+                self.recovery_gap,
+            )
             .await?)
     }
 
