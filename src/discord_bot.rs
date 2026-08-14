@@ -278,6 +278,12 @@ pub fn contract_notification_embed(message: &ContractNotificationMessage) -> Cre
     if let Some(description) = &message.description {
         embed.description(description);
     }
+    if let Some(thumbnail_url) = &message.thumbnail_url {
+        embed.thumbnail(thumbnail_url);
+    }
+    if let Some(footer) = &message.footer {
+        embed.footer(|builder| builder.text(footer));
+    }
     for field in &message.fields {
         embed.field(&field.name, &field.value, field.inline);
     }
@@ -1888,6 +1894,8 @@ mod tests {
                 value: "contract:0//45".to_string(),
                 inline: false,
             }],
+            thumbnail_url: None,
+            footer: None,
         });
 
         assert_eq!(embed.0["title"].as_str(), Some("Public contract listed"));

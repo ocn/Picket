@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{migrate::Migrator, postgres::PgPoolOptions, PgPool, Row};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
@@ -266,6 +266,20 @@ pub trait PublicContractEsi: Send + Sync {
         ))
     }
 
+    /// Public presentation data gathered while a contract remains observable.
+    /// Implementations that cannot resolve it safely return an empty context;
+    /// notification delivery must not depend on enrichment.
+    async fn observed_contract_embed_context(
+        &self,
+        _contract: &PublicContract,
+        _items: &[PublicContractItem],
+    ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
+        Ok(EsiResponse::fresh(
+            ContractEmbedContext::default(),
+            CacheMetadata::cached_for_seconds(0),
+        ))
+    }
+
     async fn observed_contract_solar_system(
         &self,
         contract: &PublicContract,
@@ -448,6 +462,56 @@ impl HttpPublicContractEsi {
             .await
             .map_err(|error| EsiError::retryable(error.to_string(), None))?;
         Ok(EsiResponse::fresh(value, metadata))
+    }
+
+    async fn post_json<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<EsiResponse<T>, EsiError> {
+        let response = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| EsiError::retryable(error.to_string(), None))?;
+        let mut metadata = cache_metadata(response.headers());
+        if !response.status().is_success() {
+            let status = response.status();
+            metadata.retry_after = metadata.retry_after.or_else(|| {
+                if matches!(status, StatusCode::TOO_MANY_REQUESTS) || status.as_u16() == 420 {
+                    metadata
+                        .error_limit_reset
+                        .map(|seconds| Utc::now() + ChronoDuration::seconds(seconds))
+                } else {
+                    None
+                }
+            });
+            return Err(EsiError::from_metadata(
+                format!("ESI returned {status}"),
+                Some(status),
+                metadata,
+            ));
+        }
+        let value = response
+            .json()
+            .await
+            .map_err(|error| EsiError::retryable(error.to_string(), None))?;
+        Ok(EsiResponse::fresh(value, metadata))
+    }
+
+    async fn optional_get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<Option<EsiResponse<T>>, EsiError> {
+        match self.get(path, None).await {
+            Ok(response) => Ok(Some(response)),
+            Err(error) if error.is_not_found() || error.status == Some(StatusCode::FORBIDDEN) => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn public_contract_items_probe(
@@ -655,6 +719,157 @@ impl PublicContractEsi for HttpPublicContractEsi {
         );
         Ok(EsiResponse::fresh(value, metadata))
     }
+
+    async fn observed_contract_embed_context(
+        &self,
+        contract: &PublicContract,
+        items: &[PublicContractItem],
+    ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
+        #[derive(Deserialize)]
+        struct Station {
+            name: String,
+            system_id: i64,
+        }
+        #[derive(Deserialize)]
+        struct Structure {
+            name: String,
+            solar_system_id: i64,
+        }
+        #[derive(Deserialize)]
+        struct SolarSystem {
+            name: String,
+            security_status: f64,
+            constellation_id: i64,
+        }
+        #[derive(Deserialize)]
+        struct Constellation {
+            region_id: i64,
+        }
+        #[derive(Deserialize)]
+        struct Region {
+            name: String,
+        }
+        #[derive(Deserialize)]
+        struct Affiliation {
+            alliance_id: Option<i64>,
+        }
+        #[derive(Deserialize)]
+        struct Name {
+            id: i64,
+            name: String,
+        }
+
+        let mut context = ContractEmbedContext {
+            observed_at: Some(Utc::now()),
+            ..ContractEmbedContext::default()
+        };
+        let mut metadata = CacheMetadata::cached_for_seconds(0);
+        let location_id = contract.start_location_id;
+        if let Ok(system_id) = u32::try_from(location_id) {
+            if (30_000_000..33_000_000).contains(&system_id) {
+                context.location.solar_system_id = Some(i64::from(system_id));
+            } else if let Some(response) = self
+                .optional_get::<Station>(&format!("universe/stations/{system_id}/"))
+                .await?
+            {
+                metadata = merge_cache_metadata(&metadata, response.metadata);
+                if let Some(station) = response.value {
+                    context.location.location_name = Some(station.name);
+                    context.location.location_kind = Some("Station".to_string());
+                    context.location.solar_system_id = Some(station.system_id);
+                }
+            }
+        }
+        if context.location.solar_system_id.is_none() {
+            if let Some(response) = self
+                .optional_get::<Structure>(&format!("universe/structures/{location_id}/"))
+                .await?
+            {
+                metadata = merge_cache_metadata(&metadata, response.metadata);
+                if let Some(structure) = response.value {
+                    context.location.location_name = Some(structure.name);
+                    context.location.location_kind = Some("Structure".to_string());
+                    context.location.solar_system_id = Some(structure.solar_system_id);
+                }
+            }
+        }
+        if let Some(system_id) = context.location.solar_system_id {
+            if let Some(response) = self
+                .optional_get::<SolarSystem>(&format!("universe/systems/{system_id}/"))
+                .await?
+            {
+                metadata = merge_cache_metadata(&metadata, response.metadata);
+                if let Some(system) = response.value {
+                    context.location.solar_system_name = Some(system.name);
+                    context.location.security_status = system
+                        .security_status
+                        .is_finite()
+                        .then_some(system.security_status);
+                    if let Some(response) = self
+                        .optional_get::<Constellation>(&format!(
+                            "universe/constellations/{}/",
+                            system.constellation_id
+                        ))
+                        .await?
+                    {
+                        metadata = merge_cache_metadata(&metadata, response.metadata);
+                        if let Some(constellation) = response.value {
+                            context.location.region_id = Some(constellation.region_id);
+                            if let Some(response) = self
+                                .optional_get::<Region>(&format!(
+                                    "universe/regions/{}/",
+                                    constellation.region_id
+                                ))
+                                .await?
+                            {
+                                metadata = merge_cache_metadata(&metadata, response.metadata);
+                                if let Some(region) = response.value {
+                                    context.location.region_name = Some(region.name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let affiliation = self
+            .post_json::<Vec<Affiliation>, _>("characters/affiliation/", &vec![contract.issuer_id])
+            .await?;
+        metadata = merge_cache_metadata(&metadata, affiliation.metadata);
+        context.issuer_alliance_id = affiliation
+            .value
+            .and_then(|affiliations| affiliations.into_iter().next())
+            .and_then(|affiliation| affiliation.alliance_id);
+
+        let mut names = BTreeSet::new();
+        names.insert(contract.issuer_id);
+        names.insert(contract.issuer_corporation_id);
+        if let Some(alliance_id) = context.issuer_alliance_id {
+            names.insert(alliance_id);
+        }
+        names.extend(items.iter().map(|item| item.type_id));
+        if !names.is_empty() {
+            let response = self
+                .post_json::<Vec<Name>, _>(
+                    "universe/names/",
+                    &names.into_iter().collect::<Vec<_>>(),
+                )
+                .await?;
+            metadata = merge_cache_metadata(&metadata, response.metadata);
+            for name in response.value.unwrap_or_default() {
+                if name.id == contract.issuer_id {
+                    context.issuer_character_name = Some(name.name);
+                } else if name.id == contract.issuer_corporation_id {
+                    context.issuer_corporation_name = Some(name.name);
+                } else if Some(name.id) == context.issuer_alliance_id {
+                    context.issuer_alliance_name = Some(name.name);
+                } else {
+                    context.item_names.insert(name.id, name.name);
+                }
+            }
+        }
+        Ok(EsiResponse::fresh(context, metadata))
+    }
 }
 
 fn cache_metadata(headers: &HeaderMap) -> CacheMetadata {
@@ -783,6 +998,20 @@ pub struct StorageCounts {
     pub contract_facts: i64,
     pub manifests: i64,
     pub presence_intervals: i64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ContractPartyHistory {
+    pub confirmed_sales: i64,
+    pub confirmed_purchases: i64,
+    pub unknown_closures: i64,
+    pub most_recent_confirmed: Option<MostRecentConfirmedContractEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MostRecentConfirmedContractEvent {
+    pub kind: ContractEventKind,
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1215,6 +1444,83 @@ pub struct ContractObservationContext {
     pub observed_affiliation_alliance_resolution: ContractContextResolution,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractLocationContext {
+    pub location_name: Option<String>,
+    pub location_kind: Option<String>,
+    pub solar_system_id: Option<i64>,
+    pub solar_system_name: Option<String>,
+    pub security_status: Option<f64>,
+    pub region_id: Option<i64>,
+    pub region_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractEmbedContext {
+    pub observed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub location: ContractLocationContext,
+    pub issuer_character_name: Option<String>,
+    pub issuer_corporation_name: Option<String>,
+    pub issuer_alliance_id: Option<i64>,
+    pub issuer_alliance_name: Option<String>,
+    #[serde(default)]
+    pub item_names: BTreeMap<i64, String>,
+}
+
+impl ContractEmbedContext {
+    fn merge_missing_from(&mut self, source: &Self) {
+        self.observed_at = self.observed_at.or(source.observed_at);
+        self.location.location_name = self
+            .location
+            .location_name
+            .clone()
+            .or_else(|| source.location.location_name.clone());
+        self.location.location_kind = self
+            .location
+            .location_kind
+            .clone()
+            .or_else(|| source.location.location_kind.clone());
+        self.location.solar_system_id = self
+            .location
+            .solar_system_id
+            .or(source.location.solar_system_id);
+        self.location.solar_system_name = self
+            .location
+            .solar_system_name
+            .clone()
+            .or_else(|| source.location.solar_system_name.clone());
+        self.location.security_status = self
+            .location
+            .security_status
+            .or(source.location.security_status);
+        self.location.region_id = self.location.region_id.or(source.location.region_id);
+        self.location.region_name = self
+            .location
+            .region_name
+            .clone()
+            .or_else(|| source.location.region_name.clone());
+        self.issuer_character_name = self
+            .issuer_character_name
+            .clone()
+            .or_else(|| source.issuer_character_name.clone());
+        self.issuer_corporation_name = self
+            .issuer_corporation_name
+            .clone()
+            .or_else(|| source.issuer_corporation_name.clone());
+        self.issuer_alliance_id = self.issuer_alliance_id.or(source.issuer_alliance_id);
+        self.issuer_alliance_name = self
+            .issuer_alliance_name
+            .clone()
+            .or_else(|| source.issuer_alliance_name.clone());
+        for (id, name) in &source.item_names {
+            self.item_names.entry(*id).or_insert_with(|| name.clone());
+        }
+    }
+}
+
 impl ContractObservationContext {
     fn normalize_resolutions(&mut self) {
         if self.solar_system_id.is_some() {
@@ -1264,6 +1570,10 @@ pub struct ContractNotificationMessage {
     pub title: String,
     pub description: Option<String>,
     pub fields: Vec<ContractEmbedField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1407,6 +1717,116 @@ impl ContractCollectionStore {
             manifests: row.get("manifests"),
             presence_intervals: row.get("presence_intervals"),
         })
+    }
+
+    pub async fn observed_embed_context(
+        &self,
+        region_id: i64,
+        contract_id: i64,
+    ) -> Result<Option<ContractEmbedContext>, sqlx::Error> {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT context FROM contract_observed_embed_contexts WHERE region_id = $1 AND contract_id = $2",
+        )
+        .bind(region_id)
+        .bind(contract_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|context| serde_json::from_value(context).map_err(json_to_sqlx))
+        .transpose()
+    }
+
+    async fn save_observed_embed_context(
+        &self,
+        region_id: i64,
+        contract_id: i64,
+        context: &ContractEmbedContext,
+    ) -> Result<(), sqlx::Error> {
+        let mut context = context.clone();
+        let observed_at = context.observed_at.unwrap_or_else(Utc::now);
+        context.observed_at = Some(observed_at);
+        sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,$4) ON CONFLICT (region_id, contract_id) DO NOTHING")
+            .bind(region_id)
+            .bind(contract_id)
+            .bind(serde_json::to_value(context).map_err(json_to_sqlx)?)
+            .bind(observed_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn contract_party_history(
+        &self,
+        issuer_id: i64,
+        issuer_corporation_id: i64,
+    ) -> Result<(ContractPartyHistory, ContractPartyHistory), sqlx::Error> {
+        let load = |identity_field: &'static str, identity: i64| async move {
+            let query = format!(
+                "SELECT \
+                    count(*) FILTER (WHERE state = 'acceptance_confirmed' \
+                        AND jsonb_array_length(COALESCE(manifest->'requested_items', '[]'::jsonb)) = 0 \
+                        AND COALESCE((contract->>'price')::double precision, 0) > 0) AS confirmed_sales, \
+                    count(*) FILTER (WHERE state = 'acceptance_confirmed' \
+                        AND jsonb_array_length(COALESCE(manifest->'offered_items', '[]'::jsonb)) = 0 \
+                        AND COALESCE((contract->>'reward')::double precision, 0) > 0) AS confirmed_purchases, \
+                    count(*) FILTER (WHERE state = 'closed_outcome_unknown') AS unknown_closures \
+                 FROM contract_resolution_cases \
+                 WHERE (contract->>'{identity_field}')::bigint = $1 \
+                   AND COALESCE(acceptance_evidence_at, updated_at) >= now() - interval '90 days' \
+                   AND state IN ('acceptance_confirmed', 'closed_outcome_unknown')"
+            );
+            let counts = sqlx::query(&query)
+                .bind(identity)
+                .fetch_one(&self.pool)
+                .await?;
+            let latest_query = format!(
+                "SELECT \
+                    CASE WHEN jsonb_array_length(COALESCE(manifest->'requested_items', '[]'::jsonb)) = 0 \
+                         AND COALESCE((contract->>'price')::double precision, 0) > 0 \
+                         THEN 'sale_confirmed' ELSE 'purchase_confirmed' END AS event_kind, \
+                    acceptance_evidence_at \
+                 FROM contract_resolution_cases \
+                 WHERE (contract->>'{identity_field}')::bigint = $1 \
+                   AND state = 'acceptance_confirmed' \
+                   AND acceptance_evidence_at >= now() - interval '90 days' \
+                   AND ( \
+                        (jsonb_array_length(COALESCE(manifest->'requested_items', '[]'::jsonb)) = 0 \
+                         AND COALESCE((contract->>'price')::double precision, 0) > 0) \
+                     OR (jsonb_array_length(COALESCE(manifest->'offered_items', '[]'::jsonb)) = 0 \
+                         AND COALESCE((contract->>'reward')::double precision, 0) > 0) \
+                   ) \
+                 ORDER BY acceptance_evidence_at DESC LIMIT 1"
+            );
+            let latest = sqlx::query(&latest_query)
+                .bind(identity)
+                .fetch_optional(&self.pool)
+                .await?
+                .map(|row| {
+                    let event_kind = match row.get::<String, _>("event_kind").as_str() {
+                        "sale_confirmed" => ContractEventKind::SaleConfirmed,
+                        "purchase_confirmed" => ContractEventKind::PurchaseConfirmed,
+                        value => {
+                            return Err(sqlx::Error::Protocol(format!(
+                                "unknown confirmed contract event kind: {value}"
+                            )))
+                        }
+                    };
+                    Ok(MostRecentConfirmedContractEvent {
+                        kind: event_kind,
+                        observed_at: row.get("acceptance_evidence_at"),
+                    })
+                })
+                .transpose()?;
+            Ok::<_, sqlx::Error>(ContractPartyHistory {
+                confirmed_sales: counts.get("confirmed_sales"),
+                confirmed_purchases: counts.get("confirmed_purchases"),
+                unknown_closures: counts.get("unknown_closures"),
+                most_recent_confirmed: latest,
+            })
+        };
+        Ok((
+            load("issuer_id", issuer_id).await?,
+            load("issuer_corporation_id", issuer_corporation_id).await?,
+        ))
     }
 
     pub async fn contract_resolution_records(
@@ -2134,6 +2554,8 @@ pub struct ContractEvent {
     pub context: ContractObservationContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceptance_evidence: Option<ContractAcceptanceEvidence>,
+    #[serde(default)]
+    pub embed_context: ContractEmbedContext,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -2226,6 +2648,7 @@ impl ContractCollector {
                             requested_items: observed.manifest.requested_items,
                             context: ContractObservationContext::default(),
                             acceptance_evidence: None,
+                            embed_context: ContractEmbedContext::default(),
                         }
                     }));
                     outcomes.push(if recorded.baseline_established {
@@ -2789,11 +3212,24 @@ impl ContractCollector {
             PrimaryDisplayItem::Resolved(item) => item,
             PrimaryDisplayItem::Deferred => return Ok(NotificationResolution::Deferred),
         };
-        let message = contract_notification_message(event, primary_item);
+        let event = self.enrich_event_for_embed(event).await?;
+        let (issuer_history, corporation_history) = self
+            .store
+            .contract_party_history(
+                event.contract.issuer_id,
+                event.contract.issuer_corporation_id,
+            )
+            .await?;
+        let message = contract_notification_message(
+            &event,
+            primary_item,
+            &issuer_history,
+            &corporation_history,
+        );
         let ping = matches!(action, ContractEventAction::PostAndPing);
         let Some(prepared) = self
             .store
-            .prepare_delivery(subscription, event, &message, ping)
+            .prepare_delivery(subscription, &event, &message, ping)
             .await?
         else {
             return Ok(NotificationResolution::Complete);
@@ -2811,6 +3247,68 @@ impl ContractCollector {
             ),
         }
         Ok(NotificationResolution::Complete)
+    }
+
+    async fn enrich_event_for_embed(
+        &self,
+        event: &ContractEvent,
+    ) -> Result<ContractEvent, ContractCollectionError> {
+        let mut enriched = event.clone();
+        let mut snapshot_obtained = false;
+        if let Some(snapshot) = self
+            .store
+            .observed_embed_context(event.region_id, event.contract.contract_id)
+            .await?
+        {
+            enriched.embed_context.merge_missing_from(&snapshot);
+            snapshot_obtained = true;
+        } else if matches!(event.kind, ContractEventKind::Listed) {
+            let items = contract_items_with_direction(event)
+                .map(|(_, item)| item.clone())
+                .collect::<Vec<_>>();
+            if self
+                .context_request_allowed(event.contract.contract_id)
+                .await?
+            {
+                if let Some(response) = self
+                    .record_context_esi_result(
+                        event.contract.contract_id,
+                        self.esi
+                            .observed_contract_embed_context(&event.contract, &items)
+                            .await,
+                    )
+                    .await?
+                {
+                    let context = response.value.unwrap_or_default();
+                    enriched.embed_context.merge_missing_from(&context);
+                    snapshot_obtained = true;
+                }
+            }
+        }
+        enriched.embed_context.location.solar_system_id = enriched
+            .embed_context
+            .location
+            .solar_system_id
+            .or(enriched.context.solar_system_id);
+        enriched.embed_context.location.security_status =
+            enriched.embed_context.location.security_status.or(enriched
+                .context
+                .security_status
+                .filter(|value| value.is_finite()));
+        enriched.embed_context.issuer_alliance_id = enriched
+            .embed_context
+            .issuer_alliance_id
+            .or(enriched.context.observed_affiliation_alliance_id);
+        if snapshot_obtained && matches!(event.kind, ContractEventKind::Listed) {
+            self.store
+                .save_observed_embed_context(
+                    event.region_id,
+                    event.contract.contract_id,
+                    &enriched.embed_context,
+                )
+                .await?;
+        }
+        Ok(enriched)
     }
 
     async fn regions(&self) -> Result<Vec<i64>, ContractCollectionError> {
@@ -3091,6 +3589,7 @@ fn acceptance_event(
             absence_observed_at,
             evidence_response_at,
         }),
+        embed_context: ContractEmbedContext::default(),
     })
 }
 
@@ -3112,6 +3611,7 @@ fn nonfinancial_terminal_event(
         requested_items: resolution.manifest.requested_items.clone(),
         context: ContractObservationContext::default(),
         acceptance_evidence: None,
+        embed_context: ContractEmbedContext::default(),
     })
 }
 
@@ -3739,8 +4239,9 @@ fn strategic_ship_group_priority(group_id: i64) -> usize {
 fn contract_notification_message(
     event: &ContractEvent,
     primary_item: Option<&PublicContractItem>,
+    issuer_history: &ContractPartyHistory,
+    corporation_history: &ContractPartyHistory,
 ) -> ContractNotificationMessage {
-    let location_id = event.contract.start_location_id;
     let event_label = match event.kind {
         ContractEventKind::Listed => "Listed",
         ContractEventKind::SaleConfirmed => "Sale Confirmed",
@@ -3748,23 +4249,34 @@ fn contract_notification_message(
         ContractEventKind::Expired => "Expired",
         ContractEventKind::ClosedOutcomeUnknown => "Closed — Outcome Unknown",
     };
+    let primary_name = primary_item
+        .and_then(|item| event.embed_context.item_names.get(&item.type_id))
+        .cloned()
+        .or_else(|| primary_item.map(|item| format!("Type {}", item.type_id)))
+        .unwrap_or_else(|| "Public contract".to_string());
+    let title_verb = match event.kind {
+        ContractEventKind::Listed => "listed",
+        ContractEventKind::SaleConfirmed => "sold",
+        ContractEventKind::PurchaseConfirmed => "purchase confirmed",
+        ContractEventKind::Expired => "expired",
+        ContractEventKind::ClosedOutcomeUnknown => "closed — outcome unknown",
+    };
+    let title_location = event
+        .embed_context
+        .location
+        .solar_system_name
+        .as_deref()
+        .map(|system| format!(" in {system}"))
+        .unwrap_or_default();
     let mut message = ContractNotificationMessage {
-        title: primary_item.map_or_else(
-            || format!("Public contract {}", event_label.to_lowercase()),
-            |item| {
-                format!(
-                    "Public contract {}: Type {}",
-                    event_label.to_lowercase(),
-                    item.type_id
-                )
-            },
-        ),
+        title: sanitize_discord_text(&format!("{primary_name} {title_verb}{title_location}")),
         description: event
             .contract
             .title
             .as_deref()
             .filter(|title| !title.is_empty())
-            .map(sanitize_discord_text)
+            .map(sanitize_contract_title)
+            .map(|title| format!("Contract title: {title}"))
             .map(|title| bounded_text(&title, 4096)),
         fields: vec![
             ContractEmbedField {
@@ -3773,55 +4285,97 @@ fn contract_notification_message(
                 inline: true,
             },
             ContractEmbedField {
-                name: "Offered Item".to_string(),
-                value: compact_bundle_summary(&event.offered_items),
+                name: "Offered".to_string(),
+                value: compact_bundle_summary(&event.offered_items, &event.embed_context),
                 inline: false,
             },
             ContractEmbedField {
-                name: "Requested Item".to_string(),
-                value: compact_bundle_summary(&event.requested_items),
-                inline: false,
-            },
-            ContractEmbedField {
-                name: "Requested ISK".to_string(),
-                value: format!("{:.2} ISK", event.contract.price),
-                inline: true,
-            },
-            ContractEmbedField {
-                name: "Offered ISK".to_string(),
-                value: format!("{:.2} ISK", event.contract.reward),
-                inline: true,
-            },
-            ContractEmbedField {
-                name: "Observed Location".to_string(),
-                value: format!("Location ID {location_id}"),
-                inline: true,
-            },
-            ContractEmbedField {
-                name: "Issuer".to_string(),
-                value: event.contract.issuer_id.to_string(),
-                inline: true,
-            },
-            ContractEmbedField {
-                name: "Contract ID".to_string(),
-                value: event.contract.contract_id.to_string(),
-                inline: true,
-            },
-            ContractEmbedField {
-                name: "Contract Address".to_string(),
-                value: format!("contract:0//{}", event.contract.contract_id),
+                name: "Requested".to_string(),
+                value: compact_bundle_summary(&event.requested_items, &event.embed_context),
                 inline: false,
             },
         ],
+        thumbnail_url: primary_item.map(|item| {
+            format!(
+                "https://images.evetech.net/types/{}/icon?size=64",
+                item.type_id
+            )
+        }),
+        footer: Some(format!(
+            "Contract {} · issued {}",
+            event.contract.contract_id,
+            compact_timestamp(event.contract.date_issued)
+        )),
     };
+    if positive_isk(event.contract.price) {
+        message.fields.push(ContractEmbedField {
+            name: "Requested ISK".to_string(),
+            value: format_compact_isk(event.contract.price),
+            inline: true,
+        });
+    }
+    if positive_isk(event.contract.reward) {
+        message.fields.push(ContractEmbedField {
+            name: "Offered ISK".to_string(),
+            value: format_compact_isk(event.contract.reward),
+            inline: true,
+        });
+    }
+    message.fields.extend([
+        ContractEmbedField {
+            name: "Observed Location".to_string(),
+            value: format_observed_location(
+                &event.embed_context.location,
+                event.contract.start_location_id,
+            ),
+            inline: false,
+        },
+        ContractEmbedField {
+            name: "Issuer".to_string(),
+            value: format_identity(
+                event.embed_context.issuer_character_name.as_deref(),
+                event.contract.issuer_id,
+            ),
+            inline: false,
+        },
+    ]);
+    let corporation = format_identity(
+        event.embed_context.issuer_corporation_name.as_deref(),
+        event.contract.issuer_corporation_id,
+    );
+    let affiliation = event
+        .embed_context
+        .issuer_alliance_id
+        .map(|id| {
+            format!(
+                "\nAlliance: {}",
+                format_identity(event.embed_context.issuer_alliance_name.as_deref(), id)
+            )
+        })
+        .unwrap_or_default();
+    message.fields.push(ContractEmbedField {
+        name: "Observed Affiliation".to_string(),
+        value: format!("At observation: {corporation}{affiliation}"),
+        inline: false,
+    });
+    message.fields.push(ContractEmbedField {
+        name: "Issuer History".to_string(),
+        value: format_party_history(issuer_history),
+        inline: false,
+    });
+    message.fields.push(ContractEmbedField {
+        name: "Corporation History".to_string(),
+        value: format_party_history(corporation_history),
+        inline: false,
+    });
     if let Some(evidence) = &event.acceptance_evidence {
         message.fields.push(ContractEmbedField {
             name: "Acceptance Evidence".to_string(),
             value: format!(
-                "Public through {}; absent at {}; 204 received {}",
-                evidence.last_public_observed_at.to_rfc3339(),
-                evidence.absence_observed_at.to_rfc3339(),
-                evidence.evidence_response_at.to_rfc3339(),
+                "Public through {}\nAbsent by {}\n204 received {}",
+                compact_timestamp(evidence.last_public_observed_at),
+                compact_timestamp(evidence.absence_observed_at),
+                compact_timestamp(evidence.evidence_response_at),
             ),
             inline: false,
         });
@@ -3830,10 +4384,27 @@ fn contract_notification_message(
             .max(0);
         message.fields.push(ContractEmbedField {
             name: "Observed Notification Latency".to_string(),
-            value: format!("{latency_seconds}s after acceptance evidence"),
+            value: format!(
+                "{} after acceptance evidence",
+                compact_duration(latency_seconds)
+            ),
             inline: true,
         });
+    } else if matches!(
+        event.kind,
+        ContractEventKind::Expired | ContractEventKind::ClosedOutcomeUnknown
+    ) {
+        message.fields.push(ContractEmbedField {
+            name: "Closure Observation".to_string(),
+            value: "Observed no longer public; no exact closure time is available.".to_string(),
+            inline: false,
+        });
     }
+    message.fields.push(ContractEmbedField {
+        name: "Contract Address".to_string(),
+        value: format!("```\ncontract:0//{}\n```", event.contract.contract_id),
+        inline: false,
+    });
     bound_embed_message(&mut message);
     message
 }
@@ -3845,11 +4416,18 @@ const MAX_EMBED_FIELD_VALUE_CHARACTERS: usize = 1024;
 const MAX_EMBED_CHARACTERS: usize = 6000;
 const MAX_BUNDLE_ITEMS_IN_EMBED: usize = 8;
 
-fn compact_bundle_summary(items: &[PublicContractItem]) -> String {
+fn compact_bundle_summary(items: &[PublicContractItem], context: &ContractEmbedContext) -> String {
     let visible = items
         .iter()
         .take(MAX_BUNDLE_ITEMS_IN_EMBED)
-        .map(|item| format!("Type {} ×{}", item.type_id, item.quantity))
+        .map(|item| {
+            let name = context
+                .item_names
+                .get(&item.type_id)
+                .cloned()
+                .unwrap_or_else(|| format!("Type {}", item.type_id));
+            format!("{name} ×{}", item.quantity)
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let hidden = items.len().saturating_sub(MAX_BUNDLE_ITEMS_IN_EMBED);
@@ -3859,6 +4437,94 @@ fn compact_bundle_summary(items: &[PublicContractItem]) -> String {
         visible
     } else {
         format!("{visible}\n+{hidden} more")
+    }
+}
+
+fn format_compact_isk(value: f64) -> String {
+    let (scaled, suffix) = if value >= 1_000_000_000.0 {
+        (value / 1_000_000_000.0, "b")
+    } else if value >= 1_000_000.0 {
+        (value / 1_000_000.0, "m")
+    } else if value >= 1_000.0 {
+        (value / 1_000.0, "k")
+    } else {
+        (value, "")
+    };
+    format!("{}{} ISK", trim_decimal(scaled), suffix)
+}
+
+fn trim_decimal(value: f64) -> String {
+    let rendered = format!("{value:.2}");
+    rendered
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
+fn format_observed_location(context: &ContractLocationContext, location_id: i64) -> String {
+    let mut lines = Vec::new();
+    if let Some(name) = &context.location_name {
+        let kind = context.location_kind.as_deref().unwrap_or("Location");
+        lines.push(format!("{kind}: {name}"));
+    }
+    if let Some(name) = &context.solar_system_name {
+        let security = context
+            .security_status
+            .filter(|value| value.is_finite())
+            .map(|value| format!(" ({value:.1})"))
+            .unwrap_or_default();
+        lines.push(format!("System: {name}{security}"));
+    } else if let Some(system_id) = context.solar_system_id {
+        lines.push(format!("System ID: {system_id}"));
+    }
+    if let Some(name) = &context.region_name {
+        lines.push(format!("Region: {name}"));
+    } else if let Some(region_id) = context.region_id {
+        lines.push(format!("Region ID: {region_id}"));
+    }
+    lines.push(format!("Location ID: {location_id}"));
+    lines.join("\n")
+}
+
+fn format_identity(name: Option<&str>, id: i64) -> String {
+    match name {
+        Some(name) => format!("{} ({id})", sanitize_discord_text(name)),
+        None => id.to_string(),
+    }
+}
+
+fn format_party_history(history: &ContractPartyHistory) -> String {
+    let mut value = format!(
+        "90d: {} sales · {} purchases · {} unknown closures",
+        history.confirmed_sales, history.confirmed_purchases, history.unknown_closures
+    );
+    if let Some(latest) = &history.most_recent_confirmed {
+        let label = match latest.kind {
+            ContractEventKind::SaleConfirmed => "Sale confirmed",
+            ContractEventKind::PurchaseConfirmed => "Purchase confirmed",
+            _ => "Confirmed",
+        };
+        value.push_str(&format!(
+            "\nLatest: {label} {}",
+            compact_timestamp(latest.observed_at)
+        ));
+    }
+    value
+}
+
+fn compact_timestamp(value: DateTime<Utc>) -> String {
+    value.format("%-d %b %Y %H:%MZ").to_string()
+}
+
+fn compact_duration(seconds: i64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 60 * 60 * 24 {
+        format!("{}h", seconds / (60 * 60))
+    } else {
+        format!("{}d", seconds / (60 * 60 * 24))
     }
 }
 
@@ -3872,7 +4538,17 @@ fn bound_embed_message(message: &mut ContractNotificationMessage) {
         field.name = bounded_text(&field.name, MAX_EMBED_FIELD_NAME_CHARACTERS);
         field.value = bounded_text(&field.value, MAX_EMBED_FIELD_VALUE_CHARACTERS);
     }
+    message.footer = message
+        .footer
+        .as_deref()
+        .map(|footer| bounded_text(footer, 2048));
     let fixed_characters = message.title.chars().count()
+        + message
+            .footer
+            .as_deref()
+            .map(str::chars)
+            .map(Iterator::count)
+            .unwrap_or(0)
         + message
             .fields
             .iter()
@@ -3901,6 +4577,21 @@ fn bounded_text(value: &str, limit: usize) -> String {
 
 pub fn sanitize_discord_text(value: &str) -> String {
     value.replace('@', "@\u{200b}")
+}
+
+fn sanitize_contract_title(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '@' => sanitized.push_str("@\u{200b}"),
+            '\\' | '`' | '*' | '_' | '~' | '>' | '[' | ']' | '(' | ')' => {
+                sanitized.push('\\');
+                sanitized.push(character);
+            }
+            _ => sanitized.push(character),
+        }
+    }
+    sanitized
 }
 
 fn merge_cache_metadata(cached: &CacheMetadata, response: CacheMetadata) -> CacheMetadata {
@@ -4048,4 +4739,220 @@ fn collection_retry_delay(interval: Duration, retry_after: Option<DateTime<Utc>>
         .and_then(|retry_after| (retry_after - Utc::now()).to_std().ok())
         .unwrap_or_default();
     interval.max(retry_delay)
+}
+
+#[cfg(test)]
+mod embed_tests {
+    use super::*;
+
+    fn contract() -> PublicContract {
+        PublicContract {
+            contract_id: 45,
+            availability: Some("public".to_string()),
+            buyout: None,
+            collateral: Some(0.0),
+            contract_type: "item_exchange".to_string(),
+            date_expired: Utc::now() + ChronoDuration::hours(1),
+            date_issued: Utc::now() - ChronoDuration::minutes(5),
+            days_to_complete: 0,
+            end_location_id: None,
+            for_corporation: false,
+            issuer_corporation_id: 98_000_001,
+            issuer_id: 90_000_001,
+            price: 77_500_000_000.0,
+            reward: 0.0,
+            start_location_id: 60_003_760,
+            title: Some("@everyone `Hel` **sale**".to_string()),
+            volume: 115_000.0,
+        }
+    }
+
+    fn item(record_id: i64, type_id: i64, included: bool) -> PublicContractItem {
+        PublicContractItem {
+            record_id,
+            type_id,
+            quantity: 1,
+            is_included: included,
+            item_id: None,
+            raw_quantity: None,
+            is_singleton: None,
+            is_blueprint_copy: None,
+            material_efficiency: None,
+            runs: None,
+            time_efficiency: None,
+        }
+    }
+
+    fn event(kind: ContractEventKind) -> ContractEvent {
+        ContractEvent {
+            region_id: 10_000_002,
+            kind,
+            contract: contract(),
+            offered_items: vec![item(1, 19_720, true), item(2, 587, true)],
+            requested_items: vec![item(3, 34, false)],
+            context: ContractObservationContext::default(),
+            acceptance_evidence: None,
+            embed_context: ContractEmbedContext {
+                observed_at: Some(Utc::now()),
+                location: ContractLocationContext {
+                    location_name: Some("K-6K16 Trade Hub".to_string()),
+                    location_kind: Some("Structure".to_string()),
+                    solar_system_id: Some(30_000_142),
+                    solar_system_name: Some("Vale of the Silent".to_string()),
+                    security_status: Some(-0.5),
+                    region_id: Some(10_000_002),
+                    region_name: Some("The Forge".to_string()),
+                },
+                issuer_character_name: Some("Issuer Name".to_string()),
+                issuer_corporation_name: Some("Issuer Corp".to_string()),
+                issuer_alliance_id: Some(99_000_001),
+                issuer_alliance_name: Some("Issuer Alliance".to_string()),
+                item_names: BTreeMap::from([
+                    (19_720, "Ragnarok".to_string()),
+                    (587, "Rifter".to_string()),
+                    (34, "Tritanium".to_string()),
+                ]),
+            },
+        }
+    }
+
+    fn field<'a>(message: &'a ContractNotificationMessage, name: &str) -> Option<&'a str> {
+        message
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| field.value.as_str())
+    }
+
+    #[test]
+    fn renders_every_contract_event_without_a_counterparty() {
+        let history = ContractPartyHistory::default();
+        for (kind, expected) in [
+            (ContractEventKind::Listed, "Listed"),
+            (ContractEventKind::SaleConfirmed, "Sale Confirmed"),
+            (ContractEventKind::PurchaseConfirmed, "Purchase Confirmed"),
+            (ContractEventKind::Expired, "Expired"),
+            (
+                ContractEventKind::ClosedOutcomeUnknown,
+                "Closed — Outcome Unknown",
+            ),
+        ] {
+            let message = contract_notification_message(
+                &event(kind),
+                Some(&item(1, 19_720, true)),
+                &history,
+                &history,
+            );
+            assert_eq!(field(&message, "Event"), Some(expected));
+            assert!(message.fields.iter().all(|field| !matches!(
+                field.name.as_str(),
+                "Buyer" | "Counterparty" | "Accepting Corporation"
+            )));
+        }
+    }
+
+    #[test]
+    fn location_degrades_without_dropping_known_facts() {
+        let history = ContractPartyHistory::default();
+        let full = contract_notification_message(
+            &event(ContractEventKind::Listed),
+            None,
+            &history,
+            &history,
+        );
+        let full_location = field(&full, "Observed Location").expect("location field");
+        assert!(full_location.contains("Structure: K-6K16 Trade Hub"));
+        assert!(full_location.contains("System: Vale of the Silent (-0.5)"));
+        assert!(full_location.contains("Region: The Forge"));
+        assert!(full_location.ends_with("Location ID: 60003760"));
+
+        let mut fallback = event(ContractEventKind::Listed);
+        fallback.embed_context.location = ContractLocationContext {
+            solar_system_id: Some(30_000_142),
+            ..ContractLocationContext::default()
+        };
+        let fallback = contract_notification_message(&fallback, None, &history, &history);
+        assert_eq!(
+            field(&fallback, "Observed Location"),
+            Some("System ID: 30000142\nLocation ID: 60003760")
+        );
+    }
+
+    #[test]
+    fn ranked_primary_ship_and_complete_bundle_stay_prominent() {
+        let history = ContractPartyHistory::default();
+        let message = contract_notification_message(
+            &event(ContractEventKind::Listed),
+            Some(&item(1, 19_720, true)),
+            &history,
+            &history,
+        );
+        assert!(message.title.starts_with("Ragnarok listed"));
+        assert_eq!(
+            message.thumbnail_url.as_deref(),
+            Some("https://images.evetech.net/types/19720/icon?size=64")
+        );
+        let offered = field(&message, "Offered").expect("offered bundle");
+        assert!(offered.contains("Ragnarok ×1"));
+        assert!(offered.contains("Rifter ×1"));
+        assert_eq!(field(&message, "Requested ISK"), Some("77.5b ISK"));
+    }
+
+    #[test]
+    fn history_evidence_and_contract_address_are_structural_and_bounded() {
+        let mut event = event(ContractEventKind::SaleConfirmed);
+        event.acceptance_evidence = Some(ContractAcceptanceEvidence {
+            last_public_observed_at: Utc::now() - ChronoDuration::minutes(3),
+            absence_observed_at: Utc::now() - ChronoDuration::minutes(2),
+            evidence_response_at: Utc::now() - ChronoDuration::seconds(90),
+        });
+        event.contract.title = Some("`@everyone` ".repeat(800));
+        event.embed_context.issuer_corporation_name = None;
+        event.embed_context.issuer_alliance_id = None;
+        event.embed_context.issuer_alliance_name = None;
+        let history = ContractPartyHistory {
+            confirmed_sales: 4,
+            confirmed_purchases: 2,
+            unknown_closures: 1,
+            most_recent_confirmed: Some(MostRecentConfirmedContractEvent {
+                kind: ContractEventKind::SaleConfirmed,
+                observed_at: Utc::now() - ChronoDuration::hours(1),
+            }),
+        };
+        let message =
+            contract_notification_message(&event, Some(&item(1, 19_720, true)), &history, &history);
+        assert!(message
+            .description
+            .as_deref()
+            .expect("title description")
+            .contains("@\u{200b}everyone"));
+        assert!(
+            message
+                .description
+                .as_deref()
+                .expect("title description")
+                .chars()
+                .count()
+                <= 4096
+        );
+        assert_eq!(
+            field(&message, "Observed Affiliation"),
+            Some("At observation: 98000001")
+        );
+        assert!(field(&message, "Issuer History")
+            .expect("history")
+            .contains("4 sales"));
+        assert!(field(&message, "Acceptance Evidence")
+            .expect("evidence")
+            .contains("204 received"));
+        assert_eq!(
+            field(&message, "Contract Address"),
+            Some("```\ncontract:0//45\n```")
+        );
+        assert!(message
+            .footer
+            .as_deref()
+            .expect("footer")
+            .contains("Contract 45"));
+    }
 }

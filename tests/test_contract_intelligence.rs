@@ -929,6 +929,14 @@ async fn pre_expiry_no_content_confirms_only_pure_matched_ship_sales_and_purchas
     assert!(resolutions
         .iter()
         .all(|record| record.state == ContractResolutionState::AcceptanceConfirmed));
+    let (issuer_history, corporation_history) = store
+        .contract_party_history(sale.issuer_id, sale.issuer_corporation_id)
+        .await
+        .expect("summarize local confirmed contract history");
+    assert_eq!(issuer_history.confirmed_sales, 1);
+    assert_eq!(issuer_history.confirmed_purchases, 1);
+    assert_eq!(issuer_history.unknown_closures, 0);
+    assert_eq!(corporation_history, issuer_history);
     let relisted = ContractCollector::new(
         store.clone(),
         Arc::new(FakeEsi {
@@ -2767,20 +2775,23 @@ async fn new_listed_ship_contracts_notify_each_matching_subscription_once_after_
     );
     assert!(sent.iter().any(|delivery| delivery.ping));
     assert!(sent.iter().all(|delivery| {
-        delivery
+        delivery.message.fields.iter().any(|field| {
+            field.name == "Contract Address" && field.value == "```\ncontract:0//45\n```"
+        }) && delivery
             .message
             .fields
             .iter()
-            .any(|field| field.name == "Contract Address" && field.value == "contract:0//45")
-            && delivery
-                .message
-                .fields
-                .iter()
-                .any(|field| field.name == "Issuer" && field.value == "90000001")
+            .any(|field| field.name == "Issuer" && field.value == "90000001")
             && delivery.message.description.as_deref()
-                == Some("@\u{200b}everyone offers <@\u{200b}1234> a ship")
+                == Some("Contract title: @\u{200b}everyone offers <@\u{200b}1234\\> a ship")
     }));
     drop(sent);
+    assert!(store
+        .observed_embed_context(10_000_002, 45)
+        .await
+        .expect("load observed embed context")
+        .and_then(|context| context.observed_at)
+        .is_some());
     assert_eq!(
         store
             .delivery_records()
@@ -3159,16 +3170,26 @@ async fn oversized_matched_bundles_produce_a_compact_embed_and_preserve_the_full
         .fields
         .iter()
         .all(|field| field.value.chars().count() <= 1024));
-    assert!(message.title.chars().count() + field_name_lengths + field_value_lengths <= 6000);
+    assert!(
+        message.title.chars().count()
+            + message
+                .footer
+                .as_deref()
+                .map(str::chars)
+                .map(Iterator::count)
+                .unwrap_or(0)
+            + field_name_lengths
+            + field_value_lengths
+            <= 6000
+    );
     assert!(message.fields.iter().any(|field| {
-        field.name == "Offered Item"
+        field.name == "Offered"
             && field.value.contains("Type 1000000 ×1")
             && field.value.contains("+232 more")
     }));
-    assert!(message
-        .fields
-        .iter()
-        .any(|field| { field.name == "Contract Address" && field.value == "contract:0//45" }));
+    assert!(message.fields.iter().any(|field| {
+        field.name == "Contract Address" && field.value == "```\ncontract:0//45\n```"
+    }));
     let delivery_id = sent[0].delivery_id;
     drop(sent);
     let persisted_event = store
@@ -3910,7 +3931,7 @@ async fn a_deferred_or_candidate_context_match_selects_the_higher_priority_ship(
 
     assert_eq!(first_context_calls, 1);
     assert_eq!(first_deliveries, 0);
-    assert_eq!(titles, vec!["Public contract listed: Type 19720"]);
+    assert_eq!(titles, vec!["Type 19720 listed"]);
 }
 
 #[tokio::test]
@@ -3920,7 +3941,7 @@ async fn a_deferred_or_candidate_context_miss_keeps_the_local_primary_ship() {
 
     assert_eq!(first_context_calls, 1);
     assert_eq!(first_deliveries, 0);
-    assert_eq!(titles, vec!["Public contract listed: Type 587"]);
+    assert_eq!(titles, vec!["Type 587 listed"]);
 }
 
 #[tokio::test]
@@ -4143,22 +4164,22 @@ async fn contract_notifications_render_both_sides_for_cross_direction_and_isk_fi
             .message
             .fields
             .iter()
-            .any(|field| field.name == "Offered Item" && field.value.contains("Type 587")));
+            .any(|field| field.name == "Offered" && field.value.contains("Type 587")));
         assert!(delivery
             .message
             .fields
             .iter()
-            .any(|field| { field.name == "Requested Item" && field.value.contains("Type 19720") }));
+            .any(|field| { field.name == "Requested" && field.value.contains("Type 19720") }));
         assert!(delivery
             .message
             .fields
             .iter()
-            .any(|field| { field.name == "Requested ISK" && field.value == "1500000000.00 ISK" }));
+            .any(|field| { field.name == "Requested ISK" && field.value == "1.5b ISK" }));
         assert!(delivery
             .message
             .fields
             .iter()
-            .any(|field| { field.name == "Offered ISK" && field.value == "2500000000.00 ISK" }));
+            .any(|field| { field.name == "Offered ISK" && field.value == "2.5b ISK" }));
     }
     drop(sent);
 
@@ -4269,7 +4290,7 @@ async fn primary_display_ship_is_selected_only_from_matching_ship_items() {
 
     assert_eq!(
         delivery.sent.lock().unwrap()[0].message.title,
-        "Public contract listed: Type 587"
+        "Type 587 listed"
     );
 
     database.destroy().await;
@@ -4388,7 +4409,7 @@ async fn primary_display_ship_uses_all_matching_or_branches_independent_of_branc
     assert_eq!(sent.len(), 2);
     assert!(sent
         .iter()
-        .all(|delivery| delivery.message.title == "Public contract listed: Type 19720"));
+        .all(|delivery| delivery.message.title == "Type 19720 listed"));
     drop(sent);
 
     database.destroy().await;
@@ -4509,7 +4530,7 @@ async fn primary_display_ship_uses_all_group_matches_independent_of_manifest_ord
     assert_eq!(sent.len(), 2);
     assert!(sent
         .iter()
-        .all(|delivery| delivery.message.title == "Public contract listed: Type 19720"));
+        .all(|delivery| delivery.message.title == "Type 19720 listed"));
     drop(sent);
 
     database.destroy().await;
@@ -4650,7 +4671,7 @@ async fn a_transient_additional_group_candidate_defers_primary_selection() {
 
     let sent = delivery.sent.lock().unwrap();
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].message.title, "Public contract listed: Type 19720");
+    assert_eq!(sent[0].message.title, "Type 19720 listed");
     drop(sent);
 
     database.destroy().await;
@@ -4767,7 +4788,7 @@ async fn a_transient_primary_ship_lookup_defers_instead_of_committing_a_fallback
     assert_eq!(delivery.sent.lock().unwrap().len(), 1);
     assert_eq!(
         delivery.sent.lock().unwrap()[0].message.title,
-        "Public contract listed: Type 587"
+        "Type 587 listed"
     );
 
     database.destroy().await;
@@ -4886,6 +4907,78 @@ async fn http_esi_resolves_context_facts_independently_for_filters() {
         affiliation.value.expect("affiliation response"),
         ContractContextValue::Resolved(99_000_111)
     );
+    server.finish();
+}
+
+#[tokio::test]
+async fn http_esi_snapshots_public_embed_context_from_public_endpoints() {
+    let server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: r#"{"name":"Jita IV - Moon 4","system_id":30000142}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: r#"{"name":"Jita","security_status":0.9,"constellation_id":20000020}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: r#"{"region_id":10000002}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: r#"{"name":"The Forge"}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: r#"[{"alliance_id":99000111}]"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: r#"[{"id":90000001,"name":"Issuer"},{"id":98000001,"name":"Issuer Corp"},{"id":99000111,"name":"Issuer Alliance"},{"id":587,"name":"Rifter"}]"#,
+        },
+    ]);
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("construct local HTTP ESI client");
+    let context = esi
+        .observed_contract_embed_context(&item_exchange_contract(44), &[offered_ship(1)])
+        .await
+        .expect("resolve public embed context")
+        .value
+        .expect("context response");
+
+    assert_eq!(
+        context.location.location_name.as_deref(),
+        Some("Jita IV - Moon 4")
+    );
+    assert_eq!(context.location.location_kind.as_deref(), Some("Station"));
+    assert_eq!(context.location.solar_system_name.as_deref(), Some("Jita"));
+    assert_eq!(context.location.region_name.as_deref(), Some("The Forge"));
+    assert_eq!(context.issuer_character_name.as_deref(), Some("Issuer"));
+    assert_eq!(
+        context.issuer_corporation_name.as_deref(),
+        Some("Issuer Corp")
+    );
+    assert_eq!(
+        context.issuer_alliance_name.as_deref(),
+        Some("Issuer Alliance")
+    );
+    assert_eq!(
+        context.item_names.get(&587).map(String::as_str),
+        Some("Rifter")
+    );
+    let requests = server.requests.lock().unwrap();
+    assert!(requests[0].starts_with("GET /universe/stations/60003760/"));
+    assert!(requests[1].starts_with("GET /universe/systems/30000142/"));
+    assert!(requests[4].starts_with("POST /characters/affiliation/"));
+    assert!(requests[5].starts_with("POST /universe/names/"));
+    drop(requests);
     server.finish();
 }
 
