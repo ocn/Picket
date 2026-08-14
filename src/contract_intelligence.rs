@@ -5887,22 +5887,31 @@ fn contract_link_place(context: &ContractLocationContext, location_id: i64) -> S
 fn contract_address(contract_id: i64, label: &str, place: &str) -> String {
     let label = bounded_text(label, 160);
     let place = bounded_text(place, 160);
-    format!("<url=\"contract:0//{contract_id}\">{label} - {place}</url>")
+    format!("`<url=\"contract:0//{contract_id}\">{label} - {place}</url>`")
 }
 
 fn compact_issuer(context: &ContractEmbedContext) -> Option<String> {
-    let parts = [
-        context.issuer_character_name.as_deref(),
-        context.issuer_corporation_name.as_deref(),
-        context.issuer_alliance_name.as_deref(),
-    ]
-    .into_iter()
-    .filter_map(|name| {
-        name.map(sanitize_contract_identity)
-            .filter(|name| !name.is_empty())
-    })
-    .collect::<Vec<_>>();
-    (!parts.is_empty()).then(|| parts.join(" • "))
+    let character = context
+        .issuer_character_name
+        .as_deref()
+        .map(sanitize_contract_identity)
+        .filter(|name| !name.is_empty())?;
+    let affiliation = context
+        .issuer_alliance_name
+        .as_deref()
+        .map(sanitize_contract_identity)
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            context
+                .issuer_corporation_name
+                .as_deref()
+                .map(sanitize_contract_identity)
+                .filter(|name| !name.is_empty())
+        });
+    let identity = affiliation
+        .map(|affiliation| format!("[{affiliation}] {character}"))
+        .unwrap_or(character);
+    Some(format!("issuer: {identity}"))
 }
 
 fn precise_contract_location(context: &ContractLocationContext) -> Option<String> {
@@ -6483,7 +6492,7 @@ mod embed_tests {
         assert_eq!(
             full.description.as_deref(),
             Some(
-                "<url=\"contract:0//45\">Public contract - Jita</url>\nIssuer Name • Issuer Corp • Issuer Alliance\nat: Jita IV Moon 4 Caldari Navy Assembly Plant"
+                "`<url=\"contract:0//45\">Public contract - Jita</url>`\nissuer: [Issuer Alliance] Issuer Name\nat: Jita IV Moon 4 Caldari Navy Assembly Plant"
             )
         );
 
@@ -6496,7 +6505,7 @@ mod embed_tests {
         assert_eq!(
             fallback.description.as_deref(),
             Some(
-                "<url=\"contract:0//45\">Public contract - Location 60003760</url>\nIssuer Name • Issuer Corp • Issuer Alliance"
+                "`<url=\"contract:0//45\">Public contract - Location 60003760</url>`\nissuer: [Issuer Alliance] Issuer Name"
             )
         );
 
@@ -6510,7 +6519,7 @@ mod embed_tests {
         assert_eq!(
             station_only.description.as_deref(),
             Some(
-                "<url=\"contract:0//45\">Public contract - Jita IV Moon 4</url>\nIssuer Name • Issuer Corp • Issuer Alliance\nat: Jita IV Moon 4"
+                "`<url=\"contract:0//45\">Public contract - Jita IV Moon 4</url>`\nissuer: [Issuer Alliance] Issuer Name\nat: Jita IV Moon 4"
             )
         );
 
@@ -6523,7 +6532,7 @@ mod embed_tests {
         assert_eq!(
             region_only.description.as_deref(),
             Some(
-                "<url=\"contract:0//45\">Public contract - Location 60003760</url>\nIssuer Name • Issuer Corp • Issuer Alliance"
+                "`<url=\"contract:0//45\">Public contract - Location 60003760</url>`\nissuer: [Issuer Alliance] Issuer Name"
             )
         );
 
@@ -6533,7 +6542,7 @@ mod embed_tests {
         assert_eq!(
             raw_only.description.as_deref(),
             Some(
-                "<url=\"contract:0//45\">Public contract - Location 60003760</url>\nIssuer Name • Issuer Corp • Issuer Alliance"
+                "`<url=\"contract:0//45\">Public contract - Location 60003760</url>`\nissuer: [Issuer Alliance] Issuer Name"
             )
         );
     }
@@ -6565,25 +6574,25 @@ mod embed_tests {
             issuer_character_name: Some("Issuer-Name".to_string()),
             ..ContractEmbedContext::default()
         };
-        assert_eq!(compact_issuer(&context).as_deref(), Some("Issuer-Name"));
+        assert_eq!(
+            compact_issuer(&context).as_deref(),
+            Some("issuer: Issuer-Name")
+        );
 
         context.issuer_corporation_name = Some("Issuer Corp".to_string());
         assert_eq!(
             compact_issuer(&context).as_deref(),
-            Some("Issuer-Name • Issuer Corp")
+            Some("issuer: [Issuer Corp] Issuer-Name")
         );
 
         context.issuer_alliance_name = Some("Issuer Alliance".to_string());
         assert_eq!(
             compact_issuer(&context).as_deref(),
-            Some("Issuer-Name • Issuer Corp • Issuer Alliance")
+            Some("issuer: [Issuer Alliance] Issuer-Name")
         );
 
         context.issuer_character_name = None;
-        assert_eq!(
-            compact_issuer(&context).as_deref(),
-            Some("Issuer Corp • Issuer Alliance")
-        );
+        assert_eq!(compact_issuer(&context).as_deref(), None);
     }
 
     #[test]
@@ -6603,7 +6612,7 @@ mod embed_tests {
         assert_eq!(
             message.description.as_deref(),
             Some(
-                "<url=\"contract:0//45\">Ragnarok - Jita</url>\nIssuer Name • Issuer Corp • Issuer Alliance\nat: Jita IV Moon 4 Caldari Navy Assembly Plant"
+                "`<url=\"contract:0//45\">Ragnarok - Jita</url>`\nissuer: [Issuer Alliance] Issuer Name\nat: Jita IV Moon 4 Caldari Navy Assembly Plant"
             )
         );
         assert!(message
@@ -6670,10 +6679,10 @@ mod embed_tests {
             .as_deref()
             .expect("contract description");
         let contract_link = description.lines().next().expect("contract link");
-        assert!(contract_link.starts_with("<url=\"contract:0//45\">"));
-        assert!(contract_link.ends_with(" - Jita</url>"));
+        assert!(contract_link.starts_with("`<url=\"contract:0//45\">"));
+        assert!(contract_link.ends_with(" - Jita</url>`"));
         assert!(!contract_link.contains("<url=\"bad\">"));
-        assert!(description.contains("Issuer-Name"));
+        assert!(description.contains("issuer: Issuer-Name"));
         assert!(!description.contains("90000001"));
         assert!(!description.contains("98000001"));
         assert!(description.chars().count() <= MAX_EMBED_DESCRIPTION_CHARACTERS);
@@ -6750,7 +6759,7 @@ mod embed_tests {
             .description
             .as_deref()
             .is_some_and(|description| description.starts_with(
-                "<url=\"contract:0//234057619\">Hel - Jita</url>\nIssuer Name • Issuer Corp • Issuer Alliance"
+                "`<url=\"contract:0//234057619\">Hel - Jita</url>`\nissuer: [Issuer Alliance] Issuer Name"
             )));
         assert!(field(&message, "History")
             .expect("issuer history")
@@ -6797,7 +6806,7 @@ mod embed_tests {
         let mut message = ContractNotificationMessage {
             title: "T".repeat(MAX_EMBED_TITLE_CHARACTERS),
             description: Some(format!(
-                "<url=\"contract:0//45\">Ragnarok - Jita</url>\n{}",
+                "`<url=\"contract:0//45\">Ragnarok - Jita</url>`\n{}",
                 "D".repeat(4_000)
             )),
             fields: (0..25)
@@ -6839,7 +6848,7 @@ mod embed_tests {
             .description
             .as_deref()
             .is_some_and(|description| description
-                .starts_with("<url=\"contract:0//45\">Ragnarok - Jita</url>")));
+                .starts_with("`<url=\"contract:0//45\">Ragnarok - Jita</url>`")));
     }
 
     #[test]
@@ -6869,6 +6878,6 @@ mod embed_tests {
         assert!(contract_link.contains("heading"));
         assert!(contract_link.contains("spoiler"));
         assert!(contract_link.contains("bold"));
-        assert!(contract_link.ends_with(" - Jita</url>"));
+        assert!(contract_link.ends_with(" - Jita</url>`"));
     }
 }
