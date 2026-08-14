@@ -1306,6 +1306,7 @@ impl ContractPingType {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContractEventActions {
+    #[serde(default)]
     pub listed: ContractEventAction,
     #[serde(default)]
     pub sale_confirmed: ContractEventAction,
@@ -5869,6 +5870,9 @@ fn collection_recovery_gap(interval: Duration) -> ChronoDuration {
 
 #[cfg(test)]
 mod embed_tests {
+    use crate::discord_bot::{contract_notification_embed, DiscordContractDelivery};
+    use serenity::http::Http;
+
     use super::*;
 
     fn contract() -> PublicContract {
@@ -6111,6 +6115,105 @@ mod embed_tests {
             .as_deref()
             .expect("footer")
             .contains("Contract 45"));
+    }
+
+    #[tokio::test]
+    #[ignore = "manual visual check; requires DISCORD_BOT_TOKEN and CONTRACT_TEST_DISCORD_CHANNEL_ID and sends one non-pinging embed"]
+    async fn manual_contract_embed_visual_delivery() {
+        dotenvy::dotenv().ok();
+        let token = std::env::var("DISCORD_BOT_TOKEN")
+            .expect("DISCORD_BOT_TOKEN is required for the manual contract embed check");
+        let channel_id = std::env::var("CONTRACT_TEST_DISCORD_CHANNEL_ID")
+            .expect(
+                "CONTRACT_TEST_DISCORD_CHANNEL_ID is required for the manual contract embed check",
+            )
+            .parse()
+            .expect("CONTRACT_TEST_DISCORD_CHANNEL_ID must be a Discord snowflake");
+        let mut event = event(ContractEventKind::SaleConfirmed);
+        event.contract.contract_id = 234_057_619;
+        event.contract.title = Some("Manual public Hel sale visual check".to_string());
+        event.offered_items = vec![item(1, 22_852, true), item(2, 587, true)];
+        event
+            .embed_context
+            .item_names
+            .insert(22_852, "Hel".to_string());
+        event.acceptance_evidence = Some(ContractAcceptanceEvidence {
+            last_public_observed_at: Utc::now() - ChronoDuration::minutes(3),
+            absence_observed_at: Utc::now() - ChronoDuration::minutes(2),
+            evidence_response_at: Utc::now() - ChronoDuration::minutes(1),
+        });
+        let issuer_history = ContractPartyHistory {
+            confirmed_sales: 4,
+            confirmed_purchases: 1,
+            unknown_closures: 0,
+            most_recent_confirmed: Some(MostRecentConfirmedContractEvent {
+                kind: ContractEventKind::SaleConfirmed,
+                observed_at: Utc::now() - ChronoDuration::hours(1),
+            }),
+        };
+        let corporation_history = ContractPartyHistory {
+            confirmed_sales: 12,
+            confirmed_purchases: 3,
+            unknown_closures: 1,
+            most_recent_confirmed: Some(MostRecentConfirmedContractEvent {
+                kind: ContractEventKind::SaleConfirmed,
+                observed_at: Utc::now() - ChronoDuration::minutes(30),
+            }),
+        };
+        let message = contract_notification_message(
+            &event,
+            Some(&event.offered_items[0]),
+            &issuer_history,
+            &corporation_history,
+        );
+        assert_eq!(message.title, "Hel sold in Vale of the Silent");
+        assert_eq!(field(&message, "Requested ISK"), Some("77.5b ISK"));
+        assert!(field(&message, "Observed Location")
+            .expect("location field")
+            .contains("Structure: K-6K16 Trade Hub"));
+        assert_eq!(field(&message, "Issuer"), Some("Issuer Name (90000001)"));
+        assert!(field(&message, "Issuer History")
+            .expect("issuer history")
+            .contains("4 sales"));
+        assert!(field(&message, "Corporation History")
+            .expect("corporation history")
+            .contains("12 sales"));
+        assert_eq!(
+            message.thumbnail_url.as_deref(),
+            Some("https://images.evetech.net/types/22852/icon?size=64")
+        );
+        assert_eq!(
+            field(&message, "Contract Address"),
+            Some("```\ncontract:0//234057619\n```")
+        );
+        let embed = contract_notification_embed(&message);
+        assert_eq!(
+            embed.0["title"].as_str(),
+            Some("Hel sold in Vale of the Silent")
+        );
+        assert_eq!(
+            embed.0["thumbnail"]["url"].as_str(),
+            Some("https://images.evetech.net/types/22852/icon?size=64")
+        );
+
+        let delivery = DiscordContractDelivery::new(Arc::new(Http::new(&token)));
+        let message_id = delivery
+            .send(PreparedContractDelivery {
+                delivery_id: 0,
+                guild_id: 0,
+                channel_id,
+                subscription_id: "manual-contract-embed-check".to_string(),
+                contract_id: event.contract.contract_id,
+                event_kind: event.kind,
+                ping: false,
+                ping_type: ContractPingType::Here,
+                nonce: "manual-contract-embed-check".to_string(),
+                enforce_nonce: false,
+                message,
+            })
+            .await
+            .expect("send manual contract embed");
+        assert!(!message_id.is_empty());
     }
 
     #[test]

@@ -8,14 +8,16 @@ use killbot_rust::contract_intelligence::{
     ContractContextRequirements, ContractContextValue, ContractDelivery, ContractDeliveryClock,
     ContractDeliveryError, ContractEmbedContext, ContractEventAction, ContractEventActions,
     ContractEventKind, ContractFilter, ContractFilterCondition, ContractFilterNode,
-    ContractItemDirection, ContractItemProbe, ContractNotificationMessage,
-    ContractObservationContext, ContractPingLimiter, ContractPingType, ContractResolutionState,
-    ContractSubscription, DeliveryFailureKind, DeliveryRecord, DeliveryStatus, EsiError,
-    EsiResponse, HttpPublicContractEsi, PreparedContractDelivery, PublicContract,
-    PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
+    ContractItemDirection, ContractItemProbe, ContractObservationContext, ContractPingLimiter,
+    ContractPingType, ContractResolutionState, ContractSubscription, DeliveryFailureKind,
+    DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HttpPublicContractEsi,
+    PreparedContractDelivery, PublicContract, PublicContractEsi, PublicContractItem,
+    ShipGroupLookup, ShipGroupResolver,
 };
-use killbot_rust::discord_bot::DiscordContractDelivery;
 use killbot_rust::esi::EsiClient;
+use killbot_rust::feed::{FeedError, KillmailFeed};
+use killbot_rust::models::{ZkData, ZkDataNoEsi};
+use killbot_rust::pipeline::{run_producer, ProcessedResult};
 use moka::future::Cache;
 use sha2::{Digest, Sha384};
 use sqlx::postgres::PgPoolOptions;
@@ -28,7 +30,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use url::Url;
 
 static DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -386,9 +388,54 @@ impl PublicContractEsi for FakeEsi {
 
 struct FailingContractEsi;
 
+struct PausedFailingContractEsi {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+struct SingleInlineKillmailFeed {
+    item: Mutex<Option<ZkDataNoEsi>>,
+}
+
+#[async_trait]
+impl KillmailFeed for SingleInlineKillmailFeed {
+    async fn next(&self) -> Result<Option<ZkDataNoEsi>, FeedError> {
+        if let Some(item) = self.item.lock().await.take() {
+            return Ok(Some(item));
+        }
+        std::future::pending().await
+    }
+}
+
 #[async_trait]
 impl PublicContractEsi for FailingContractEsi {
     async fn regions(&self, _etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        Err(EsiError::retryable("ESI is unavailable", None))
+    }
+
+    async fn public_contracts_page(
+        &self,
+        _region_id: i64,
+        _page: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        Err(EsiError::retryable("ESI is unavailable", None))
+    }
+
+    async fn public_contract_items(
+        &self,
+        _contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        Err(EsiError::retryable("ESI is unavailable", None))
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for PausedFailingContractEsi {
+    async fn regions(&self, _etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.entered.notify_one();
+        self.release.notified().await;
         Err(EsiError::retryable("ESI is unavailable", None))
     }
 
@@ -3256,23 +3303,72 @@ async fn stale_cached_responses_are_conditionally_revalidated_without_losing_pag
 }
 
 #[tokio::test]
-async fn contract_database_retries_do_not_block_an_unrelated_runtime_task() {
-    let collection = tokio::spawn(
+async fn contract_failures_do_not_block_the_killmail_producer_path() {
+    let database_retry = tokio::spawn(
         killbot_rust::contract_intelligence::run_contract_collection_loop(
             "postgres://killbot_contracts:killbot_contracts@127.0.0.1:1/never".to_string(),
             Duration::from_secs(60),
             Duration::from_millis(100),
         ),
     );
-
-    let unrelated_task = tokio::time::timeout(Duration::from_millis(50), async { 7_u8 }).await;
-
-    assert_eq!(
-        unrelated_task.expect("contract retry must not block runtime"),
-        7
+    let database = TemporaryDatabase::new().await;
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let collector = ContractCollector::new(
+        database.store().await,
+        Arc::new(PausedFailingContractEsi {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
     );
-    assert!(!collection.is_finished());
-    collection.abort();
+    let collector_failure = tokio::spawn(async move { collector.collect_cycle().await });
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("contract collector reaches its ESI request");
+
+    let fixture: ZkData =
+        serde_json::from_str(include_str!("../resources/106140056_small_bubble.json"))
+            .expect("parse inline killmail fixture");
+    let (result_tx, mut result_rx) = mpsc::channel(1);
+    let producer = tokio::spawn(run_producer(
+        Box::new(SingleInlineKillmailFeed {
+            item: Mutex::new(Some(ZkDataNoEsi {
+                kill_id: fixture.kill_id,
+                zkb: fixture.zkb,
+                inline_killmail: Some(fixture.killmail),
+            })),
+        }),
+        app_state_for_ping_limiter(),
+        result_tx,
+        Arc::new(Semaphore::new(1)),
+    ));
+
+    let processed = tokio::time::timeout(Duration::from_secs(1), result_rx.recv())
+        .await
+        .expect("killmail producer must make progress while contract work is failing")
+        .expect("producer sends a result");
+    assert!(matches!(
+        processed,
+        ProcessedResult::NoMatch {
+            kill_id: 106_140_056,
+            ..
+        }
+    ));
+    assert!(
+        !database_retry.is_finished(),
+        "database retry runtime remains isolated from the killmail producer"
+    );
+    release.notify_one();
+    let collector_error = tokio::time::timeout(Duration::from_secs(1), collector_failure)
+        .await
+        .expect("failing collector finishes")
+        .expect("join failing collector")
+        .expect_err("simulated ESI collector failure is surfaced");
+    assert!(collector_error.to_string().contains("ESI is unavailable"));
+
+    producer.abort();
+    database_retry.abort();
+    database.destroy().await;
 }
 
 #[tokio::test]
@@ -3323,6 +3419,56 @@ async fn contract_migrations_apply_to_clean_and_already_current_databases() {
             presence_intervals: 0,
         }
     );
+    let invalid_lifecycle = sqlx::query(
+        "INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES (1, 1, '{}'::jsonb, '{}'::jsonb, now(), now(), now(), 'invalid')",
+    )
+    .execute(&validation_pool)
+    .await
+    .expect_err("invalid resolution lifecycle state is rejected");
+    assert_eq!(
+        invalid_lifecycle
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514")
+    );
+
+    sqlx::query(
+        "INSERT INTO contract_subscriptions (guild_id, channel_id, subscription_id, description, filter, event_actions) VALUES (42, 77, 'dedupe', 'migration validation', '{}'::jsonb, '{}'::jsonb)",
+    )
+    .execute(&validation_pool)
+    .await
+    .expect("insert delivery subscription");
+    sqlx::query(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, delivery_nonce) VALUES (42, 77, 'dedupe', 45, 'sale_confirmed', '{}'::jsonb, '{}'::jsonb, FALSE, 'prepared', 'ci-dedupe-1')",
+    )
+    .execute(&validation_pool)
+    .await
+    .expect("insert initial delivery identity");
+    let duplicate_delivery = sqlx::query(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, delivery_nonce) VALUES (42, 77, 'dedupe', 45, 'sale_confirmed', '{}'::jsonb, '{}'::jsonb, FALSE, 'prepared', 'ci-dedupe-2')",
+    )
+    .execute(&validation_pool)
+    .await
+    .expect_err("duplicate contract delivery identity is rejected");
+    assert_eq!(
+        duplicate_delivery
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23505")
+    );
+    let delivery_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM contract_outbound_deliveries WHERE guild_id = 42 AND channel_id = 77 AND subscription_id = 'dedupe' AND contract_id = 45 AND event_kind = 'sale_confirmed'",
+    )
+    .fetch_one(&validation_pool)
+    .await
+    .expect("count delivery identity rows");
+    assert_eq!(delivery_count, 1);
+
+    ContractCollectionStore::connect(&database.url)
+        .await
+        .expect("reapply migrations after constraint validation");
     validation_pool.close().await;
     database.destroy().await;
 }
@@ -7790,53 +7936,4 @@ async fn http_esi_station_not_found_keeps_location_context_indeterminate() {
         ContractContextValue::Indeterminate
     );
     server.finish();
-}
-
-#[tokio::test]
-#[ignore = "manual visual check; requires DISCORD_BOT_TOKEN and CONTRACT_TEST_DISCORD_CHANNEL_ID and sends one non-pinging embed"]
-async fn manual_contract_embed_visual_delivery() {
-    dotenvy::dotenv().ok();
-    let token = std::env::var("DISCORD_BOT_TOKEN")
-        .expect("DISCORD_BOT_TOKEN is required for the manual contract embed check");
-    let channel_id = std::env::var("CONTRACT_TEST_DISCORD_CHANNEL_ID")
-        .expect("CONTRACT_TEST_DISCORD_CHANNEL_ID is required for the manual contract embed check")
-        .parse()
-        .expect("CONTRACT_TEST_DISCORD_CHANNEL_ID must be a Discord snowflake");
-    let delivery = DiscordContractDelivery::new(Arc::new(serenity::http::Http::new(&token)));
-    let message_id = delivery
-        .send(PreparedContractDelivery {
-            delivery_id: 0,
-            guild_id: 0,
-            channel_id,
-            subscription_id: "manual-contract-embed-check".to_string(),
-            contract_id: 234_057_619,
-            event_kind: ContractEventKind::SaleConfirmed,
-            ping: false,
-            ping_type: ContractPingType::Here,
-            nonce: "manual-contract-embed-check".to_string(),
-            enforce_nonce: false,
-            message: ContractNotificationMessage {
-                title: "Manual contract embed check".to_string(),
-                description: Some(
-                    "This non-pinging message is safe to delete after visual review.".to_string(),
-                ),
-                fields: vec![
-                    killbot_rust::contract_intelligence::ContractEmbedField {
-                        name: "Event".to_string(),
-                        value: "Sale Confirmed".to_string(),
-                        inline: true,
-                    },
-                    killbot_rust::contract_intelligence::ContractEmbedField {
-                        name: "Contract Address".to_string(),
-                        value: "contract:0//234057619".to_string(),
-                        inline: false,
-                    },
-                ],
-                thumbnail_url: None,
-                footer: Some("Manual visual check".to_string()),
-            },
-        })
-        .await
-        .expect("send manual contract embed");
-    assert!(!message_id.is_empty());
 }
