@@ -175,6 +175,7 @@ impl<T> EsiResponse<T> {
 pub enum ContractItemProbe {
     Available(EsiResponse<Vec<PublicContractItem>>),
     NoContent(CacheMetadata),
+    NotFound(CacheMetadata),
 }
 
 impl ContractItemProbe {
@@ -182,6 +183,7 @@ impl ContractItemProbe {
         match self {
             Self::Available(response) => &response.metadata,
             Self::NoContent(metadata) => metadata,
+            Self::NotFound(metadata) => metadata,
         }
     }
 }
@@ -465,6 +467,7 @@ impl HttpPublicContractEsi {
         let metadata = cache_metadata(response.headers());
         match response.status() {
             StatusCode::NO_CONTENT => Ok(ContractItemProbe::NoContent(metadata)),
+            StatusCode::NOT_FOUND => Ok(ContractItemProbe::NotFound(metadata)),
             StatusCode::NOT_MODIFIED => Ok(ContractItemProbe::Available(
                 EsiResponse::not_modified(metadata),
             )),
@@ -782,10 +785,12 @@ pub struct StorageCounts {
     pub presence_intervals: i64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContractResolutionState {
     AwaitingResolution,
     AcceptanceConfirmed,
+    Expired,
+    ClosedOutcomeUnknown,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -804,6 +809,8 @@ pub enum ContractEventKind {
     Listed,
     SaleConfirmed,
     PurchaseConfirmed,
+    Expired,
+    ClosedOutcomeUnknown,
 }
 
 impl ContractEventKind {
@@ -812,6 +819,8 @@ impl ContractEventKind {
             Self::Listed => "listed",
             Self::SaleConfirmed => "sale_confirmed",
             Self::PurchaseConfirmed => "purchase_confirmed",
+            Self::Expired => "expired",
+            Self::ClosedOutcomeUnknown => "closed_outcome_unknown",
         }
     }
 }
@@ -845,6 +854,10 @@ pub struct ContractEventActions {
     pub sale_confirmed: ContractEventAction,
     #[serde(default)]
     pub purchase_confirmed: ContractEventAction,
+    #[serde(default)]
+    pub expired: ContractEventAction,
+    #[serde(default)]
+    pub closed_outcome_unknown: ContractEventAction,
 }
 
 impl Default for ContractEventActions {
@@ -853,6 +866,8 @@ impl Default for ContractEventActions {
             listed: ContractEventAction::Ignore,
             sale_confirmed: ContractEventAction::Ignore,
             purchase_confirmed: ContractEventAction::Ignore,
+            expired: ContractEventAction::Ignore,
+            closed_outcome_unknown: ContractEventAction::Ignore,
         }
     }
 }
@@ -1724,14 +1739,24 @@ impl ContractCollectionStore {
             let manifest: ItemManifest =
                 serde_json::from_value(row.get("manifest")).map_err(json_to_sqlx)?;
             let last_public_observed_at: DateTime<Utc> = row.get("last_observed_at");
-            let inserted = sqlx::query_scalar::<_, i64>("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$6,COALESCE((SELECT expires_at FROM esi_cache_metadata WHERE resource_key = $7),$6),'awaiting_resolution') ON CONFLICT (region_id, contract_id) DO NOTHING RETURNING contract_id")
+            let cached_probe_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+                "SELECT expires_at FROM esi_cache_metadata WHERE resource_key = $1",
+            )
+            .bind(format!("contracts/public/items/{contract_id}"))
+            .fetch_optional(&mut *transaction)
+            .await?
+            .flatten();
+            let next_probe_at = cached_probe_at
+                .map(|expires_at| std::cmp::min(expires_at, contract.date_expired))
+                .unwrap_or(now);
+            let inserted = sqlx::query_scalar::<_, i64>("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$6,$7,'awaiting_resolution') ON CONFLICT (region_id, contract_id) DO NOTHING RETURNING contract_id")
                 .bind(region_id)
                 .bind(contract_id)
                 .bind(serde_json::to_value(&contract).map_err(json_to_sqlx)?)
                 .bind(serde_json::to_value(&manifest).map_err(json_to_sqlx)?)
                 .bind(last_public_observed_at)
                 .bind(now)
-                .bind(format!("contracts/public/items/{contract_id}"))
+                .bind(next_probe_at)
                 .fetch_optional(&mut *transaction)
                 .await?;
             if inserted.is_some() {
@@ -1806,15 +1831,15 @@ impl ContractCollectionStore {
             .collect()
     }
 
-    async fn pending_acceptance_notifications(
+    async fn pending_terminal_notifications(
         &self,
-    ) -> Result<Vec<ConfirmedContractResolution>, sqlx::Error> {
-        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at FROM contract_resolution_cases WHERE state = 'acceptance_confirmed' AND notification_pending = TRUE ORDER BY region_id, contract_id")
+    ) -> Result<Vec<TerminalContractResolution>, sqlx::Error> {
+        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at, state FROM contract_resolution_cases WHERE state <> 'awaiting_resolution' AND notification_pending = TRUE ORDER BY region_id, contract_id")
             .fetch_all(&self.pool)
             .await?
             .into_iter()
             .map(|row| {
-                Ok(ConfirmedContractResolution {
+                Ok(TerminalContractResolution {
                     region_id: row.get("region_id"),
                     contract_id: row.get("contract_id"),
                     contract: serde_json::from_value(row.get("contract")).map_err(json_to_sqlx)?,
@@ -1822,6 +1847,7 @@ impl ContractCollectionStore {
                     last_public_observed_at: row.get("last_public_observed_at"),
                     absence_observed_at: row.get("absence_observed_at"),
                     acceptance_evidence_at: row.get("acceptance_evidence_at"),
+                    state: contract_resolution_state_from_str(&row.get::<String, _>("state"))?,
                 })
             })
             .collect()
@@ -1876,12 +1902,55 @@ impl ContractCollectionStore {
         Ok(confirmed.is_some())
     }
 
-    async fn mark_acceptance_notifications_reported(
+    async fn resolve_nonfinancial_terminal(
+        &self,
+        resolution: &AwaitingContractResolution,
+        state: ContractResolutionState,
+        observed_at: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let (state_name, evidence_kind) = match state {
+            ContractResolutionState::Expired => ("expired", "expired"),
+            ContractResolutionState::ClosedOutcomeUnknown => {
+                ("closed_outcome_unknown", "closed_outcome_unknown")
+            }
+            ContractResolutionState::AwaitingResolution
+            | ContractResolutionState::AcceptanceConfirmed => {
+                return Err(sqlx::Error::Protocol(
+                    "nonfinancial terminal state must be expired or closed_outcome_unknown"
+                        .to_string(),
+                ))
+            }
+        };
+        let mut transaction = self.pool.begin().await?;
+        let resolved = sqlx::query_scalar::<_, i64>("UPDATE contract_resolution_cases SET state = $3, notification_pending = TRUE, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution' RETURNING contract_id")
+            .bind(resolution.region_id)
+            .bind(resolution.contract_id)
+            .bind(state_name)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        if resolved.is_some() {
+            sqlx::query("INSERT INTO contract_lifecycle_evidence (region_id, contract_id, evidence_kind, observed_at, detail) VALUES ($1,$2,$3,$4,$5)")
+                .bind(resolution.region_id)
+                .bind(resolution.contract_id)
+                .bind(evidence_kind)
+                .bind(observed_at)
+                .bind(serde_json::json!({
+                    "last_public_observed_at": resolution.last_public_observed_at,
+                    "absence_observed_at": resolution.absence_observed_at,
+                }))
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(resolved.is_some())
+    }
+
+    async fn mark_terminal_notifications_reported(
         &self,
         cases: &[ResolutionCaseKey],
     ) -> Result<(), sqlx::Error> {
         for case in cases {
-            sqlx::query("UPDATE contract_resolution_cases SET notification_pending = FALSE, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'acceptance_confirmed' AND notification_pending = TRUE")
+            sqlx::query("UPDATE contract_resolution_cases SET notification_pending = FALSE, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state <> 'awaiting_resolution' AND notification_pending = TRUE")
                 .bind(case.region_id)
                 .bind(case.contract_id)
                 .execute(&self.pool)
@@ -1924,15 +1993,7 @@ fn delivery_record_from_row(row: sqlx::postgres::PgRow) -> Result<DeliveryRecord
 fn contract_resolution_record_from_row(
     row: sqlx::postgres::PgRow,
 ) -> Result<ContractResolutionRecord, sqlx::Error> {
-    let state = match row.get::<String, _>("state").as_str() {
-        "awaiting_resolution" => ContractResolutionState::AwaitingResolution,
-        "acceptance_confirmed" => ContractResolutionState::AcceptanceConfirmed,
-        value => {
-            return Err(sqlx::Error::Protocol(format!(
-                "unknown resolution state: {value}"
-            )))
-        }
-    };
+    let state = contract_resolution_state_from_str(&row.get::<String, _>("state"))?;
     Ok(ContractResolutionRecord {
         region_id: row.get("region_id"),
         contract_id: row.get("contract_id"),
@@ -1940,6 +2001,20 @@ fn contract_resolution_record_from_row(
         last_public_observed_at: row.get("last_public_observed_at"),
         absence_observed_at: row.get("absence_observed_at"),
         acceptance_evidence_at: row.get("acceptance_evidence_at"),
+    })
+}
+
+fn contract_resolution_state_from_str(value: &str) -> Result<ContractResolutionState, sqlx::Error> {
+    Ok(match value {
+        "awaiting_resolution" => ContractResolutionState::AwaitingResolution,
+        "acceptance_confirmed" => ContractResolutionState::AcceptanceConfirmed,
+        "expired" => ContractResolutionState::Expired,
+        "closed_outcome_unknown" => ContractResolutionState::ClosedOutcomeUnknown,
+        value => {
+            return Err(sqlx::Error::Protocol(format!(
+                "unknown resolution state: {value}"
+            )))
+        }
     })
 }
 
@@ -1972,14 +2047,15 @@ struct AwaitingContractResolution {
 }
 
 #[derive(Clone, Debug)]
-struct ConfirmedContractResolution {
+struct TerminalContractResolution {
     region_id: i64,
     contract_id: i64,
     contract: PublicContract,
     manifest: ItemManifest,
     last_public_observed_at: DateTime<Utc>,
     absence_observed_at: DateTime<Utc>,
-    acceptance_evidence_at: DateTime<Utc>,
+    acceptance_evidence_at: Option<DateTime<Utc>>,
+    state: ContractResolutionState,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2184,7 +2260,7 @@ impl ContractCollector {
         self.notify(&events).await?;
         if self.notifications.is_some() {
             self.store
-                .mark_acceptance_notifications_reported(&resolution_batch.notification_cases)
+                .mark_terminal_notifications_reported(&resolution_batch.notification_cases)
                 .await?;
         }
         Ok(CollectionReport {
@@ -2272,15 +2348,8 @@ impl ContractCollector {
         &self,
     ) -> Result<ResolutionBatch, ContractCollectionError> {
         let mut batch = ResolutionBatch::default();
-        for resolution in self.store.pending_acceptance_notifications().await? {
-            if let Some(event) = acceptance_event(
-                resolution.region_id,
-                &resolution.contract,
-                &resolution.manifest,
-                resolution.last_public_observed_at,
-                resolution.absence_observed_at,
-                resolution.acceptance_evidence_at,
-            ) {
+        for resolution in self.store.pending_terminal_notifications().await? {
+            if let Some(event) = terminal_resolution_event(&resolution) {
                 batch.events.push(event);
                 batch.notification_cases.push(ResolutionCaseKey {
                     region_id: resolution.region_id,
@@ -2290,7 +2359,7 @@ impl ContractCollector {
                 warn!(
                     region_id = resolution.region_id,
                     contract_id = resolution.contract_id,
-                    "acceptance notification recovery found a non-financial contract"
+                    "terminal notification recovery found an unreportable resolution"
                 );
             }
         }
@@ -2352,6 +2421,15 @@ impl ContractCollector {
         let cached = self.store.cache(&key).await?;
         if let Some(cached) = &cached {
             if cached.metadata.is_fresh() {
+                if Utc::now() >= resolution.contract.date_expired {
+                    return self
+                        .resolve_nonfinancial_terminal(
+                            resolution,
+                            ContractResolutionState::Expired,
+                            Utc::now(),
+                        )
+                        .await;
+                }
                 self.store
                     .schedule_resolution_probe(
                         resolution.region_id,
@@ -2400,6 +2478,15 @@ impl ContractCollector {
                     )
                 };
                 self.store.save_cache(&key, &items, &metadata).await?;
+                if Utc::now() >= resolution.contract.date_expired {
+                    return self
+                        .resolve_nonfinancial_terminal(
+                            resolution,
+                            ContractResolutionState::Expired,
+                            Utc::now(),
+                        )
+                        .await;
+                }
                 self.store
                     .schedule_resolution_probe(
                         resolution.region_id,
@@ -2412,14 +2499,13 @@ impl ContractCollector {
             ContractItemProbe::NoContent(metadata) => {
                 let evidence_response_at = Utc::now();
                 if evidence_response_at >= resolution.contract.date_expired {
-                    self.store
-                        .schedule_resolution_probe(
-                            resolution.region_id,
-                            resolution.contract_id,
-                            evidence_response_at + ChronoDuration::minutes(5),
+                    return self
+                        .resolve_nonfinancial_terminal(
+                            resolution,
+                            ContractResolutionState::Expired,
+                            evidence_response_at,
                         )
-                        .await?;
-                    return Ok(None);
+                        .await;
                 }
                 let event = acceptance_event(
                     resolution.region_id,
@@ -2444,7 +2530,33 @@ impl ContractCollector {
                     Ok(None)
                 }
             }
+            ContractItemProbe::NotFound(_) => {
+                let observed_at = Utc::now();
+                let state = if observed_at >= resolution.contract.date_expired {
+                    ContractResolutionState::Expired
+                } else {
+                    ContractResolutionState::ClosedOutcomeUnknown
+                };
+                self.resolve_nonfinancial_terminal(resolution, state, observed_at)
+                    .await
+            }
         }
+    }
+
+    async fn resolve_nonfinancial_terminal(
+        &self,
+        resolution: &AwaitingContractResolution,
+        state: ContractResolutionState,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<ContractEvent>, ContractCollectionError> {
+        if self
+            .store
+            .resolve_nonfinancial_terminal(resolution, state, observed_at)
+            .await?
+        {
+            return Ok(nonfinancial_terminal_event(resolution, state));
+        }
+        Ok(None)
     }
 
     async fn notify(&self, events: &[ContractEvent]) -> Result<(), ContractCollectionError> {
@@ -2667,6 +2779,7 @@ impl ContractCollector {
             ContractEventKind::Listed => None,
             ContractEventKind::SaleConfirmed => Some(ContractItemDirection::Offered),
             ContractEventKind::PurchaseConfirmed => Some(ContractItemDirection::Requested),
+            ContractEventKind::Expired | ContractEventKind::ClosedOutcomeUnknown => None,
         };
         if required_direction.is_some_and(|direction| !evaluator.has_matching_ship_item(direction))
         {
@@ -2932,6 +3045,10 @@ fn contract_event_action(
         ContractEventKind::Listed => subscription.event_actions.listed,
         ContractEventKind::SaleConfirmed => subscription.event_actions.sale_confirmed,
         ContractEventKind::PurchaseConfirmed => subscription.event_actions.purchase_confirmed,
+        ContractEventKind::Expired => subscription.event_actions.expired,
+        ContractEventKind::ClosedOutcomeUnknown => {
+            subscription.event_actions.closed_outcome_unknown
+        }
     }
 }
 
@@ -2975,6 +3092,54 @@ fn acceptance_event(
             evidence_response_at,
         }),
     })
+}
+
+fn nonfinancial_terminal_event(
+    resolution: &AwaitingContractResolution,
+    state: ContractResolutionState,
+) -> Option<ContractEvent> {
+    let kind = match state {
+        ContractResolutionState::Expired => ContractEventKind::Expired,
+        ContractResolutionState::ClosedOutcomeUnknown => ContractEventKind::ClosedOutcomeUnknown,
+        ContractResolutionState::AwaitingResolution
+        | ContractResolutionState::AcceptanceConfirmed => return None,
+    };
+    Some(ContractEvent {
+        region_id: resolution.region_id,
+        kind,
+        contract: resolution.contract.clone(),
+        offered_items: resolution.manifest.offered_items.clone(),
+        requested_items: resolution.manifest.requested_items.clone(),
+        context: ContractObservationContext::default(),
+        acceptance_evidence: None,
+    })
+}
+
+fn terminal_resolution_event(resolution: &TerminalContractResolution) -> Option<ContractEvent> {
+    match resolution.state {
+        ContractResolutionState::AcceptanceConfirmed => acceptance_event(
+            resolution.region_id,
+            &resolution.contract,
+            &resolution.manifest,
+            resolution.last_public_observed_at,
+            resolution.absence_observed_at,
+            resolution.acceptance_evidence_at?,
+        ),
+        ContractResolutionState::Expired | ContractResolutionState::ClosedOutcomeUnknown => {
+            nonfinancial_terminal_event(
+                &AwaitingContractResolution {
+                    region_id: resolution.region_id,
+                    contract_id: resolution.contract_id,
+                    contract: resolution.contract.clone(),
+                    manifest: resolution.manifest.clone(),
+                    last_public_observed_at: resolution.last_public_observed_at,
+                    absence_observed_at: resolution.absence_observed_at,
+                },
+                resolution.state,
+            )
+        }
+        ContractResolutionState::AwaitingResolution => None,
+    }
 }
 
 fn positive_isk(value: f64) -> bool {
@@ -3580,6 +3745,8 @@ fn contract_notification_message(
         ContractEventKind::Listed => "Listed",
         ContractEventKind::SaleConfirmed => "Sale Confirmed",
         ContractEventKind::PurchaseConfirmed => "Purchase Confirmed",
+        ContractEventKind::Expired => "Expired",
+        ContractEventKind::ClosedOutcomeUnknown => "Closed — Outcome Unknown",
     };
     let mut message = ContractNotificationMessage {
         title: primary_item.map_or_else(
