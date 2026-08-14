@@ -1306,10 +1306,6 @@ async fn a_resolution_probe_failure_does_not_discard_prior_listings_or_confirmat
         probes: StdMutex::new(vec![
             Ok(ContractItemProbe::NoContent(expiring_cache())),
             Err(EsiError::retryable("transient item probe failure", None)),
-            Ok(ContractItemProbe::Available(EsiResponse::fresh(
-                vec![offered_ship(2)],
-                cached_item_metadata("items-45-v2", 60),
-            ))),
         ]),
         probe_calls: StdMutex::new(Vec::new()),
     });
@@ -1344,16 +1340,78 @@ async fn a_resolution_probe_failure_does_not_discard_prior_listings_or_confirmat
         resolutions[1].state,
         ContractResolutionState::AwaitingResolution
     );
+    let failures = store
+        .unresolved_collection_failures()
+        .await
+        .expect("read the scoped retryable resolution failure");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].region_id, Some(10_000_002));
+    assert_eq!(failures[0].contract_id, Some(45));
+    assert_eq!(
+        failures[0].resource_key.as_deref(),
+        Some("contracts/public/items/45")
+    );
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed an unrelated resolution failure");
+    sqlx::query("INSERT INTO contract_collection_failures (region_id, contract_id, resource_key, observed_at, failure_kind, detail) VALUES ($1,$2,$3,now(),$4,$5)")
+        .bind(10_000_002_i64)
+        .bind(99_i64)
+        .bind("contracts/public/items/99")
+        .bind("resolution_probe")
+        .bind("unrelated retryable probe")
+        .execute(&raw_pool)
+        .await
+        .expect("seed unrelated resolution failure");
+    raw_pool.close().await;
 
-    let second = collector
+    let restarted_resolver = Arc::new(ResolutionEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![listed], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                46,
+                Ok(EsiResponse::fresh(vec![offered_ship(3)], expiring_cache())),
+            )]),
+        },
+        probes: StdMutex::new(vec![Ok(ContractItemProbe::Available(EsiResponse::fresh(
+            vec![offered_ship(2)],
+            cached_item_metadata("items-45-v2", 60),
+        )))]),
+        probe_calls: StdMutex::new(Vec::new()),
+    });
+    let second = ContractCollector::new(store.clone(), restarted_resolver.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+            delivery.clone(),
+        )
         .collect_cycle()
         .await
-        .expect("retry the unresolved independent case");
+        .expect("a restarted collector retries the unresolved independent case");
     assert!(second.events.is_empty());
     assert_eq!(delivery.sent.lock().unwrap().len(), 2);
     assert_eq!(
         resolver.probe_calls.lock().unwrap().as_slice(),
-        [(44, None), (45, None), (45, None)]
+        [(44, None), (45, None)]
+    );
+    assert_eq!(
+        restarted_resolver.probe_calls.lock().unwrap().as_slice(),
+        [(45, None)]
+    );
+    let remaining_failures = store
+        .unresolved_collection_failures()
+        .await
+        .expect("successful retry resolves only its matching failure");
+    assert_eq!(remaining_failures.len(), 1);
+    assert_eq!(remaining_failures[0].contract_id, Some(99));
+    assert_eq!(
+        remaining_failures[0].resource_key.as_deref(),
+        Some("contracts/public/items/99")
     );
     database.destroy().await;
 }
@@ -3243,28 +3301,21 @@ async fn missing_embed_context_is_backfilled_and_retried_after_a_transient_failu
             regions: vec![10_000_002],
             pages: HashMap::from([(
                 (10_000_002, 1),
-                Ok(EsiResponse::fresh(vec![contract], expiring_page(1))),
+                Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
             )]),
             items: HashMap::from([(
                 44,
                 Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
             )]),
         },
-        contexts: StdMutex::new(vec![
-            Err(EsiError::retryable("temporary context failure", None)),
-            Ok(EsiResponse::fresh(
-                ContractEmbedContext {
-                    issuer_corporation_name: Some("Recovered Corporation".to_string()),
-                    ..ContractEmbedContext::default()
-                },
-                CacheMetadata::cached_for_seconds(60),
-            )),
-        ]),
+        contexts: StdMutex::new(vec![Err(EsiError::retryable(
+            "temporary context failure",
+            None,
+        ))]),
         calls: StdMutex::new(Vec::new()),
     });
-    let collector = ContractCollector::new(store.clone(), esi.clone());
 
-    collector
+    ContractCollector::new(store.clone(), esi.clone())
         .collect_cycle()
         .await
         .expect("preserve the complete observation when enrichment is transiently unavailable");
@@ -3273,12 +3324,60 @@ async fn missing_embed_context_is_backfilled_and_retried_after_a_transient_failu
         .await
         .expect("read absent transient snapshot")
         .is_none());
+    let failures = store
+        .unresolved_collection_failures()
+        .await
+        .expect("read the scoped embed-context failure");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].region_id, Some(10_000_002));
+    assert_eq!(failures[0].contract_id, Some(44));
+    assert_eq!(
+        failures[0].resource_key.as_deref(),
+        Some("contract-embed-context:44")
+    );
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed an unrelated enrichment failure");
+    sqlx::query("INSERT INTO contract_collection_failures (region_id, contract_id, resource_key, observed_at, failure_kind, detail) VALUES ($1,$2,$3,now(),$4,$5)")
+        .bind(10_000_002_i64)
+        .bind(45_i64)
+        .bind("contract-embed-context:45")
+        .bind("embed_context_enrichment")
+        .bind("unrelated retryable enrichment")
+        .execute(&raw_pool)
+        .await
+        .expect("seed unrelated enrichment failure");
+    raw_pool.close().await;
 
-    collector
+    let restarted_esi = Arc::new(SnapshottingEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![contract], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        },
+        contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+            ContractEmbedContext {
+                issuer_corporation_name: Some("Recovered Corporation".to_string()),
+                ..ContractEmbedContext::default()
+            },
+            CacheMetadata::cached_for_seconds(60),
+        ))]),
+        calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), restarted_esi.clone())
         .collect_cycle()
         .await
-        .expect("retry the missing observation-time enrichment");
-    assert_eq!(esi.calls.lock().unwrap().as_slice(), &[44, 44]);
+        .expect("a restarted collector retries the missing observation-time enrichment");
+    assert_eq!(esi.calls.lock().unwrap().as_slice(), &[44]);
+    assert_eq!(restarted_esi.calls.lock().unwrap().as_slice(), &[44]);
     assert_eq!(
         store
             .observed_embed_context(10_000_002, 44)
@@ -3286,6 +3385,16 @@ async fn missing_embed_context_is_backfilled_and_retried_after_a_transient_failu
             .expect("load retried snapshot")
             .and_then(|context| context.issuer_corporation_name),
         Some("Recovered Corporation".to_string())
+    );
+    let remaining_failures = store
+        .unresolved_collection_failures()
+        .await
+        .expect("successful enrichment resolves only its matching failure");
+    assert_eq!(remaining_failures.len(), 1);
+    assert_eq!(remaining_failures[0].contract_id, Some(45));
+    assert_eq!(
+        remaining_failures[0].resource_key.as_deref(),
+        Some("contract-embed-context:45")
     );
 
     database.destroy().await;
@@ -4277,6 +4386,7 @@ async fn prepared_contract_delivery_survives_restart_and_retries_without_nonce_e
     let store = database.store().await;
     let baseline_contract = item_exchange_contract(44);
     let listed_contract = item_exchange_contract(45);
+    let second_listed_contract = item_exchange_contract(46);
     let ship = offered_ship(1);
     ContractCollector::new(
         store.clone(),
@@ -4317,7 +4427,13 @@ async fn prepared_contract_delivery_survives_restart_and_retries_without_nonce_e
         attempts: StdMutex::new(Vec::new()),
         outcomes: StdMutex::new(vec![
             Err(ContractDeliveryError::ambiguous("connection closed")),
-            Err(ContractDeliveryError::transient("Discord unavailable")),
+            Err(ContractDeliveryError::ambiguous("connection closed")),
+            Err(ContractDeliveryError::transient(
+                "Discord unavailable\nretry @everyone",
+            )),
+            Err(ContractDeliveryError::transient(
+                "Discord unavailable\nretry @everyone",
+            )),
         ]),
     });
     ContractCollector::new(
@@ -4327,7 +4443,7 @@ async fn prepared_contract_delivery_survives_restart_and_retries_without_nonce_e
             pages: HashMap::from([(
                 (10_000_002, 1),
                 Ok(EsiResponse::fresh(
-                    vec![baseline_contract, listed_contract],
+                    vec![baseline_contract, listed_contract, second_listed_contract],
                     expiring_page(1),
                 )),
             )]),
@@ -4337,6 +4453,10 @@ async fn prepared_contract_delivery_survives_restart_and_retries_without_nonce_e
                     Ok(EsiResponse::fresh(vec![ship.clone()], expiring_cache())),
                 ),
                 (45, Ok(EsiResponse::fresh(vec![ship], expiring_cache()))),
+                (
+                    46,
+                    Ok(EsiResponse::fresh(vec![offered_ship(3)], expiring_cache())),
+                ),
             ]),
         }),
     )
@@ -4344,7 +4464,7 @@ async fn prepared_contract_delivery_survives_restart_and_retries_without_nonce_e
         Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
         first_delivery.clone(),
         Arc::new(RecordingContractPingLimiter {
-            outcomes: StdMutex::new(vec![true, false]),
+            outcomes: StdMutex::new(vec![true, false, false, false]),
             channels: StdMutex::new(Vec::new()),
         }),
     )
@@ -4354,23 +4474,48 @@ async fn prepared_contract_delivery_survives_restart_and_retries_without_nonce_e
     .expect("leave ambiguous delivery prepared after its immediate retry");
 
     let first_attempts = first_delivery.attempts.lock().unwrap();
-    assert_eq!(first_attempts.len(), 2);
+    assert_eq!(first_attempts.len(), 4);
     assert_eq!(first_attempts[0].nonce, first_attempts[1].nonce);
+    assert_eq!(first_attempts[2].nonce, first_attempts[3].nonce);
     assert!(first_attempts.iter().all(|attempt| attempt.enforce_nonce));
     assert!(first_attempts[0].ping);
     assert!(!first_attempts[1].ping);
     assert!(first_attempts
         .iter()
         .all(|attempt| attempt.ping_type == ContractPingType::Everyone));
-    let nonce = first_attempts[0].nonce.clone();
+    let nonces = first_attempts
+        .chunks_exact(2)
+        .map(|attempts| (attempts[0].contract_id, attempts[0].nonce.clone()))
+        .collect::<HashMap<_, _>>();
     drop(first_attempts);
+    let prepared = store
+        .delivery_records()
+        .await
+        .expect("read prepared deliveries");
+    assert_eq!(prepared.len(), 2);
+    assert!(prepared
+        .iter()
+        .all(|record| record.status == DeliveryStatus::Prepared));
+    let failures = store
+        .unresolved_delivery_failures()
+        .await
+        .expect("read retryable delivery failures for operators");
+    assert_eq!(failures.len(), 2);
     assert_eq!(
-        store
-            .delivery_records()
-            .await
-            .expect("read prepared delivery")[0]
-            .status,
-        DeliveryStatus::Prepared
+        failures
+            .iter()
+            .map(|failure| (failure.contract_id, failure.failure_kind.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (45, DeliveryFailureKind::Ambiguous),
+            (46, DeliveryFailureKind::Transient),
+        ]
+    );
+    assert_eq!(failures[1].status, DeliveryStatus::Prepared);
+    assert_eq!(failures[1].attempt_count, 2);
+    assert_eq!(
+        failures[1].detail,
+        "Discord unavailable retry @\u{200b}everyone"
     );
 
     *clock.0.lock().unwrap() += chrono::Duration::minutes(6);
@@ -4389,14 +4534,17 @@ async fn prepared_contract_delivery_survives_restart_and_retries_without_nonce_e
     let restarted_delivery = Arc::new(ScriptedDelivery {
         store: store.clone(),
         attempts: StdMutex::new(Vec::new()),
-        outcomes: StdMutex::new(vec![Ok("post-window-message".to_string())]),
+        outcomes: StdMutex::new(vec![
+            Ok("post-window-message-45".to_string()),
+            Ok("post-window-message-46".to_string()),
+        ]),
     });
     let restart_error = ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
         .with_notifications_and_ping_limiter(
             Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
             restarted_delivery.clone(),
             Arc::new(RecordingContractPingLimiter {
-                outcomes: StdMutex::new(vec![true]),
+                outcomes: StdMutex::new(vec![true, false]),
                 channels: StdMutex::new(Vec::new()),
             }),
         )
@@ -4411,16 +4559,33 @@ async fn prepared_contract_delivery_survives_restart_and_retries_without_nonce_e
         .contains("persisted global ESI limiter"));
 
     let restarted_attempts = restarted_delivery.attempts.lock().unwrap();
-    assert_eq!(restarted_attempts.len(), 1);
-    assert_eq!(restarted_attempts[0].nonce, nonce);
-    assert!(!restarted_attempts[0].enforce_nonce);
+    assert_eq!(restarted_attempts.len(), 2);
+    assert!(restarted_attempts.iter().all(|attempt| {
+        attempt.nonce == nonces[&attempt.contract_id]
+            && !attempt.enforce_nonce
+            && attempt.ping_type == ContractPingType::Everyone
+    }));
     assert!(restarted_attempts[0].ping);
-    assert_eq!(restarted_attempts[0].ping_type, ContractPingType::Everyone);
+    assert!(!restarted_attempts[1].ping);
     drop(restarted_attempts);
-    assert_eq!(
-        store.delivery_records().await.expect("read sent delivery")[0].status,
-        DeliveryStatus::Sent
-    );
+    assert!(store
+        .delivery_records()
+        .await
+        .expect("read sent deliveries")
+        .iter()
+        .all(|record| record.status == DeliveryStatus::Sent));
+    assert!(store
+        .unresolved_delivery_failures()
+        .await
+        .expect("successful retry resolves operator-visible delivery failures")
+        .is_empty());
+    for delivery in prepared {
+        assert!(store
+            .delivery_failure(delivery.id)
+            .await
+            .expect("read resolved delivery failure")
+            .is_none());
+    }
 
     database.destroy().await;
 }
