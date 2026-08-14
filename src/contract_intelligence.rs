@@ -5675,137 +5675,81 @@ fn contract_notification_message(
     issuer_history: &ContractPartyHistory,
     corporation_history: &ContractPartyHistory,
 ) -> ContractNotificationMessage {
-    let event_label = match event.kind {
-        ContractEventKind::Listed => "Listed",
-        ContractEventKind::SaleConfirmed => "Sale Confirmed",
-        ContractEventKind::PurchaseConfirmed => "Purchase Confirmed",
-        ContractEventKind::Expired => "Expired",
-        ContractEventKind::ClosedOutcomeUnknown => "Closed — Outcome Unknown",
-    };
     let primary_name = primary_item
         .and_then(|item| event.embed_context.item_names.get(&item.type_id))
-        .cloned()
+        .map(|name| sanitize_contract_text(name))
         .or_else(|| primary_item.map(|item| format!("Type {}", item.type_id)))
         .unwrap_or_else(|| "Public contract".to_string());
-    let title_verb = match event.kind {
-        ContractEventKind::Listed => "listed",
-        ContractEventKind::SaleConfirmed => "sold",
-        ContractEventKind::PurchaseConfirmed => "purchase confirmed",
-        ContractEventKind::Expired => "expired",
-        ContractEventKind::ClosedOutcomeUnknown => "closed — outcome unknown",
-    };
-    let title_location = event
-        .embed_context
-        .location
-        .solar_system_name
-        .as_deref()
-        .map(|system| format!(" in {system}"))
-        .unwrap_or_default();
+    let title_location = contract_title_location(&event.embed_context.location);
+    let title_isk = title_isk(event, primary_item);
+    let (title, title_has_isk) = contract_embed_title(
+        &primary_name,
+        event.kind,
+        title_isk.as_deref(),
+        &title_location,
+    );
+    let mut footer_parts = Vec::new();
+    if !title_has_isk {
+        if let Some(isk) = contract_isk_footer(event, primary_item) {
+            footer_parts.push(isk);
+        }
+    }
+    footer_parts.push(format!(
+        "Issued {}",
+        compact_timestamp(event.contract.date_issued)
+    ));
+    let mut description = vec![contract_address(
+        event.contract.contract_id,
+        &primary_name,
+        contract_link_place(
+            &event.embed_context.location,
+            event.contract.start_location_id,
+        )
+        .as_str(),
+    )];
+    if let Some(issuer) = compact_issuer(&event.embed_context) {
+        description.push(issuer);
+    }
+    if let Some(location) = precise_contract_location(&event.embed_context.location) {
+        description.push(format!("at: {location}"));
+    }
     let mut message = ContractNotificationMessage {
-        title: sanitize_discord_text(&format!("{primary_name} {title_verb}{title_location}")),
-        description: event
-            .contract
-            .title
-            .as_deref()
-            .filter(|title| !title.is_empty())
-            .map(sanitize_contract_title)
-            .map(|title| format!("Contract title: {title}"))
-            .map(|title| bounded_text(&title, 4096)),
-        fields: vec![
-            ContractEmbedField {
-                name: "Event".to_string(),
-                value: event_label.to_string(),
-                inline: true,
-            },
-            ContractEmbedField {
-                name: "Offered".to_string(),
-                value: compact_bundle_summary(&event.offered_items, &event.embed_context),
-                inline: false,
-            },
-            ContractEmbedField {
-                name: "Requested".to_string(),
-                value: compact_bundle_summary(&event.requested_items, &event.embed_context),
-                inline: false,
-            },
-        ],
+        title,
+        description: Some(bounded_text(
+            &description.join("\n"),
+            MAX_EMBED_DESCRIPTION_CHARACTERS,
+        )),
+        fields: Vec::new(),
         thumbnail_url: primary_item.map(|item| {
             format!(
                 "https://images.evetech.net/types/{}/icon?size=64",
                 item.type_id
             )
         }),
-        footer: Some(format!(
-            "Contract {} · issued {}",
-            event.contract.contract_id,
-            compact_timestamp(event.contract.date_issued)
-        )),
+        footer: Some(footer_parts.join(" • ")),
     };
-    if positive_isk(event.contract.price) {
+    if has_party_history(issuer_history) || has_party_history(corporation_history) {
+        let mut history = Vec::new();
+        if has_party_history(issuer_history) {
+            history.push(format!("Issuer: {}", format_party_history(issuer_history)));
+        }
+        if has_party_history(corporation_history) {
+            history.push(format!(
+                "Corp: {}",
+                format_party_history(corporation_history)
+            ));
+        }
         message.fields.push(ContractEmbedField {
-            name: "Requested ISK".to_string(),
-            value: format_compact_isk(event.contract.price),
-            inline: true,
+            name: "History".to_string(),
+            value: history.join("\n"),
+            inline: false,
         });
     }
-    if positive_isk(event.contract.reward) {
-        message.fields.push(ContractEmbedField {
-            name: "Offered ISK".to_string(),
-            value: format_compact_isk(event.contract.reward),
-            inline: true,
-        });
-    }
-    message.fields.extend([
-        ContractEmbedField {
-            name: "Observed Location".to_string(),
-            value: format_observed_location(
-                &event.embed_context.location,
-                event.contract.start_location_id,
-            ),
-            inline: false,
-        },
-        ContractEmbedField {
-            name: "Issuer".to_string(),
-            value: format_identity(
-                event.embed_context.issuer_character_name.as_deref(),
-                event.contract.issuer_id,
-            ),
-            inline: false,
-        },
-    ]);
-    let corporation = format_identity(
-        event.embed_context.issuer_corporation_name.as_deref(),
-        event.contract.issuer_corporation_id,
-    );
-    let affiliation = event
-        .embed_context
-        .issuer_alliance_id
-        .map(|id| {
-            format!(
-                "\nAlliance: {}",
-                format_identity(event.embed_context.issuer_alliance_name.as_deref(), id)
-            )
-        })
-        .unwrap_or_default();
-    message.fields.push(ContractEmbedField {
-        name: "Observed Affiliation".to_string(),
-        value: format!("At observation: {corporation}{affiliation}"),
-        inline: false,
-    });
-    message.fields.push(ContractEmbedField {
-        name: "Issuer History".to_string(),
-        value: format_party_history(issuer_history),
-        inline: false,
-    });
-    message.fields.push(ContractEmbedField {
-        name: "Corporation History".to_string(),
-        value: format_party_history(corporation_history),
-        inline: false,
-    });
     if let Some(evidence) = &event.acceptance_evidence {
         message.fields.push(ContractEmbedField {
-            name: "Acceptance Evidence".to_string(),
+            name: "Evidence".to_string(),
             value: format!(
-                "Public through {}\nAbsent by {}\n204 received {}",
+                "Public {}\nAbsent {}\n204 {}",
                 compact_timestamp(evidence.last_public_observed_at),
                 compact_timestamp(evidence.absence_observed_at),
                 compact_timestamp(evidence.evidence_response_at),
@@ -5816,11 +5760,8 @@ fn contract_notification_message(
             .num_seconds()
             .max(0);
         message.fields.push(ContractEmbedField {
-            name: "Observed Notification Latency".to_string(),
-            value: format!(
-                "{} after acceptance evidence",
-                compact_duration(latency_seconds)
-            ),
+            name: "Delay".to_string(),
+            value: format!("{} after 204", compact_duration(latency_seconds)),
             inline: true,
         });
     } else if matches!(
@@ -5828,16 +5769,19 @@ fn contract_notification_message(
         ContractEventKind::Expired | ContractEventKind::ClosedOutcomeUnknown
     ) {
         message.fields.push(ContractEmbedField {
-            name: "Closure Observation".to_string(),
-            value: "Observed no longer public; no exact closure time is available.".to_string(),
+            name: "Evidence".to_string(),
+            value: match event.kind {
+                ContractEventKind::Expired => {
+                    format!("Expired {}", compact_timestamp(event.contract.date_expired))
+                }
+                ContractEventKind::ClosedOutcomeUnknown => {
+                    "No longer public; closure time unknown".to_string()
+                }
+                _ => unreachable!("only terminal events without acceptance evidence reach here"),
+            },
             inline: false,
         });
     }
-    message.fields.push(ContractEmbedField {
-        name: "Contract Address".to_string(),
-        value: format!("```\ncontract:0//{}\n```", event.contract.contract_id),
-        inline: false,
-    });
     bound_embed_message(&mut message);
     message
 }
@@ -5848,43 +5792,175 @@ const MAX_EMBED_FIELD_NAME_CHARACTERS: usize = 256;
 const MAX_EMBED_FIELD_VALUE_CHARACTERS: usize = 1024;
 const MAX_EMBED_CHARACTERS: usize = 6000;
 const MAX_EMBED_FIELDS: usize = 25;
-const MAX_BUNDLE_ITEMS_IN_EMBED: usize = 8;
 
-fn compact_bundle_summary(items: &[PublicContractItem], context: &ContractEmbedContext) -> String {
-    let visible = items
-        .iter()
-        .take(MAX_BUNDLE_ITEMS_IN_EMBED)
-        .map(|item| {
-            let name = context
-                .item_names
-                .get(&item.type_id)
-                .cloned()
-                .unwrap_or_else(|| format!("Type {}", item.type_id));
-            format!("{name} ×{}", item.quantity)
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let hidden = items.len().saturating_sub(MAX_BUNDLE_ITEMS_IN_EMBED);
-    if visible.is_empty() {
-        "None".to_string()
-    } else if hidden == 0 {
-        visible
-    } else {
-        format!("{visible}\n+{hidden} more")
+fn contract_embed_title(
+    primary_name: &str,
+    kind: ContractEventKind,
+    title_isk: Option<&str>,
+    location: &str,
+) -> (String, bool) {
+    let action = match kind {
+        ContractEventKind::Listed => "listed",
+        ContractEventKind::SaleConfirmed => "sold",
+        ContractEventKind::PurchaseConfirmed => "bought",
+        ContractEventKind::Expired => "expired",
+        ContractEventKind::ClosedOutcomeUnknown => "closed (outcome unknown)",
+    };
+    let with_isk = title_isk.map(|isk| format!("{primary_name} {action} for {isk}{location}"));
+    if let Some(title) =
+        with_isk.filter(|title| title.chars().count() <= MAX_EMBED_TITLE_CHARACTERS)
+    {
+        return (title, true);
+    }
+    (
+        bounded_text(
+            &format!("{primary_name} {action}{location}"),
+            MAX_EMBED_TITLE_CHARACTERS,
+        ),
+        false,
+    )
+}
+
+fn title_isk(event: &ContractEvent, primary_item: Option<&PublicContractItem>) -> Option<String> {
+    if !matches!(
+        event.kind,
+        ContractEventKind::Listed
+            | ContractEventKind::SaleConfirmed
+            | ContractEventKind::PurchaseConfirmed
+    ) {
+        return None;
+    }
+    let value = contract_display_isk(event, primary_item)?;
+    positive_isk(value).then(|| format_compact_isk_short(value))
+}
+
+fn contract_isk_footer(
+    event: &ContractEvent,
+    primary_item: Option<&PublicContractItem>,
+) -> Option<String> {
+    contract_display_isk(event, primary_item)
+        .filter(|value| positive_isk(*value))
+        .map(|value| format!("Value: {}", format_compact_isk(value)))
+}
+
+fn contract_display_isk(
+    event: &ContractEvent,
+    primary_item: Option<&PublicContractItem>,
+) -> Option<f64> {
+    let value = match primary_item {
+        Some(item) if item.is_included => event.contract.price,
+        Some(_) => event.contract.reward,
+        None => event.contract.price.max(event.contract.reward),
+    };
+    positive_isk(value).then_some(value)
+}
+
+fn contract_title_location(context: &ContractLocationContext) -> String {
+    match (
+        context.solar_system_name.as_deref(),
+        context.region_name.as_deref(),
+    ) {
+        (Some(system), Some(region)) => {
+            format!(
+                " in {} ({})",
+                sanitize_contract_text(system),
+                sanitize_contract_text(region)
+            )
+        }
+        (Some(system), None) => format!(" in {}", sanitize_contract_text(system)),
+        (None, Some(region)) => format!(" in {}", sanitize_contract_text(region)),
+        (None, None) => String::new(),
     }
 }
 
+fn contract_link_place(context: &ContractLocationContext, location_id: i64) -> String {
+    context
+        .solar_system_name
+        .as_deref()
+        .or(context.location_name.as_deref())
+        .or(context.region_name.as_deref())
+        .map(sanitize_contract_text)
+        .filter(|place| !place.is_empty())
+        .unwrap_or_else(|| format!("Location {location_id}"))
+}
+
+fn contract_address(contract_id: i64, label: &str, place: &str) -> String {
+    let label = bounded_text(label, 160);
+    let place = bounded_text(place, 160);
+    format!("<url=\"contract:0//{contract_id}\">{label} - {place}</url>")
+}
+
+fn compact_issuer(context: &ContractEmbedContext) -> Option<String> {
+    let parts = [
+        context.issuer_character_name.as_deref(),
+        context.issuer_corporation_name.as_deref(),
+        context.issuer_alliance_name.as_deref(),
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        name.map(sanitize_contract_identity)
+            .filter(|name| !name.is_empty())
+    })
+    .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join(" • "))
+}
+
+fn precise_contract_location(context: &ContractLocationContext) -> Option<String> {
+    if let Some(location) = context
+        .location_name
+        .as_deref()
+        .map(sanitize_contract_text)
+        .filter(|location| !location.is_empty())
+    {
+        return Some(location);
+    }
+    let mut parts = Vec::new();
+    if let Some(system) = context
+        .solar_system_name
+        .as_deref()
+        .map(sanitize_contract_text)
+        .filter(|system| !system.is_empty())
+    {
+        let security = context
+            .security_status
+            .filter(|value| value.is_finite())
+            .map(|value| format!(" ({value:.1})"))
+            .unwrap_or_default();
+        parts.push(format!("{system}{security}"));
+    }
+    if let Some(region) = context
+        .region_name
+        .as_deref()
+        .map(sanitize_contract_text)
+        .filter(|region| !region.is_empty())
+    {
+        parts.push(region);
+    }
+    (!parts.is_empty()).then(|| parts.join(" • "))
+}
+
+fn has_party_history(history: &ContractPartyHistory) -> bool {
+    history.confirmed_sales > 0
+        || history.confirmed_purchases > 0
+        || history.unknown_closures > 0
+        || history.most_recent_confirmed.is_some()
+}
+
 fn format_compact_isk(value: f64) -> String {
+    format!("{} ISK", format_compact_isk_short(value))
+}
+
+fn format_compact_isk_short(value: f64) -> String {
     let (scaled, suffix) = if value >= 1_000_000_000.0 {
-        (value / 1_000_000_000.0, "b")
+        (value / 1_000_000_000.0, "B")
     } else if value >= 1_000_000.0 {
-        (value / 1_000_000.0, "m")
+        (value / 1_000_000.0, "M")
     } else if value >= 1_000.0 {
-        (value / 1_000.0, "k")
+        (value / 1_000.0, "K")
     } else {
         (value, "")
     };
-    format!("{}{} ISK", trim_decimal(scaled), suffix)
+    format!("{}{}", trim_decimal(scaled), suffix)
 }
 
 fn trim_decimal(value: f64) -> String {
@@ -5895,55 +5971,26 @@ fn trim_decimal(value: f64) -> String {
         .to_string()
 }
 
-fn format_observed_location(context: &ContractLocationContext, location_id: i64) -> String {
-    let mut lines = Vec::new();
-    if let Some(name) = &context.location_name {
-        let kind = context.location_kind.as_deref().unwrap_or("Location");
-        lines.push(format!("{kind}: {name}"));
-    }
-    if let Some(name) = &context.solar_system_name {
-        let security = context
-            .security_status
-            .filter(|value| value.is_finite())
-            .map(|value| format!(" ({value:.1})"))
-            .unwrap_or_default();
-        lines.push(format!("System: {name}{security}"));
-    } else if let Some(system_id) = context.solar_system_id {
-        lines.push(format!("System ID: {system_id}"));
-    }
-    if let Some(name) = &context.region_name {
-        lines.push(format!("Region: {name}"));
-    } else if let Some(region_id) = context.region_id {
-        lines.push(format!("Region ID: {region_id}"));
-    }
-    lines.push(format!("Location ID: {location_id}"));
-    lines.join("\n")
-}
-
-fn format_identity(name: Option<&str>, id: i64) -> String {
-    match name {
-        Some(name) => format!("{} ({id})", sanitize_discord_text(name)),
-        None => id.to_string(),
-    }
-}
-
 fn format_party_history(history: &ContractPartyHistory) -> String {
-    let mut value = format!(
-        "90d: {} sales · {} purchases · {} unknown closures",
-        history.confirmed_sales, history.confirmed_purchases, history.unknown_closures
-    );
+    let mut entries = Vec::new();
+    if history.confirmed_sales > 0 {
+        entries.push(format!("{} sales", history.confirmed_sales));
+    }
+    if history.confirmed_purchases > 0 {
+        entries.push(format!("{} purchases", history.confirmed_purchases));
+    }
+    if history.unknown_closures > 0 {
+        entries.push(format!("{} unknown", history.unknown_closures));
+    }
     if let Some(latest) = &history.most_recent_confirmed {
         let label = match latest.kind {
-            ContractEventKind::SaleConfirmed => "Sale confirmed",
-            ContractEventKind::PurchaseConfirmed => "Purchase confirmed",
-            _ => "Confirmed",
+            ContractEventKind::SaleConfirmed => "last sale",
+            ContractEventKind::PurchaseConfirmed => "last purchase",
+            _ => "last confirmed",
         };
-        value.push_str(&format!(
-            "\nLatest: {label} {}",
-            compact_timestamp(latest.observed_at)
-        ));
+        entries.push(format!("{label} {}", compact_timestamp(latest.observed_at)));
     }
-    value
+    entries.join(" • ")
 }
 
 fn compact_timestamp(value: DateTime<Utc>) -> String {
@@ -5976,53 +6023,22 @@ fn bound_embed_message(message: &mut ContractNotificationMessage) {
         .footer
         .as_deref()
         .map(|footer| bounded_text(footer, 2048));
-    if message.fields.len() > MAX_EMBED_FIELDS {
-        let contract_address = message
-            .fields
-            .iter()
-            .position(|field| field.name == "Contract Address")
-            .map(|index| message.fields.remove(index));
-        message
-            .fields
-            .truncate(MAX_EMBED_FIELDS - usize::from(contract_address.is_some()));
-        if let Some(contract_address) = contract_address {
-            message.fields.push(contract_address);
+    message.fields.truncate(MAX_EMBED_FIELDS);
+    if embed_character_count(message) <= MAX_EMBED_CHARACTERS {
+        return;
+    }
+
+    while embed_character_count(message) > MAX_EMBED_CHARACTERS {
+        if message.fields.pop().is_none() {
+            break;
         }
     }
-    if embed_character_count(message) <= MAX_EMBED_CHARACTERS {
-        return;
-    }
-
-    message.description = None;
-    if embed_character_count(message) <= MAX_EMBED_CHARACTERS {
-        return;
-    }
-
-    let excess = embed_character_count(message).saturating_sub(MAX_EMBED_CHARACTERS);
-    if let Some(footer) = &message.footer {
-        let footer_budget = footer.chars().count().saturating_sub(excess);
-        message.footer = (footer_budget > 0).then(|| bounded_text(footer, footer_budget));
-    }
-    while embed_character_count(message) > MAX_EMBED_CHARACTERS {
-        let Some(index) = message
-            .fields
-            .iter()
-            .rposition(|field| field.name != "Contract Address")
-        else {
-            break;
-        };
-        message.fields.remove(index);
-    }
     if embed_character_count(message) > MAX_EMBED_CHARACTERS {
-        message.footer = None;
-    }
-    if embed_character_count(message) > MAX_EMBED_CHARACTERS {
-        let title_budget = message
-            .title
-            .chars()
-            .count()
-            .saturating_sub(embed_character_count(message) - MAX_EMBED_CHARACTERS);
-        message.title = bounded_text(&message.title, title_budget);
+        let excess = embed_character_count(message) - MAX_EMBED_CHARACTERS;
+        if let Some(footer) = &message.footer {
+            let footer_budget = footer.chars().count().saturating_sub(excess);
+            message.footer = (footer_budget > 0).then(|| bounded_text(footer, footer_budget));
+        }
     }
 }
 
@@ -6081,13 +6097,22 @@ pub fn sanitize_discord_text(value: &str) -> String {
     value.replace('@', "@\u{200b}")
 }
 
-fn sanitize_contract_title(value: &str) -> String {
+fn sanitize_contract_text(value: &str) -> String {
+    sanitize_contract_visible_text(value, false)
+}
+
+fn sanitize_contract_identity(value: &str) -> String {
+    sanitize_contract_visible_text(value, true)
+}
+
+fn sanitize_contract_visible_text(value: &str, preserve_name_punctuation: bool) -> String {
     let mut sanitized = String::with_capacity(value.len());
     for character in value.chars() {
         match character {
             '@' => sanitized.push_str("@\u{200b}"),
+            '-' | '.' if preserve_name_punctuation => sanitized.push(character),
             '\\' | '`' | '*' | '_' | '~' | '>' | '<' | '[' | ']' | '(' | ')' | '#' | '+' | '-'
-            | '.' | '!' | '|' | '{' | '}' => sanitized.push(' '),
+            | '.' | '!' | '|' | '{' | '}' | '"' => sanitized.push(' '),
             character if character.is_whitespace() || character.is_control() => sanitized.push(' '),
             _ => sanitized.push(character),
         }
@@ -6421,13 +6446,13 @@ mod embed_tests {
     fn renders_every_contract_event_without_a_counterparty() {
         let history = ContractPartyHistory::default();
         for (kind, expected) in [
-            (ContractEventKind::Listed, "Listed"),
-            (ContractEventKind::SaleConfirmed, "Sale Confirmed"),
-            (ContractEventKind::PurchaseConfirmed, "Purchase Confirmed"),
-            (ContractEventKind::Expired, "Expired"),
+            (ContractEventKind::Listed, "listed"),
+            (ContractEventKind::SaleConfirmed, "sold"),
+            (ContractEventKind::PurchaseConfirmed, "bought"),
+            (ContractEventKind::Expired, "expired"),
             (
                 ContractEventKind::ClosedOutcomeUnknown,
-                "Closed — Outcome Unknown",
+                "closed (outcome unknown)",
             ),
         ] {
             let message = contract_notification_message(
@@ -6436,7 +6461,9 @@ mod embed_tests {
                 &history,
                 &history,
             );
-            assert_eq!(field(&message, "Event"), Some(expected));
+            assert!(message.title.contains(expected));
+            assert_eq!(field(&message, "Event"), None);
+            assert_eq!(field(&message, "History"), None);
             assert!(message.fields.iter().all(|field| !matches!(
                 field.name.as_str(),
                 "Buyer" | "Counterparty" | "Accepting Corporation"
@@ -6453,11 +6480,12 @@ mod embed_tests {
             &history,
             &history,
         );
-        let full_location = field(&full, "Observed Location").expect("location field");
-        assert!(full_location.contains("Station: Jita IV - Moon 4 - Caldari Navy Assembly Plant"));
-        assert!(full_location.contains("System: Jita (0.9)"));
-        assert!(full_location.contains("Region: The Forge"));
-        assert!(full_location.ends_with("Location ID: 60003760"));
+        assert_eq!(
+            full.description.as_deref(),
+            Some(
+                "<url=\"contract:0//45\">Public contract - Jita</url>\nIssuer Name • Issuer Corp • Issuer Alliance\nat: Jita IV Moon 4 Caldari Navy Assembly Plant"
+            )
+        );
 
         let mut fallback = event(ContractEventKind::Listed);
         fallback.embed_context.location = ContractLocationContext {
@@ -6466,8 +6494,10 @@ mod embed_tests {
         };
         let fallback = contract_notification_message(&fallback, None, &history, &history);
         assert_eq!(
-            field(&fallback, "Observed Location"),
-            Some("System ID: 30000142\nLocation ID: 60003760")
+            fallback.description.as_deref(),
+            Some(
+                "<url=\"contract:0//45\">Public contract - Location 60003760</url>\nIssuer Name • Issuer Corp • Issuer Alliance"
+            )
         );
 
         let mut station_only = event(ContractEventKind::Listed);
@@ -6478,8 +6508,10 @@ mod embed_tests {
         };
         let station_only = contract_notification_message(&station_only, None, &history, &history);
         assert_eq!(
-            field(&station_only, "Observed Location"),
-            Some("Station: Jita IV - Moon 4\nLocation ID: 60003760")
+            station_only.description.as_deref(),
+            Some(
+                "<url=\"contract:0//45\">Public contract - Jita IV Moon 4</url>\nIssuer Name • Issuer Corp • Issuer Alliance\nat: Jita IV Moon 4"
+            )
         );
 
         let mut region_only = event(ContractEventKind::Listed);
@@ -6489,16 +6521,20 @@ mod embed_tests {
         };
         let region_only = contract_notification_message(&region_only, None, &history, &history);
         assert_eq!(
-            field(&region_only, "Observed Location"),
-            Some("Region ID: 10000002\nLocation ID: 60003760")
+            region_only.description.as_deref(),
+            Some(
+                "<url=\"contract:0//45\">Public contract - Location 60003760</url>\nIssuer Name • Issuer Corp • Issuer Alliance"
+            )
         );
 
         let mut raw_only = event(ContractEventKind::Listed);
         raw_only.embed_context.location = ContractLocationContext::default();
         let raw_only = contract_notification_message(&raw_only, None, &history, &history);
         assert_eq!(
-            field(&raw_only, "Observed Location"),
-            Some("Location ID: 60003760")
+            raw_only.description.as_deref(),
+            Some(
+                "<url=\"contract:0//45\">Public contract - Location 60003760</url>\nIssuer Name • Issuer Corp • Issuer Alliance"
+            )
         );
     }
 
@@ -6516,21 +6552,105 @@ mod embed_tests {
             message.thumbnail_url.as_deref(),
             Some("https://images.evetech.net/types/19720/icon?size=64")
         );
-        let offered = field(&message, "Offered").expect("offered bundle");
-        assert!(offered.contains("Ragnarok ×1"));
-        assert!(offered.contains("Rifter ×1"));
-        assert_eq!(field(&message, "Requested ISK"), Some("77.5b ISK"));
+        assert!(message.fields.is_empty());
+        let description = message.description.expect("compact contract description");
+        assert!(description.contains("Ragnarok - Jita"));
+        assert!(!description.contains("Rifter"));
+        assert!(!description.contains("Tritanium"));
     }
 
     #[test]
-    fn history_evidence_and_contract_address_are_structural_and_bounded() {
+    fn issuer_affiliations_render_progressively_without_ids() {
+        let mut context = ContractEmbedContext {
+            issuer_character_name: Some("Issuer-Name".to_string()),
+            ..ContractEmbedContext::default()
+        };
+        assert_eq!(compact_issuer(&context).as_deref(), Some("Issuer-Name"));
+
+        context.issuer_corporation_name = Some("Issuer Corp".to_string());
+        assert_eq!(
+            compact_issuer(&context).as_deref(),
+            Some("Issuer-Name • Issuer Corp")
+        );
+
+        context.issuer_alliance_name = Some("Issuer Alliance".to_string());
+        assert_eq!(
+            compact_issuer(&context).as_deref(),
+            Some("Issuer-Name • Issuer Corp • Issuer Alliance")
+        );
+
+        context.issuer_character_name = None;
+        assert_eq!(
+            compact_issuer(&context).as_deref(),
+            Some("Issuer Corp • Issuer Alliance")
+        );
+    }
+
+    #[test]
+    fn compact_listing_embed_keeps_only_the_matched_ship_and_its_contract_link() {
+        let history = ContractPartyHistory::default();
+        let message = contract_notification_message(
+            &event(ContractEventKind::Listed),
+            Some(&item(1, 19_720, true)),
+            &history,
+            &history,
+        );
+
+        assert_eq!(
+            message.title,
+            "Ragnarok listed for 77.5B in Jita (The Forge)"
+        );
+        assert_eq!(
+            message.description.as_deref(),
+            Some(
+                "<url=\"contract:0//45\">Ragnarok - Jita</url>\nIssuer Name • Issuer Corp • Issuer Alliance\nat: Jita IV Moon 4 Caldari Navy Assembly Plant"
+            )
+        );
+        assert!(message
+            .footer
+            .as_deref()
+            .is_some_and(|footer| footer.starts_with("Issued ")));
+        assert!(message.fields.iter().all(|field| {
+            !matches!(
+                field.name.as_str(),
+                "Event"
+                    | "Contract"
+                    | "Terms"
+                    | "Issuer"
+                    | "Location"
+                    | "Offered"
+                    | "Requested"
+                    | "Requested ISK"
+                    | "Offered ISK"
+                    | "Observed Location"
+                    | "Observed Affiliation"
+                    | "Issuer History"
+                    | "Corporation History"
+            )
+        }));
+        let values = message
+            .fields
+            .iter()
+            .map(|field| field.value.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!values.contains("Rifter"));
+        assert!(!values.contains("Tritanium"));
+    }
+
+    #[test]
+    fn history_evidence_and_contract_link_are_structural_and_bounded() {
         let mut event = event(ContractEventKind::SaleConfirmed);
         event.acceptance_evidence = Some(ContractAcceptanceEvidence {
             last_public_observed_at: Utc::now() - ChronoDuration::minutes(3),
             absence_observed_at: Utc::now() - ChronoDuration::minutes(2),
             evidence_response_at: Utc::now() - ChronoDuration::seconds(90),
         });
-        event.contract.title = Some("`@everyone` ".repeat(800));
+        event.embed_context.item_names.insert(
+            19_720,
+            format!("`@everyone` <url=\"bad\">{}</url>", "R".repeat(400)),
+        );
+        event.embed_context.issuer_character_name = Some("Issuer-Name".to_string());
         event.embed_context.issuer_corporation_name = None;
         event.embed_context.issuer_alliance_id = None;
         event.embed_context.issuer_alliance_name = None;
@@ -6545,39 +6665,30 @@ mod embed_tests {
         };
         let message =
             contract_notification_message(&event, Some(&item(1, 19_720, true)), &history, &history);
-        assert!(message
+        let description = message
             .description
             .as_deref()
-            .expect("title description")
-            .contains("@\u{200b}everyone"));
-        assert!(
-            message
-                .description
-                .as_deref()
-                .expect("title description")
-                .chars()
-                .count()
-                <= 4096
-        );
-        assert_eq!(
-            field(&message, "Observed Affiliation"),
-            Some("At observation: 98000001")
-        );
-        assert!(field(&message, "Issuer History")
+            .expect("contract description");
+        let contract_link = description.lines().next().expect("contract link");
+        assert!(contract_link.starts_with("<url=\"contract:0//45\">"));
+        assert!(contract_link.ends_with(" - Jita</url>"));
+        assert!(!contract_link.contains("<url=\"bad\">"));
+        assert!(description.contains("Issuer-Name"));
+        assert!(!description.contains("90000001"));
+        assert!(!description.contains("98000001"));
+        assert!(description.chars().count() <= MAX_EMBED_DESCRIPTION_CHARACTERS);
+        assert!(field(&message, "History")
             .expect("history")
             .contains("4 sales"));
-        assert!(field(&message, "Acceptance Evidence")
+        assert!(field(&message, "Evidence")
             .expect("evidence")
-            .contains("204 received"));
-        assert_eq!(
-            field(&message, "Contract Address"),
-            Some("```\ncontract:0//45\n```")
-        );
-        assert!(message
-            .footer
-            .as_deref()
-            .expect("footer")
-            .contains("Contract 45"));
+            .contains("204 "));
+        assert!(field(&message, "Delay").is_some_and(|delay| delay.ends_with(" after 204")));
+        assert_eq!(field(&message, "Observed Affiliation"), None);
+        assert_eq!(field(&message, "Contract Address"), None);
+        let footer = message.footer.as_deref().expect("footer");
+        assert!(footer.starts_with("Value: 77.5B ISK • Issued "));
+        assert!(embed_character_count(&message) <= MAX_EMBED_CHARACTERS);
     }
 
     #[test]
@@ -6634,28 +6745,28 @@ mod embed_tests {
             &issuer_history,
             &corporation_history,
         );
-        assert_eq!(message.title, "Hel sold in Jita");
-        assert_eq!(field(&message, "Requested ISK"), Some("77.5b ISK"));
-        assert!(field(&message, "Observed Location")
-            .expect("location field")
-            .contains("Station: Jita IV - Moon 4 - Caldari Navy Assembly Plant"));
-        assert_eq!(field(&message, "Issuer"), Some("Issuer Name (90000001)"));
-        assert!(field(&message, "Issuer History")
+        assert_eq!(message.title, "Hel sold for 77.5B in Jita (The Forge)");
+        assert!(message
+            .description
+            .as_deref()
+            .is_some_and(|description| description.starts_with(
+                "<url=\"contract:0//234057619\">Hel - Jita</url>\nIssuer Name • Issuer Corp • Issuer Alliance"
+            )));
+        assert!(field(&message, "History")
             .expect("issuer history")
             .contains("4 sales"));
-        assert!(field(&message, "Corporation History")
+        assert!(field(&message, "History")
             .expect("corporation history")
             .contains("12 sales"));
         assert_eq!(
             message.thumbnail_url.as_deref(),
             Some("https://images.evetech.net/types/22852/icon?size=64")
         );
-        assert_eq!(
-            field(&message, "Contract Address"),
-            Some("```\ncontract:0//234057619\n```")
-        );
         let embed = contract_notification_embed(&message);
-        assert_eq!(embed.0["title"].as_str(), Some("Hel sold in Jita"));
+        assert_eq!(
+            embed.0["title"].as_str(),
+            Some("Hel sold for 77.5B in Jita (The Forge)")
+        );
         assert_eq!(
             embed.0["thumbnail"]["url"].as_str(),
             Some("https://images.evetech.net/types/22852/icon?size=64")
@@ -6682,21 +6793,19 @@ mod embed_tests {
     }
 
     #[test]
-    fn aggregate_embed_limit_trims_optional_content_before_contract_address() {
+    fn aggregate_embed_limit_preserves_the_contract_link() {
         let mut message = ContractNotificationMessage {
             title: "T".repeat(MAX_EMBED_TITLE_CHARACTERS),
-            description: Some("D".repeat(MAX_EMBED_DESCRIPTION_CHARACTERS)),
-            fields: (0..24)
+            description: Some(format!(
+                "<url=\"contract:0//45\">Ragnarok - Jita</url>\n{}",
+                "D".repeat(4_000)
+            )),
+            fields: (0..25)
                 .map(|index| ContractEmbedField {
                     name: format!("Field {index} {}", "N".repeat(240)),
                     value: "V".repeat(MAX_EMBED_FIELD_VALUE_CHARACTERS),
                     inline: false,
                 })
-                .chain(std::iter::once(ContractEmbedField {
-                    name: "Contract Address".to_string(),
-                    value: "```\ncontract:0//45\n```".to_string(),
-                    inline: false,
-                }))
                 .collect(),
             thumbnail_url: None,
             footer: Some("F".repeat(2048)),
@@ -6726,29 +6835,40 @@ mod embed_tests {
                 <= MAX_EMBED_CHARACTERS
         );
         assert!(message.fields.len() <= MAX_EMBED_FIELDS);
-        assert_eq!(
-            field(&message, "Contract Address"),
-            Some("```\ncontract:0//45\n```")
-        );
+        assert!(message
+            .description
+            .as_deref()
+            .is_some_and(|description| description
+                .starts_with("<url=\"contract:0//45\">Ragnarok - Jita</url>")));
     }
 
     #[test]
-    fn contract_titles_are_single_line_plain_text_without_discord_markdown() {
+    fn contract_embed_text_is_single_line_plain_text_without_discord_markdown() {
         let mut event = event(ContractEventKind::Listed);
-        event.contract.title = Some("# heading\n- list ||spoiler|| **bold** <@1234>".to_string());
+        event.embed_context.item_names.insert(
+            19_720,
+            "# heading\n- list ||spoiler|| **bold** <@1234>".to_string(),
+        );
         let history = ContractPartyHistory::default();
 
-        let message = contract_notification_message(&event, None, &history, &history);
-        let description = message.description.expect("sanitized contract title");
+        let message = contract_notification_message(
+            &event,
+            Some(&event.offered_items[0]),
+            &history,
+            &history,
+        );
+        let description = message.description.expect("sanitized contract description");
+        let contract_link = description.lines().next().expect("contract link");
 
-        assert!(!description.contains('\n'));
-        assert!(!description.contains("# heading"));
-        assert!(!description.contains("- list"));
-        assert!(!description.contains("||spoiler||"));
-        assert!(!description.contains("**bold**"));
-        assert!(!description.contains("<@1234>"));
-        assert!(description.contains("heading"));
-        assert!(description.contains("spoiler"));
-        assert!(description.contains("bold"));
+        assert!(!contract_link.contains('\n'));
+        assert!(!contract_link.contains("# heading"));
+        assert!(!contract_link.contains("- list"));
+        assert!(!contract_link.contains("||spoiler||"));
+        assert!(!contract_link.contains("**bold**"));
+        assert!(!contract_link.contains("<@1234>"));
+        assert!(contract_link.contains("heading"));
+        assert!(contract_link.contains("spoiler"));
+        assert!(contract_link.contains("bold"));
+        assert!(contract_link.ends_with(" - Jita</url>"));
     }
 }
