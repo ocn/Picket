@@ -2,13 +2,15 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::header::{HeaderMap, ETAG, EXPIRES, IF_NONE_MATCH, LAST_MODIFIED, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Error as DeError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{migrate::Migrator, postgres::PgPoolOptions, PgPool, Row};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -171,6 +173,7 @@ impl<T> EsiResponse<T> {
 #[derive(Clone, Debug)]
 pub struct EsiError {
     message: String,
+    status: Option<StatusCode>,
     retry_after: Option<DateTime<Utc>>,
     metadata: CacheMetadata,
 }
@@ -179,6 +182,7 @@ impl EsiError {
     pub fn retryable(message: impl Into<String>, retry_after: Option<DateTime<Utc>>) -> Self {
         Self {
             message: message.into(),
+            status: None,
             retry_after,
             metadata: CacheMetadata {
                 retry_after,
@@ -187,12 +191,21 @@ impl EsiError {
         }
     }
 
-    fn from_metadata(message: impl Into<String>, metadata: CacheMetadata) -> Self {
+    fn from_metadata(
+        message: impl Into<String>,
+        status: Option<StatusCode>,
+        metadata: CacheMetadata,
+    ) -> Self {
         Self {
             message: message.into(),
+            status,
             retry_after: metadata.retry_after,
             metadata,
         }
+    }
+
+    fn is_not_found(&self) -> bool {
+        self.status == Some(StatusCode::NOT_FOUND)
     }
 }
 
@@ -218,6 +231,17 @@ pub trait PublicContractEsi: Send + Sync {
         contract_id: i64,
         etag: Option<&str>,
     ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError>;
+
+    async fn observed_contract_context(
+        &self,
+        _contract: &PublicContract,
+        _requirements: ContractContextRequirements,
+    ) -> Result<EsiResponse<ContractObservationContext>, EsiError> {
+        Ok(EsiResponse::fresh(
+            ContractObservationContext::default(),
+            CacheMetadata::cached_for_seconds(0),
+        ))
+    }
 }
 
 pub struct HttpPublicContractEsi {
@@ -277,6 +301,7 @@ impl HttpPublicContractEsi {
             metadata.retry_after = retry_after;
             return Err(EsiError::from_metadata(
                 format!("ESI returned {}", response.status()),
+                Some(response.status()),
                 metadata,
             ));
         }
@@ -311,6 +336,99 @@ impl PublicContractEsi for HttpPublicContractEsi {
     ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
         self.get(&format!("contracts/public/items/{contract_id}/"), etag)
             .await
+    }
+
+    async fn observed_contract_context(
+        &self,
+        contract: &PublicContract,
+        requirements: ContractContextRequirements,
+    ) -> Result<EsiResponse<ContractObservationContext>, EsiError> {
+        #[derive(Deserialize)]
+        struct Station {
+            system_id: i64,
+        }
+
+        #[derive(Deserialize)]
+        struct SolarSystem {
+            security_status: f64,
+        }
+
+        #[derive(Deserialize)]
+        struct Affiliation {
+            alliance_id: Option<i64>,
+        }
+
+        let mut context = ContractObservationContext::default();
+        let mut metadata = CacheMetadata::cached_for_seconds(0);
+        if requirements.solar_system || requirements.security_status {
+            let system_id = match u32::try_from(contract.start_location_id) {
+                Ok(location_id) if (30_000_000..33_000_000).contains(&location_id) => {
+                    Some(i64::from(location_id))
+                }
+                Ok(location_id) => match self
+                    .get::<Station>(&format!("universe/stations/{location_id}/"), None)
+                    .await
+                {
+                    Ok(response) => {
+                        metadata = merge_cache_metadata(&metadata, response.metadata);
+                        response.value.map(|station| station.system_id)
+                    }
+                    Err(error) if error.is_not_found() => None,
+                    Err(error) => return Err(error),
+                },
+                Err(_) => None,
+            };
+            if let Some(system_id) = system_id {
+                let response = self
+                    .get::<SolarSystem>(&format!("universe/systems/{system_id}/"), None)
+                    .await?;
+                metadata = merge_cache_metadata(&metadata, response.metadata);
+                let system = response.value.ok_or_else(|| {
+                    EsiError::retryable("solar system context returned no response body", None)
+                })?;
+                context.solar_system_id = Some(system_id);
+                if system.security_status.is_finite() {
+                    context.security_status = Some(system.security_status);
+                }
+            }
+        }
+        if requirements.observed_affiliation {
+            let response = self
+                .client
+                .post(format!("{}characters/affiliation/", self.base_url))
+                .json(&[contract.issuer_id])
+                .send()
+                .await
+                .map_err(|error| EsiError::retryable(error.to_string(), None))?;
+            let mut response_metadata = cache_metadata(response.headers());
+            if !response.status().is_success() {
+                let status = response.status();
+                response_metadata.retry_after = response_metadata.retry_after.or_else(|| {
+                    if matches!(status, StatusCode::TOO_MANY_REQUESTS) || status.as_u16() == 420 {
+                        response_metadata
+                            .error_limit_reset
+                            .map(|seconds| Utc::now() + ChronoDuration::seconds(seconds))
+                    } else {
+                        None
+                    }
+                });
+                return Err(EsiError::from_metadata(
+                    format!("ESI returned {status}"),
+                    Some(status),
+                    response_metadata,
+                ));
+            }
+            metadata = merge_cache_metadata(&metadata, response_metadata);
+            let affiliations = response
+                .json::<Vec<Affiliation>>()
+                .await
+                .map_err(|error| EsiError::retryable(error.to_string(), None))?;
+            context.observed_affiliation_alliance_id = affiliations
+                .into_iter()
+                .next()
+                .and_then(|affiliation| affiliation.alliance_id);
+        }
+        Ok(EsiResponse::fresh(context, metadata))
     }
 }
 
@@ -472,28 +590,336 @@ pub enum ContractEventAction {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContractEventActions {
     pub listed: ContractEventAction,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+impl ContractEventActions {
+    pub fn validate(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ContractFilter {
-    pub events: Vec<ContractEventKind>,
-    pub item_direction: ContractItemDirection,
-    pub type_ids: Vec<i64>,
-    pub ship_group_ids: Vec<i64>,
+    pub root: ContractFilterNode,
 }
 
 impl ContractFilter {
+    pub fn listed_ship(
+        direction: ContractItemDirection,
+        type_ids: Vec<i64>,
+        ship_group_ids: Vec<i64>,
+    ) -> Self {
+        let mut items = Vec::new();
+        if !type_ids.is_empty() {
+            items.push(ContractFilterNode::Condition(
+                ContractFilterCondition::ItemTypes {
+                    direction,
+                    ids: type_ids,
+                },
+            ));
+        }
+        if !ship_group_ids.is_empty() {
+            items.push(ContractFilterNode::Condition(
+                ContractFilterCondition::ShipGroups {
+                    direction,
+                    ids: ship_group_ids,
+                },
+            ));
+        }
+        let item_filter = match items.len() {
+            0 => ContractFilterNode::And(Vec::new()),
+            1 => items.pop().expect("one item filter"),
+            _ => ContractFilterNode::Or(items),
+        };
+        Self {
+            root: ContractFilterNode::And(vec![
+                ContractFilterNode::Condition(ContractFilterCondition::EventKinds(vec![
+                    ContractEventKind::Listed,
+                ])),
+                item_filter,
+            ]),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
-        if !self.events.contains(&ContractEventKind::Listed) {
-            return Err("the initial contract filter must include the Listed event".to_string());
+        self.root.validate(0, &mut 0)
+    }
+
+    pub fn context_requirements(&self) -> ContractContextRequirements {
+        self.root.context_requirements()
+    }
+}
+
+impl<'de> Deserialize<'de> for ContractFilter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct FilterDocument {
+            root: ContractFilterNode,
         }
-        if self.type_ids.is_empty() && self.ship_group_ids.is_empty() {
-            return Err("provide at least one ship type ID or ship group ID".to_string());
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyContractFilter {
+            events: Vec<ContractEventKind>,
+            item_direction: ContractItemDirection,
+            type_ids: Vec<i64>,
+            ship_group_ids: Vec<i64>,
         }
+
+        let value = Value::deserialize(deserializer)?;
+        if value.get("root").is_some() {
+            let document =
+                serde_json::from_value::<FilterDocument>(value).map_err(D::Error::custom)?;
+            return Ok(Self {
+                root: document.root,
+            });
+        }
+        let legacy =
+            serde_json::from_value::<LegacyContractFilter>(value).map_err(D::Error::custom)?;
+        let mut item_filters = Vec::new();
+        if !legacy.type_ids.is_empty() {
+            item_filters.push(ContractFilterNode::Condition(
+                ContractFilterCondition::ItemTypes {
+                    direction: legacy.item_direction,
+                    ids: legacy.type_ids,
+                },
+            ));
+        }
+        if !legacy.ship_group_ids.is_empty() {
+            item_filters.push(ContractFilterNode::Condition(
+                ContractFilterCondition::ShipGroups {
+                    direction: legacy.item_direction,
+                    ids: legacy.ship_group_ids,
+                },
+            ));
+        }
+        let item_filter = match item_filters.len() {
+            0 => ContractFilterNode::And(Vec::new()),
+            1 => item_filters.pop().expect("one legacy item filter"),
+            _ => ContractFilterNode::Or(item_filters),
+        };
+        Ok(Self {
+            root: ContractFilterNode::And(vec![
+                ContractFilterNode::Condition(ContractFilterCondition::EventKinds(legacy.events)),
+                item_filter,
+            ]),
+        })
+    }
+}
+
+const MAX_CONTRACT_FILTER_DEPTH: usize = 16;
+const MAX_CONTRACT_FILTER_NODES: usize = 128;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContractFilterNode {
+    Condition(ContractFilterCondition),
+    And(Vec<ContractFilterNode>),
+    Or(Vec<ContractFilterNode>),
+    Not(Box<ContractFilterNode>),
+}
+
+impl ContractFilterNode {
+    fn validate(&self, depth: usize, node_count: &mut usize) -> Result<(), String> {
+        if depth > MAX_CONTRACT_FILTER_DEPTH {
+            return Err(format!(
+                "contract filter nesting cannot exceed {MAX_CONTRACT_FILTER_DEPTH} levels"
+            ));
+        }
+        *node_count += 1;
+        if *node_count > MAX_CONTRACT_FILTER_NODES {
+            return Err(format!(
+                "contract filters cannot contain more than {MAX_CONTRACT_FILTER_NODES} nodes"
+            ));
+        }
+        match self {
+            Self::Condition(condition) => condition.validate(),
+            Self::And(nodes) | Self::Or(nodes) => {
+                if nodes.is_empty() {
+                    return Err("AND and OR contract filter nodes must not be empty".to_string());
+                }
+                for node in nodes {
+                    node.validate(depth + 1, node_count)?;
+                }
+                Ok(())
+            }
+            Self::Not(node) => node.validate(depth + 1, node_count),
+        }
+    }
+
+    fn context_requirements(&self) -> ContractContextRequirements {
+        match self {
+            Self::Condition(condition) => condition.context_requirements(),
+            Self::And(nodes) | Self::Or(nodes) => nodes.iter().fold(
+                ContractContextRequirements::default(),
+                |requirements, node| requirements.union(node.context_requirements()),
+            ),
+            Self::Not(node) => node.context_requirements(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContractFilterCondition {
+    EventKinds(Vec<ContractEventKind>),
+    OfferedItems,
+    RequestedItems,
+    ItemTypes {
+        direction: ContractItemDirection,
+        ids: Vec<i64>,
+    },
+    ShipGroups {
+        direction: ContractItemDirection,
+        ids: Vec<i64>,
+    },
+    MinimumIsk {
+        direction: ContractItemDirection,
+        value: f64,
+    },
+    MaximumIsk {
+        direction: ContractItemDirection,
+        value: f64,
+    },
+    Regions(Vec<i64>),
+    SolarSystems(Vec<i64>),
+    SecurityRange {
+        min: f64,
+        max: f64,
+    },
+    LocationIds(Vec<i64>),
+    IssuerCharacters(Vec<i64>),
+    IssuerCorporations(Vec<i64>),
+    ObservedAffiliationAlliances(Vec<i64>),
+    PersonalIssuance,
+    CorporationIssuance,
+    TitleFragment(String),
+}
+
+impl Eq for ContractFilterCondition {}
+
+impl ContractFilterCondition {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::EventKinds(events) => validate_ids(events, "event kind"),
+            Self::OfferedItems
+            | Self::RequestedItems
+            | Self::PersonalIssuance
+            | Self::CorporationIssuance => Ok(()),
+            Self::ItemTypes { ids, .. } => validate_i64_ids(ids, "item type ID"),
+            Self::ShipGroups { ids, .. } => validate_i64_ids(ids, "ship group ID"),
+            Self::MinimumIsk { value, .. } | Self::MaximumIsk { value, .. } => {
+                validate_money(*value)
+            }
+            Self::Regions(ids) => validate_i64_ids(ids, "region ID"),
+            Self::SolarSystems(ids) => validate_i64_ids(ids, "solar system ID"),
+            Self::SecurityRange { min, max } => {
+                if !min.is_finite() || !max.is_finite() || min > max {
+                    Err(
+                        "security range must have finite minimum and maximum values in order"
+                            .to_string(),
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+            Self::LocationIds(ids) => validate_i64_ids(ids, "location ID"),
+            Self::IssuerCharacters(ids) => validate_i64_ids(ids, "issuer character ID"),
+            Self::IssuerCorporations(ids) => validate_i64_ids(ids, "issuer corporation ID"),
+            Self::ObservedAffiliationAlliances(ids) => {
+                validate_i64_ids(ids, "observed affiliation alliance ID")
+            }
+            Self::TitleFragment(fragment) => {
+                if fragment.trim().is_empty() {
+                    Err("title fragment cannot be empty".to_string())
+                } else if fragment.chars().count() > 256 {
+                    Err("title fragment cannot exceed 256 characters".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn context_requirements(&self) -> ContractContextRequirements {
+        match self {
+            Self::SolarSystems(_) => ContractContextRequirements {
+                solar_system: true,
+                ..ContractContextRequirements::default()
+            },
+            Self::SecurityRange { .. } => ContractContextRequirements {
+                solar_system: true,
+                security_status: true,
+                ..ContractContextRequirements::default()
+            },
+            Self::ObservedAffiliationAlliances(_) => ContractContextRequirements {
+                observed_affiliation: true,
+                ..ContractContextRequirements::default()
+            },
+            _ => ContractContextRequirements::default(),
+        }
+    }
+}
+
+fn validate_ids<T>(ids: &[T], label: &str) -> Result<(), String> {
+    if ids.is_empty() {
+        Err(format!("provide at least one {label}"))
+    } else {
         Ok(())
     }
+}
+
+fn validate_i64_ids(ids: &[i64], label: &str) -> Result<(), String> {
+    validate_ids(ids, label)?;
+    if ids.iter().any(|id| *id <= 0) {
+        Err(format!("{label}s must be positive integers"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_money(value: f64) -> Result<(), String> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err("ISK values must be finite, non-negative numbers".to_string())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContractContextRequirements {
+    pub solar_system: bool,
+    pub security_status: bool,
+    pub observed_affiliation: bool,
+}
+
+impl ContractContextRequirements {
+    fn union(self, other: Self) -> Self {
+        Self {
+            solar_system: self.solar_system || other.solar_system,
+            security_status: self.security_status || other.security_status,
+            observed_affiliation: self.observed_affiliation || other.observed_affiliation,
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        !self.solar_system && !self.security_status && !self.observed_affiliation
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractObservationContext {
+    pub solar_system_id: Option<i64>,
+    pub security_status: Option<f64>,
+    pub observed_affiliation_alliance_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -514,7 +940,8 @@ impl ContractSubscription {
         if self.description.trim().is_empty() {
             return Err("subscription description cannot be empty".to_string());
         }
-        self.filter.validate()
+        self.filter.validate()?;
+        self.event_actions.validate()
     }
 }
 
@@ -1098,6 +1525,8 @@ pub struct ContractEvent {
     pub contract: PublicContract,
     pub offered_items: Vec<PublicContractItem>,
     pub requested_items: Vec<PublicContractItem>,
+    #[serde(default)]
+    pub context: ContractObservationContext,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1174,6 +1603,7 @@ impl ContractCollector {
                             contract: observed.contract,
                             offered_items: observed.manifest.offered_items,
                             requested_items: observed.manifest.requested_items,
+                            context: ContractObservationContext::default(),
                         }
                     }));
                     outcomes.push(if recorded.baseline_established {
@@ -1291,8 +1721,19 @@ impl ContractCollector {
         let deferred_matches = self.store.deferred_contract_matches().await?;
         let subscriptions = self.store.all_contract_subscriptions().await?;
         for deferred in deferred_matches {
+            let (event, context_unavailable) = self
+                .event_with_observed_context(
+                    &deferred.event,
+                    std::slice::from_ref(&deferred.subscription),
+                )
+                .await?;
             match self
-                .notify_subscription(&deferred.subscription, &deferred.event, notifications)
+                .notify_subscription(
+                    &deferred.subscription,
+                    &event,
+                    context_unavailable,
+                    notifications,
+                )
                 .await?
             {
                 NotificationResolution::Complete => {
@@ -1304,36 +1745,96 @@ impl ContractCollector {
             }
         }
         for event in events {
+            let (event, context_unavailable) = self
+                .event_with_observed_context(event, &subscriptions)
+                .await?;
             for subscription in &subscriptions {
                 if matches!(
-                    self.notify_subscription(subscription, event, notifications)
-                        .await?,
+                    self.notify_subscription(
+                        subscription,
+                        &event,
+                        context_unavailable,
+                        notifications,
+                    )
+                    .await?,
                     NotificationResolution::Deferred
                 ) {
-                    self.store.defer_contract_match(subscription, event).await?;
+                    self.store
+                        .defer_contract_match(subscription, &event)
+                        .await?;
                 }
             }
         }
         Ok(())
     }
 
+    async fn event_with_observed_context(
+        &self,
+        event: &ContractEvent,
+        subscriptions: &[ContractSubscription],
+    ) -> Result<(ContractEvent, bool), ContractCollectionError> {
+        let requirements = subscriptions.iter().fold(
+            ContractContextRequirements::default(),
+            |requirements, subscription| {
+                if matches!(
+                    contract_event_action(subscription, &event.kind),
+                    ContractEventAction::Ignore
+                ) {
+                    requirements
+                } else {
+                    requirements.union(subscription.filter.context_requirements())
+                }
+            },
+        );
+        if requirements.is_empty() {
+            return Ok((event.clone(), false));
+        }
+        match self
+            .esi
+            .observed_contract_context(&event.contract, requirements)
+            .await
+        {
+            Ok(response) => {
+                self.store.record_esi_limiter(&response.metadata).await?;
+                let mut event = event.clone();
+                event.context = response.value.ok_or_else(|| {
+                    ContractCollectionError::Cache(
+                        "observed contract context returned no response body".to_string(),
+                    )
+                })?;
+                Ok((event, false))
+            }
+            Err(error) => {
+                self.store.record_esi_limiter(&error.metadata).await?;
+                warn!(
+                    contract_id = event.contract.contract_id,
+                    "contract context will be retried before context-dependent notifications: {error}"
+                );
+                Ok((event.clone(), true))
+            }
+        }
+    }
+
     async fn notify_subscription(
         &self,
         subscription: &ContractSubscription,
         event: &ContractEvent,
+        context_unavailable: bool,
         notifications: &ContractNotifications,
     ) -> Result<NotificationResolution, ContractCollectionError> {
         let action = contract_event_action(subscription, &event.kind);
         if matches!(action, ContractEventAction::Ignore) {
             return Ok(NotificationResolution::Complete);
         }
-        let matched_items =
-            match matching_items(subscription, event, &*notifications.ship_groups).await {
-                MatchingItems::Matched(items) => items,
-                MatchingItems::Unmatched => return Ok(NotificationResolution::Complete),
-                MatchingItems::Deferred => return Ok(NotificationResolution::Deferred),
-            };
-        let message = contract_notification_message(event, &subscription.filter, &matched_items);
+        let mut evaluator =
+            ContractFilterEvaluator::new(event, &*notifications.ship_groups, context_unavailable);
+        match evaluator.matches(&subscription.filter.root).await {
+            ContractFilterMatch::Matched => {}
+            ContractFilterMatch::Unmatched => return Ok(NotificationResolution::Complete),
+            ContractFilterMatch::Deferred => return Ok(NotificationResolution::Deferred),
+        }
+        let primary_item = evaluator.primary_display_item().await;
+        let message = contract_notification_message(event, &subscription.filter, primary_item);
         let ping = matches!(action, ContractEventAction::PostAndPing);
         let Some(prepared) = self
             .store
@@ -1516,72 +2017,272 @@ fn contract_event_action(
     }
 }
 
-enum MatchingItems {
-    Matched(Vec<PublicContractItem>),
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ContractFilterMatch {
+    Matched,
     Unmatched,
     Deferred,
 }
 
-async fn matching_items(
-    subscription: &ContractSubscription,
-    event: &ContractEvent,
-    ship_groups: &dyn ShipGroupResolver,
-) -> MatchingItems {
-    if !subscription.filter.events.contains(&event.kind) {
-        return MatchingItems::Unmatched;
-    }
-    let items = match subscription.filter.item_direction {
-        ContractItemDirection::Offered => &event.offered_items,
-        ContractItemDirection::Requested => &event.requested_items,
-    };
-    let mut matches = Vec::new();
-    let mut unavailable_group_lookup = false;
-    for item in items {
-        let type_matches = subscription.filter.type_ids.contains(&item.type_id);
-        let group_matches = if type_matches || subscription.filter.ship_group_ids.is_empty() {
-            false
-        } else {
-            match ship_groups.group_for_type(item.type_id).await {
-                ShipGroupLookup::Resolved(Some(group_id)) => {
-                    subscription.filter.ship_group_ids.contains(&group_id)
-                }
-                ShipGroupLookup::Resolved(None) => false,
-                ShipGroupLookup::TemporarilyUnavailable => {
-                    unavailable_group_lookup = true;
-                    false
-                }
-            }
-        };
-        if type_matches || group_matches {
-            matches.push(item.clone());
+struct ContractFilterEvaluator<'a> {
+    event: &'a ContractEvent,
+    ship_groups: &'a dyn ShipGroupResolver,
+    context_unavailable: bool,
+    group_cache: HashMap<i64, ShipGroupLookup>,
+}
+
+impl<'a> ContractFilterEvaluator<'a> {
+    fn new(
+        event: &'a ContractEvent,
+        ship_groups: &'a dyn ShipGroupResolver,
+        context_unavailable: bool,
+    ) -> Self {
+        Self {
+            event,
+            ship_groups,
+            context_unavailable,
+            group_cache: HashMap::new(),
         }
     }
-    if !matches.is_empty() {
-        MatchingItems::Matched(matches)
-    } else if unavailable_group_lookup {
-        MatchingItems::Deferred
-    } else {
-        MatchingItems::Unmatched
+
+    async fn matches(&mut self, node: &ContractFilterNode) -> ContractFilterMatch {
+        evaluate_contract_filter_node(node.clone(), self).await
     }
+
+    async fn group_for_type(&mut self, type_id: i64) -> ShipGroupLookup {
+        if let Some(group) = self.group_cache.get(&type_id).copied() {
+            return group;
+        }
+        let group = self.ship_groups.group_for_type(type_id).await;
+        self.group_cache.insert(type_id, group);
+        group
+    }
+
+    async fn primary_display_item(&mut self) -> Option<&'a PublicContractItem> {
+        let mut primary: Option<(&PublicContractItem, usize)> = None;
+        for item in self
+            .event
+            .offered_items
+            .iter()
+            .chain(self.event.requested_items.iter())
+        {
+            let priority = match self.group_for_type(item.type_id).await {
+                ShipGroupLookup::Resolved(Some(group_id)) => {
+                    strategic_ship_group_priority(group_id)
+                }
+                ShipGroupLookup::Resolved(None) | ShipGroupLookup::TemporarilyUnavailable => {
+                    usize::MAX
+                }
+            };
+            let candidate = (item, priority);
+            if primary.as_ref().is_none_or(|(current, current_priority)| {
+                (candidate.1, candidate.0.type_id, candidate.0.record_id)
+                    < (*current_priority, current.type_id, current.record_id)
+            }) {
+                primary = Some(candidate);
+            }
+        }
+        primary.map(|(item, _)| item)
+    }
+}
+
+fn evaluate_contract_filter_node<'borrow, 'event>(
+    node: ContractFilterNode,
+    evaluator: &'borrow mut ContractFilterEvaluator<'event>,
+) -> Pin<Box<dyn Future<Output = ContractFilterMatch> + Send + 'borrow>> {
+    Box::pin(async move {
+        match node {
+            ContractFilterNode::Condition(condition) => {
+                evaluate_contract_filter_condition(&condition, evaluator).await
+            }
+            ContractFilterNode::And(nodes) => {
+                let mut deferred = false;
+                for node in nodes {
+                    match evaluate_contract_filter_node(node, evaluator).await {
+                        ContractFilterMatch::Matched => {}
+                        ContractFilterMatch::Unmatched => return ContractFilterMatch::Unmatched,
+                        ContractFilterMatch::Deferred => deferred = true,
+                    }
+                }
+                if deferred {
+                    ContractFilterMatch::Deferred
+                } else {
+                    ContractFilterMatch::Matched
+                }
+            }
+            ContractFilterNode::Or(nodes) => {
+                let mut deferred = false;
+                for node in nodes {
+                    match evaluate_contract_filter_node(node, evaluator).await {
+                        ContractFilterMatch::Matched => return ContractFilterMatch::Matched,
+                        ContractFilterMatch::Unmatched => {}
+                        ContractFilterMatch::Deferred => deferred = true,
+                    }
+                }
+                if deferred {
+                    ContractFilterMatch::Deferred
+                } else {
+                    ContractFilterMatch::Unmatched
+                }
+            }
+            ContractFilterNode::Not(node) => {
+                match evaluate_contract_filter_node(*node, evaluator).await {
+                    ContractFilterMatch::Matched => ContractFilterMatch::Unmatched,
+                    ContractFilterMatch::Unmatched => ContractFilterMatch::Matched,
+                    ContractFilterMatch::Deferred => ContractFilterMatch::Deferred,
+                }
+            }
+        }
+    })
+}
+
+async fn evaluate_contract_filter_condition(
+    condition: &ContractFilterCondition,
+    evaluator: &mut ContractFilterEvaluator<'_>,
+) -> ContractFilterMatch {
+    let event = evaluator.event;
+    match condition {
+        ContractFilterCondition::EventKinds(kinds) => bool_match(kinds.contains(&event.kind)),
+        ContractFilterCondition::OfferedItems => bool_match(!event.offered_items.is_empty()),
+        ContractFilterCondition::RequestedItems => bool_match(!event.requested_items.is_empty()),
+        ContractFilterCondition::ItemTypes { direction, ids } => bool_match(
+            items_for_direction(event, *direction)
+                .iter()
+                .any(|item| ids.contains(&item.type_id)),
+        ),
+        ContractFilterCondition::ShipGroups { direction, ids } => {
+            let mut deferred = false;
+            for item in items_for_direction(event, *direction) {
+                match evaluator.group_for_type(item.type_id).await {
+                    ShipGroupLookup::Resolved(Some(group_id)) if ids.contains(&group_id) => {
+                        return ContractFilterMatch::Matched
+                    }
+                    ShipGroupLookup::TemporarilyUnavailable => deferred = true,
+                    ShipGroupLookup::Resolved(Some(_)) | ShipGroupLookup::Resolved(None) => {}
+                }
+            }
+            if deferred {
+                ContractFilterMatch::Deferred
+            } else {
+                ContractFilterMatch::Unmatched
+            }
+        }
+        ContractFilterCondition::MinimumIsk { direction, value } => {
+            money_match(relevant_isk(event, *direction), |amount| amount >= *value)
+        }
+        ContractFilterCondition::MaximumIsk { direction, value } => {
+            money_match(relevant_isk(event, *direction), |amount| amount <= *value)
+        }
+        ContractFilterCondition::Regions(ids) => bool_match(ids.contains(&event.region_id)),
+        ContractFilterCondition::SolarSystems(ids) => context_match(
+            event.context.solar_system_id,
+            evaluator.context_unavailable,
+            |system_id| ids.contains(&system_id),
+        ),
+        ContractFilterCondition::SecurityRange { min, max } => context_match(
+            event.context.security_status,
+            evaluator.context_unavailable,
+            |security_status| {
+                security_status.is_finite() && security_status >= *min && security_status <= *max
+            },
+        ),
+        ContractFilterCondition::LocationIds(ids) => {
+            bool_match(ids.contains(&event.contract.start_location_id))
+        }
+        ContractFilterCondition::IssuerCharacters(ids) => {
+            bool_match(ids.contains(&event.contract.issuer_id))
+        }
+        ContractFilterCondition::IssuerCorporations(ids) => {
+            bool_match(ids.contains(&event.contract.issuer_corporation_id))
+        }
+        ContractFilterCondition::ObservedAffiliationAlliances(ids) => context_match(
+            event.context.observed_affiliation_alliance_id,
+            evaluator.context_unavailable,
+            |alliance_id| ids.contains(&alliance_id),
+        ),
+        ContractFilterCondition::PersonalIssuance => bool_match(!event.contract.for_corporation),
+        ContractFilterCondition::CorporationIssuance => bool_match(event.contract.for_corporation),
+        ContractFilterCondition::TitleFragment(fragment) => bool_match(
+            event
+                .contract
+                .title
+                .as_deref()
+                .is_some_and(|title| title.to_lowercase().contains(&fragment.to_lowercase())),
+        ),
+    }
+}
+
+fn bool_match(matches: bool) -> ContractFilterMatch {
+    if matches {
+        ContractFilterMatch::Matched
+    } else {
+        ContractFilterMatch::Unmatched
+    }
+}
+
+fn money_match(amount: f64, predicate: impl FnOnce(f64) -> bool) -> ContractFilterMatch {
+    bool_match(amount.is_finite() && amount >= 0.0 && predicate(amount))
+}
+
+fn context_match<T>(
+    value: Option<T>,
+    context_unavailable: bool,
+    predicate: impl FnOnce(T) -> bool,
+) -> ContractFilterMatch {
+    match value {
+        Some(value) => bool_match(predicate(value)),
+        None if context_unavailable => ContractFilterMatch::Deferred,
+        None => ContractFilterMatch::Unmatched,
+    }
+}
+
+fn items_for_direction(
+    event: &ContractEvent,
+    direction: ContractItemDirection,
+) -> &[PublicContractItem] {
+    match direction {
+        ContractItemDirection::Offered => &event.offered_items,
+        ContractItemDirection::Requested => &event.requested_items,
+    }
+}
+
+fn relevant_isk(event: &ContractEvent, direction: ContractItemDirection) -> f64 {
+    match direction {
+        ContractItemDirection::Offered => event.contract.reward,
+        ContractItemDirection::Requested => event.contract.price,
+    }
+}
+
+const STRATEGIC_SHIP_GROUP_PRIORITY: &[i64] = &[30, 659, 4594, 485, 1538, 547, 883, 902, 513];
+
+fn strategic_ship_group_priority(group_id: i64) -> usize {
+    STRATEGIC_SHIP_GROUP_PRIORITY
+        .iter()
+        .position(|priority| *priority == group_id)
+        .unwrap_or(usize::MAX)
 }
 
 fn contract_notification_message(
     event: &ContractEvent,
     filter: &ContractFilter,
-    matched_items: &[PublicContractItem],
+    primary_item: Option<&PublicContractItem>,
 ) -> ContractNotificationMessage {
-    let item_label = compact_bundle_summary(matched_items);
-    let (isk_label, isk) = match filter.item_direction {
+    let direction = display_item_direction(&filter.root).unwrap_or(ContractItemDirection::Offered);
+    let item_label = compact_bundle_summary(items_for_direction(event, direction));
+    let (isk_label, isk) = match direction {
         ContractItemDirection::Offered => ("Requested ISK", event.contract.price),
         ContractItemDirection::Requested => ("Offered ISK", event.contract.reward),
     };
-    let direction = match filter.item_direction {
+    let item_direction = match direction {
         ContractItemDirection::Offered => "Offered Item",
         ContractItemDirection::Requested => "Requested Item",
     };
     let location_id = event.contract.start_location_id;
     let mut message = ContractNotificationMessage {
-        title: "Public contract listed".to_string(),
+        title: primary_item.map_or_else(
+            || "Public contract listed".to_string(),
+            |item| format!("Public contract listed: Type {}", item.type_id),
+        ),
         description: event
             .contract
             .title
@@ -1596,7 +2297,7 @@ fn contract_notification_message(
                 inline: true,
             },
             ContractEmbedField {
-                name: direction.to_string(),
+                name: item_direction.to_string(),
                 value: item_label,
                 inline: false,
             },
@@ -1629,6 +2330,31 @@ fn contract_notification_message(
     };
     bound_embed_message(&mut message);
     message
+}
+
+fn display_item_direction(node: &ContractFilterNode) -> Option<ContractItemDirection> {
+    match node {
+        ContractFilterNode::Condition(ContractFilterCondition::ItemTypes { direction, .. })
+        | ContractFilterNode::Condition(ContractFilterCondition::ShipGroups {
+            direction, ..
+        })
+        | ContractFilterNode::Condition(ContractFilterCondition::MinimumIsk {
+            direction, ..
+        })
+        | ContractFilterNode::Condition(ContractFilterCondition::MaximumIsk {
+            direction, ..
+        }) => Some(*direction),
+        ContractFilterNode::Condition(ContractFilterCondition::OfferedItems) => {
+            Some(ContractItemDirection::Offered)
+        }
+        ContractFilterNode::Condition(ContractFilterCondition::RequestedItems) => {
+            Some(ContractItemDirection::Requested)
+        }
+        ContractFilterNode::Condition(_) | ContractFilterNode::Not(_) => None,
+        ContractFilterNode::And(nodes) | ContractFilterNode::Or(nodes) => {
+            nodes.iter().find_map(display_item_direction)
+        }
+    }
 }
 
 const MAX_EMBED_TITLE_CHARACTERS: usize = 256;

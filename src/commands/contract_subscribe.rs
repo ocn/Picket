@@ -2,8 +2,7 @@ use crate::commands::contract_command::{defer_then_edit, SerenityContractCommand
 use crate::commands::{get_option_value, Command};
 use crate::config::AppState;
 use crate::contract_intelligence::{
-    available_contract_store, ContractEventAction, ContractEventActions, ContractEventKind,
-    ContractFilter, ContractItemDirection, ContractSubscription,
+    available_contract_store, ContractEventActions, ContractFilter, ContractSubscription,
 };
 use crate::ContractStoreContainer;
 use serenity::async_trait;
@@ -28,52 +27,37 @@ impl ContractSubscribeCommand {
             Some(CommandDataOptionValue::String(value)) => Ok(value.as_str()),
             _ => Err(format!("missing required option: {name}")),
         };
-        let direction = match option("direction")? {
-            "offered" => ContractItemDirection::Offered,
-            "requested" => ContractItemDirection::Requested,
-            _ => return Err("direction must be offered or requested".to_string()),
-        };
-        let listed = match option("listed_action")? {
-            "ignore" => ContractEventAction::Ignore,
-            "post" => ContractEventAction::Post,
-            "post_and_ping" => ContractEventAction::PostAndPing,
-            _ => return Err("listed_action must be ignore, post, or post_and_ping".to_string()),
-        };
+        Self::subscription_from_documents(
+            guild_id,
+            channel_id,
+            option("id")?,
+            option("description")?,
+            option("filter")?,
+            option("event_actions")?,
+        )
+    }
+
+    fn subscription_from_documents(
+        guild_id: u64,
+        channel_id: u64,
+        id: &str,
+        description: &str,
+        filter_document: &str,
+        event_actions_document: &str,
+    ) -> Result<ContractSubscription, String> {
         let subscription = ContractSubscription {
             guild_id,
             channel_id,
-            id: option("id")?.to_string(),
-            description: option("description")?.to_string(),
-            filter: ContractFilter {
-                events: vec![ContractEventKind::Listed],
-                item_direction: direction,
-                type_ids: parse_ids(get_option_value(&command.data.options, "type_ids"))?,
-                ship_group_ids: parse_ids(get_option_value(
-                    &command.data.options,
-                    "ship_group_ids",
-                ))?,
-            },
-            event_actions: ContractEventActions { listed },
+            id: id.to_string(),
+            description: description.to_string(),
+            filter: serde_json::from_str::<ContractFilter>(filter_document)
+                .map_err(|error| format!("invalid filter JSON: {error}"))?,
+            event_actions: serde_json::from_str::<ContractEventActions>(event_actions_document)
+                .map_err(|error| format!("invalid event actions JSON: {error}"))?,
         };
         subscription.validate()?;
         Ok(subscription)
     }
-}
-
-fn parse_ids(option: Option<&CommandDataOptionValue>) -> Result<Vec<i64>, String> {
-    let Some(CommandDataOptionValue::String(value)) = option else {
-        return Ok(Vec::new());
-    };
-    value
-        .split(',')
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| {
-            value
-                .trim()
-                .parse::<i64>()
-                .map_err(|_| format!("invalid numeric ID: {}", value.trim()))
-        })
-        .collect()
 }
 
 #[async_trait]
@@ -105,33 +89,16 @@ impl Command for ContractSubscribeCommand {
             })
             .create_option(|option| {
                 option
-                    .name("direction")
-                    .description("Whether the issuer offers or requests the ship.")
+                    .name("filter")
+                    .description("Contract filter JSON using condition, and, or, and not nodes.")
                     .kind(CommandOptionType::String)
-                    .add_string_choice("Offered Item", "offered")
-                    .add_string_choice("Requested Item", "requested")
                     .required(true)
             })
             .create_option(|option| {
                 option
-                    .name("type_ids")
-                    .description("Comma-separated ship type IDs.")
+                    .name("event_actions")
+                    .description("Event action JSON, for example {\"listed\":\"post\"}.")
                     .kind(CommandOptionType::String)
-            })
-            .create_option(|option| {
-                option
-                    .name("ship_group_ids")
-                    .description("Comma-separated ship group IDs.")
-                    .kind(CommandOptionType::String)
-            })
-            .create_option(|option| {
-                option
-                    .name("listed_action")
-                    .description("Action for Listed events.")
-                    .kind(CommandOptionType::String)
-                    .add_string_choice("Ignore", "ignore")
-                    .add_string_choice("Post", "post")
-                    .add_string_choice("Post and ping", "post_and_ping")
                     .required(true)
             })
     }
@@ -183,6 +150,65 @@ impl Command for ContractSubscribeCommand {
         .await
         {
             error!("Cannot respond to contract subscribe command: {error}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FILTER: &str = r#"{
+        "root": {
+            "and": [
+                {"condition": {"event_kinds": ["listed"]}},
+                {"or": [
+                    {"condition": {"item_types": {"direction": "offered", "ids": [587]}}},
+                    {"not": {"condition": {"title_fragment": "scam"}}}
+                ]}
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn contract_subscribe_documents_express_the_recursive_grammar() {
+        let subscription = ContractSubscribeCommand::subscription_from_documents(
+            42,
+            77,
+            "capitals",
+            "capital contracts",
+            FILTER,
+            r#"{"listed":"post_and_ping"}"#,
+        )
+        .expect("valid recursive subscription document");
+        assert_eq!(subscription.guild_id, 42);
+        assert_eq!(subscription.channel_id, 77);
+        assert!(matches!(
+            subscription.filter.root,
+            crate::contract_intelligence::ContractFilterNode::And(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_contract_subscribe_documents_do_not_produce_a_subscription() {
+        for (filter, actions) in [
+            (r#"{"root":{"and":[]}}"#, r#"{"listed":"post"}"#),
+            (
+                r#"{"root":{"condition":{"location_ids":[0]}}}"#,
+                r#"{"listed":"post"}"#,
+            ),
+            (FILTER, r#"{"listed":"post","unknown":"post"}"#),
+            (FILTER, r#"{"listed":"unknown"}"#),
+        ] {
+            assert!(ContractSubscribeCommand::subscription_from_documents(
+                42,
+                77,
+                "capitals",
+                "capital contracts",
+                filter,
+                actions,
+            )
+            .is_err());
         }
     }
 }
