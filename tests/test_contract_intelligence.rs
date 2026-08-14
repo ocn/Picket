@@ -2707,6 +2707,153 @@ async fn wire_304_responses_preserve_last_modified_for_paginated_snapshot_valida
 }
 
 #[tokio::test]
+async fn wire_empty_success_body_is_retried_without_invalidating_the_region() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: "[10000002]",
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60"), ("X-Pages", "1")],
+            body: ESI_PUBLIC_CONTRACT_SUMMARY_FIXTURE,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![
+                ("Cache-Control", "max-age=60"),
+                ("ETag", "\"items-empty\""),
+                ("X-ESI-Error-Limit-Remain", "100"),
+                ("X-ESI-Error-Limit-Reset", "60"),
+            ],
+            body: "",
+        },
+        WireReply {
+            status: 200,
+            headers: vec![
+                ("Cache-Control", "max-age=60"),
+                ("ETag", "\"items-v1\""),
+                ("X-ESI-Error-Limit-Remain", "99"),
+                ("X-ESI-Error-Limit-Reset", "60"),
+            ],
+            body: ESI_PUBLIC_CONTRACT_ITEMS_FIXTURE,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"{"name":"Jita IV - Moon 4","system_id":30000142}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"{"name":"Jita","security_status":0.9,"constellation_id":20000020}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"{"region_id":10000002}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"{"name":"The Forge"}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"[{"alliance_id":99000111}]"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"[{"id":90000001,"name":"Issuer"},{"id":98000001,"name":"Issuer Corp"},{"id":99000111,"name":"Issuer Alliance"},{"id":48473,"name":"Blueprint"}]"#,
+        },
+    ]);
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("construct HTTP ESI client");
+    let collector = ContractCollector::new(store.clone(), Arc::new(esi));
+
+    let first = collector
+        .collect_cycle()
+        .await
+        .expect("transient empty body is retried within the collection cycle");
+    assert_eq!(
+        first.regions,
+        vec![CollectionOutcome::BaselineEstablished {
+            region_id: 10_000_002,
+        }]
+    );
+    let request_count = server.requests.lock().unwrap().len();
+    assert_eq!(request_count, 10);
+    assert!(server.requests.lock().unwrap()[2].contains("/contracts/public/items/234057619/"));
+    assert!(server.requests.lock().unwrap()[3].contains("/contracts/public/items/234057619/"));
+
+    let second = collector
+        .collect_cycle()
+        .await
+        .expect("successful retry representation remains cached");
+    assert_eq!(
+        second.regions,
+        vec![CollectionOutcome::Complete {
+            region_id: 10_000_002,
+            observed_contracts: 1,
+        }]
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), request_count);
+    assert_eq!(
+        store
+            .region_state(10_000_002)
+            .await
+            .expect("region state")
+            .expect("stored region")
+            .complete_observations,
+        2
+    );
+
+    server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn wire_empty_success_body_does_not_retry_across_an_esi_error_limit_boundary() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let server = SequenceHttpServer::start(vec![WireReply {
+        status: 200,
+        headers: vec![
+            ("X-ESI-Error-Limit-Remain", "0"),
+            ("X-ESI-Error-Limit-Reset", "60"),
+        ],
+        body: "",
+    }]);
+    let esi = Arc::new(
+        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+            .expect("construct HTTP ESI client"),
+    );
+    let collector = ContractCollector::new(store, esi.clone());
+
+    let error = collector
+        .collect_cycle()
+        .await
+        .expect_err("error-limit boundary suppresses the body retry");
+    assert!(error.to_string().contains("EOF while parsing a value"));
+
+    let restarted_collector = ContractCollector::new(database.store().await, esi);
+    let error = restarted_collector
+        .collect_cycle()
+        .await
+        .expect_err("error-limit pause survives restart");
+    assert!(error.to_string().contains("persisted global ESI limiter"));
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+
+    server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn wire_rate_limit_headers_stop_the_collector_before_the_next_request() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;

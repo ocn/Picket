@@ -19,6 +19,8 @@ use tracing::{info, warn};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 const CONTRACT_COLLECTOR_USER_AGENT: &str = "killbot-rust Global Public Contract Intelligence";
+const ESI_BODY_MAX_ATTEMPTS: usize = 3;
+const ESI_BODY_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 const MAX_EMBED_CONTEXT_ENRICHMENTS_PER_CYCLE: usize = 8;
 const DISCORD_NONCE_ENFORCEMENT_WINDOW: ChronoDuration = ChronoDuration::minutes(5);
 const DEFAULT_COLLECTION_RECOVERY_GAP: ChronoDuration = ChronoDuration::minutes(15);
@@ -146,14 +148,16 @@ impl CacheMetadata {
 
     fn collection_pause_until(&self) -> Option<DateTime<Utc>> {
         self.retry_after.or_else(|| {
-            (self.rate_limit_remaining.unwrap_or(1) <= 0)
-                .then(|| {
-                    self.rate_limit_limit
-                        .as_deref()
-                        .and_then(rate_limit_window_seconds)
-                })
-                .flatten()
-                .map(|seconds| Utc::now() + ChronoDuration::seconds(seconds))
+            let reset_seconds = if self.error_limit_remain.unwrap_or(1) <= 0 {
+                self.error_limit_reset
+            } else if self.rate_limit_remaining.unwrap_or(1) <= 0 {
+                self.rate_limit_limit
+                    .as_deref()
+                    .and_then(rate_limit_window_seconds)
+            } else {
+                None
+            };
+            reset_seconds.map(|seconds| Utc::now() + ChronoDuration::seconds(seconds))
         })
     }
 }
@@ -469,43 +473,64 @@ impl HttpPublicContractEsi {
         etag: Option<&str>,
     ) -> Result<EsiResponse<T>, EsiError> {
         let url = format!("{}{}", self.base_url, path);
-        let mut request = self.client.get(url);
-        if let Some(etag) = etag {
-            request = request.header(IF_NONE_MATCH, etag);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| EsiError::retryable(error.to_string(), None))?;
-        let metadata = cache_metadata(response.headers());
-        if response.status() == StatusCode::NOT_MODIFIED {
-            return Ok(EsiResponse::not_modified(metadata));
-        }
-        if !response.status().is_success() {
-            let retry_after = metadata.retry_after.or_else(|| {
-                if matches!(response.status(), StatusCode::TOO_MANY_REQUESTS)
-                    || response.status().as_u16() == 420
-                {
-                    metadata
-                        .error_limit_reset
-                        .map(|seconds| Utc::now() + ChronoDuration::seconds(seconds))
-                } else {
-                    None
+        for attempt in 0..ESI_BODY_MAX_ATTEMPTS {
+            let mut request = self.client.get(&url);
+            if let Some(etag) = etag {
+                request = request.header(IF_NONE_MATCH, etag);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|error| EsiError::retryable(error.to_string(), None))?;
+            let metadata = cache_metadata(response.headers());
+            if response.status() == StatusCode::NOT_MODIFIED {
+                return Ok(EsiResponse::not_modified(metadata));
+            }
+            if !response.status().is_success() {
+                let retry_after = metadata.retry_after.or_else(|| {
+                    if matches!(response.status(), StatusCode::TOO_MANY_REQUESTS)
+                        || response.status().as_u16() == 420
+                    {
+                        metadata
+                            .error_limit_reset
+                            .map(|seconds| Utc::now() + ChronoDuration::seconds(seconds))
+                    } else {
+                        None
+                    }
+                });
+                let mut metadata = metadata;
+                metadata.retry_after = retry_after;
+                return Err(EsiError::from_metadata(
+                    format!("ESI returned {}", response.status()),
+                    Some(response.status()),
+                    metadata,
+                ));
+            }
+            let body = match response.bytes().await {
+                Ok(body) => body,
+                Err(error) => {
+                    if body_retry_allowed(attempt, &metadata) {
+                        tokio::time::sleep(body_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(EsiError::from_metadata(error.to_string(), None, metadata));
                 }
-            });
-            let mut metadata = metadata;
-            metadata.retry_after = retry_after;
-            return Err(EsiError::from_metadata(
-                format!("ESI returned {}", response.status()),
-                Some(response.status()),
-                metadata,
-            ));
+            };
+            match serde_json::from_slice(&body) {
+                Ok(value) => return Ok(EsiResponse::fresh(value, metadata)),
+                Err(error) if error.is_eof() && body_retry_allowed(attempt, &metadata) => {
+                    tokio::time::sleep(body_retry_delay(attempt)).await;
+                }
+                Err(error) => {
+                    return Err(EsiError::from_metadata(
+                        format!("error decoding response body: {error}"),
+                        None,
+                        metadata,
+                    ));
+                }
+            }
         }
-        let value = response
-            .json()
-            .await
-            .map_err(|error| EsiError::retryable(error.to_string(), None))?;
-        Ok(EsiResponse::fresh(value, metadata))
+        unreachable!("ESI body attempt loop always returns on its final attempt")
     }
 
     async fn post_json<T: DeserializeOwned, B: Serialize>(
@@ -1046,6 +1071,20 @@ impl PublicContractEsi for HttpPublicContractEsi {
         }
         Ok(EsiResponse::fresh(context, metadata))
     }
+}
+
+fn body_retry_allowed(attempt: usize, metadata: &CacheMetadata) -> bool {
+    attempt + 1 < ESI_BODY_MAX_ATTEMPTS
+        && metadata.error_limit_remain.unwrap_or(1) > 0
+        && metadata.rate_limit_remaining.unwrap_or(1) > 0
+        && metadata
+            .collection_pause_until()
+            .map(|pause_until| pause_until <= Utc::now())
+            .unwrap_or(true)
+}
+
+fn body_retry_delay(attempt: usize) -> Duration {
+    ESI_BODY_RETRY_BASE_DELAY * (1_u32 << attempt)
 }
 
 fn cache_metadata(headers: &HeaderMap) -> CacheMetadata {
