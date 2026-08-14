@@ -3,9 +3,10 @@ use chrono::{TimeZone, Utc};
 use killbot_rust::contract_intelligence::{
     available_contract_store, new_contract_store_handle,
     spawn_contract_collection_loop_with_notifications, CacheMetadata, CollectionOutcome,
-    ContractCollectionStore, ContractCollector, ContractDelivery, ContractDeliveryError,
-    ContractEventAction, ContractEventActions, ContractEventKind, ContractFilter,
-    ContractItemDirection, ContractSubscription, DeliveryRecord, DeliveryStatus, EsiError,
+    ContractCollectionStore, ContractCollector, ContractContextRequirements, ContractDelivery,
+    ContractDeliveryError, ContractEventAction, ContractEventActions, ContractEventKind,
+    ContractFilter, ContractFilterCondition, ContractFilterNode, ContractItemDirection,
+    ContractObservationContext, ContractSubscription, DeliveryRecord, DeliveryStatus, EsiError,
     EsiResponse, HttpPublicContractEsi, PreparedContractDelivery, PublicContract,
     PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
 };
@@ -194,6 +195,11 @@ struct FakeEsi {
     items: HashMap<i64, Result<EsiResponse<Vec<PublicContractItem>>, EsiError>>,
 }
 
+struct ContextualFakeEsi {
+    inner: FakeEsi,
+    context: ContractObservationContext,
+}
+
 #[derive(Default)]
 struct ConditionalEsi {
     received_etags: StdMutex<Vec<Option<String>>>,
@@ -298,6 +304,43 @@ impl PublicContractEsi for FakeEsi {
             .get(&contract_id)
             .expect("fake ESI manifest configured")
             .clone()
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for ContextualFakeEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+
+    async fn observed_contract_context(
+        &self,
+        _contract: &PublicContract,
+        _requirements: ContractContextRequirements,
+    ) -> Result<EsiResponse<ContractObservationContext>, EsiError> {
+        Ok(EsiResponse::fresh(
+            self.context.clone(),
+            CacheMetadata::cached_for_seconds(0),
+        ))
     }
 }
 
@@ -429,12 +472,7 @@ fn contract_subscription(
         channel_id: 77,
         id: id.to_string(),
         description: format!("{id} subscription"),
-        filter: ContractFilter {
-            events: vec![ContractEventKind::Listed],
-            item_direction: direction,
-            type_ids,
-            ship_group_ids,
-        },
+        filter: ContractFilter::listed_ship(direction, type_ids, ship_group_ids),
         event_actions: ContractEventActions { listed },
     }
 }
@@ -1248,10 +1286,7 @@ async fn contract_subscribe_persistence_replaces_and_removes_the_invoking_channe
         .expect("create contract subscription");
     let replacement = ContractSubscription {
         description: "replacement subscription".to_string(),
-        filter: ContractFilter {
-            ship_group_ids: vec![25],
-            ..original.filter.clone()
-        },
+        filter: ContractFilter::listed_ship(ContractItemDirection::Offered, vec![], vec![25]),
         ..original
     };
     store
@@ -2055,4 +2090,309 @@ async fn contract_runtime_recovers_the_shared_store_after_postgres_becomes_avail
         .expect_err("background contract runtime is cancelled")
         .is_cancelled());
     database.destroy().await;
+}
+
+#[tokio::test]
+async fn recursive_contract_filters_match_every_public_fact_once_per_contract() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let baseline = item_exchange_contract(44);
+    let mut listed = item_exchange_contract(45);
+    listed.for_corporation = false;
+    listed.issuer_id = 90_000_111;
+    listed.issuer_corporation_id = 98_000_111;
+    listed.price = 1_500_000_000.0;
+    listed.reward = 2_500_000_000.0;
+    listed.title = Some("HEL exchange in Delve".to_string());
+
+    let offered_hel = PublicContractItem {
+        record_id: 1,
+        type_id: 587,
+        quantity: 1,
+        is_included: true,
+        item_id: Some(1_001),
+        raw_quantity: None,
+        is_singleton: None,
+        is_blueprint_copy: None,
+        material_efficiency: None,
+        runs: None,
+        time_efficiency: None,
+    };
+    let requested_titan = PublicContractItem {
+        record_id: 2,
+        type_id: 19_720,
+        quantity: 1,
+        is_included: false,
+        item_id: Some(1_002),
+        raw_quantity: None,
+        is_singleton: None,
+        is_blueprint_copy: None,
+        material_efficiency: None,
+        runs: None,
+        time_efficiency: None,
+    };
+
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![baseline.clone()], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(
+                    vec![offered_hel.clone()],
+                    expiring_cache(),
+                )),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+
+    let conditions = vec![
+        ContractFilterCondition::EventKinds(vec![ContractEventKind::Listed]),
+        ContractFilterCondition::OfferedItems,
+        ContractFilterCondition::RequestedItems,
+        ContractFilterCondition::ItemTypes {
+            direction: ContractItemDirection::Offered,
+            ids: vec![587],
+        },
+        ContractFilterCondition::ShipGroups {
+            direction: ContractItemDirection::Offered,
+            ids: vec![659],
+        },
+        ContractFilterCondition::MinimumIsk {
+            direction: ContractItemDirection::Requested,
+            value: 1_000_000_000.0,
+        },
+        ContractFilterCondition::MaximumIsk {
+            direction: ContractItemDirection::Requested,
+            value: 2_000_000_000.0,
+        },
+        ContractFilterCondition::MinimumIsk {
+            direction: ContractItemDirection::Offered,
+            value: 2_000_000_000.0,
+        },
+        ContractFilterCondition::MaximumIsk {
+            direction: ContractItemDirection::Offered,
+            value: 3_000_000_000.0,
+        },
+        ContractFilterCondition::Regions(vec![10_000_002]),
+        ContractFilterCondition::SolarSystems(vec![30_000_142]),
+        ContractFilterCondition::SecurityRange {
+            min: -0.6,
+            max: -0.4,
+        },
+        ContractFilterCondition::LocationIds(vec![60_003_760]),
+        ContractFilterCondition::IssuerCharacters(vec![90_000_111]),
+        ContractFilterCondition::IssuerCorporations(vec![98_000_111]),
+        ContractFilterCondition::ObservedAffiliationAlliances(vec![99_000_111]),
+        ContractFilterCondition::PersonalIssuance,
+        ContractFilterCondition::TitleFragment("hEl ExChAnGe".to_string()),
+        ContractFilterCondition::TitleFragment("this does not match".to_string()),
+    ];
+    for (index, condition) in conditions.into_iter().enumerate() {
+        let root = if index + 1 == 19 {
+            ContractFilterNode::And(vec![
+                ContractFilterNode::Condition(ContractFilterCondition::EventKinds(vec![
+                    ContractEventKind::Listed,
+                ])),
+                ContractFilterNode::Or(vec![
+                    ContractFilterNode::Condition(condition),
+                    ContractFilterNode::Not(Box::new(ContractFilterNode::Condition(
+                        ContractFilterCondition::IssuerCharacters(vec![1]),
+                    ))),
+                ]),
+            ])
+        } else {
+            ContractFilterNode::Condition(condition)
+        };
+        store
+            .upsert_contract_subscription(&ContractSubscription {
+                guild_id: 42,
+                channel_id: 77,
+                id: format!("condition-{index}"),
+                description: format!("condition {index}"),
+                filter: ContractFilter { root },
+                event_actions: ContractEventActions {
+                    listed: ContractEventAction::Post,
+                },
+            })
+            .await
+            .expect("persist a recursive contract filter");
+    }
+
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let report = ContractCollector::new(
+        store.clone(),
+        Arc::new(ContextualFakeEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![baseline, listed], expiring_page(1))),
+                )]),
+                items: HashMap::from([
+                    (
+                        44,
+                        Ok(EsiResponse::fresh(
+                            vec![offered_hel.clone()],
+                            expiring_cache(),
+                        )),
+                    ),
+                    (
+                        45,
+                        Ok(EsiResponse::fresh(
+                            vec![offered_hel, requested_titan],
+                            expiring_cache(),
+                        )),
+                    ),
+                ]),
+            },
+            context: ContractObservationContext {
+                solar_system_id: Some(30_000_142),
+                security_status: Some(-0.5),
+                observed_affiliation_alliance_id: Some(99_000_111),
+            },
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659), (19_720, 30)]))),
+        delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("evaluate every recursive filter through the collection seam");
+
+    assert_eq!(
+        report.events.len(),
+        1,
+        "one event for the multi-ship bundle"
+    );
+    assert_eq!(delivery.sent.lock().unwrap().len(), 19);
+    assert!(delivery
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|delivery| delivery.message.title.contains("19720")));
+
+    database.destroy().await;
+}
+
+#[test]
+fn contract_filter_validation_rejects_invalid_trees_ranges_money_and_identifiers() {
+    for root in [
+        ContractFilterNode::And(vec![]),
+        ContractFilterNode::Condition(ContractFilterCondition::SecurityRange {
+            min: 0.5,
+            max: -0.5,
+        }),
+        ContractFilterNode::Condition(ContractFilterCondition::MinimumIsk {
+            direction: ContractItemDirection::Requested,
+            value: f64::NAN,
+        }),
+        ContractFilterNode::Condition(ContractFilterCondition::LocationIds(vec![0])),
+    ] {
+        assert!(ContractFilter { root }.validate().is_err());
+    }
+    assert_eq!(
+        ContractFilter {
+            root: ContractFilterNode::Condition(ContractFilterCondition::SolarSystems(vec![
+                30_000_142,
+            ])),
+        }
+        .context_requirements(),
+        ContractContextRequirements {
+            solar_system: true,
+            security_status: false,
+            observed_affiliation: false,
+        }
+    );
+}
+
+#[tokio::test]
+async fn invalid_contract_filter_cannot_partially_replace_a_persisted_subscription() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let original = contract_subscription(
+        "ships",
+        ContractItemDirection::Offered,
+        vec![587],
+        vec![],
+        ContractEventAction::Post,
+    );
+    store
+        .upsert_contract_subscription(&original)
+        .await
+        .expect("persist the original subscription");
+    let invalid_replacement = ContractSubscription {
+        description: "invalid replacement".to_string(),
+        filter: ContractFilter {
+            root: ContractFilterNode::Or(vec![]),
+        },
+        ..original.clone()
+    };
+    assert!(store
+        .upsert_contract_subscription(&invalid_replacement)
+        .await
+        .is_err());
+    assert_eq!(
+        store
+            .contract_subscriptions_for_channel(42, 77)
+            .await
+            .expect("read the unchanged subscription"),
+        vec![original]
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn http_esi_resolves_station_system_security_and_observed_affiliation_for_filters() {
+    let server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: r#"{"system_id":30000142}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: r#"{"security_status":-0.5}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: r#"[{"alliance_id":99000111}]"#,
+        },
+    ]);
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("construct local HTTP ESI client");
+    let response = esi
+        .observed_contract_context(
+            &item_exchange_contract(44),
+            ContractContextRequirements {
+                solar_system: true,
+                security_status: true,
+                observed_affiliation: true,
+            },
+        )
+        .await
+        .expect("resolve public contract context");
+    assert_eq!(
+        response.value.expect("context response"),
+        ContractObservationContext {
+            solar_system_id: Some(30_000_142),
+            security_status: Some(-0.5),
+            observed_affiliation_alliance_id: Some(99_000_111),
+        }
+    );
+    server.finish();
 }
