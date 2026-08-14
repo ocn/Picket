@@ -8,6 +8,7 @@ use serenity::prelude::Context;
 use std::sync::Arc;
 use tracing::error;
 
+pub mod contract_command;
 pub mod contract_subscribe;
 pub mod contract_unsubscribe;
 pub mod diag;

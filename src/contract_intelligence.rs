@@ -545,6 +545,12 @@ pub struct DeliveryRecord {
 }
 
 #[derive(Clone, Debug)]
+struct DeferredContractMatch {
+    subscription: ContractSubscription,
+    event: ContractEvent,
+}
+
+#[derive(Clone, Debug)]
 pub struct ContractDeliveryError(pub String);
 
 impl Display for ContractDeliveryError {
@@ -565,7 +571,13 @@ pub trait ContractDelivery: Send + Sync {
 
 #[async_trait]
 pub trait ShipGroupResolver: Send + Sync {
-    async fn group_for_type(&self, type_id: i64) -> Option<i64>;
+    async fn group_for_type(&self, type_id: i64) -> ShipGroupLookup;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShipGroupLookup {
+    Resolved(Option<i64>),
+    TemporarilyUnavailable,
 }
 
 #[derive(Clone, Debug)]
@@ -631,7 +643,7 @@ impl ContractCollectionStore {
         subscription
             .validate()
             .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-        sqlx::query("INSERT INTO contract_subscriptions (guild_id, channel_id, subscription_id, description, filter, event_actions) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (guild_id, channel_id, subscription_id) DO UPDATE SET description = EXCLUDED.description, filter = EXCLUDED.filter, event_actions = EXCLUDED.event_actions, updated_at = now()")
+        sqlx::query("INSERT INTO contract_subscriptions (guild_id, channel_id, subscription_id, description, filter, event_actions) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (guild_id, channel_id, subscription_id) DO UPDATE SET description = EXCLUDED.description, filter = EXCLUDED.filter, event_actions = EXCLUDED.event_actions, deleted_at = NULL, updated_at = now()")
             .bind(subscription.guild_id as i64)
             .bind(subscription.channel_id as i64)
             .bind(&subscription.id)
@@ -648,7 +660,7 @@ impl ContractCollectionStore {
         guild_id: u64,
         channel_id: u64,
     ) -> Result<Vec<ContractSubscription>, sqlx::Error> {
-        sqlx::query("SELECT guild_id, channel_id, subscription_id, description, filter, event_actions FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 ORDER BY subscription_id")
+        sqlx::query("SELECT guild_id, channel_id, subscription_id, description, filter, event_actions FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND deleted_at IS NULL ORDER BY subscription_id")
             .bind(guild_id as i64)
             .bind(channel_id as i64)
             .fetch_all(&self.pool)
@@ -664,12 +676,22 @@ impl ContractCollectionStore {
         channel_id: u64,
         id: &str,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query("DELETE FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3")
+        let mut transaction = self.pool.begin().await?;
+        let result = sqlx::query("UPDATE contract_subscriptions SET deleted_at = now(), updated_at = now() WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND deleted_at IS NULL")
             .bind(guild_id as i64)
             .bind(channel_id as i64)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
+        if result.rows_affected() == 1 {
+            sqlx::query("DELETE FROM contract_deferred_subscription_matches WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3")
+                .bind(guild_id as i64)
+                .bind(channel_id as i64)
+                .bind(id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -698,12 +720,75 @@ impl ContractCollectionStore {
     }
 
     async fn all_contract_subscriptions(&self) -> Result<Vec<ContractSubscription>, sqlx::Error> {
-        sqlx::query("SELECT guild_id, channel_id, subscription_id, description, filter, event_actions FROM contract_subscriptions ORDER BY guild_id, channel_id, subscription_id")
+        sqlx::query("SELECT guild_id, channel_id, subscription_id, description, filter, event_actions FROM contract_subscriptions WHERE deleted_at IS NULL ORDER BY guild_id, channel_id, subscription_id")
             .fetch_all(&self.pool)
             .await?
             .into_iter()
             .map(contract_subscription_from_row)
             .collect()
+    }
+
+    pub async fn delivery_event(
+        &self,
+        delivery_id: i64,
+    ) -> Result<Option<ContractEvent>, sqlx::Error> {
+        let event = sqlx::query_scalar::<_, Value>(
+            "SELECT event FROM contract_outbound_deliveries WHERE id = $1",
+        )
+        .bind(delivery_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        event
+            .map(|event| serde_json::from_value(event).map_err(json_to_sqlx))
+            .transpose()
+    }
+
+    async fn deferred_contract_matches(&self) -> Result<Vec<DeferredContractMatch>, sqlx::Error> {
+        sqlx::query("SELECT contract_subscriptions.guild_id, contract_subscriptions.channel_id, contract_subscriptions.subscription_id, contract_subscriptions.description, contract_subscriptions.filter, contract_subscriptions.event_actions, contract_deferred_subscription_matches.event FROM contract_deferred_subscription_matches JOIN contract_subscriptions USING (guild_id, channel_id, subscription_id) WHERE contract_subscriptions.deleted_at IS NULL ORDER BY contract_deferred_subscription_matches.created_at, contract_subscriptions.guild_id, contract_subscriptions.channel_id, contract_subscriptions.subscription_id")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let event = serde_json::from_value(row.get("event")).map_err(json_to_sqlx)?;
+                Ok(DeferredContractMatch {
+                    subscription: contract_subscription_from_row(row)?,
+                    event,
+                })
+            })
+            .collect()
+    }
+
+    async fn defer_contract_match(
+        &self,
+        subscription: &ContractSubscription,
+        event: &ContractEvent,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT INTO contract_deferred_subscription_matches (guild_id, channel_id, subscription_id, contract_id, event_kind, event) SELECT $1,$2,$3,$4,$5,$6 WHERE EXISTS (SELECT 1 FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND deleted_at IS NULL) ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind) DO UPDATE SET event = EXCLUDED.event, updated_at = now()")
+            .bind(subscription.guild_id as i64)
+            .bind(subscription.channel_id as i64)
+            .bind(&subscription.id)
+            .bind(event.contract.contract_id)
+            .bind(event.kind.as_str())
+            .bind(serde_json::to_value(event).map_err(json_to_sqlx)?)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn resolve_deferred_contract_match(
+        &self,
+        subscription: &ContractSubscription,
+        event: &ContractEvent,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM contract_deferred_subscription_matches WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND contract_id = $4 AND event_kind = $5")
+            .bind(subscription.guild_id as i64)
+            .bind(subscription.channel_id as i64)
+            .bind(&subscription.id)
+            .bind(event.contract.contract_id)
+            .bind(event.kind.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     async fn prepare_delivery(
@@ -713,7 +798,7 @@ impl ContractCollectionStore {
         message: &ContractNotificationMessage,
         ping: bool,
     ) -> Result<Option<PreparedContractDelivery>, sqlx::Error> {
-        let delivery_id = sqlx::query_scalar::<_, i64>("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'prepared') ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind) DO NOTHING RETURNING id")
+        let delivery_id = sqlx::query_scalar::<_, i64>("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status) SELECT $1,$2,$3,$4,$5,$6,$7,$8,'prepared' WHERE EXISTS (SELECT 1 FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND deleted_at IS NULL) ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind) DO NOTHING RETURNING id")
             .bind(subscription.guild_id as i64)
             .bind(subscription.channel_id as i64)
             .bind(&subscription.id)
@@ -741,11 +826,16 @@ impl ContractCollectionStore {
         delivery_id: i64,
         discord_message_id: &str,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE contract_outbound_deliveries SET status = 'sent', discord_message_id = $2, sent_at = now() WHERE id = $1 AND status = 'prepared'")
+        let result = sqlx::query("UPDATE contract_outbound_deliveries SET status = 'sent', discord_message_id = $2, sent_at = now() WHERE id = $1 AND status = 'prepared'")
             .bind(delivery_id)
             .bind(discord_message_id)
             .execute(&self.pool)
             .await?;
+        if result.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol(format!(
+                "contract delivery {delivery_id} was not prepared when Discord returned success"
+            )));
+        }
         Ok(())
     }
 
@@ -988,7 +1078,7 @@ pub enum CollectionOutcome {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ContractEvent {
     pub region_id: i64,
     pub kind: ContractEventKind,
@@ -1013,6 +1103,11 @@ pub struct ContractCollector {
 struct ContractNotifications {
     ship_groups: Arc<dyn ShipGroupResolver>,
     delivery: Arc<dyn ContractDelivery>,
+}
+
+enum NotificationResolution {
+    Complete,
+    Deferred,
 }
 
 impl ContractCollector {
@@ -1180,43 +1275,73 @@ impl ContractCollector {
         let Some(notifications) = &self.notifications else {
             return Ok(());
         };
+        let deferred_matches = self.store.deferred_contract_matches().await?;
         let subscriptions = self.store.all_contract_subscriptions().await?;
+        for deferred in deferred_matches {
+            match self
+                .notify_subscription(&deferred.subscription, &deferred.event, notifications)
+                .await?
+            {
+                NotificationResolution::Complete => {
+                    self.store
+                        .resolve_deferred_contract_match(&deferred.subscription, &deferred.event)
+                        .await?;
+                }
+                NotificationResolution::Deferred => {}
+            }
+        }
         for event in events {
             for subscription in &subscriptions {
-                let action = contract_event_action(subscription, &event.kind);
-                if matches!(action, ContractEventAction::Ignore) {
-                    continue;
-                }
-                let matched_items =
-                    matching_items(subscription, event, &*notifications.ship_groups).await;
-                if matched_items.is_empty() {
-                    continue;
-                }
-                let message =
-                    contract_notification_message(event, &subscription.filter, &matched_items);
-                let ping = matches!(action, ContractEventAction::PostAndPing);
-                let Some(prepared) = self
-                    .store
-                    .prepare_delivery(subscription, event, &message, ping)
-                    .await?
-                else {
-                    continue;
-                };
-                match notifications.delivery.send(prepared.clone()).await {
-                    Ok(message_id) => {
-                        self.store
-                            .mark_delivery_sent(prepared.delivery_id, &message_id)
-                            .await?
-                    }
-                    Err(error) => warn!(
-                        subscription_id = %subscription.id,
-                        contract_id = event.contract.contract_id,
-                        "contract delivery remains prepared after Discord failure: {error}"
-                    ),
+                if matches!(
+                    self.notify_subscription(subscription, event, notifications)
+                        .await?,
+                    NotificationResolution::Deferred
+                ) {
+                    self.store.defer_contract_match(subscription, event).await?;
                 }
             }
         }
         Ok(())
+    }
+
+    async fn notify_subscription(
+        &self,
+        subscription: &ContractSubscription,
+        event: &ContractEvent,
+        notifications: &ContractNotifications,
+    ) -> Result<NotificationResolution, ContractCollectionError> {
+        let action = contract_event_action(subscription, &event.kind);
+        if matches!(action, ContractEventAction::Ignore) {
+            return Ok(NotificationResolution::Complete);
+        }
+        let matched_items =
+            match matching_items(subscription, event, &*notifications.ship_groups).await {
+                MatchingItems::Matched(items) => items,
+                MatchingItems::Unmatched => return Ok(NotificationResolution::Complete),
+                MatchingItems::Deferred => return Ok(NotificationResolution::Deferred),
+            };
+        let message = contract_notification_message(event, &subscription.filter, &matched_items);
+        let ping = matches!(action, ContractEventAction::PostAndPing);
+        let Some(prepared) = self
+            .store
+            .prepare_delivery(subscription, event, &message, ping)
+            .await?
+        else {
+            return Ok(NotificationResolution::Complete);
+        };
+        match notifications.delivery.send(prepared.clone()).await {
+            Ok(message_id) => {
+                self.store
+                    .mark_delivery_sent(prepared.delivery_id, &message_id)
+                    .await?
+            }
+            Err(error) => warn!(
+                subscription_id = %subscription.id,
+                contract_id = event.contract.contract_id,
+                "contract delivery remains prepared after Discord failure: {error}"
+            ),
+        }
+        Ok(NotificationResolution::Complete)
     }
 
     async fn regions(&self) -> Result<Vec<i64>, ContractCollectionError> {
@@ -1378,35 +1503,53 @@ fn contract_event_action(
     }
 }
 
+enum MatchingItems {
+    Matched(Vec<PublicContractItem>),
+    Unmatched,
+    Deferred,
+}
+
 async fn matching_items(
     subscription: &ContractSubscription,
     event: &ContractEvent,
     ship_groups: &dyn ShipGroupResolver,
-) -> Vec<PublicContractItem> {
+) -> MatchingItems {
     if !subscription.filter.events.contains(&event.kind) {
-        return Vec::new();
+        return MatchingItems::Unmatched;
     }
     let items = match subscription.filter.item_direction {
         ContractItemDirection::Offered => &event.offered_items,
         ContractItemDirection::Requested => &event.requested_items,
     };
     let mut matches = Vec::new();
+    let mut unavailable_group_lookup = false;
     for item in items {
         let type_matches = subscription.filter.type_ids.contains(&item.type_id);
-        let group_matches = if subscription.filter.ship_group_ids.is_empty() {
+        let group_matches = if type_matches || subscription.filter.ship_group_ids.is_empty() {
             false
         } else {
-            ship_groups
-                .group_for_type(item.type_id)
-                .await
-                .map(|group_id| subscription.filter.ship_group_ids.contains(&group_id))
-                .unwrap_or(false)
+            match ship_groups.group_for_type(item.type_id).await {
+                ShipGroupLookup::Resolved(Some(group_id)) => {
+                    subscription.filter.ship_group_ids.contains(&group_id)
+                }
+                ShipGroupLookup::Resolved(None) => false,
+                ShipGroupLookup::TemporarilyUnavailable => {
+                    unavailable_group_lookup = true;
+                    false
+                }
+            }
         };
         if type_matches || group_matches {
             matches.push(item.clone());
         }
     }
-    matches
+    if !matches.is_empty() {
+        MatchingItems::Matched(matches)
+    } else if unavailable_group_lookup {
+        MatchingItems::Deferred
+    } else {
+        MatchingItems::Unmatched
+    }
 }
 
 fn contract_notification_message(
@@ -1414,11 +1557,7 @@ fn contract_notification_message(
     filter: &ContractFilter,
     matched_items: &[PublicContractItem],
 ) -> ContractNotificationMessage {
-    let item_label = matched_items
-        .iter()
-        .map(|item| format!("Type {} ×{}", item.type_id, item.quantity))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let item_label = compact_bundle_summary(matched_items);
     let (isk_label, isk) = match filter.item_direction {
         ContractItemDirection::Offered => ("Requested ISK", event.contract.price),
         ContractItemDirection::Requested => ("Offered ISK", event.contract.reward),
@@ -1428,14 +1567,15 @@ fn contract_notification_message(
         ContractItemDirection::Requested => "Requested Item",
     };
     let location_id = event.contract.start_location_id;
-    ContractNotificationMessage {
+    let mut message = ContractNotificationMessage {
         title: "Public contract listed".to_string(),
         description: event
             .contract
             .title
             .as_deref()
             .filter(|title| !title.is_empty())
-            .map(sanitize_discord_text),
+            .map(sanitize_discord_text)
+            .map(|title| bounded_text(&title, 4096)),
         fields: vec![
             ContractEmbedField {
                 name: "Event".to_string(),
@@ -1473,7 +1613,68 @@ fn contract_notification_message(
                 inline: false,
             },
         ],
+    };
+    bound_embed_message(&mut message);
+    message
+}
+
+const MAX_EMBED_TITLE_CHARACTERS: usize = 256;
+const MAX_EMBED_DESCRIPTION_CHARACTERS: usize = 4096;
+const MAX_EMBED_FIELD_NAME_CHARACTERS: usize = 256;
+const MAX_EMBED_FIELD_VALUE_CHARACTERS: usize = 1024;
+const MAX_EMBED_CHARACTERS: usize = 6000;
+const MAX_BUNDLE_ITEMS_IN_EMBED: usize = 8;
+
+fn compact_bundle_summary(items: &[PublicContractItem]) -> String {
+    let visible = items
+        .iter()
+        .take(MAX_BUNDLE_ITEMS_IN_EMBED)
+        .map(|item| format!("Type {} ×{}", item.type_id, item.quantity))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hidden = items.len().saturating_sub(MAX_BUNDLE_ITEMS_IN_EMBED);
+    if hidden == 0 {
+        visible
+    } else {
+        format!("{visible}\n+{hidden} more")
     }
+}
+
+fn bound_embed_message(message: &mut ContractNotificationMessage) {
+    message.title = bounded_text(&message.title, MAX_EMBED_TITLE_CHARACTERS);
+    message.description = message
+        .description
+        .as_deref()
+        .map(|description| bounded_text(description, MAX_EMBED_DESCRIPTION_CHARACTERS));
+    for field in &mut message.fields {
+        field.name = bounded_text(&field.name, MAX_EMBED_FIELD_NAME_CHARACTERS);
+        field.value = bounded_text(&field.value, MAX_EMBED_FIELD_VALUE_CHARACTERS);
+    }
+    let fixed_characters = message.title.chars().count()
+        + message
+            .fields
+            .iter()
+            .map(|field| field.name.chars().count() + field.value.chars().count())
+            .sum::<usize>();
+    let description_budget = MAX_EMBED_CHARACTERS.saturating_sub(fixed_characters);
+    message.description = message
+        .description
+        .as_deref()
+        .filter(|_| description_budget > 0)
+        .map(|description| bounded_text(description, description_budget));
+}
+
+fn bounded_text(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    if limit == 0 {
+        return String::new();
+    }
+    if limit <= 3 {
+        return "…".repeat(limit);
+    }
+    format!("{}…", value.chars().take(limit - 1).collect::<String>())
 }
 
 pub fn sanitize_discord_text(value: &str) -> String {
@@ -1517,22 +1718,43 @@ pub async fn run_contract_collection_loop(
 }
 
 pub async fn run_contract_collection_loop_with_notifications(
-    database_url: String,
+    store: Arc<ContractCollectionStore>,
     interval: Duration,
     esi_timeout: Duration,
     ship_groups: Arc<dyn ShipGroupResolver>,
     delivery: Arc<dyn ContractDelivery>,
 ) {
-    run_contract_collection_loop_inner(
-        database_url,
-        interval,
-        esi_timeout,
-        Some(ContractNotifications {
-            ship_groups,
-            delivery,
-        }),
-    )
-    .await;
+    let notifications = ContractNotifications {
+        ship_groups,
+        delivery,
+    };
+    loop {
+        let mut delay = interval;
+        match HttpPublicContractEsi::new(esi_timeout) {
+            Ok(esi) => {
+                let collector = ContractCollector::new((*store).clone(), Arc::new(esi))
+                    .with_notifications(
+                        notifications.ship_groups.clone(),
+                        notifications.delivery.clone(),
+                    );
+                match collector.collect_cycle().await {
+                    Ok(report) => {
+                        delay = collection_retry_delay(interval, report.retry_after);
+                        info!(
+                            regions = report.regions.len(),
+                            "contract collection cycle finished"
+                        )
+                    }
+                    Err(error) => {
+                        delay = collection_retry_delay(interval, error.retry_after());
+                        warn!("contract collection paused after failure: {error}")
+                    }
+                }
+            }
+            Err(error) => warn!("contract collection HTTP client unavailable: {error}"),
+        }
+        tokio::time::sleep(delay).await;
+    }
 }
 
 async fn run_contract_collection_loop_inner(
