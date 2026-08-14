@@ -3,13 +3,14 @@ use chrono::{TimeZone, Utc};
 use killbot_rust::contract_intelligence::{
     available_contract_store, new_contract_store_handle,
     spawn_contract_collection_loop_with_notifications, CacheMetadata, CollectionOutcome,
-    ContractCollectionStore, ContractCollector, ContractContextRequirements, ContractContextValue,
-    ContractDelivery, ContractDeliveryError, ContractEventAction, ContractEventActions,
-    ContractEventKind, ContractFilter, ContractFilterCondition, ContractFilterNode,
-    ContractItemDirection, ContractItemProbe, ContractObservationContext, ContractResolutionState,
-    ContractSubscription, DeliveryRecord, DeliveryStatus, EsiError, EsiResponse,
-    HttpPublicContractEsi, PreparedContractDelivery, PublicContract, PublicContractEsi,
-    PublicContractItem, ShipGroupLookup, ShipGroupResolver,
+    ContractCollectionStore, ContractCollector, ContractContextLimiter,
+    ContractContextRequirements, ContractContextValue, ContractDelivery, ContractDeliveryError,
+    ContractEmbedContext, ContractEventAction, ContractEventActions, ContractEventKind,
+    ContractFilter, ContractFilterCondition, ContractFilterNode, ContractItemDirection,
+    ContractItemProbe, ContractObservationContext, ContractResolutionState, ContractSubscription,
+    DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HttpPublicContractEsi,
+    PreparedContractDelivery, PublicContract, PublicContractEsi, PublicContractItem,
+    ShipGroupLookup, ShipGroupResolver,
 };
 use sha2::{Digest, Sha384};
 use sqlx::postgres::PgPoolOptions;
@@ -221,6 +222,19 @@ struct StopsBetweenContextCallsEsi {
     calls: StdMutex<Vec<String>>,
 }
 
+struct SnapshottingEsi {
+    inner: FakeEsi,
+    contexts: StdMutex<Vec<Result<EsiResponse<ContractEmbedContext>, EsiError>>>,
+    calls: StdMutex<Vec<i64>>,
+}
+
+#[derive(Default)]
+struct BoundaryContextLimiter {
+    request_checks: StdMutex<usize>,
+    responses: StdMutex<usize>,
+    blocked: StdMutex<bool>,
+}
+
 fn expiring_metadata(etag: &str, expected_pages: Option<u32>) -> CacheMetadata {
     CacheMetadata {
         etag: Some(etag.to_string()),
@@ -315,6 +329,57 @@ impl PublicContractEsi for FakeEsi {
             .get(&contract_id)
             .expect("fake ESI manifest configured")
             .clone()
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for SnapshottingEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+
+    async fn observed_contract_embed_context(
+        &self,
+        contract: &PublicContract,
+        _items: &[PublicContractItem],
+    ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
+        self.calls.lock().unwrap().push(contract.contract_id);
+        self.contexts.lock().unwrap().remove(0)
+    }
+}
+
+#[async_trait]
+impl ContractContextLimiter for BoundaryContextLimiter {
+    async fn request_allowed(&self) -> Result<bool, EsiError> {
+        *self.request_checks.lock().unwrap() += 1;
+        Ok(!*self.blocked.lock().unwrap())
+    }
+
+    async fn record_response(&self, metadata: &CacheMetadata) -> Result<(), EsiError> {
+        *self.responses.lock().unwrap() += 1;
+        if metadata.rate_limit_remaining == Some(0) {
+            *self.blocked.lock().unwrap() = true;
+        }
+        Ok(())
     }
 }
 
@@ -937,6 +1002,37 @@ async fn pre_expiry_no_content_confirms_only_pure_matched_ship_sales_and_purchas
     assert_eq!(issuer_history.confirmed_purchases, 1);
     assert_eq!(issuer_history.unknown_closures, 0);
     assert_eq!(corporation_history, issuer_history);
+
+    let history_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to adjust retained local history");
+    sqlx::query(
+        "UPDATE contract_resolution_cases \
+         SET acceptance_evidence_at = CASE contract_id \
+             WHEN 44 THEN now() - interval '90 days' - interval '1 second' \
+             WHEN 45 THEN now() - interval '90 days' + interval '1 second' \
+         END \
+         WHERE contract_id IN (44, 45)",
+    )
+    .execute(&history_pool)
+    .await
+    .expect("place one history event on each side of the 90-day boundary");
+    history_pool.close().await;
+    let (issuer_history, _) = store
+        .contract_party_history(sale.issuer_id, sale.issuer_corporation_id)
+        .await
+        .expect("exclude old history while retaining an in-window boundary event");
+    assert_eq!(issuer_history.confirmed_sales, 0);
+    assert_eq!(issuer_history.confirmed_purchases, 1);
+    assert_eq!(
+        issuer_history
+            .most_recent_confirmed
+            .as_ref()
+            .map(|event| event.kind),
+        Some(ContractEventKind::PurchaseConfirmed)
+    );
     let relisted = ContractCollector::new(
         store.clone(),
         Arc::new(FakeEsi {
@@ -2783,7 +2879,7 @@ async fn new_listed_ship_contracts_notify_each_matching_subscription_once_after_
             .iter()
             .any(|field| field.name == "Issuer" && field.value == "90000001")
             && delivery.message.description.as_deref()
-                == Some("Contract title: @\u{200b}everyone offers <@\u{200b}1234\\> a ship")
+                == Some("Contract title: @\u{200b}everyone offers @\u{200b}1234 a ship")
     }));
     drop(sent);
     assert!(store
@@ -2817,6 +2913,271 @@ async fn new_listed_ship_contracts_notify_each_matching_subscription_once_after_
             .len(),
         3
     );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn complete_observations_snapshot_embed_context_without_a_subscription_or_listing_event() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let contract = item_exchange_contract(44);
+    let esi = Arc::new(SnapshottingEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        },
+        contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+            ContractEmbedContext {
+                issuer_character_name: Some("Observed Issuer".to_string()),
+                ..ContractEmbedContext::default()
+            },
+            CacheMetadata::cached_for_seconds(60),
+        ))]),
+        calls: StdMutex::new(Vec::new()),
+    });
+
+    let report = ContractCollector::new(store.clone(), esi.clone())
+        .collect_cycle()
+        .await
+        .expect("record a complete silent baseline");
+
+    assert_eq!(
+        report.regions,
+        vec![CollectionOutcome::BaselineEstablished {
+            region_id: 10_000_002
+        }]
+    );
+    assert!(report.events.is_empty());
+    assert_eq!(esi.calls.lock().unwrap().as_slice(), &[44]);
+    assert_eq!(
+        store
+            .observed_embed_context(10_000_002, 44)
+            .await
+            .expect("load baseline snapshot")
+            .and_then(|context| context.issuer_character_name),
+        Some("Observed Issuer".to_string())
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn missing_embed_context_is_backfilled_and_retried_after_a_transient_failure() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let contract = item_exchange_contract(44);
+    let esi = Arc::new(SnapshottingEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![contract], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        },
+        contexts: StdMutex::new(vec![
+            Err(EsiError::retryable("temporary context failure", None)),
+            Ok(EsiResponse::fresh(
+                ContractEmbedContext {
+                    issuer_corporation_name: Some("Recovered Corporation".to_string()),
+                    ..ContractEmbedContext::default()
+                },
+                CacheMetadata::cached_for_seconds(60),
+            )),
+        ]),
+        calls: StdMutex::new(Vec::new()),
+    });
+    let collector = ContractCollector::new(store.clone(), esi.clone());
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("preserve the complete observation when enrichment is transiently unavailable");
+    assert!(store
+        .observed_embed_context(10_000_002, 44)
+        .await
+        .expect("read absent transient snapshot")
+        .is_none());
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("retry the missing observation-time enrichment");
+    assert_eq!(esi.calls.lock().unwrap().as_slice(), &[44, 44]);
+    assert_eq!(
+        store
+            .observed_embed_context(10_000_002, 44)
+            .await
+            .expect("load retried snapshot")
+            .and_then(|context| context.issuer_corporation_name),
+        Some("Recovered Corporation".to_string())
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn observation_context_enrichment_stops_at_the_persisted_limiter_boundary() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let first = item_exchange_contract(44);
+    let second = item_exchange_contract(45);
+    let esi = Arc::new(SnapshottingEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![first.clone(), second.clone()],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    45,
+                    Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                ),
+            ]),
+        },
+        contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+            ContractEmbedContext::default(),
+            CacheMetadata {
+                rate_limit_limit: Some("1/1m".to_string()),
+                rate_limit_remaining: Some(0),
+                ..CacheMetadata::cached_for_seconds(60)
+            },
+        ))]),
+        calls: StdMutex::new(Vec::new()),
+    });
+
+    ContractCollector::new(store.clone(), esi.clone())
+        .collect_cycle()
+        .await
+        .expect("retain the complete observation while deferring later context enrichment");
+
+    assert_eq!(esi.calls.lock().unwrap().as_slice(), &[44]);
+    assert!(store
+        .observed_embed_context(10_000_002, first.contract_id)
+        .await
+        .expect("read first snapshot")
+        .is_some());
+    assert!(store
+        .observed_embed_context(10_000_002, second.contract_id)
+        .await
+        .expect("read deferred snapshot")
+        .is_none());
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_only_subscription_uses_the_persisted_observation_time_context() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut contract = item_exchange_contract(44);
+    contract.date_expired = Utc::now() + chrono::Duration::hours(1);
+    let baseline_esi = SnapshottingEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        },
+        contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+            ContractEmbedContext {
+                issuer_character_name: Some("Observed Issuer".to_string()),
+                issuer_corporation_name: Some("Observed Corporation".to_string()),
+                issuer_alliance_id: Some(99_000_111),
+                issuer_alliance_name: Some("Observed Alliance".to_string()),
+                ..ContractEmbedContext::default()
+            },
+            CacheMetadata::cached_for_seconds(60),
+        ))]),
+        calls: StdMutex::new(Vec::new()),
+    };
+    ContractCollector::new(store.clone(), Arc::new(baseline_esi))
+        .collect_cycle()
+        .await
+        .expect("snapshot the silent baseline contract");
+    let mut terminal_subscription = confirmed_ship_subscription(
+        "terminal-only-sale",
+        ContractEventKind::SaleConfirmed,
+        ContractItemDirection::Offered,
+        ContractEventAction::Post,
+    );
+    terminal_subscription.filter.root = ContractFilterNode::And(vec![
+        terminal_subscription.filter.root,
+        ContractFilterNode::Condition(ContractFilterCondition::ObservedAffiliationAlliances(vec![
+            99_000_111,
+        ])),
+    ]);
+    store
+        .upsert_contract_subscription(&terminal_subscription)
+        .await
+        .expect("persist a terminal-only subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let resolver = ResolutionEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        },
+        probes: StdMutex::new(vec![Ok(ContractItemProbe::NoContent(expiring_cache()))]),
+        probe_calls: StdMutex::new(Vec::new()),
+    };
+
+    ContractCollector::new(store.clone(), Arc::new(resolver))
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+            delivery.clone(),
+        )
+        .collect_cycle()
+        .await
+        .expect("confirm the disappeared public sale");
+
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0]
+        .message
+        .fields
+        .iter()
+        .any(|field| { field.name == "Issuer" && field.value == "Observed Issuer (90000001)" }));
+    assert!(sent[0].message.fields.iter().any(|field| {
+        field.name == "Observed Affiliation"
+            && field.value == "At observation: Observed Corporation (98000001)"
+    }));
+    assert!(sent[0]
+        .message
+        .fields
+        .iter()
+        .all(|field| !matches!(field.name.as_str(), "Buyer" | "Counterparty")));
+    drop(sent);
 
     database.destroy().await;
 }
@@ -4915,32 +5276,32 @@ async fn http_esi_snapshots_public_embed_context_from_public_endpoints() {
     let server = SequenceHttpServer::start(vec![
         WireReply {
             status: 200,
-            headers: vec![],
+            headers: vec![("Cache-Control", "max-age=60")],
             body: r#"{"name":"Jita IV - Moon 4","system_id":30000142}"#,
         },
         WireReply {
             status: 200,
-            headers: vec![],
+            headers: vec![("Cache-Control", "max-age=60")],
             body: r#"{"name":"Jita","security_status":0.9,"constellation_id":20000020}"#,
         },
         WireReply {
             status: 200,
-            headers: vec![],
+            headers: vec![("Cache-Control", "max-age=60")],
             body: r#"{"region_id":10000002}"#,
         },
         WireReply {
             status: 200,
-            headers: vec![],
+            headers: vec![("Cache-Control", "max-age=60")],
             body: r#"{"name":"The Forge"}"#,
         },
         WireReply {
             status: 200,
-            headers: vec![],
+            headers: vec![("Cache-Control", "max-age=60")],
             body: r#"[{"alliance_id":99000111}]"#,
         },
         WireReply {
             status: 200,
-            headers: vec![],
+            headers: vec![("Cache-Control", "max-age=60")],
             body: r#"[{"id":90000001,"name":"Issuer"},{"id":98000001,"name":"Issuer Corp"},{"id":99000111,"name":"Issuer Alliance"},{"id":587,"name":"Rifter"}]"#,
         },
     ]);
@@ -4973,11 +5334,195 @@ async fn http_esi_snapshots_public_embed_context_from_public_endpoints() {
         context.item_names.get(&587).map(String::as_str),
         Some("Rifter")
     );
+    let shared_context = esi
+        .observed_contract_embed_context(&item_exchange_contract(45), &[offered_ship(2)])
+        .await
+        .expect("reuse fresh public context resources across observed contracts")
+        .value
+        .expect("shared context response");
+    assert_eq!(
+        shared_context.issuer_character_name.as_deref(),
+        Some("Issuer")
+    );
     let requests = server.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        6,
+        "fresh entity context is shared across contracts"
+    );
     assert!(requests[0].starts_with("GET /universe/stations/60003760/"));
     assert!(requests[1].starts_with("GET /universe/systems/30000142/"));
     assert!(requests[4].starts_with("POST /characters/affiliation/"));
     assert!(requests[5].starts_with("POST /universe/names/"));
+    drop(requests);
+    server.finish();
+}
+
+#[tokio::test]
+async fn http_esi_revalidates_expired_context_with_an_etag() {
+    let server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![("ETag", "system-v1"), ("Cache-Control", "max-age=0")],
+            body: r#"{"name":"Jita","security_status":0.9,"constellation_id":20000020}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"{"region_id":10000002}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"{"name":"The Forge"}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"[{"alliance_id":99000111}]"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"[{"id":90000001,"name":"Issuer"},{"id":98000001,"name":"Issuer Corp"},{"id":99000111,"name":"Issuer Alliance"},{"id":587,"name":"Rifter"}]"#,
+        },
+        WireReply {
+            status: 304,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: "",
+        },
+    ]);
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("construct local HTTP ESI client");
+    let mut contract = item_exchange_contract(44);
+    contract.start_location_id = 30_000_142;
+
+    esi.observed_contract_embed_context(&contract, &[offered_ship(1)])
+        .await
+        .expect("cache the initial public context");
+    let context = esi
+        .observed_contract_embed_context(&contract, &[offered_ship(1)])
+        .await
+        .expect("reuse the 304 representation")
+        .value
+        .expect("revalidated context response");
+
+    assert_eq!(context.location.solar_system_name.as_deref(), Some("Jita"));
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    assert!(requests[5]
+        .to_ascii_lowercase()
+        .contains("if-none-match: system-v1"));
+    drop(requests);
+    server.finish();
+}
+
+#[tokio::test]
+async fn http_esi_stops_an_enrichment_chain_at_a_persisted_limiter_boundary() {
+    let server = SequenceHttpServer::start(vec![WireReply {
+        status: 200,
+        headers: vec![
+            ("X-RateLimit-Limit", "1/1m"),
+            ("X-RateLimit-Remaining", "0"),
+        ],
+        body: r#"{"name":"Jita IV - Moon 4","system_id":30000142}"#,
+    }]);
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("construct local HTTP ESI client");
+    let limiter = BoundaryContextLimiter::default();
+
+    let error = esi
+        .observed_contract_embed_context_limited(
+            &item_exchange_contract(44),
+            &[offered_ship(1)],
+            &limiter,
+        )
+        .await
+        .expect_err("stop before the next context request after the recorded boundary");
+
+    assert!(error.to_string().contains("limiter boundary"));
+    assert_eq!(*limiter.responses.lock().unwrap(), 1);
+    assert_eq!(*limiter.request_checks.lock().unwrap(), 2);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    drop(requests);
+    server.finish();
+}
+
+#[tokio::test]
+async fn http_esi_skips_scoped_structure_resolution_for_public_contracts() {
+    let server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: r#"[{"alliance_id":99000111}]"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: r#"[{"id":90000001,"name":"Issuer"},{"id":98000001,"name":"Issuer Corp"},{"id":99000111,"name":"Issuer Alliance"},{"id":587,"name":"Rifter"}]"#,
+        },
+    ]);
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("construct unauthenticated public ESI client");
+    let mut contract = item_exchange_contract(44);
+    contract.start_location_id = 1_035_466_617_946;
+
+    let context = esi
+        .observed_contract_embed_context(&contract, &[offered_ship(1)])
+        .await
+        .expect("an inaccessible structure does not abort public enrichment")
+        .value
+        .expect("context response");
+
+    assert!(context.location.location_name.is_none());
+    assert!(context.location.solar_system_id.is_none());
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("POST /characters/affiliation/"));
+    assert!(requests[1].starts_with("POST /universe/names/"));
+    assert!(requests
+        .iter()
+        .all(|request| !request.contains("/universe/structures/")));
+    drop(requests);
+    server.finish();
+}
+
+#[tokio::test]
+async fn http_esi_continues_after_an_inaccessible_station_lookup() {
+    let server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 401,
+            headers: vec![],
+            body: "{}",
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: r#"[{"alliance_id":99000111}]"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: r#"[{"id":90000001,"name":"Issuer"},{"id":98000001,"name":"Issuer Corp"},{"id":99000111,"name":"Issuer Alliance"},{"id":587,"name":"Rifter"}]"#,
+        },
+    ]);
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("construct unauthenticated public ESI client");
+
+    let context = esi
+        .observed_contract_embed_context(&item_exchange_contract(44), &[offered_ship(1)])
+        .await
+        .expect("an inaccessible location lookup does not abort issuer enrichment")
+        .value
+        .expect("partial public context");
+
+    assert!(context.location.location_name.is_none());
+    assert_eq!(context.issuer_character_name.as_deref(), Some("Issuer"));
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with("GET /universe/stations/60003760/"));
+    assert!(requests[1].starts_with("POST /characters/affiliation/"));
     drop(requests);
     server.finish();
 }
