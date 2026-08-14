@@ -6,9 +6,10 @@ use killbot_rust::contract_intelligence::{
     ContractCollectionStore, ContractCollector, ContractContextRequirements, ContractContextValue,
     ContractDelivery, ContractDeliveryError, ContractEventAction, ContractEventActions,
     ContractEventKind, ContractFilter, ContractFilterCondition, ContractFilterNode,
-    ContractItemDirection, ContractObservationContext, ContractSubscription, DeliveryRecord,
-    DeliveryStatus, EsiError, EsiResponse, HttpPublicContractEsi, PreparedContractDelivery,
-    PublicContract, PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
+    ContractItemDirection, ContractItemProbe, ContractObservationContext, ContractResolutionState,
+    ContractSubscription, DeliveryRecord, DeliveryStatus, EsiError, EsiResponse,
+    HttpPublicContractEsi, PreparedContractDelivery, PublicContract, PublicContractEsi,
+    PublicContractItem, ShipGroupLookup, ShipGroupResolver,
 };
 use sha2::{Digest, Sha384};
 use sqlx::postgres::PgPoolOptions;
@@ -519,6 +520,50 @@ struct RecordingDelivery {
 
 struct NoopDelivery;
 
+struct ResolutionEsi {
+    inner: FakeEsi,
+    probes: StdMutex<Vec<Result<ContractItemProbe, EsiError>>>,
+    probe_calls: StdMutex<Vec<(i64, Option<String>)>>,
+}
+
+#[async_trait]
+impl PublicContractEsi for ResolutionEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+
+    async fn public_contract_items_probe(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<ContractItemProbe, EsiError> {
+        self.probe_calls
+            .lock()
+            .unwrap()
+            .push((contract_id, etag.map(str::to_owned)));
+        self.probes.lock().unwrap().remove(0)
+    }
+}
+
 struct RemovingDelivery {
     store: ContractCollectionStore,
     sent: StdMutex<Vec<PreparedContractDelivery>>,
@@ -585,7 +630,48 @@ fn contract_subscription(
         id: id.to_string(),
         description: format!("{id} subscription"),
         filter: ContractFilter::listed_ship(direction, type_ids, ship_group_ids),
-        event_actions: ContractEventActions { listed },
+        event_actions: ContractEventActions {
+            listed,
+            ..ContractEventActions::default()
+        },
+    }
+}
+
+fn confirmed_ship_subscription(
+    id: &str,
+    event_kind: ContractEventKind,
+    direction: ContractItemDirection,
+    action: ContractEventAction,
+) -> ContractSubscription {
+    ContractSubscription {
+        guild_id: 42,
+        channel_id: 77,
+        id: id.to_string(),
+        description: format!("{id} subscription"),
+        filter: ContractFilter {
+            root: ContractFilterNode::And(vec![
+                ContractFilterNode::Condition(ContractFilterCondition::EventKinds(vec![
+                    event_kind,
+                ])),
+                ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                    direction,
+                    ids: vec![587],
+                }),
+            ]),
+        },
+        event_actions: ContractEventActions {
+            listed: ContractEventAction::Ignore,
+            sale_confirmed: if event_kind == ContractEventKind::SaleConfirmed {
+                action
+            } else {
+                ContractEventAction::Ignore
+            },
+            purchase_confirmed: if event_kind == ContractEventKind::PurchaseConfirmed {
+                action
+            } else {
+                ContractEventAction::Ignore
+            },
+        },
     }
 }
 
@@ -617,6 +703,361 @@ fn expiring_page(expected_pages: u32) -> CacheMetadata {
 
 fn expiring_cache() -> CacheMetadata {
     CacheMetadata::cached_for_seconds(0)
+}
+
+fn cached_item_metadata(etag: &str, seconds: i64) -> CacheMetadata {
+    CacheMetadata {
+        etag: Some(etag.to_string()),
+        ..CacheMetadata::cached_for_seconds(seconds)
+    }
+}
+
+fn offered_ship(record_id: i64) -> PublicContractItem {
+    PublicContractItem {
+        record_id,
+        type_id: 587,
+        quantity: 1,
+        is_included: true,
+        item_id: Some(1_000 + record_id),
+        raw_quantity: None,
+        is_singleton: None,
+        is_blueprint_copy: None,
+        material_efficiency: None,
+        runs: None,
+        time_efficiency: None,
+    }
+}
+
+fn requested_ship(record_id: i64) -> PublicContractItem {
+    PublicContractItem {
+        is_included: false,
+        ..offered_ship(record_id)
+    }
+}
+
+#[tokio::test]
+async fn pre_expiry_no_content_confirms_only_pure_matched_ship_sales_and_purchases() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut sale = item_exchange_contract(44);
+    sale.date_expired = Utc::now() + chrono::Duration::hours(1);
+    let mut purchase = item_exchange_contract(45);
+    purchase.date_expired = Utc::now() + chrono::Duration::hours(1);
+    purchase.price = 0.0;
+    purchase.reward = 1_500_000_000.0;
+    let mut zero_isk = item_exchange_contract(46);
+    zero_isk.date_expired = Utc::now() + chrono::Duration::hours(1);
+    zero_isk.price = 0.0;
+    let mut malformed_isk = item_exchange_contract(47);
+    malformed_isk.date_expired = Utc::now() + chrono::Duration::hours(1);
+    malformed_isk.price = -1.0;
+    let mut barter = item_exchange_contract(48);
+    barter.date_expired = Utc::now() + chrono::Duration::hours(1);
+    let baseline_items = HashMap::from([
+        (
+            44,
+            Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+        ),
+        (
+            45,
+            Ok(EsiResponse::fresh(
+                vec![requested_ship(2)],
+                expiring_cache(),
+            )),
+        ),
+        (
+            46,
+            Ok(EsiResponse::fresh(vec![offered_ship(3)], expiring_cache())),
+        ),
+        (
+            47,
+            Ok(EsiResponse::fresh(vec![offered_ship(4)], expiring_cache())),
+        ),
+        (
+            48,
+            Ok(EsiResponse::fresh(
+                vec![offered_ship(5), requested_ship(6), requested_ship(7)],
+                expiring_cache(),
+            )),
+        ),
+    ]);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![
+                        sale.clone(),
+                        purchase.clone(),
+                        zero_isk.clone(),
+                        malformed_isk.clone(),
+                        barter.clone(),
+                    ],
+                    expiring_page(1),
+                )),
+            )]),
+            items: baseline_items,
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "sale",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::PostAndPing,
+        ))
+        .await
+        .expect("persist sale subscription");
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "purchase",
+            ContractEventKind::PurchaseConfirmed,
+            ContractItemDirection::Requested,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist purchase subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let resolver = ResolutionEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        },
+        probes: StdMutex::new(vec![
+            Ok(ContractItemProbe::Accepted(expiring_cache())),
+            Ok(ContractItemProbe::Accepted(expiring_cache())),
+            Ok(ContractItemProbe::Accepted(expiring_cache())),
+            Ok(ContractItemProbe::Accepted(expiring_cache())),
+            Ok(ContractItemProbe::Accepted(expiring_cache())),
+        ]),
+        probe_calls: StdMutex::new(Vec::new()),
+    };
+    let collector = ContractCollector::new(store.clone(), Arc::new(resolver)).with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    );
+
+    let report = collector
+        .collect_cycle()
+        .await
+        .expect("resolve the disappeared public contracts");
+
+    assert_eq!(
+        report
+            .events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            ContractEventKind::SaleConfirmed,
+            ContractEventKind::PurchaseConfirmed,
+        ]
+    );
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert!(sent.iter().any(|message| message.ping));
+    assert!(sent.iter().all(|message| {
+        message
+            .message
+            .fields
+            .iter()
+            .any(|field| field.name == "Acceptance Evidence")
+            && message
+                .message
+                .fields
+                .iter()
+                .any(|field| field.name == "Observed Notification Latency")
+    }));
+    drop(sent);
+
+    let resolutions = store
+        .contract_resolution_records()
+        .await
+        .expect("read retained acceptance evidence");
+    assert_eq!(resolutions.len(), 5);
+    assert!(resolutions
+        .iter()
+        .all(|record| record.state == ContractResolutionState::AcceptanceConfirmed));
+    let relisted = ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![
+                        sale.clone(),
+                        purchase.clone(),
+                        zero_isk.clone(),
+                        malformed_isk.clone(),
+                        barter.clone(),
+                    ],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    45,
+                    Ok(EsiResponse::fresh(
+                        vec![requested_ship(2)],
+                        expiring_cache(),
+                    )),
+                ),
+                (
+                    46,
+                    Ok(EsiResponse::fresh(vec![offered_ship(3)], expiring_cache())),
+                ),
+                (
+                    47,
+                    Ok(EsiResponse::fresh(vec![offered_ship(4)], expiring_cache())),
+                ),
+                (
+                    48,
+                    Ok(EsiResponse::fresh(
+                        vec![offered_ship(5), requested_ship(6), requested_ship(7)],
+                        expiring_cache(),
+                    )),
+                ),
+            ]),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("a later public observation cannot invalidate acceptance evidence");
+    assert!(relisted.events.is_empty());
+
+    let repeated = collector
+        .collect_cycle()
+        .await
+        .expect("leave positive acceptance evidence terminal");
+    assert!(repeated.events.is_empty());
+    assert_eq!(delivery.sent.lock().unwrap().len(), 2);
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn cached_item_evidence_defers_resolution_for_200_and_conditional_304() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut contract = item_exchange_contract(44);
+    contract.date_expired = Utc::now() + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(
+                    vec![offered_ship(1)],
+                    cached_item_metadata("items-v1", 3_600),
+                )),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish a cached public contract baseline");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let resolver = Arc::new(ResolutionEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        },
+        probes: StdMutex::new(vec![
+            Ok(ContractItemProbe::Available(EsiResponse::fresh(
+                vec![offered_ship(1)],
+                cached_item_metadata("items-v2", 3_600),
+            ))),
+            Ok(ContractItemProbe::Available(EsiResponse::not_modified(
+                CacheMetadata::cached_for_seconds(3_600),
+            ))),
+        ]),
+        probe_calls: StdMutex::new(Vec::new()),
+    });
+    let collector = ContractCollector::new(store.clone(), resolver.clone()).with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    );
+
+    let first = collector
+        .collect_cycle()
+        .await
+        .expect("cached items cannot establish acceptance");
+    assert!(first.events.is_empty());
+    assert!(resolver.probe_calls.lock().unwrap().is_empty());
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to the temporary contract database");
+
+    sqlx::query("UPDATE esi_cache_metadata SET expires_at = now() - interval '1 second' WHERE resource_key = 'contracts/public/items/44'")
+        .execute(&raw_pool)
+        .await
+        .expect("expire the cached item representation");
+    sqlx::query("UPDATE contract_resolution_cases SET next_probe_at = now() - interval '1 second' WHERE contract_id = 44")
+        .execute(&raw_pool)
+        .await
+        .expect("schedule the cached item probe");
+    let second = collector
+        .collect_cycle()
+        .await
+        .expect("a fresh 200 item representation remains non-terminal evidence");
+    assert!(second.events.is_empty());
+
+    sqlx::query("UPDATE esi_cache_metadata SET expires_at = now() - interval '1 second' WHERE resource_key = 'contracts/public/items/44'")
+        .execute(&raw_pool)
+        .await
+        .expect("expire the fresh 200 item representation");
+    sqlx::query("UPDATE contract_resolution_cases SET next_probe_at = now() - interval '1 second' WHERE contract_id = 44")
+        .execute(&raw_pool)
+        .await
+        .expect("schedule the conditional item probe");
+    let third = collector
+        .collect_cycle()
+        .await
+        .expect("a conditional 304 item representation remains non-terminal evidence");
+    assert!(third.events.is_empty());
+    assert_eq!(
+        resolver.probe_calls.lock().unwrap().as_slice(),
+        [
+            (44, Some("items-v1".to_string())),
+            (44, Some("items-v2".to_string()))
+        ]
+    );
+    assert!(delivery.sent.lock().unwrap().is_empty());
+    database.destroy().await;
 }
 
 async fn resolve_candidate_branch_after_unknown_location(
@@ -692,6 +1133,7 @@ async fn resolve_candidate_branch_after_unknown_location(
             },
             event_actions: ContractEventActions {
                 listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
             },
         })
         .await
@@ -822,6 +1264,21 @@ async fn http_esi_preserves_public_blueprint_item_facts() {
     assert_eq!(item.material_efficiency, Some(10));
     assert_eq!(item.runs, Some(3));
     assert_eq!(item.time_efficiency, Some(20));
+    server.finish();
+}
+
+#[tokio::test]
+async fn http_esi_distinguishes_a_no_content_item_probe_from_a_json_item_response() {
+    let server = OneShotHttpServer::start(204, &[("Cache-Control", "max-age=60")], "");
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("construct HTTP ESI client");
+
+    let probe = esi
+        .public_contract_items_probe(44, Some("\"items-v1\""))
+        .await
+        .expect("decode the positive acceptance probe");
+
+    assert!(matches!(probe, ContractItemProbe::Accepted(_)));
     server.finish();
 }
 
@@ -2493,6 +2950,7 @@ async fn recursive_contract_filters_match_every_public_fact_once_per_contract() 
                 filter: ContractFilter { root },
                 event_actions: ContractEventActions {
                     listed: ContractEventAction::Post,
+                    ..ContractEventActions::default()
                 },
             })
             .await
@@ -2621,6 +3079,7 @@ async fn unknown_location_does_not_make_a_negated_context_filter_eligible() {
             },
             event_actions: ContractEventActions {
                 listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
             },
         })
         .await
@@ -2636,6 +3095,7 @@ async fn unknown_location_does_not_make_a_negated_context_filter_eligible() {
             },
             event_actions: ContractEventActions {
                 listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
             },
         })
         .await
@@ -2726,6 +3186,7 @@ async fn local_filter_mismatches_do_not_trigger_contract_context_enrichment() {
             },
             event_actions: ContractEventActions {
                 listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
             },
         })
         .await
@@ -2813,6 +3274,7 @@ async fn a_definite_ship_group_mismatch_skips_later_context_enrichment() {
             },
             event_actions: ContractEventActions {
                 listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
             },
         })
         .await
@@ -2890,6 +3352,7 @@ async fn a_local_or_match_skips_unneeded_context_enrichment() {
             },
             event_actions: ContractEventActions {
                 listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
             },
         })
         .await
@@ -2989,6 +3452,7 @@ async fn a_context_rate_boundary_stops_later_context_requests_for_the_same_event
             },
             event_actions: ContractEventActions {
                 listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
             },
         })
         .await
@@ -3112,6 +3576,7 @@ async fn contract_notifications_render_both_sides_for_cross_direction_and_isk_fi
                 filter: ContractFilter { root },
                 event_actions: ContractEventActions {
                     listed: ContractEventAction::Post,
+                    ..ContractEventActions::default()
                 },
             })
             .await
@@ -3365,6 +3830,7 @@ async fn primary_display_ship_uses_all_matching_or_branches_independent_of_branc
                 },
                 event_actions: ContractEventActions {
                     listed: ContractEventAction::Post,
+                    ..ContractEventActions::default()
                 },
             })
             .await
@@ -3476,6 +3942,7 @@ async fn primary_display_ship_uses_all_group_matches_independent_of_manifest_ord
             },
             event_actions: ContractEventActions {
                 listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
             },
         })
         .await
@@ -3594,6 +4061,7 @@ async fn a_transient_additional_group_candidate_defers_primary_selection() {
             },
             event_actions: ContractEventActions {
                 listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
             },
         })
         .await
