@@ -20,6 +20,7 @@ use tracing::{info, warn};
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 const CONTRACT_COLLECTOR_USER_AGENT: &str = "killbot-rust Global Public Contract Intelligence";
 const MAX_EMBED_CONTEXT_ENRICHMENTS_PER_CYCLE: usize = 8;
+const DISCORD_NONCE_ENFORCEMENT_WINDOW: ChronoDuration = ChronoDuration::minutes(5);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PublicContract {
@@ -1750,13 +1751,22 @@ pub struct PreparedContractDelivery {
     pub contract_id: i64,
     pub event_kind: ContractEventKind,
     pub ping: bool,
+    pub nonce: String,
+    pub enforce_nonce: bool,
     pub message: ContractNotificationMessage,
+}
+
+struct DeliveryOrdering {
+    strategic_priority: usize,
+    relevant_isk: f64,
+    confirmed_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeliveryStatus {
     Prepared,
     Sent,
+    Failed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1766,6 +1776,11 @@ pub struct DeliveryRecord {
     pub discord_message_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeliveryFailureKind {
+    Permanent,
+}
+
 #[derive(Clone, Debug)]
 struct DeferredContractMatch {
     subscription: ContractSubscription,
@@ -1773,11 +1788,37 @@ struct DeferredContractMatch {
 }
 
 #[derive(Clone, Debug)]
-pub struct ContractDeliveryError(pub String);
+pub enum ContractDeliveryError {
+    Transient(String),
+    Ambiguous(String),
+    Permanent(String),
+}
+
+impl ContractDeliveryError {
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self::Transient(message.into())
+    }
+
+    pub fn ambiguous(message: impl Into<String>) -> Self {
+        Self::Ambiguous(message.into())
+    }
+
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self::Permanent(message.into())
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::Transient(message) | Self::Ambiguous(message) | Self::Permanent(message) => {
+                message
+            }
+        }
+    }
+}
 
 impl Display for ContractDeliveryError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.0)
+        write!(formatter, "{}", self.message())
     }
 }
 
@@ -1789,6 +1830,49 @@ pub trait ContractDelivery: Send + Sync {
         &self,
         delivery: PreparedContractDelivery,
     ) -> Result<String, ContractDeliveryError>;
+}
+
+pub trait ContractDeliveryClock: Send + Sync {
+    fn now(&self) -> DateTime<Utc>;
+}
+
+struct SystemContractDeliveryClock;
+
+impl ContractDeliveryClock for SystemContractDeliveryClock {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+}
+
+#[async_trait]
+pub trait ContractPingLimiter: Send + Sync {
+    async fn try_acquire(&self, channel_id: u64) -> bool;
+}
+
+struct UnrestrictedContractPingLimiter;
+
+#[async_trait]
+impl ContractPingLimiter for UnrestrictedContractPingLimiter {
+    async fn try_acquire(&self, _channel_id: u64) -> bool {
+        true
+    }
+}
+
+pub struct AppStateContractPingLimiter {
+    app_state: Arc<crate::config::AppState>,
+}
+
+impl AppStateContractPingLimiter {
+    pub fn new(app_state: Arc<crate::config::AppState>) -> Self {
+        Self { app_state }
+    }
+}
+
+#[async_trait]
+impl ContractPingLimiter for AppStateContractPingLimiter {
+    async fn try_acquire(&self, channel_id: u64) -> bool {
+        crate::config::try_acquire_channel_ping(&self.app_state.last_ping_times, channel_id).await
+    }
 }
 
 #[async_trait]
@@ -2095,6 +2179,30 @@ impl ContractCollectionStore {
         .collect()
     }
 
+    pub async fn delivery_failure(
+        &self,
+        delivery_id: i64,
+    ) -> Result<Option<(DeliveryFailureKind, String)>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT failure_kind, last_error FROM contract_outbound_deliveries WHERE id = $1 AND status = 'failed'",
+        )
+        .bind(delivery_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let kind = match row.get::<String, _>("failure_kind").as_str() {
+                "permanent" => DeliveryFailureKind::Permanent,
+                value => {
+                    return Err(sqlx::Error::Protocol(format!(
+                        "unknown contract delivery failure kind: {value}"
+                    )))
+                }
+            };
+            Ok((kind, row.get("last_error")))
+        })
+        .transpose()
+    }
+
     async fn all_contract_subscriptions(&self) -> Result<Vec<ContractSubscription>, sqlx::Error> {
         sqlx::query("SELECT guild_id, channel_id, subscription_id, description, filter, event_actions FROM contract_subscriptions WHERE deleted_at IS NULL ORDER BY guild_id, channel_id, subscription_id")
             .fetch_all(&self.pool)
@@ -2173,8 +2281,10 @@ impl ContractCollectionStore {
         event: &ContractEvent,
         message: &ContractNotificationMessage,
         ping: bool,
-    ) -> Result<Option<PreparedContractDelivery>, sqlx::Error> {
-        let delivery_id = sqlx::query_scalar::<_, i64>("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status) SELECT $1,$2,$3,$4,$5,$6,$7,$8,'prepared' WHERE EXISTS (SELECT 1 FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND deleted_at IS NULL) ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind) DO NOTHING RETURNING id")
+        ordering: DeliveryOrdering,
+    ) -> Result<(), sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let delivery_id = sqlx::query_scalar::<_, i64>("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, delivery_nonce, strategic_priority, relevant_isk, confirmed_at) SELECT $1,$2,$3,$4,$5,$6,$7,$8,'prepared',$9,$10,$11,$12 WHERE EXISTS (SELECT 1 FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND deleted_at IS NULL) ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind) DO NOTHING RETURNING id")
             .bind(subscription.guild_id as i64)
             .bind(subscription.channel_id as i64)
             .bind(&subscription.id)
@@ -2183,18 +2293,52 @@ impl ContractCollectionStore {
             .bind(serde_json::to_value(event).map_err(json_to_sqlx)?)
             .bind(serde_json::to_value(message).map_err(json_to_sqlx)?)
             .bind(ping)
+            .bind("pending")
+            .bind(i64::try_from(ordering.strategic_priority).unwrap_or(i64::MAX))
+            .bind(ordering.relevant_isk)
+            .bind(ordering.confirmed_at)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        if let Some(delivery_id) = delivery_id {
+            sqlx::query(
+                "UPDATE contract_outbound_deliveries SET delivery_nonce = $2 WHERE id = $1",
+            )
+            .bind(delivery_id)
+            .bind(format!("ci-{delivery_id}"))
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await
+    }
+
+    async fn prepared_deliveries(&self) -> Result<Vec<PreparedContractDelivery>, sqlx::Error> {
+        sqlx::query("SELECT id, guild_id, channel_id, subscription_id, contract_id, event_kind, message, ping, delivery_nonce, nonce_window_until FROM contract_outbound_deliveries WHERE status = 'prepared' ORDER BY strategic_priority ASC, relevant_isk DESC, confirmed_at ASC, id ASC")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(prepared_contract_delivery_from_row)
+            .collect()
+    }
+
+    async fn begin_delivery_attempt(
+        &self,
+        delivery_id: i64,
+        attempted_at: DateTime<Utc>,
+    ) -> Result<Option<PreparedContractDelivery>, sqlx::Error> {
+        let nonce_window_until = attempted_at + DISCORD_NONCE_ENFORCEMENT_WINDOW;
+        let row = sqlx::query("UPDATE contract_outbound_deliveries SET attempt_count = attempt_count + 1, first_attempt_at = COALESCE(first_attempt_at, $2), last_attempt_at = $2, nonce_window_until = COALESCE(nonce_window_until, $3) WHERE id = $1 AND status = 'prepared' RETURNING id, guild_id, channel_id, subscription_id, contract_id, event_kind, message, ping, delivery_nonce, nonce_window_until")
+            .bind(delivery_id)
+            .bind(attempted_at)
+            .bind(nonce_window_until)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(delivery_id.map(|delivery_id| PreparedContractDelivery {
-            delivery_id,
-            guild_id: subscription.guild_id,
-            channel_id: subscription.channel_id,
-            subscription_id: subscription.id.clone(),
-            contract_id: event.contract.contract_id,
-            event_kind: event.kind.clone(),
-            ping,
-            message: message.clone(),
-        }))
+        row.map(|row| {
+            let nonce_window_until = row.get::<Option<DateTime<Utc>>, _>("nonce_window_until");
+            let mut delivery = prepared_contract_delivery_from_row(row)?;
+            delivery.enforce_nonce = nonce_window_until.is_some_and(|until| until > attempted_at);
+            Ok(delivery)
+        })
+        .transpose()
     }
 
     async fn mark_delivery_sent(
@@ -2210,6 +2354,26 @@ impl ContractCollectionStore {
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol(format!(
                 "contract delivery {delivery_id} was not prepared when Discord returned success"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn mark_delivery_failed(
+        &self,
+        delivery_id: i64,
+        error: &ContractDeliveryError,
+        failed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let result = sqlx::query("UPDATE contract_outbound_deliveries SET status = 'failed', failure_kind = 'permanent', last_error = $2, failed_at = $3 WHERE id = $1 AND status = 'prepared'")
+            .bind(delivery_id)
+            .bind(error.message())
+            .bind(failed_at)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol(format!(
+                "contract delivery {delivery_id} was not prepared when Discord returned a permanent failure"
             )));
         }
         Ok(())
@@ -2570,6 +2734,7 @@ fn delivery_record_from_row(row: sqlx::postgres::PgRow) -> Result<DeliveryRecord
     let status = match row.get::<String, _>("status").as_str() {
         "prepared" => DeliveryStatus::Prepared,
         "sent" => DeliveryStatus::Sent,
+        "failed" => DeliveryStatus::Failed,
         value => {
             return Err(sqlx::Error::Protocol(format!(
                 "unknown delivery status: {value}"
@@ -2580,6 +2745,35 @@ fn delivery_record_from_row(row: sqlx::postgres::PgRow) -> Result<DeliveryRecord
         id: row.get("id"),
         status,
         discord_message_id: row.get("discord_message_id"),
+    })
+}
+
+fn prepared_contract_delivery_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<PreparedContractDelivery, sqlx::Error> {
+    let event_kind = match row.get::<String, _>("event_kind").as_str() {
+        "listed" => ContractEventKind::Listed,
+        "sale_confirmed" => ContractEventKind::SaleConfirmed,
+        "purchase_confirmed" => ContractEventKind::PurchaseConfirmed,
+        "expired" => ContractEventKind::Expired,
+        "closed_outcome_unknown" => ContractEventKind::ClosedOutcomeUnknown,
+        value => {
+            return Err(sqlx::Error::Protocol(format!(
+                "unknown contract delivery event kind: {value}"
+            )))
+        }
+    };
+    Ok(PreparedContractDelivery {
+        delivery_id: row.get("id"),
+        guild_id: row.get::<i64, _>("guild_id") as u64,
+        channel_id: row.get::<i64, _>("channel_id") as u64,
+        subscription_id: row.get("subscription_id"),
+        contract_id: row.get("contract_id"),
+        event_kind,
+        ping: row.get("ping"),
+        nonce: row.get("delivery_nonce"),
+        enforce_nonce: false,
+        message: serde_json::from_value(row.get("message")).map_err(json_to_sqlx)?,
     })
 }
 
@@ -2750,11 +2944,13 @@ pub struct ContractCollector {
     store: ContractCollectionStore,
     esi: Arc<dyn PublicContractEsi>,
     notifications: Option<ContractNotifications>,
+    delivery_clock: Arc<dyn ContractDeliveryClock>,
 }
 
 struct ContractNotifications {
     ship_groups: Arc<dyn ShipGroupResolver>,
     delivery: Arc<dyn ContractDelivery>,
+    ping_limiter: Arc<dyn ContractPingLimiter>,
 }
 
 enum NotificationResolution {
@@ -2797,18 +2993,38 @@ impl ContractCollector {
             store,
             esi,
             notifications: None,
+            delivery_clock: Arc::new(SystemContractDeliveryClock),
         }
     }
 
     pub fn with_notifications(
+        self,
+        ship_groups: Arc<dyn ShipGroupResolver>,
+        delivery: Arc<dyn ContractDelivery>,
+    ) -> Self {
+        self.with_notifications_and_ping_limiter(
+            ship_groups,
+            delivery,
+            Arc::new(UnrestrictedContractPingLimiter),
+        )
+    }
+
+    pub fn with_notifications_and_ping_limiter(
         mut self,
         ship_groups: Arc<dyn ShipGroupResolver>,
         delivery: Arc<dyn ContractDelivery>,
+        ping_limiter: Arc<dyn ContractPingLimiter>,
     ) -> Self {
         self.notifications = Some(ContractNotifications {
             ship_groups,
             delivery,
+            ping_limiter,
         });
+        self
+    }
+
+    pub fn with_delivery_clock(mut self, delivery_clock: Arc<dyn ContractDeliveryClock>) -> Self {
+        self.delivery_clock = delivery_clock;
         self
     }
 
@@ -3204,7 +3420,7 @@ impl ContractCollector {
                 )
                 .await?;
             match self
-                .notify_subscription(&deferred.subscription, &event, &ship_groups, notifications)
+                .notify_subscription(&deferred.subscription, &event, &ship_groups)
                 .await?
             {
                 NotificationResolution::Complete => {
@@ -3221,7 +3437,7 @@ impl ContractCollector {
                 .await?;
             for subscription in &subscriptions {
                 if matches!(
-                    self.notify_subscription(subscription, &event, &ship_groups, notifications)
+                    self.notify_subscription(subscription, &event, &ship_groups)
                         .await?,
                     NotificationResolution::Deferred
                 ) {
@@ -3231,6 +3447,7 @@ impl ContractCollector {
                 }
             }
         }
+        self.deliver_prepared_notifications(notifications).await?;
         Ok(())
     }
 
@@ -3425,7 +3642,6 @@ impl ContractCollector {
         subscription: &ContractSubscription,
         event: &ContractEvent,
         ship_groups: &dyn ShipGroupResolver,
-        notifications: &ContractNotifications,
     ) -> Result<NotificationResolution, ContractCollectionError> {
         let action = contract_event_action(subscription, &event.kind);
         if matches!(action, ContractEventAction::Ignore) {
@@ -3447,8 +3663,11 @@ impl ContractCollector {
         {
             return Ok(NotificationResolution::Complete);
         }
-        let primary_item = match evaluator.primary_display_item().await {
-            PrimaryDisplayItem::Resolved(item) => item,
+        let (primary_item, strategic_priority) = match evaluator.primary_display_item().await {
+            PrimaryDisplayItem::Resolved {
+                item,
+                strategic_priority,
+            } => (item, strategic_priority),
             PrimaryDisplayItem::Deferred => return Ok(NotificationResolution::Deferred),
         };
         let event = self.enrich_event_for_embed(event).await?;
@@ -3466,26 +3685,101 @@ impl ContractCollector {
             &corporation_history,
         );
         let ping = matches!(action, ContractEventAction::PostAndPing);
-        let Some(prepared) = self
+        let relevant_isk = event.contract.price.max(event.contract.reward);
+        let confirmed_at = match event.kind {
+            ContractEventKind::SaleConfirmed | ContractEventKind::PurchaseConfirmed => event
+                .acceptance_evidence
+                .as_ref()
+                .map(|evidence| evidence.evidence_response_at)
+                .unwrap_or(event.contract.date_issued),
+            ContractEventKind::Expired | ContractEventKind::ClosedOutcomeUnknown => {
+                event.contract.date_expired
+            }
+            ContractEventKind::Listed => event.contract.date_issued,
+        };
+        self.store
+            .prepare_delivery(
+                subscription,
+                &event,
+                &message,
+                ping,
+                DeliveryOrdering {
+                    strategic_priority,
+                    relevant_isk,
+                    confirmed_at,
+                },
+            )
+            .await?;
+        Ok(NotificationResolution::Complete)
+    }
+
+    async fn deliver_prepared_notifications(
+        &self,
+        notifications: &ContractNotifications,
+    ) -> Result<(), ContractCollectionError> {
+        for pending in self.store.prepared_deliveries().await? {
+            let retry = self
+                .deliver_prepared_notification(&pending, notifications)
+                .await?;
+            if retry {
+                self.deliver_prepared_notification(&pending, notifications)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn deliver_prepared_notification(
+        &self,
+        pending: &PreparedContractDelivery,
+        notifications: &ContractNotifications,
+    ) -> Result<bool, ContractCollectionError> {
+        let attempted_at = self.delivery_clock.now();
+        let Some(mut prepared) = self
             .store
-            .prepare_delivery(subscription, &event, &message, ping)
+            .begin_delivery_attempt(pending.delivery_id, attempted_at)
             .await?
         else {
-            return Ok(NotificationResolution::Complete);
+            return Ok(false);
         };
+        if prepared.ping {
+            prepared.ping = notifications
+                .ping_limiter
+                .try_acquire(prepared.channel_id)
+                .await;
+        }
         match notifications.delivery.send(prepared.clone()).await {
             Ok(message_id) => {
                 self.store
                     .mark_delivery_sent(prepared.delivery_id, &message_id)
-                    .await?
+                    .await?;
+                Ok(false)
             }
-            Err(error) => warn!(
-                subscription_id = %subscription.id,
-                contract_id = event.contract.contract_id,
-                "contract delivery remains prepared after Discord failure: {error}"
-            ),
+            Err(ContractDeliveryError::Permanent(error)) => {
+                let error = ContractDeliveryError::Permanent(error);
+                self.store
+                    .mark_delivery_failed(prepared.delivery_id, &error, attempted_at)
+                    .await?;
+                warn!(
+                    delivery_id = prepared.delivery_id,
+                    subscription_id = %prepared.subscription_id,
+                    contract_id = prepared.contract_id,
+                    "contract delivery failed permanently: {error}"
+                );
+                Ok(false)
+            }
+            Err(
+                error @ (ContractDeliveryError::Transient(_) | ContractDeliveryError::Ambiguous(_)),
+            ) => {
+                warn!(
+                    delivery_id = prepared.delivery_id,
+                    subscription_id = %prepared.subscription_id,
+                    contract_id = prepared.contract_id,
+                    "contract delivery remains prepared after retryable Discord failure: {error}"
+                );
+                Ok(true)
+            }
         }
-        Ok(NotificationResolution::Complete)
     }
 
     async fn enrich_event_for_embed(
@@ -4030,7 +4324,10 @@ impl<'a> ContractFilterEvaluator<'a> {
                 primary = Some(candidate);
             }
         }
-        PrimaryDisplayItem::Resolved(primary.map(|(item, _)| item))
+        PrimaryDisplayItem::Resolved {
+            item: primary.map(|(item, _)| item),
+            strategic_priority: primary.map(|(_, priority)| priority).unwrap_or(usize::MAX),
+        }
     }
 
     fn has_matching_ship_item(&self, direction: ContractItemDirection) -> bool {
@@ -4041,7 +4338,10 @@ impl<'a> ContractFilterEvaluator<'a> {
 }
 
 enum PrimaryDisplayItem<'a> {
-    Resolved(Option<&'a PublicContractItem>),
+    Resolved {
+        item: Option<&'a PublicContractItem>,
+        strategic_priority: usize,
+    },
     Deferred,
 }
 
@@ -5004,6 +5304,7 @@ pub fn spawn_contract_collection_loop_with_notifications(
     esi_timeout: Duration,
     ship_groups: Arc<dyn ShipGroupResolver>,
     delivery: Arc<dyn ContractDelivery>,
+    ping_limiter: Arc<dyn ContractPingLimiter>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_contract_collection_loop_with_notifications(
         database_url,
@@ -5012,6 +5313,7 @@ pub fn spawn_contract_collection_loop_with_notifications(
         esi_timeout,
         ship_groups,
         delivery,
+        ping_limiter,
     ))
 }
 
@@ -5022,10 +5324,12 @@ pub async fn run_contract_collection_loop_with_notifications(
     esi_timeout: Duration,
     ship_groups: Arc<dyn ShipGroupResolver>,
     delivery: Arc<dyn ContractDelivery>,
+    ping_limiter: Arc<dyn ContractPingLimiter>,
 ) {
     let notifications = ContractNotifications {
         ship_groups,
         delivery,
+        ping_limiter,
     };
     let esi = loop {
         match HttpPublicContractEsi::new(esi_timeout) {
@@ -5043,9 +5347,10 @@ pub async fn run_contract_collection_loop_with_notifications(
                 let store = Arc::new(store);
                 *store_handle.write().await = Some(store.clone());
                 let collector = ContractCollector::new((*store).clone(), esi.clone())
-                    .with_notifications(
+                    .with_notifications_and_ping_limiter(
                         notifications.ship_groups.clone(),
                         notifications.delivery.clone(),
+                        notifications.ping_limiter.clone(),
                     );
                 match collector.collect_cycle().await {
                     Ok(report) => {

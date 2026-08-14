@@ -12,8 +12,9 @@ use crate::esi::Celestial;
 use crate::models::{Attacker, ZkData};
 use crate::processor::{AttackerKey, Color, NamedFilterResult};
 use chrono::{DateTime, FixedOffset, Utc};
+use serde_json::Value;
 use serenity::async_trait;
-use serenity::builder::{CreateEmbed, ParseValue};
+use serenity::builder::{CreateEmbed, CreateMessage, ParseValue};
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::model::guild::UnavailableGuild;
@@ -24,8 +25,6 @@ use serenity::prelude::*;
 use serenity::utils::Colour;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::Instant;
 use tracing::{error, info, trace, warn};
 
 pub(crate) const SHIP_GROUP_PRIORITY: &[u32] = &[
@@ -214,24 +213,54 @@ impl ContractDelivery for DiscordContractDelivery {
     ) -> Result<String, ContractDeliveryError> {
         let message = ChannelId(delivery.channel_id)
             .send_message(&self.http, |builder| {
-                if delivery.ping {
-                    builder.content("@here");
-                }
-                builder
-                    .allowed_mentions(|mentions| {
-                        let mentions = mentions.empty_parse();
-                        if delivery.ping {
-                            mentions.parse(ParseValue::Everyone)
-                        } else {
-                            mentions
-                        }
-                    })
-                    .set_embed(contract_notification_embed(&delivery.message))
+                configure_contract_delivery_message(builder, &delivery)
             })
             .await
-            .map_err(|error| ContractDeliveryError(error.to_string()))?;
+            .map_err(contract_delivery_error)?;
         Ok(message.id.to_string())
     }
+}
+
+fn configure_contract_delivery_message<'a, 'builder>(
+    builder: &'builder mut CreateMessage<'a>,
+    delivery: &PreparedContractDelivery,
+) -> &'builder mut CreateMessage<'a> {
+    if delivery.ping {
+        builder.content("@here");
+    }
+    let builder = builder
+        .allowed_mentions(|mentions| {
+            let mentions = mentions.empty_parse();
+            if delivery.ping {
+                mentions.parse(ParseValue::Everyone)
+            } else {
+                mentions
+            }
+        })
+        .set_embed(contract_notification_embed(&delivery.message));
+    builder
+        .0
+        .insert("nonce", Value::String(delivery.nonce.clone()));
+    builder
+        .0
+        .insert("enforce_nonce", Value::Bool(delivery.enforce_nonce));
+    builder
+}
+
+fn contract_delivery_error(error: serenity::Error) -> ContractDeliveryError {
+    let message = error.to_string();
+    if let serenity::Error::Http(http_error) = &error {
+        if let serenity::http::error::Error::UnsuccessfulRequest(response) = &**http_error {
+            let status = response.status_code.as_u16();
+            let detail = format!("Discord HTTP {status}: {message}");
+            return if (400..500).contains(&status) && status != 429 {
+                ContractDeliveryError::permanent(detail)
+            } else {
+                ContractDeliveryError::transient(detail)
+            };
+        }
+    }
+    ContractDeliveryError::ambiguous(message)
 }
 
 pub struct DiscordShipGroupResolver {
@@ -943,15 +972,9 @@ pub async fn send_killmail_message(
             let max_delay = ping_type.max_ping_delay_in_minutes().unwrap_or(0);
             if max_delay == 0 || kill_age.num_minutes() <= max_delay as i64 {
                 let channel_id = subscription.action.channel_id.parse::<u64>().unwrap_or(0);
-                let mut ping_times = app_state.last_ping_times.lock().await;
-
-                let now = Instant::now();
-                let last_ping = ping_times
-                    .entry(channel_id)
-                    .or_insert(now - Duration::from_secs(301));
-
-                if now.duration_since(*last_ping) > Duration::from_secs(300) {
-                    *last_ping = now;
+                if crate::config::try_acquire_channel_ping(&app_state.last_ping_times, channel_id)
+                    .await
+                {
                     Some(match ping_type {
                         PingType::Here { .. } => "@here",
                         PingType::Everyone { .. } => "@everyone",
@@ -1907,4 +1930,56 @@ mod tests {
         assert_eq!(fields[0]["name"].as_str(), Some("Contract Address"));
         assert_eq!(fields[0]["value"].as_str(), Some("contract:0//45"));
     }
+
+    #[test]
+    fn contract_delivery_nonce_and_allowed_mentions_are_explicit() {
+        let message = ContractNotificationMessage {
+            title: "@everyone cannot notify anyone".to_string(),
+            description: None,
+            fields: vec![],
+            thumbnail_url: None,
+            footer: None,
+        };
+        let delivery = PreparedContractDelivery {
+            delivery_id: 1,
+            guild_id: 2,
+            channel_id: 3,
+            subscription_id: "ships".to_string(),
+            contract_id: 4,
+            event_kind: crate::contract_intelligence::ContractEventKind::Listed,
+            ping: true,
+            nonce: "ci-1".to_string(),
+            enforce_nonce: true,
+            message: message.clone(),
+        };
+        let mut ping_builder = CreateMessage::default();
+        configure_contract_delivery_message(&mut ping_builder, &delivery);
+        assert_eq!(ping_builder.0["content"].as_str(), Some("@here"));
+        assert_eq!(ping_builder.0["nonce"].as_str(), Some("ci-1"));
+        assert_eq!(ping_builder.0["enforce_nonce"].as_bool(), Some(true));
+        assert_eq!(
+            ping_builder.0["allowed_mentions"]["parse"],
+            serde_json::json!(["everyone"])
+        );
+
+        let mut non_pinging_builder = CreateMessage::default();
+        configure_contract_delivery_message(
+            &mut non_pinging_builder,
+            &PreparedContractDelivery {
+                ping: false,
+                enforce_nonce: false,
+                ..delivery
+            },
+        );
+        assert!(non_pinging_builder.0.get("content").is_none());
+        assert_eq!(
+            non_pinging_builder.0["enforce_nonce"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            non_pinging_builder.0["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+    }
+
 }

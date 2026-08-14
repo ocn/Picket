@@ -231,6 +231,9 @@ pub async fn run() {
             timeout,
             ship_groups,
             delivery,
+            Arc::new(contract_intelligence::AppStateContractPingLimiter::new(
+                app_state.clone(),
+            )),
         );
     }
 

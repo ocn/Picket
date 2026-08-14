@@ -4,13 +4,13 @@ use killbot_rust::contract_intelligence::{
     available_contract_store, new_contract_store_handle,
     spawn_contract_collection_loop_with_notifications, CacheMetadata, CollectionOutcome,
     ContractCollectionStore, ContractCollector, ContractContextLimiter,
-    ContractContextRequirements, ContractContextValue, ContractDelivery, ContractDeliveryError,
-    ContractEmbedContext, ContractEventAction, ContractEventActions, ContractEventKind,
-    ContractFilter, ContractFilterCondition, ContractFilterNode, ContractItemDirection,
-    ContractItemProbe, ContractObservationContext, ContractResolutionState, ContractSubscription,
-    DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HttpPublicContractEsi,
-    PreparedContractDelivery, PublicContract, PublicContractEsi, PublicContractItem,
-    ShipGroupLookup, ShipGroupResolver,
+    ContractContextRequirements, ContractContextValue, ContractDelivery, ContractDeliveryClock,
+    ContractDeliveryError, ContractEmbedContext, ContractEventAction, ContractEventActions,
+    ContractEventKind, ContractFilter, ContractFilterCondition, ContractFilterNode,
+    ContractItemDirection, ContractItemProbe, ContractObservationContext, ContractPingLimiter,
+    ContractResolutionState, ContractSubscription, DeliveryFailureKind, DeliveryRecord,
+    DeliveryStatus, EsiError, EsiResponse, HttpPublicContractEsi, PreparedContractDelivery,
+    PublicContract, PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
 };
 use sha2::{Digest, Sha384};
 use sqlx::postgres::PgPoolOptions;
@@ -585,6 +585,19 @@ struct RecordingDelivery {
 
 struct NoopDelivery;
 
+struct ScriptedDelivery {
+    store: ContractCollectionStore,
+    attempts: StdMutex<Vec<PreparedContractDelivery>>,
+    outcomes: StdMutex<Vec<Result<String, ContractDeliveryError>>>,
+}
+
+struct RecordingContractPingLimiter {
+    outcomes: StdMutex<Vec<bool>>,
+    channels: StdMutex<Vec<u64>>,
+}
+
+struct FixedDeliveryClock(StdMutex<chrono::DateTime<Utc>>);
+
 struct ResolutionEsi {
     inner: FakeEsi,
     probes: StdMutex<Vec<Result<ContractItemProbe, EsiError>>>,
@@ -679,6 +692,38 @@ impl ContractDelivery for NoopDelivery {
         _delivery: PreparedContractDelivery,
     ) -> Result<String, ContractDeliveryError> {
         Ok("ignored".to_string())
+    }
+}
+
+#[async_trait]
+impl ContractDelivery for ScriptedDelivery {
+    async fn send(
+        &self,
+        delivery: PreparedContractDelivery,
+    ) -> Result<String, ContractDeliveryError> {
+        let record = self
+            .store
+            .delivery_record(delivery.delivery_id)
+            .await
+            .expect("read the persisted delivery before Discord is called")
+            .expect("delivery exists before Discord is called");
+        assert_eq!(record.status, DeliveryStatus::Prepared);
+        self.attempts.lock().unwrap().push(delivery);
+        self.outcomes.lock().unwrap().remove(0)
+    }
+}
+
+#[async_trait]
+impl ContractPingLimiter for RecordingContractPingLimiter {
+    async fn try_acquire(&self, channel_id: u64) -> bool {
+        self.channels.lock().unwrap().push(channel_id);
+        self.outcomes.lock().unwrap().remove(0)
+    }
+}
+
+impl ContractDeliveryClock for FixedDeliveryClock {
+    fn now(&self) -> chrono::DateTime<Utc> {
+        *self.0.lock().unwrap()
     }
 }
 
@@ -3815,6 +3860,422 @@ async fn a_listing_without_a_manifest_cannot_match_or_notify_a_ship_subscription
 }
 
 #[tokio::test]
+async fn contract_delivery_retries_with_a_stable_nonce_and_retains_permanent_failures() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let baseline_contract = item_exchange_contract(44);
+    let listed_contract = item_exchange_contract(45);
+    let ship = offered_ship(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![baseline_contract.clone()],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(vec![ship.clone()], expiring_cache())),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+
+    for id in ["a-transient", "b-ambiguous", "c-permanent"] {
+        store
+            .upsert_contract_subscription(&contract_subscription(
+                id,
+                ContractItemDirection::Offered,
+                vec![587],
+                vec![],
+                ContractEventAction::PostAndPing,
+            ))
+            .await
+            .expect("persist matching contract subscription");
+    }
+    let delivery = Arc::new(ScriptedDelivery {
+        store: store.clone(),
+        attempts: StdMutex::new(Vec::new()),
+        outcomes: StdMutex::new(vec![
+            Err(ContractDeliveryError::transient("Discord rate limited")),
+            Ok("transient-retry-message".to_string()),
+            Err(ContractDeliveryError::ambiguous("connection closed")),
+            Ok("ambiguous-retry-message".to_string()),
+            Err(ContractDeliveryError::permanent(
+                "missing Send Messages permission",
+            )),
+        ]),
+    });
+    let ping_limiter = Arc::new(RecordingContractPingLimiter {
+        outcomes: StdMutex::new(vec![true, false, false, false, false]),
+        channels: StdMutex::new(Vec::new()),
+    });
+    let clock = Arc::new(FixedDeliveryClock(StdMutex::new(
+        Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0).unwrap(),
+    )));
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![baseline_contract, listed_contract],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(vec![ship.clone()], expiring_cache())),
+                ),
+                (45, Ok(EsiResponse::fresh(vec![ship], expiring_cache()))),
+            ]),
+        }),
+    )
+    .with_notifications_and_ping_limiter(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+        delivery.clone(),
+        ping_limiter.clone(),
+    )
+    .with_delivery_clock(clock)
+    .collect_cycle()
+    .await
+    .expect("deliver the listed contracts with immediate retries");
+
+    let attempts = delivery.attempts.lock().unwrap();
+    assert_eq!(attempts.len(), 5);
+    assert_eq!(attempts[0].subscription_id, "a-transient");
+    assert_eq!(attempts[0].nonce, attempts[1].nonce);
+    assert!(attempts[0].enforce_nonce);
+    assert!(attempts[1].enforce_nonce);
+    assert!(attempts[0].ping);
+    assert!(attempts[1..].iter().all(|attempt| !attempt.ping));
+    drop(attempts);
+    assert_eq!(
+        ping_limiter.channels.lock().unwrap().as_slice(),
+        &[77, 77, 77, 77, 77]
+    );
+
+    let records = store.delivery_records().await.expect("read deliveries");
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.status == DeliveryStatus::Sent)
+            .count(),
+        2
+    );
+    let failed = records
+        .iter()
+        .find(|record| record.status == DeliveryStatus::Failed)
+        .expect("retain permanent failure");
+    assert_eq!(
+        store
+            .delivery_failure(failed.id)
+            .await
+            .expect("read delivery failure")
+            .expect("permanent failure context"),
+        (
+            DeliveryFailureKind::Permanent,
+            "missing Send Messages permission".to_string()
+        )
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn prepared_contract_delivery_survives_restart_and_retries_without_nonce_enforcement_after_window(
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let baseline_contract = item_exchange_contract(44);
+    let listed_contract = item_exchange_contract(45);
+    let ship = offered_ship(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![baseline_contract.clone()],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(vec![ship.clone()], expiring_cache())),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "ships",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist matching subscription");
+
+    let clock = Arc::new(FixedDeliveryClock(StdMutex::new(
+        Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0).unwrap(),
+    )));
+    let first_delivery = Arc::new(ScriptedDelivery {
+        store: store.clone(),
+        attempts: StdMutex::new(Vec::new()),
+        outcomes: StdMutex::new(vec![
+            Err(ContractDeliveryError::ambiguous("connection closed")),
+            Err(ContractDeliveryError::transient("Discord unavailable")),
+        ]),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![baseline_contract, listed_contract],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(vec![ship.clone()], expiring_cache())),
+                ),
+                (45, Ok(EsiResponse::fresh(vec![ship], expiring_cache()))),
+            ]),
+        }),
+    )
+    .with_notifications_and_ping_limiter(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+        first_delivery.clone(),
+        Arc::new(RecordingContractPingLimiter {
+            outcomes: StdMutex::new(Vec::new()),
+            channels: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_delivery_clock(clock.clone())
+    .collect_cycle()
+    .await
+    .expect("leave ambiguous delivery prepared after its immediate retry");
+
+    let first_attempts = first_delivery.attempts.lock().unwrap();
+    assert_eq!(first_attempts.len(), 2);
+    assert_eq!(first_attempts[0].nonce, first_attempts[1].nonce);
+    assert!(first_attempts.iter().all(|attempt| attempt.enforce_nonce));
+    let nonce = first_attempts[0].nonce.clone();
+    drop(first_attempts);
+    assert_eq!(
+        store
+            .delivery_records()
+            .await
+            .expect("read prepared delivery")[0]
+            .status,
+        DeliveryStatus::Prepared
+    );
+
+    *clock.0.lock().unwrap() += chrono::Duration::minutes(6);
+    let restarted_delivery = Arc::new(ScriptedDelivery {
+        store: store.clone(),
+        attempts: StdMutex::new(Vec::new()),
+        outcomes: StdMutex::new(vec![Ok("post-window-message".to_string())]),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![item_exchange_contract(44), item_exchange_contract(45)],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    45,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+            ]),
+        }),
+    )
+    .with_notifications_and_ping_limiter(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+        restarted_delivery.clone(),
+        Arc::new(RecordingContractPingLimiter {
+            outcomes: StdMutex::new(Vec::new()),
+            channels: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_delivery_clock(clock)
+    .collect_cycle()
+    .await
+    .expect("retry pending delivery after restart");
+
+    let restarted_attempts = restarted_delivery.attempts.lock().unwrap();
+    assert_eq!(restarted_attempts.len(), 1);
+    assert_eq!(restarted_attempts[0].nonce, nonce);
+    assert!(!restarted_attempts[0].enforce_nonce);
+    drop(restarted_attempts);
+    assert_eq!(
+        store.delivery_records().await.expect("read sent delivery")[0].status,
+        DeliveryStatus::Sent
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn prepared_contract_deliveries_are_sent_by_ship_priority_then_isk_then_confirmation_time() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let baseline_contract = item_exchange_contract(44);
+    let baseline_ship = offered_ship(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![baseline_contract.clone()],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(
+                    vec![baseline_ship.clone()],
+                    expiring_cache(),
+                )),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "ships",
+            ContractItemDirection::Offered,
+            vec![19_720, 587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist matching subscription");
+
+    let mut titan_contract = item_exchange_contract(45);
+    titan_contract.price = 1_000_000_000.0;
+    let mut lower_value_frigate = item_exchange_contract(46);
+    lower_value_frigate.price = 5_000_000_000.0;
+    let mut higher_value_frigate = item_exchange_contract(47);
+    higher_value_frigate.price = 10_000_000_000.0;
+    let mut older_equal_value_frigate = item_exchange_contract(48);
+    older_equal_value_frigate.price = 10_000_000_000.0;
+    older_equal_value_frigate.date_issued -= chrono::Duration::hours(1);
+    let titan_ship = PublicContractItem {
+        type_id: 19_720,
+        ..offered_ship(2)
+    };
+    let lower_value_frigate_ship = offered_ship(3);
+    let higher_value_frigate_ship = offered_ship(4);
+    let older_equal_value_frigate_ship = offered_ship(5);
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![
+                        baseline_contract,
+                        lower_value_frigate,
+                        titan_contract,
+                        higher_value_frigate,
+                        older_equal_value_frigate,
+                    ],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(vec![baseline_ship], expiring_cache())),
+                ),
+                (
+                    45,
+                    Ok(EsiResponse::fresh(vec![titan_ship], expiring_cache())),
+                ),
+                (
+                    46,
+                    Ok(EsiResponse::fresh(
+                        vec![lower_value_frigate_ship],
+                        expiring_cache(),
+                    )),
+                ),
+                (
+                    47,
+                    Ok(EsiResponse::fresh(
+                        vec![higher_value_frigate_ship],
+                        expiring_cache(),
+                    )),
+                ),
+                (
+                    48,
+                    Ok(EsiResponse::fresh(
+                        vec![older_equal_value_frigate_ship],
+                        expiring_cache(),
+                    )),
+                ),
+            ]),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(19_720, 30), (587, 25)]))),
+        delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("deliver sorted contract notifications");
+
+    assert_eq!(
+        delivery
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|delivery| delivery.contract_id)
+            .collect::<Vec<_>>(),
+        vec![45, 48, 47, 46]
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn contract_runtime_recovers_the_shared_store_after_postgres_becomes_available() {
     let database = TemporaryDatabase::unavailable().await;
     let store_handle = new_contract_store_handle();
@@ -3825,6 +4286,10 @@ async fn contract_runtime_recovers_the_shared_store_after_postgres_becomes_avail
         Duration::from_millis(10),
         Arc::new(StaticShipGroups(HashMap::new())),
         Arc::new(NoopDelivery),
+        Arc::new(RecordingContractPingLimiter {
+            outcomes: StdMutex::new(Vec::new()),
+            channels: StdMutex::new(Vec::new()),
+        }),
     );
 
     let (processing_started, processing_complete) = tokio::sync::oneshot::channel();
