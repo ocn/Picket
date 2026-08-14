@@ -3524,7 +3524,7 @@ impl ContractCollector {
         remaining: usize,
     ) -> Result<usize, ContractCollectionError> {
         let mut consumed = 0;
-        for observed in observed.iter().take(remaining) {
+        for observed in observed {
             if self
                 .store
                 .observed_embed_context(region_id, observed.contract.contract_id)
@@ -3533,13 +3533,16 @@ impl ContractCollector {
             {
                 continue;
             }
-            consumed += 1;
+            if consumed >= remaining {
+                break;
+            }
             if !self
                 .context_request_allowed(observed.contract.contract_id)
                 .await?
             {
                 break;
             }
+            consumed += 1;
             let items = observed
                 .manifest
                 .offered_items
@@ -5024,34 +5027,38 @@ pub async fn run_contract_collection_loop_with_notifications(
         ship_groups,
         delivery,
     };
+    let esi = loop {
+        match HttpPublicContractEsi::new(esi_timeout) {
+            Ok(esi) => break Arc::new(esi),
+            Err(error) => {
+                warn!("contract collection HTTP client unavailable: {error}");
+                tokio::time::sleep(interval).await;
+            }
+        }
+    };
     loop {
         let mut delay = interval;
         match ContractCollectionStore::connect(&database_url).await {
             Ok(store) => {
                 let store = Arc::new(store);
                 *store_handle.write().await = Some(store.clone());
-                match HttpPublicContractEsi::new(esi_timeout) {
-                    Ok(esi) => {
-                        let collector = ContractCollector::new((*store).clone(), Arc::new(esi))
-                            .with_notifications(
-                                notifications.ship_groups.clone(),
-                                notifications.delivery.clone(),
-                            );
-                        match collector.collect_cycle().await {
-                            Ok(report) => {
-                                delay = collection_retry_delay(interval, report.retry_after);
-                                info!(
-                                    regions = report.regions.len(),
-                                    "contract collection cycle finished"
-                                )
-                            }
-                            Err(error) => {
-                                delay = collection_retry_delay(interval, error.retry_after());
-                                warn!("contract collection paused after failure: {error}")
-                            }
-                        }
+                let collector = ContractCollector::new((*store).clone(), esi.clone())
+                    .with_notifications(
+                        notifications.ship_groups.clone(),
+                        notifications.delivery.clone(),
+                    );
+                match collector.collect_cycle().await {
+                    Ok(report) => {
+                        delay = collection_retry_delay(interval, report.retry_after);
+                        info!(
+                            regions = report.regions.len(),
+                            "contract collection cycle finished"
+                        )
                     }
-                    Err(error) => warn!("contract collection HTTP client unavailable: {error}"),
+                    Err(error) => {
+                        delay = collection_retry_delay(interval, error.retry_after());
+                        warn!("contract collection paused after failure: {error}")
+                    }
                 }
             }
             Err(error) => {
@@ -5069,12 +5076,20 @@ async fn run_contract_collection_loop_inner(
     esi_timeout: Duration,
     notifications: Option<ContractNotifications>,
 ) {
+    let esi = loop {
+        match HttpPublicContractEsi::new(esi_timeout) {
+            Ok(esi) => break Arc::new(esi),
+            Err(error) => {
+                warn!("contract collection HTTP client unavailable: {error}");
+                tokio::time::sleep(interval).await;
+            }
+        }
+    };
     loop {
         let mut delay = interval;
         match ContractCollectionStore::connect(&database_url).await {
             Ok(store) => {
-                let esi = match HttpPublicContractEsi::new(esi_timeout) { Ok(esi) => Arc::new(esi), Err(error) => { warn!("contract collection HTTP client unavailable: {error}"); tokio::time::sleep(interval).await; continue; } };
-                let mut collector = ContractCollector::new(store, esi);
+                let mut collector = ContractCollector::new(store, esi.clone());
                 if let Some(notifications) = &notifications {
                     collector = collector.with_notifications(
                         notifications.ship_groups.clone(),
