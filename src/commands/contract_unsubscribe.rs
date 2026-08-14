@@ -1,6 +1,7 @@
 use crate::commands::contract_command::{defer_then_edit, SerenityContractCommandResponder};
 use crate::commands::{get_option_value, Command};
 use crate::config::AppState;
+use crate::contract_intelligence::available_contract_store;
 use crate::ContractStoreContainer;
 use serenity::async_trait;
 use serenity::builder::CreateApplicationCommand;
@@ -42,7 +43,7 @@ impl Command for ContractUnsubscribeCommand {
         command: &ApplicationCommandInteraction,
         _app_state: &Arc<AppState>,
     ) {
-        let store = ctx
+        let store_handle = ctx
             .data
             .read()
             .await
@@ -64,7 +65,11 @@ impl Command for ContractUnsubscribeCommand {
                 Ok(removal) => removal,
                 Err(response) => return response.to_string(),
             };
-            let Some(store) = store else {
+            let Some(store_handle) = store_handle else {
+                return "Contract subscriptions are unavailable because the contract database is not connected."
+                    .to_string();
+            };
+            let Some(store) = available_contract_store(&store_handle).await else {
                 return "Contract subscriptions are unavailable because the contract database is not connected."
                     .to_string();
             };

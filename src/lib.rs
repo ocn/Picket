@@ -39,7 +39,7 @@ impl TypeMapKey for AppStateContainer {
 pub struct ContractStoreContainer;
 
 impl TypeMapKey for ContractStoreContainer {
-    type Value = Arc<contract_intelligence::ContractCollectionStore>;
+    type Value = contract_intelligence::ContractStoreHandle;
 }
 
 fn generate_queue_id() -> String {
@@ -177,18 +177,11 @@ pub async fn run() {
 
     let command_map_arc = Arc::new(command_map);
 
-    let contract_store = match std::env::var("CONTRACT_DATABASE_URL") {
-        Ok(database_url) => {
-            match contract_intelligence::ContractCollectionStore::connect(&database_url).await {
-                Ok(store) => Some(Arc::new(store)),
-                Err(error) => {
-                    error!(
-                        "Contract collection disabled: contract database is unavailable: {error}"
-                    );
-                    None
-                }
-            }
-        }
+    let contract_runtime = match std::env::var("CONTRACT_DATABASE_URL") {
+        Ok(database_url) => Some((
+            database_url,
+            contract_intelligence::new_contract_store_handle(),
+        )),
         Err(_) => {
             info!("Contract collection disabled: CONTRACT_DATABASE_URL is not configured");
             None
@@ -212,14 +205,14 @@ pub async fn run() {
         let mut data = client.data.write().await;
         data.insert::<AppStateContainer>(app_state.clone());
         data.insert::<CommandMap>(command_map_arc.clone());
-        if let Some(store) = &contract_store {
-            data.insert::<ContractStoreContainer>(store.clone());
+        if let Some((_, store_handle)) = &contract_runtime {
+            data.insert::<ContractStoreContainer>(store_handle.clone());
         }
     }
 
     let http_client = client.cache_and_http.http.clone();
 
-    if let Some(store) = contract_store {
+    if let Some((database_url, store_handle)) = contract_runtime {
         let interval = std::env::var("CONTRACT_COLLECTION_INTERVAL_SECS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -231,14 +224,13 @@ pub async fn run() {
         let delivery = Arc::new(discord_bot::DiscordContractDelivery::new(
             http_client.clone(),
         ));
-        tokio::spawn(
-            contract_intelligence::run_contract_collection_loop_with_notifications(
-                store,
-                Duration::from_secs(interval),
-                timeout,
-                ship_groups,
-                delivery,
-            ),
+        contract_intelligence::spawn_contract_collection_loop_with_notifications(
+            database_url,
+            store_handle,
+            Duration::from_secs(interval),
+            timeout,
+            ship_groups,
+            delivery,
         );
     }
 
