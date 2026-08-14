@@ -619,6 +619,167 @@ fn expiring_cache() -> CacheMetadata {
     CacheMetadata::cached_for_seconds(0)
 }
 
+async fn resolve_candidate_branch_after_unknown_location(
+    resolved_solar_system_id: i64,
+) -> (usize, usize, Vec<String>) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let baseline = item_exchange_contract(44);
+    let listed = item_exchange_contract(45);
+    let offered_hel = PublicContractItem {
+        record_id: 1,
+        type_id: 587,
+        quantity: 1,
+        is_included: true,
+        item_id: Some(1_001),
+        raw_quantity: None,
+        is_singleton: None,
+        is_blueprint_copy: None,
+        material_efficiency: None,
+        runs: None,
+        time_efficiency: None,
+    };
+    let offered_titan = PublicContractItem {
+        record_id: 2,
+        type_id: 19_720,
+        quantity: 1,
+        is_included: true,
+        item_id: Some(1_002),
+        raw_quantity: None,
+        is_singleton: None,
+        is_blueprint_copy: None,
+        material_efficiency: None,
+        runs: None,
+        time_efficiency: None,
+    };
+
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![baseline.clone()], expiring_page(1))),
+            )]),
+            items: HashMap::from([(44, Ok(EsiResponse::fresh(vec![], expiring_cache())))]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "local-hel-or-contextual-titan".to_string(),
+            description: "Hel or Titan in one system".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::Or(vec![
+                    ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                        direction: ContractItemDirection::Offered,
+                        ids: vec![587],
+                    }),
+                    ContractFilterNode::And(vec![
+                        ContractFilterNode::Condition(ContractFilterCondition::SolarSystems(vec![
+                            30_000_142,
+                        ])),
+                        ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                            direction: ContractItemDirection::Offered,
+                            ids: vec![19_720],
+                        }),
+                    ]),
+                ]),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+            },
+        })
+        .await
+        .expect("persist the local-or-contextual-candidate filter");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let unknown_context_esi = Arc::new(CountingContextEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![baseline.clone(), listed.clone()],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (44, Ok(EsiResponse::fresh(vec![], expiring_cache()))),
+                (
+                    45,
+                    Ok(EsiResponse::fresh(
+                        vec![offered_hel.clone(), offered_titan.clone()],
+                        expiring_cache(),
+                    )),
+                ),
+            ]),
+        },
+        context_calls: StdMutex::new(0),
+    });
+
+    ContractCollector::new(store.clone(), unknown_context_esi.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 659), (19_720, 30)]))),
+            delivery.clone(),
+        )
+        .collect_cycle()
+        .await
+        .expect("defer while the candidate-bearing location branch is unresolved");
+    let first_context_calls = *unknown_context_esi.context_calls.lock().unwrap();
+    let first_deliveries = delivery.sent.lock().unwrap().len();
+
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(ContextualFakeEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![baseline, listed], expiring_page(1))),
+                )]),
+                items: HashMap::from([
+                    (44, Ok(EsiResponse::fresh(vec![], expiring_cache()))),
+                    (
+                        45,
+                        Ok(EsiResponse::fresh(
+                            vec![offered_hel, offered_titan],
+                            expiring_cache(),
+                        )),
+                    ),
+                ]),
+            },
+            context: ContractObservationContext {
+                solar_system_id: Some(resolved_solar_system_id),
+                ..ContractObservationContext::default()
+            },
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659), (19_720, 30)]))),
+        delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("resolve the candidate-bearing location branch on the next cycle");
+
+    let titles = delivery
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|delivery| delivery.message.title.clone())
+        .collect();
+    database.destroy().await;
+    (first_context_calls, first_deliveries, titles)
+}
+
 #[tokio::test]
 async fn http_esi_accepts_a_public_contract_when_false_for_corporation_is_omitted() {
     let server = OneShotHttpServer::start(
@@ -2762,6 +2923,26 @@ async fn a_local_or_match_skips_unneeded_context_enrichment() {
     assert_eq!(delivery.sent.lock().unwrap().len(), 1);
 
     database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_deferred_or_candidate_context_match_selects_the_higher_priority_ship() {
+    let (first_context_calls, first_deliveries, titles) =
+        resolve_candidate_branch_after_unknown_location(30_000_142).await;
+
+    assert_eq!(first_context_calls, 1);
+    assert_eq!(first_deliveries, 0);
+    assert_eq!(titles, vec!["Public contract listed: Type 19720"]);
+}
+
+#[tokio::test]
+async fn a_deferred_or_candidate_context_miss_keeps_the_local_primary_ship() {
+    let (first_context_calls, first_deliveries, titles) =
+        resolve_candidate_branch_after_unknown_location(30_000_143).await;
+
+    assert_eq!(first_context_calls, 1);
+    assert_eq!(first_deliveries, 0);
+    assert_eq!(titles, vec!["Public contract listed: Type 587"]);
 }
 
 #[tokio::test]
