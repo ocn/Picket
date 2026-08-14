@@ -511,6 +511,32 @@ pub struct AppState {
     pub sso_states: Arc<Mutex<HashMap<String, SsoState>>>, // For tracking the SSO flow
 }
 
+pub const CHANNEL_PING_COOLDOWN: Duration = Duration::from_secs(300);
+
+pub async fn try_acquire_channel_ping(
+    last_ping_times: &Mutex<HashMap<u64, Instant>>,
+    channel_id: u64,
+) -> bool {
+    try_acquire_channel_ping_at(last_ping_times, channel_id, Instant::now()).await
+}
+
+pub async fn try_acquire_channel_ping_at(
+    last_ping_times: &Mutex<HashMap<u64, Instant>>,
+    channel_id: u64,
+    now: Instant,
+) -> bool {
+    let mut ping_times = last_ping_times.lock().await;
+    let last_ping = ping_times
+        .entry(channel_id)
+        .or_insert(now - CHANNEL_PING_COOLDOWN - Duration::from_secs(1));
+    if now.duration_since(*last_ping) > CHANNEL_PING_COOLDOWN {
+        *last_ping = now;
+        true
+    } else {
+        false
+    }
+}
+
 impl AppState {
     pub fn new(
         app_config: AppConfig,
@@ -699,6 +725,24 @@ pub fn save_subscriptions_for_guild(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn channel_ping_limiter_is_keyed_by_channel_and_uses_a_five_minute_window() {
+        let ping_times = Mutex::new(HashMap::new());
+        let now = Instant::now();
+        assert!(try_acquire_channel_ping_at(&ping_times, 77, now).await);
+        assert!(!try_acquire_channel_ping_at(&ping_times, 77, now).await);
+        assert!(try_acquire_channel_ping_at(&ping_times, 78, now).await);
+        assert!(!try_acquire_channel_ping_at(&ping_times, 77, now + CHANNEL_PING_COOLDOWN,).await);
+        assert!(
+            try_acquire_channel_ping_at(
+                &ping_times,
+                77,
+                now + CHANNEL_PING_COOLDOWN + Duration::from_secs(1),
+            )
+            .await
+        );
+    }
 
     #[test]
     fn test_load_subscription_file() {

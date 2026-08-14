@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
-use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 pub struct WorkItem {
@@ -305,16 +304,13 @@ async fn send_prepared_dispatch(
 
             let max_delay = ping_type.max_ping_delay_in_minutes().unwrap_or(0);
             if max_delay == 0 || kill_age.num_minutes() <= max_delay as i64 {
-                let channel_id = dispatch.subscription.action.channel_id.parse::<u64>().unwrap_or(0);
-                let mut ping_times = app_state.last_ping_times.lock().await;
-
-                let now = Instant::now();
-                let last_ping = ping_times
-                    .entry(channel_id)
-                    .or_insert(now - Duration::from_secs(301));
-
-                if now.duration_since(*last_ping) > Duration::from_secs(300) {
-                    *last_ping = now;
+                let channel_id = dispatch
+                    .subscription
+                    .action
+                    .channel_id
+                    .parse::<u64>()
+                    .unwrap_or(0);
+                if config::try_acquire_channel_ping(&app_state.last_ping_times, channel_id).await {
                     Some(match ping_type {
                         config::PingType::Here { .. } => "@here",
                         config::PingType::Everyone { .. } => "@everyone",
