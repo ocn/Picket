@@ -18,16 +18,17 @@ The collector first records a complete regional baseline silently. A complete la
 
 ## Configuration and startup
 
-Docker Compose starts PostgreSQL 16 and injects the internal `CONTRACT_DATABASE_URL` automatically. Before the first startup, set a non-default `CONTRACT_DATABASE_PASSWORD` in `.env`; changing it after the database volume exists does not change the database role password.
+Docker Compose starts PostgreSQL 16. Its safe default uses the default local-only credentials. If you set a non-default `CONTRACT_DATABASE_PASSWORD` before first startup, also set an explicit `CONTRACT_DATABASE_URL` using the Compose host `postgres:5432` and a percent-encoded password. Compose interpolates values before the container starts; it cannot safely derive a PostgreSQL URI from an arbitrary raw password. Changing either value after the database volume exists does not change the database role password.
 
 ```sh
 cp docs/env.sample .env
-# Set DISCORD_BOT_TOKEN, DISCORD_CLIENT_ID, and CONTRACT_DATABASE_PASSWORD.
+# Set DISCORD_BOT_TOKEN and DISCORD_CLIENT_ID.
+# If changing CONTRACT_DATABASE_PASSWORD, set a matching percent-encoded CONTRACT_DATABASE_URL.
 docker compose up --build -d
 docker compose ps
 ```
 
-For a non-Compose process, set `CONTRACT_DATABASE_URL` and optionally `CONTRACT_COLLECTION_INTERVAL_SECS` (default: 300 seconds). Each successful connection runs the SQLx migrations. If `CONTRACT_DATABASE_URL` is absent, contract collection and its commands are unavailable, while the killmail feed continues unchanged.
+For a non-Compose process, set `CONTRACT_DATABASE_URL` and optionally `CONTRACT_COLLECTION_INTERVAL_SECS` (default: 300 seconds); use `127.0.0.1:5433` for the local exposed Compose port. PostgreSQL URI userinfo reserves characters including `:`, `/`, `?`, `#`, `[`, `]`, and `@`; percent-encode them (and a literal `%`) in the URL, while `CONTRACT_DATABASE_PASSWORD` remains the raw password. Each successful connection runs the SQLx migrations. If `CONTRACT_DATABASE_URL` is absent, contract collection and its commands are unavailable, while the killmail feed continues unchanged.
 
 Keep the PostgreSQL volume when rolling back the bot image. A prior bot release ignores the contract tables; the JSON-backed killmail subscriptions, caches, standings, and feed checkpoints are separate and unchanged. Re-enable the current image and database URL to resume collection; migrations are re-run safely against an already-current database. Do not remove the PostgreSQL volume as a rollback step.
 
@@ -41,7 +42,7 @@ Create or replace a subscription in the target guild channel with `/contract_sub
 
 Filter nodes are `condition`, `and`, `or`, and `not`. Conditions support event kinds, offered/requested item presence, item type, ship group, ISK bounds, region, solar system, security range, location ID, issuer character/corporation, observed issuer alliance, issuance type, and title fragment. IDs must be positive. The maximum filter depth is 16 and the maximum node count is 128.
 
-Each action is `ignore`, `post`, or `post_and_ping`. `ping_type:here` uses `@here`; `ping_type:everyone` changes all pinging actions in that subscription to `@everyone`. A contract ping shares the existing per-channel five-minute limiter with killmail pings. Delivery still posts if a requested ping is rate-limited.
+Each action is `ignore`, `post`, or `post_and_ping`. Omitted actions, including `listed`, default to `ignore`, so `{"sale_confirmed":"post"}` is valid. `ping_type:here` uses `@here`; `ping_type:everyone` changes all pinging actions in that subscription to `@everyone`. A contract ping shares the existing per-channel five-minute limiter with killmail pings. Delivery still posts if a requested ping is rate-limited.
 
 ## Recovery, storage, and operation
 
@@ -73,7 +74,7 @@ CONTRACT_TEST_DATABASE_URL=postgres://killbot_contracts:killbot_contracts@127.0.
 The final command skips only the independently proven baseline hang in `esi::tests::test_esi_timeout_is_configured`. Existing credentialed killmail and tracking embed checks remain ignored. A contract-specific ignored visual check sends exactly one non-pinging embed to a dedicated channel:
 
 ```sh
-CONTRACT_TEST_DISCORD_CHANNEL_ID=<dedicated-channel-id> cargo test --test test_contract_intelligence manual_contract_embed_visual_delivery -- --ignored --nocapture
+CONTRACT_TEST_DISCORD_CHANNEL_ID=<dedicated-channel-id> cargo test manual_contract_embed_visual_delivery -- --ignored --nocapture
 ```
 
 Review the title, compact fields, no ping, and standalone `contract:0//<id>` Contract Address field, then delete the manual message.
@@ -87,3 +88,5 @@ This release has no authenticated-contract feed, counterparty tracking, provisio
 - [ESI best practices](https://developers.eveonline.com/docs/services/esi/best-practices/)
 - [ESI rate limiting](https://developers.eveonline.com/docs/services/esi/rate-limiting/)
 - [Discord interaction responses](https://docs.discord.com/developers/interactions/receiving-and-responding)
+- [Docker Compose variable interpolation](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/)
+- [PostgreSQL connection strings](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING)

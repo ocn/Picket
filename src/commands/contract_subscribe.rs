@@ -221,6 +221,47 @@ mod tests {
     }
 
     #[test]
+    fn sale_only_event_actions_default_listed_to_ignore_and_preserve_explicit_legacy_actions() {
+        let sale_only = ContractSubscribeCommand::subscription_from_documents(
+            42,
+            77,
+            "sale-only",
+            "confirmed sales only",
+            FILTER,
+            r#"{"sale_confirmed":"post"}"#,
+            None,
+        )
+        .expect("sale-only actions are valid");
+        assert_eq!(
+            sale_only.event_actions.listed,
+            crate::contract_intelligence::ContractEventAction::Ignore
+        );
+        assert_eq!(
+            sale_only.event_actions.sale_confirmed,
+            crate::contract_intelligence::ContractEventAction::Post
+        );
+
+        let legacy = ContractSubscribeCommand::subscription_from_documents(
+            42,
+            77,
+            "legacy-listed",
+            "legacy listed action",
+            FILTER,
+            r#"{"listed":"post_and_ping","sale_confirmed":"post"}"#,
+            Some("everyone"),
+        )
+        .expect("explicit legacy listed action remains valid");
+        assert_eq!(
+            legacy.event_actions.listed,
+            crate::contract_intelligence::ContractEventAction::PostAndPingEveryone
+        );
+        assert_eq!(
+            legacy.event_actions.sale_confirmed,
+            crate::contract_intelligence::ContractEventAction::Post
+        );
+    }
+
+    #[test]
     fn contract_subscribe_exposes_a_bounded_ping_type_option() {
         let mut command = CreateApplicationCommand::default();
         ContractSubscribeCommand.register(&mut command);
