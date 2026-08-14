@@ -5875,6 +5875,8 @@ mod embed_tests {
 
     use super::*;
 
+    const MANUAL_CONTRACT_EMBED_NONCE: &str = "ci-manual-contract-check";
+
     fn contract() -> PublicContract {
         PublicContract {
             contract_id: 45,
@@ -5925,11 +5927,13 @@ mod embed_tests {
             embed_context: ContractEmbedContext {
                 observed_at: Some(Utc::now()),
                 location: ContractLocationContext {
-                    location_name: Some("K-6K16 Trade Hub".to_string()),
-                    location_kind: Some("Structure".to_string()),
+                    location_name: Some(
+                        "Jita IV - Moon 4 - Caldari Navy Assembly Plant".to_string(),
+                    ),
+                    location_kind: Some("Station".to_string()),
                     solar_system_id: Some(30_000_142),
-                    solar_system_name: Some("Vale of the Silent".to_string()),
-                    security_status: Some(-0.5),
+                    solar_system_name: Some("Jita".to_string()),
+                    security_status: Some(0.945_913_136_005_401_6),
                     region_id: Some(10_000_002),
                     region_name: Some("The Forge".to_string()),
                 },
@@ -5991,8 +5995,8 @@ mod embed_tests {
             &history,
         );
         let full_location = field(&full, "Observed Location").expect("location field");
-        assert!(full_location.contains("Structure: K-6K16 Trade Hub"));
-        assert!(full_location.contains("System: Vale of the Silent (-0.5)"));
+        assert!(full_location.contains("Station: Jita IV - Moon 4 - Caldari Navy Assembly Plant"));
+        assert!(full_location.contains("System: Jita (0.9)"));
         assert!(full_location.contains("Region: The Forge"));
         assert!(full_location.ends_with("Location ID: 60003760"));
 
@@ -6117,6 +6121,11 @@ mod embed_tests {
             .contains("Contract 45"));
     }
 
+    #[test]
+    fn manual_contract_embed_nonce_fits_discord_limit() {
+        assert!(MANUAL_CONTRACT_EMBED_NONCE.chars().count() <= 25);
+    }
+
     #[tokio::test]
     #[ignore = "manual visual check; requires DISCORD_BOT_TOKEN and CONTRACT_TEST_DISCORD_CHANNEL_ID and sends one non-pinging embed"]
     async fn manual_contract_embed_visual_delivery() {
@@ -6166,11 +6175,11 @@ mod embed_tests {
             &issuer_history,
             &corporation_history,
         );
-        assert_eq!(message.title, "Hel sold in Vale of the Silent");
+        assert_eq!(message.title, "Hel sold in Jita");
         assert_eq!(field(&message, "Requested ISK"), Some("77.5b ISK"));
         assert!(field(&message, "Observed Location")
             .expect("location field")
-            .contains("Structure: K-6K16 Trade Hub"));
+            .contains("Station: Jita IV - Moon 4 - Caldari Navy Assembly Plant"));
         assert_eq!(field(&message, "Issuer"), Some("Issuer Name (90000001)"));
         assert!(field(&message, "Issuer History")
             .expect("issuer history")
@@ -6187,10 +6196,7 @@ mod embed_tests {
             Some("```\ncontract:0//234057619\n```")
         );
         let embed = contract_notification_embed(&message);
-        assert_eq!(
-            embed.0["title"].as_str(),
-            Some("Hel sold in Vale of the Silent")
-        );
+        assert_eq!(embed.0["title"].as_str(), Some("Hel sold in Jita"));
         assert_eq!(
             embed.0["thumbnail"]["url"].as_str(),
             Some("https://images.evetech.net/types/22852/icon?size=64")
@@ -6207,7 +6213,7 @@ mod embed_tests {
                 event_kind: event.kind,
                 ping: false,
                 ping_type: ContractPingType::Here,
-                nonce: "manual-contract-embed-check".to_string(),
+                nonce: MANUAL_CONTRACT_EMBED_NONCE.to_string(),
                 enforce_nonce: false,
                 message,
             })
