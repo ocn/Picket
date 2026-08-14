@@ -36,6 +36,12 @@ impl TypeMapKey for AppStateContainer {
     type Value = Arc<config::AppState>;
 }
 
+pub struct ContractStoreContainer;
+
+impl TypeMapKey for ContractStoreContainer {
+    type Value = Arc<contract_intelligence::ContractCollectionStore>;
+}
+
 fn generate_queue_id() -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -171,6 +177,24 @@ pub async fn run() {
 
     let command_map_arc = Arc::new(command_map);
 
+    let contract_store = match std::env::var("CONTRACT_DATABASE_URL") {
+        Ok(database_url) => {
+            match contract_intelligence::ContractCollectionStore::connect(&database_url).await {
+                Ok(store) => Some(Arc::new(store)),
+                Err(error) => {
+                    error!(
+                        "Contract collection disabled: contract database is unavailable: {error}"
+                    );
+                    None
+                }
+            }
+        }
+        Err(_) => {
+            info!("Contract collection disabled: CONTRACT_DATABASE_URL is not configured");
+            None
+        }
+    };
+
     // --- Start Discord Bot ---
     let discord_token = app_config.discord_bot_token.clone();
     let intents = GatewayIntents::non_privileged()
@@ -188,11 +212,14 @@ pub async fn run() {
         let mut data = client.data.write().await;
         data.insert::<AppStateContainer>(app_state.clone());
         data.insert::<CommandMap>(command_map_arc.clone());
+        if let Some(store) = &contract_store {
+            data.insert::<ContractStoreContainer>(store.clone());
+        }
     }
 
     let http_client = client.cache_and_http.http.clone();
 
-    if let Ok(database_url) = std::env::var("CONTRACT_DATABASE_URL") {
+    if let Some(store) = contract_store {
         let interval = std::env::var("CONTRACT_COLLECTION_INTERVAL_SECS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -206,15 +233,13 @@ pub async fn run() {
         ));
         tokio::spawn(
             contract_intelligence::run_contract_collection_loop_with_notifications(
-                database_url,
+                store,
                 Duration::from_secs(interval),
                 timeout,
                 ship_groups,
                 delivery,
             ),
         );
-    } else {
-        info!("Contract collection disabled: CONTRACT_DATABASE_URL is not configured");
     }
 
     tokio::spawn(async move {

@@ -1,9 +1,11 @@
+use crate::commands::contract_command::{defer_then_edit, SerenityContractCommandResponder};
 use crate::commands::{get_option_value, Command};
 use crate::config::AppState;
 use crate::contract_intelligence::{
-    ContractCollectionStore, ContractEventAction, ContractEventActions, ContractEventKind,
-    ContractFilter, ContractItemDirection, ContractSubscription,
+    ContractEventAction, ContractEventActions, ContractEventKind, ContractFilter,
+    ContractItemDirection, ContractSubscription,
 };
+use crate::ContractStoreContainer;
 use serenity::async_trait;
 use serenity::builder::CreateApplicationCommand;
 use serenity::model::prelude::command::CommandOptionType;
@@ -140,37 +142,41 @@ impl Command for ContractSubscribeCommand {
         command: &ApplicationCommandInteraction,
         _app_state: &Arc<AppState>,
     ) {
-        let response = match command.guild_id {
-            Some(guild_id) => match Self::subscription(guild_id.0, command.channel_id.0, command) {
-                Ok(subscription) => match std::env::var("CONTRACT_DATABASE_URL") {
-                    Ok(database_url) => match ContractCollectionStore::connect(&database_url).await {
-                        Ok(store) => match store.upsert_contract_subscription(&subscription).await {
-                            Ok(()) => format!(
-                                "Contract subscription '{}' saved for this channel.",
-                                subscription.id
-                            ),
-                            Err(error) => {
-                                error!("cannot persist contract subscription: {error}");
-                                "Contract subscription could not be saved.".to_string()
-                            }
-                        },
-                        Err(error) => {
-                            error!("contract database unavailable for subscription command: {error}");
-                            "Contract subscriptions are unavailable because the contract database is not connected.".to_string()
-                        }
-                    },
-                    Err(_) => "Contract subscriptions are unavailable because CONTRACT_DATABASE_URL is not configured.".to_string(),
-                },
-                Err(error) => format!("Invalid contract subscription: {error}"),
-            },
-            None => "Contract subscriptions can only be created in a server channel.".to_string(),
-        };
-        if let Err(error) = command
-            .create_interaction_response(&ctx.http, |response_builder| {
-                response_builder
-                    .interaction_response_data(|message| message.content(response).ephemeral(true))
-            })
+        let store = ctx
+            .data
+            .read()
             .await
+            .get::<ContractStoreContainer>()
+            .cloned();
+        let response = match command.guild_id {
+            Some(guild_id) => Self::subscription(guild_id.0, command.channel_id.0, command)
+                .map_err(|error| format!("Invalid contract subscription: {error}")),
+            None => {
+                Err("Contract subscriptions can only be created in a server channel.".to_string())
+            }
+        };
+        let mut responder = SerenityContractCommandResponder::new(ctx, command);
+        if let Err(error) = defer_then_edit(&mut responder, async move {
+            let subscription = match response {
+                Ok(subscription) => subscription,
+                Err(response) => return response,
+            };
+            let Some(store) = store else {
+                return "Contract subscriptions are unavailable because the contract database is not connected."
+                    .to_string();
+            };
+            match store.upsert_contract_subscription(&subscription).await {
+                Ok(()) => format!(
+                    "Contract subscription '{}' saved for this channel.",
+                    subscription.id
+                ),
+                Err(error) => {
+                    error!("cannot persist contract subscription: {error}");
+                    "Contract subscription could not be saved.".to_string()
+                }
+            }
+        })
+        .await
         {
             error!("Cannot respond to contract subscribe command: {error}");
         }

@@ -6,7 +6,7 @@ use crate::config::{
 };
 use crate::contract_intelligence::{
     ContractDelivery, ContractDeliveryError, ContractNotificationMessage, PreparedContractDelivery,
-    ShipGroupResolver,
+    ShipGroupLookup, ShipGroupResolver,
 };
 use crate::esi::Celestial;
 use crate::models::{Attacker, ZkData};
@@ -246,11 +246,29 @@ impl DiscordShipGroupResolver {
 
 #[async_trait]
 impl ShipGroupResolver for DiscordShipGroupResolver {
-    async fn group_for_type(&self, type_id: i64) -> Option<i64> {
-        let type_id = u32::try_from(type_id).ok()?;
-        get_ship_group_id(&self.app_state, type_id)
-            .await
-            .map(i64::from)
+    async fn group_for_type(&self, type_id: i64) -> ShipGroupLookup {
+        let Ok(type_id) = u32::try_from(type_id) else {
+            return ShipGroupLookup::Resolved(None);
+        };
+        if let Some(group_id) = self.app_state.ships.read().unwrap().get(&type_id).copied() {
+            return ShipGroupLookup::Resolved(Some(i64::from(group_id)));
+        }
+        match self.app_state.esi_client.get_ship_group_id(type_id).await {
+            Ok(group_id) => {
+                let _lock = self.app_state.ships_file_lock.lock().await;
+                let mut ships = self.app_state.ships.write().unwrap();
+                ships.insert(type_id, group_id);
+                save_ships(&ships);
+                ShipGroupLookup::Resolved(Some(i64::from(group_id)))
+            }
+            Err(error) => {
+                warn!(
+                    type_id,
+                    "contract ship group lookup will be retried: {error}"
+                );
+                ShipGroupLookup::TemporarilyUnavailable
+            }
+        }
     }
 }
 
