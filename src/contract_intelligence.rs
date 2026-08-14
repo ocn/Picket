@@ -174,14 +174,14 @@ impl<T> EsiResponse<T> {
 #[derive(Clone, Debug)]
 pub enum ContractItemProbe {
     Available(EsiResponse<Vec<PublicContractItem>>),
-    Accepted(CacheMetadata),
+    NoContent(CacheMetadata),
 }
 
 impl ContractItemProbe {
     fn metadata(&self) -> &CacheMetadata {
         match self {
             Self::Available(response) => &response.metadata,
-            Self::Accepted(metadata) => metadata,
+            Self::NoContent(metadata) => metadata,
         }
     }
 }
@@ -464,7 +464,7 @@ impl HttpPublicContractEsi {
             .map_err(|error| EsiError::retryable(error.to_string(), None))?;
         let metadata = cache_metadata(response.headers());
         match response.status() {
-            StatusCode::NO_CONTENT => Ok(ContractItemProbe::Accepted(metadata)),
+            StatusCode::NO_CONTENT => Ok(ContractItemProbe::NoContent(metadata)),
             StatusCode::NOT_MODIFIED => Ok(ContractItemProbe::Available(
                 EsiResponse::not_modified(metadata),
             )),
@@ -1806,6 +1806,27 @@ impl ContractCollectionStore {
             .collect()
     }
 
+    async fn pending_acceptance_notifications(
+        &self,
+    ) -> Result<Vec<ConfirmedContractResolution>, sqlx::Error> {
+        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at FROM contract_resolution_cases WHERE state = 'acceptance_confirmed' AND notification_pending = TRUE ORDER BY region_id, contract_id")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(ConfirmedContractResolution {
+                    region_id: row.get("region_id"),
+                    contract_id: row.get("contract_id"),
+                    contract: serde_json::from_value(row.get("contract")).map_err(json_to_sqlx)?,
+                    manifest: serde_json::from_value(row.get("manifest")).map_err(json_to_sqlx)?,
+                    last_public_observed_at: row.get("last_public_observed_at"),
+                    absence_observed_at: row.get("absence_observed_at"),
+                    acceptance_evidence_at: row.get("acceptance_evidence_at"),
+                })
+            })
+            .collect()
+    }
+
     async fn schedule_resolution_probe(
         &self,
         region_id: i64,
@@ -1826,13 +1847,15 @@ impl ContractCollectionStore {
         resolution: &AwaitingContractResolution,
         evidence_response_at: DateTime<Utc>,
         metadata: &CacheMetadata,
+        notification_pending: bool,
     ) -> Result<bool, sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
-        let confirmed = sqlx::query_scalar::<_, i64>("UPDATE contract_resolution_cases SET state = 'acceptance_confirmed', acceptance_evidence_at = $3, acceptance_response_metadata = $4, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution' RETURNING contract_id")
+        let confirmed = sqlx::query_scalar::<_, i64>("UPDATE contract_resolution_cases SET state = 'acceptance_confirmed', acceptance_evidence_at = $3, acceptance_response_metadata = $4, notification_pending = $5, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution' RETURNING contract_id")
             .bind(resolution.region_id)
             .bind(resolution.contract_id)
             .bind(evidence_response_at)
             .bind(serde_json::to_value(metadata).map_err(json_to_sqlx)?)
+            .bind(notification_pending)
             .fetch_optional(&mut *transaction)
             .await?;
         if confirmed.is_some() {
@@ -1851,6 +1874,20 @@ impl ContractCollectionStore {
         }
         transaction.commit().await?;
         Ok(confirmed.is_some())
+    }
+
+    async fn mark_acceptance_notifications_reported(
+        &self,
+        cases: &[ResolutionCaseKey],
+    ) -> Result<(), sqlx::Error> {
+        for case in cases {
+            sqlx::query("UPDATE contract_resolution_cases SET notification_pending = FALSE, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'acceptance_confirmed' AND notification_pending = TRUE")
+                .bind(case.region_id)
+                .bind(case.contract_id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -1932,6 +1969,23 @@ struct AwaitingContractResolution {
     manifest: ItemManifest,
     last_public_observed_at: DateTime<Utc>,
     absence_observed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+struct ConfirmedContractResolution {
+    region_id: i64,
+    contract_id: i64,
+    contract: PublicContract,
+    manifest: ItemManifest,
+    last_public_observed_at: DateTime<Utc>,
+    absence_observed_at: DateTime<Utc>,
+    acceptance_evidence_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResolutionCaseKey {
+    region_id: i64,
+    contract_id: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -2036,6 +2090,13 @@ enum NotificationResolution {
     Deferred,
 }
 
+#[derive(Default)]
+struct ResolutionBatch {
+    events: Vec<ContractEvent>,
+    notification_cases: Vec<ResolutionCaseKey>,
+    retry_after: Option<DateTime<Utc>>,
+}
+
 impl ContractCollector {
     pub fn new(store: ContractCollectionStore, esi: Arc<dyn PublicContractEsi>) -> Self {
         Self {
@@ -2117,8 +2178,15 @@ impl ContractCollector {
                 }
             }
         }
-        events.extend(self.resolve_awaiting_resolutions().await?);
+        let resolution_batch = self.resolve_awaiting_resolutions().await?;
+        retry_after = std::cmp::max(retry_after, resolution_batch.retry_after);
+        events.extend(resolution_batch.events);
         self.notify(&events).await?;
+        if self.notifications.is_some() {
+            self.store
+                .mark_acceptance_notifications_reported(&resolution_batch.notification_cases)
+                .await?;
+        }
         Ok(CollectionReport {
             regions: outcomes,
             events,
@@ -2202,106 +2270,181 @@ impl ContractCollector {
 
     async fn resolve_awaiting_resolutions(
         &self,
-    ) -> Result<Vec<ContractEvent>, ContractCollectionError> {
-        let mut events = Vec::new();
-        for resolution in self.store.awaiting_resolution_cases().await? {
-            let key = format!("contracts/public/items/{}", resolution.contract_id);
-            let cached = self.store.cache(&key).await?;
-            if let Some(cached) = &cached {
-                if cached.metadata.is_fresh() {
-                    self.store
-                        .schedule_resolution_probe(
-                            resolution.region_id,
-                            resolution.contract_id,
-                            cached
-                                .metadata
-                                .expires_at
-                                .expect("fresh cache has expiration"),
-                        )
-                        .await?;
-                    continue;
-                }
+    ) -> Result<ResolutionBatch, ContractCollectionError> {
+        let mut batch = ResolutionBatch::default();
+        for resolution in self.store.pending_acceptance_notifications().await? {
+            if let Some(event) = acceptance_event(
+                resolution.region_id,
+                &resolution.contract,
+                &resolution.manifest,
+                resolution.last_public_observed_at,
+                resolution.absence_observed_at,
+                resolution.acceptance_evidence_at,
+            ) {
+                batch.events.push(event);
+                batch.notification_cases.push(ResolutionCaseKey {
+                    region_id: resolution.region_id,
+                    contract_id: resolution.contract_id,
+                });
+            } else {
+                warn!(
+                    region_id = resolution.region_id,
+                    contract_id = resolution.contract_id,
+                    "acceptance notification recovery found a non-financial contract"
+                );
             }
-            let etag = cached
-                .as_ref()
-                .and_then(|cached| cached.metadata.etag.clone());
-            self.ensure_esi_limiter_allows_requests().await?;
-            let probe = self
-                .record_item_probe_result(
-                    self.esi
-                        .public_contract_items_probe(resolution.contract_id, etag.as_deref())
-                        .await,
-                )
-                .await?;
-            match probe {
-                ContractItemProbe::Available(response) => {
-                    let (items, metadata) = if response.not_modified {
-                        let cached = cached.as_ref().ok_or_else(|| {
-                            ContractCollectionError::Cache(format!(
-                                "{key} returned 304 without a cached item representation"
-                            ))
-                        })?;
-                        (
-                            cached.response.clone(),
-                            merge_cache_metadata(&cached.metadata, response.metadata),
-                        )
-                    } else {
-                        (
-                            serde_json::to_value(response.value.ok_or_else(|| {
-                                ContractCollectionError::Cache(format!(
-                                    "{key} returned no item representation"
-                                ))
-                            })?)
-                            .map_err(|error| ContractCollectionError::Cache(error.to_string()))?,
-                            response.metadata,
-                        )
-                    };
-                    self.store.save_cache(&key, &items, &metadata).await?;
-                    self.store
-                        .schedule_resolution_probe(
-                            resolution.region_id,
-                            resolution.contract_id,
-                            metadata.expires_at.unwrap_or_else(Utc::now),
-                        )
-                        .await?;
+        }
+        for resolution in self.store.awaiting_resolution_cases().await? {
+            let resolution_key = ResolutionCaseKey {
+                region_id: resolution.region_id,
+                contract_id: resolution.contract_id,
+            };
+            match self.resolve_awaiting_resolution(&resolution).await {
+                Ok(Some(event)) => {
+                    batch.events.push(event);
+                    batch.notification_cases.push(resolution_key);
                 }
-                ContractItemProbe::Accepted(metadata) => {
-                    let evidence_response_at = Utc::now();
-                    if evidence_response_at >= resolution.contract.date_expired {
-                        self.store
-                            .schedule_resolution_probe(
-                                resolution.region_id,
-                                resolution.contract_id,
-                                evidence_response_at + ChronoDuration::minutes(5),
-                            )
-                            .await?;
-                        continue;
-                    }
-                    if self
+                Ok(None) => {}
+                Err(error) => {
+                    let retry_after = error.retry_after();
+                    warn!(
+                        region_id = resolution.region_id,
+                        contract_id = resolution.contract_id,
+                        "contract resolution remains retryable after an independent failure: {error}"
+                    );
+                    if let Err(record_error) = self
                         .store
-                        .confirm_acceptance(&resolution, evidence_response_at, &metadata)
-                        .await?
+                        .record_failure(
+                            Some(resolution.region_id),
+                            "resolution_probe",
+                            &error.to_string(),
+                            retry_after,
+                        )
+                        .await
                     {
-                        if let Some(kind) = confirmed_contract_event_kind(&resolution) {
-                            events.push(ContractEvent {
-                                region_id: resolution.region_id,
-                                kind,
-                                contract: resolution.contract,
-                                offered_items: resolution.manifest.offered_items,
-                                requested_items: resolution.manifest.requested_items,
-                                context: ContractObservationContext::default(),
-                                acceptance_evidence: Some(ContractAcceptanceEvidence {
-                                    last_public_observed_at: resolution.last_public_observed_at,
-                                    absence_observed_at: resolution.absence_observed_at,
-                                    evidence_response_at,
-                                }),
-                            });
-                        }
+                        warn!(
+                            region_id = resolution.region_id,
+                            contract_id = resolution.contract_id,
+                            "failed to persist contract resolution failure: {record_error}"
+                        );
+                    }
+                    batch.retry_after = std::cmp::max(batch.retry_after, retry_after);
+                    match self.store.active_esi_limiter_deadline().await {
+                        Ok(Some(_)) => break,
+                        Ok(None) => {}
+                        Err(limiter_error) => warn!(
+                            region_id = resolution.region_id,
+                            contract_id = resolution.contract_id,
+                            "could not read the persisted ESI limiter after a resolution failure: {limiter_error}"
+                        ),
                     }
                 }
             }
         }
-        Ok(events)
+        Ok(batch)
+    }
+
+    async fn resolve_awaiting_resolution(
+        &self,
+        resolution: &AwaitingContractResolution,
+    ) -> Result<Option<ContractEvent>, ContractCollectionError> {
+        let key = format!("contracts/public/items/{}", resolution.contract_id);
+        let cached = self.store.cache(&key).await?;
+        if let Some(cached) = &cached {
+            if cached.metadata.is_fresh() {
+                self.store
+                    .schedule_resolution_probe(
+                        resolution.region_id,
+                        resolution.contract_id,
+                        cached
+                            .metadata
+                            .expires_at
+                            .expect("fresh cache has expiration"),
+                    )
+                    .await?;
+                return Ok(None);
+            }
+        }
+        let etag = cached
+            .as_ref()
+            .and_then(|cached| cached.metadata.etag.clone());
+        self.ensure_esi_limiter_allows_requests().await?;
+        let probe = self
+            .record_item_probe_result(
+                self.esi
+                    .public_contract_items_probe(resolution.contract_id, etag.as_deref())
+                    .await,
+            )
+            .await?;
+        match probe {
+            ContractItemProbe::Available(response) => {
+                let (items, metadata) = if response.not_modified {
+                    let cached = cached.as_ref().ok_or_else(|| {
+                        ContractCollectionError::Cache(format!(
+                            "{key} returned 304 without a cached item representation"
+                        ))
+                    })?;
+                    (
+                        cached.response.clone(),
+                        merge_cache_metadata(&cached.metadata, response.metadata),
+                    )
+                } else {
+                    (
+                        serde_json::to_value(response.value.ok_or_else(|| {
+                            ContractCollectionError::Cache(format!(
+                                "{key} returned no item representation"
+                            ))
+                        })?)
+                        .map_err(|error| ContractCollectionError::Cache(error.to_string()))?,
+                        response.metadata,
+                    )
+                };
+                self.store.save_cache(&key, &items, &metadata).await?;
+                self.store
+                    .schedule_resolution_probe(
+                        resolution.region_id,
+                        resolution.contract_id,
+                        metadata.expires_at.unwrap_or_else(Utc::now),
+                    )
+                    .await?;
+                Ok(None)
+            }
+            ContractItemProbe::NoContent(metadata) => {
+                let evidence_response_at = Utc::now();
+                if evidence_response_at >= resolution.contract.date_expired {
+                    self.store
+                        .schedule_resolution_probe(
+                            resolution.region_id,
+                            resolution.contract_id,
+                            evidence_response_at + ChronoDuration::minutes(5),
+                        )
+                        .await?;
+                    return Ok(None);
+                }
+                let event = acceptance_event(
+                    resolution.region_id,
+                    &resolution.contract,
+                    &resolution.manifest,
+                    resolution.last_public_observed_at,
+                    resolution.absence_observed_at,
+                    evidence_response_at,
+                );
+                if self
+                    .store
+                    .confirm_acceptance(
+                        resolution,
+                        evidence_response_at,
+                        &metadata,
+                        event.is_some(),
+                    )
+                    .await?
+                {
+                    Ok(event)
+                } else {
+                    Ok(None)
+                }
+            }
+        }
     }
 
     async fn notify(&self, events: &[ContractEvent]) -> Result<(), ContractCollectionError> {
@@ -2793,21 +2936,45 @@ fn contract_event_action(
 }
 
 fn confirmed_contract_event_kind(
-    resolution: &AwaitingContractResolution,
+    contract: &PublicContract,
+    manifest: &ItemManifest,
 ) -> Option<ContractEventKind> {
-    if resolution.manifest.requested_items.is_empty()
-        && !resolution.manifest.offered_items.is_empty()
-        && positive_isk(resolution.contract.price)
+    if manifest.requested_items.is_empty()
+        && !manifest.offered_items.is_empty()
+        && positive_isk(contract.price)
     {
         return Some(ContractEventKind::SaleConfirmed);
     }
-    if resolution.manifest.offered_items.is_empty()
-        && !resolution.manifest.requested_items.is_empty()
-        && positive_isk(resolution.contract.reward)
+    if manifest.offered_items.is_empty()
+        && !manifest.requested_items.is_empty()
+        && positive_isk(contract.reward)
     {
         return Some(ContractEventKind::PurchaseConfirmed);
     }
     None
+}
+
+fn acceptance_event(
+    region_id: i64,
+    contract: &PublicContract,
+    manifest: &ItemManifest,
+    last_public_observed_at: DateTime<Utc>,
+    absence_observed_at: DateTime<Utc>,
+    evidence_response_at: DateTime<Utc>,
+) -> Option<ContractEvent> {
+    Some(ContractEvent {
+        region_id,
+        kind: confirmed_contract_event_kind(contract, manifest)?,
+        contract: contract.clone(),
+        offered_items: manifest.offered_items.clone(),
+        requested_items: manifest.requested_items.clone(),
+        context: ContractObservationContext::default(),
+        acceptance_evidence: Some(ContractAcceptanceEvidence {
+            last_public_observed_at,
+            absence_observed_at,
+            evidence_response_at,
+        }),
+    })
 }
 
 fn positive_isk(value: f64) -> bool {
