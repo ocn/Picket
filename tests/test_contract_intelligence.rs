@@ -8,12 +8,13 @@ use killbot_rust::contract_intelligence::{
     ContractContextRequirements, ContractContextValue, ContractDelivery, ContractDeliveryClock,
     ContractDeliveryError, ContractEmbedContext, ContractEventAction, ContractEventActions,
     ContractEventKind, ContractFilter, ContractFilterCondition, ContractFilterNode,
-    ContractItemDirection, ContractItemProbe, ContractObservationContext, ContractPingLimiter,
-    ContractPingType, ContractResolutionState, ContractSubscription, DeliveryFailureKind,
-    DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HttpPublicContractEsi,
-    PreparedContractDelivery, PublicContract, PublicContractEsi, PublicContractItem,
-    ShipGroupLookup, ShipGroupResolver,
+    ContractItemDirection, ContractItemProbe, ContractNotificationMessage,
+    ContractObservationContext, ContractPingLimiter, ContractPingType, ContractResolutionState,
+    ContractSubscription, DeliveryFailureKind, DeliveryRecord, DeliveryStatus, EsiError,
+    EsiResponse, HttpPublicContractEsi, PreparedContractDelivery, PublicContract,
+    PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
 };
+use killbot_rust::discord_bot::DiscordContractDelivery;
 use killbot_rust::esi::EsiClient;
 use moka::future::Cache;
 use sha2::{Digest, Sha384};
@@ -31,6 +32,10 @@ use tokio::sync::Mutex;
 use url::Url;
 
 static DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const ESI_PUBLIC_CONTRACT_SUMMARY_FIXTURE: &str =
+    include_str!("../resources/contracts/public-contract-summary.json");
+const ESI_PUBLIC_CONTRACT_ITEMS_FIXTURE: &str =
+    include_str!("../resources/contracts/public-contract-items.json");
 
 fn app_state_for_ping_limiter() -> Arc<AppState> {
     Arc::new(AppState {
@@ -1233,6 +1238,250 @@ async fn pre_expiry_no_content_confirms_only_pure_matched_ship_sales_and_purchas
 }
 
 #[tokio::test]
+async fn contract_cycle_release_seam_preserves_all_public_lifecycle_outcomes_and_deliveries() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut sale = item_exchange_contract(44);
+    sale.date_expired = Utc::now() + chrono::Duration::hours(1);
+    let mut purchase = item_exchange_contract(45);
+    purchase.date_expired = Utc::now() + chrono::Duration::hours(1);
+    purchase.price = 0.0;
+    purchase.reward = 1_500_000_000.0;
+    let mut expired = item_exchange_contract(46);
+    expired.date_expired = Utc::now() - chrono::Duration::minutes(1);
+    let mut unknown = item_exchange_contract(47);
+    unknown.date_expired = Utc::now() + chrono::Duration::hours(1);
+    let mut listed = item_exchange_contract(48);
+    listed.date_expired = Utc::now() + chrono::Duration::hours(1);
+
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let ship_groups = Arc::new(StaticShipGroups(HashMap::from([(587, 659)])));
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![
+                        sale.clone(),
+                        purchase.clone(),
+                        expired.clone(),
+                        unknown.clone(),
+                    ],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    sale.contract_id,
+                    Ok(EsiResponse::fresh(
+                        vec![offered_ship(1)],
+                        cached_item_metadata("sale-v1", 3_600),
+                    )),
+                ),
+                (
+                    purchase.contract_id,
+                    Ok(EsiResponse::fresh(
+                        vec![requested_ship(2)],
+                        cached_item_metadata("purchase-v1", 3_600),
+                    )),
+                ),
+                (
+                    expired.contract_id,
+                    Ok(EsiResponse::fresh(
+                        vec![offered_ship(3)],
+                        cached_item_metadata("expired-v1", 3_600),
+                    )),
+                ),
+                (
+                    unknown.contract_id,
+                    Ok(EsiResponse::fresh(
+                        vec![offered_ship(4)],
+                        cached_item_metadata("unknown-v1", 3_600),
+                    )),
+                ),
+            ]),
+        }),
+    )
+    .with_notifications(ship_groups.clone(), delivery.clone())
+    .collect_cycle()
+    .await
+    .expect("establish a silent regional baseline");
+    assert!(delivery.sent.lock().unwrap().is_empty());
+
+    for subscription in [
+        contract_subscription(
+            "listed",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ),
+        confirmed_ship_subscription(
+            "sale",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ),
+        confirmed_ship_subscription(
+            "purchase",
+            ContractEventKind::PurchaseConfirmed,
+            ContractItemDirection::Requested,
+            ContractEventAction::Post,
+        ),
+        terminal_ship_subscription(
+            "expired",
+            ContractEventKind::Expired,
+            ContractEventAction::Post,
+        ),
+        terminal_ship_subscription(
+            "unknown",
+            ContractEventKind::ClosedOutcomeUnknown,
+            ContractEventAction::Post,
+        ),
+        contract_subscription(
+            "nonmatching",
+            ContractItemDirection::Offered,
+            vec![999],
+            vec![],
+            ContractEventAction::Post,
+        ),
+    ] {
+        store
+            .upsert_contract_subscription(&subscription)
+            .await
+            .expect("persist lifecycle subscription");
+    }
+
+    let first_transition = ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![listed.clone()], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                listed.contract_id,
+                Ok(EsiResponse::fresh(
+                    vec![offered_ship(5)],
+                    cached_item_metadata("listed-v1", 3_600),
+                )),
+            )]),
+        }),
+    )
+    .with_notifications(ship_groups.clone(), delivery.clone())
+    .collect_cycle()
+    .await
+    .expect("record a listing and public disappearance");
+    assert!(first_transition
+        .events
+        .iter()
+        .any(|event| event.kind == ContractEventKind::Listed));
+    assert!(first_transition
+        .events
+        .iter()
+        .any(|event| event.kind == ContractEventKind::Expired));
+
+    let records = store
+        .contract_resolution_records()
+        .await
+        .expect("persist awaiting and terminal lifecycle state");
+    assert!(records.iter().any(|record| {
+        record.contract_id == sale.contract_id
+            && record.state == ContractResolutionState::AwaitingResolution
+    }));
+    assert!(records.iter().any(|record| {
+        record.contract_id == purchase.contract_id
+            && record.state == ContractResolutionState::AwaitingResolution
+    }));
+    assert!(records.iter().any(|record| {
+        record.contract_id == unknown.contract_id
+            && record.state == ContractResolutionState::AwaitingResolution
+    }));
+    assert!(records.iter().any(|record| {
+        record.contract_id == expired.contract_id
+            && record.state == ContractResolutionState::Expired
+    }));
+
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to release-seam database");
+    sqlx::query(
+        "UPDATE contract_resolution_cases SET next_probe_at = now() - interval '1 second' WHERE contract_id IN (44,45,47)",
+    )
+    .execute(&raw_pool)
+    .await
+    .expect("make persisted awaiting cases eligible for public resolution");
+    sqlx::query(
+        "UPDATE esi_cache_metadata SET expires_at = now() - interval '1 second' WHERE resource_key IN ('contracts/public/items/44','contracts/public/items/45','contracts/public/items/47')",
+    )
+    .execute(&raw_pool)
+    .await
+    .expect("expire cached public item representations before resolution probes");
+    raw_pool.close().await;
+
+    let resolved = ContractCollector::new(
+        store.clone(),
+        Arc::new(ResolutionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![listed], expiring_page(1))),
+                )]),
+                items: HashMap::new(),
+            },
+            probes: StdMutex::new(vec![
+                Ok(ContractItemProbe::NoContent(expiring_cache())),
+                Ok(ContractItemProbe::NoContent(expiring_cache())),
+                Ok(ContractItemProbe::NotFound(expiring_cache())),
+            ]),
+            probe_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(ship_groups, delivery.clone())
+    .collect_cycle()
+    .await
+    .expect("resolve persisted public evidence");
+    assert!(resolved
+        .events
+        .iter()
+        .any(|event| event.kind == ContractEventKind::SaleConfirmed));
+    assert!(resolved
+        .events
+        .iter()
+        .any(|event| event.kind == ContractEventKind::PurchaseConfirmed));
+    assert!(resolved
+        .events
+        .iter()
+        .any(|event| event.kind == ContractEventKind::ClosedOutcomeUnknown));
+
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 5);
+    assert!(sent
+        .iter()
+        .all(|delivery| delivery.subscription_id != "nonmatching"));
+    assert!(sent.iter().all(|delivery| !delivery.ping));
+    drop(sent);
+    let delivery_records = store
+        .delivery_records()
+        .await
+        .expect("prepared deliveries are committed before send");
+    assert_eq!(delivery_records.len(), 5);
+    assert!(delivery_records
+        .iter()
+        .all(|record| record.status == DeliveryStatus::Sent));
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn a_resolution_probe_failure_does_not_discard_prior_listings_or_confirmations() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
@@ -2208,7 +2457,7 @@ async fn http_esi_accepts_a_public_contract_when_false_for_corporation_is_omitte
     let server = OneShotHttpServer::start(
         200,
         &[("X-Pages", "1"), ("Cache-Control", "max-age=60")],
-        r#"[{"availability":"public","buyout":2500000000.0,"collateral":750000000.0,"contract_id":44,"date_expired":"2026-08-14T12:00:00Z","date_issued":"2026-08-13T12:00:00Z","days_to_complete":0,"issuer_corporation_id":98000001,"issuer_id":90000001,"price":1500000000.0,"reward":0.0,"start_location_id":60003760,"type":"item_exchange","volume":115000.0}]"#,
+        ESI_PUBLIC_CONTRACT_SUMMARY_FIXTURE,
     );
     let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
         .expect("construct HTTP ESI client");
@@ -2220,8 +2469,9 @@ async fn http_esi_accepts_a_public_contract_when_false_for_corporation_is_omitte
 
     let contract = response.value.expect("response body").remove(0);
     assert!(!contract.for_corporation);
-    assert_eq!(contract.buyout, Some(2_500_000_000.0));
-    assert_eq!(contract.collateral, Some(750_000_000.0));
+    assert_eq!(contract.contract_id, 234_057_619);
+    assert_eq!(contract.price, 388_000_000.0);
+    assert_eq!(contract.end_location_id, Some(60_003_760));
     server.finish();
 }
 
@@ -2230,7 +2480,7 @@ async fn http_esi_preserves_public_blueprint_item_facts() {
     let server = OneShotHttpServer::start(
         200,
         &[("Cache-Control", "max-age=60")],
-        r#"[{"is_blueprint_copy":true,"is_included":true,"item_id":1001,"material_efficiency":10,"quantity":1,"record_id":1,"runs":3,"time_efficiency":20,"type_id":587}]"#,
+        ESI_PUBLIC_CONTRACT_ITEMS_FIXTURE,
     );
     let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
         .expect("construct HTTP ESI client");
@@ -2242,9 +2492,10 @@ async fn http_esi_preserves_public_blueprint_item_facts() {
 
     let item = response.value.expect("response body").remove(0);
     assert_eq!(item.is_blueprint_copy, Some(true));
-    assert_eq!(item.material_efficiency, Some(10));
-    assert_eq!(item.runs, Some(3));
-    assert_eq!(item.time_efficiency, Some(20));
+    assert_eq!(item.material_efficiency, Some(0));
+    assert_eq!(item.runs, Some(1));
+    assert_eq!(item.time_efficiency, Some(0));
+    assert_eq!(item.type_id, 48_473);
     server.finish();
 }
 
@@ -3022,6 +3273,58 @@ async fn contract_database_retries_do_not_block_an_unrelated_runtime_task() {
     );
     assert!(!collection.is_finished());
     collection.abort();
+}
+
+#[tokio::test]
+async fn contract_migrations_apply_to_clean_and_already_current_databases() {
+    let database = TemporaryDatabase::new().await;
+    let clean_store = database.store().await;
+    let validation_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to clean migrated database");
+    for table in [
+        "regional_collection_metadata",
+        "contract_subscriptions",
+        "contract_outbound_deliveries",
+        "contract_resolution_cases",
+        "contract_observed_embed_contexts",
+    ] {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(table)
+            .fetch_one(&validation_pool)
+            .await
+            .expect("read migrated table from clean database");
+        assert!(exists, "migration created {table}");
+    }
+    assert_eq!(
+        clean_store
+            .storage_counts()
+            .await
+            .expect("read from clean migrated database"),
+        killbot_rust::contract_intelligence::StorageCounts {
+            contract_facts: 0,
+            manifests: 0,
+            presence_intervals: 0,
+        }
+    );
+    let current_store = ContractCollectionStore::connect(&database.url)
+        .await
+        .expect("reapply migrations to an already-current database");
+    assert_eq!(
+        current_store
+            .storage_counts()
+            .await
+            .expect("read from already-current database"),
+        killbot_rust::contract_intelligence::StorageCounts {
+            contract_facts: 0,
+            manifests: 0,
+            presence_intervals: 0,
+        }
+    );
+    validation_pool.close().await;
+    database.destroy().await;
 }
 
 #[tokio::test]
@@ -7487,4 +7790,53 @@ async fn http_esi_station_not_found_keeps_location_context_indeterminate() {
         ContractContextValue::Indeterminate
     );
     server.finish();
+}
+
+#[tokio::test]
+#[ignore = "manual visual check; requires DISCORD_BOT_TOKEN and CONTRACT_TEST_DISCORD_CHANNEL_ID and sends one non-pinging embed"]
+async fn manual_contract_embed_visual_delivery() {
+    dotenvy::dotenv().ok();
+    let token = std::env::var("DISCORD_BOT_TOKEN")
+        .expect("DISCORD_BOT_TOKEN is required for the manual contract embed check");
+    let channel_id = std::env::var("CONTRACT_TEST_DISCORD_CHANNEL_ID")
+        .expect("CONTRACT_TEST_DISCORD_CHANNEL_ID is required for the manual contract embed check")
+        .parse()
+        .expect("CONTRACT_TEST_DISCORD_CHANNEL_ID must be a Discord snowflake");
+    let delivery = DiscordContractDelivery::new(Arc::new(serenity::http::Http::new(&token)));
+    let message_id = delivery
+        .send(PreparedContractDelivery {
+            delivery_id: 0,
+            guild_id: 0,
+            channel_id,
+            subscription_id: "manual-contract-embed-check".to_string(),
+            contract_id: 234_057_619,
+            event_kind: ContractEventKind::SaleConfirmed,
+            ping: false,
+            ping_type: ContractPingType::Here,
+            nonce: "manual-contract-embed-check".to_string(),
+            enforce_nonce: false,
+            message: ContractNotificationMessage {
+                title: "Manual contract embed check".to_string(),
+                description: Some(
+                    "This non-pinging message is safe to delete after visual review.".to_string(),
+                ),
+                fields: vec![
+                    killbot_rust::contract_intelligence::ContractEmbedField {
+                        name: "Event".to_string(),
+                        value: "Sale Confirmed".to_string(),
+                        inline: true,
+                    },
+                    killbot_rust::contract_intelligence::ContractEmbedField {
+                        name: "Contract Address".to_string(),
+                        value: "contract:0//234057619".to_string(),
+                        inline: false,
+                    },
+                ],
+                thumbnail_url: None,
+                footer: Some("Manual visual check".to_string()),
+            },
+        })
+        .await
+        .expect("send manual contract embed");
+    assert!(!message_id.is_empty());
 }

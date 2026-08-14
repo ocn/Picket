@@ -1,0 +1,18 @@
+[
+  {
+    "collateral": 0.0,
+    "contract_id": 234057619,
+    "date_expired": "2026-08-14T09:28:25Z",
+    "date_issued": "2026-07-17T09:28:25Z",
+    "days_to_complete": 0,
+    "end_location_id": 60003760,
+    "issuer_corporation_id": 98595110,
+    "issuer_id": 2121772332,
+    "price": 388000000.0,
+    "reward": 0.0,
+    "start_location_id": 60003760,
+    "title": "",
+    "type": "item_exchange",
+    "volume": 5.08999999999995
+  }
+]

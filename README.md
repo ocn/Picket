@@ -26,6 +26,7 @@ The bot operates by subscribing to a data feed from zkillboard.com and processes
 - [Commands](#commands)
 - [Advanced Examples](#advanced-examples)                                                                                                                                    
 - [Manual Configuration](#manual-configuration)
+- [Global Public Contract Intelligence](#global-public-contract-intelligence)
 - [Development](#development)
 - [Contact](#contact)
 - [License](#license)
@@ -133,6 +134,10 @@ This JSON structure is equivalent to the example `/subscribe` command shown abov
   }
 ]
 ```
+
+## Global Public Contract Intelligence
+
+The public-contract feed is documented in [the operator runbook](docs/contract-intelligence.md). It is an optional PostgreSQL-backed feed and does not migrate or replace the JSON-backed killmail configuration.
 
 ## Development
 
