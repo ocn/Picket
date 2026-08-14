@@ -4938,7 +4938,7 @@ async fn new_listed_ship_contracts_notify_each_matching_subscription_once_after_
             .as_deref()
             .is_some_and(|description| {
                 description.lines().next().is_some_and(|line| {
-                    line.starts_with("<url=\"contract:0//45\">") && line.ends_with("</url>")
+                    line.starts_with("`<url=\"contract:0//45\">") && line.ends_with("</url>`")
                 }) && !description.contains("@everyone")
                     && !description.contains("<@1234>")
             })
@@ -5351,10 +5351,10 @@ async fn snapshot_backfill_cap_counts_missing_contexts_and_terminal_delivery_use
         .message
         .description
         .as_deref()
-        .is_some_and(|description| description
-            .lines()
-            .any(|line| { line == format!("Backfilled Issuer {}", last_contract.contract_id) })
-            && !description.contains(&last_contract.issuer_id.to_string())));
+        .is_some_and(|description| description.lines().any(|line| {
+            line == format!("issuer: Backfilled Issuer {}", last_contract.contract_id)
+        }) && !description
+            .contains(&last_contract.issuer_id.to_string())));
     drop(sent);
 
     database.destroy().await;
@@ -5503,7 +5503,7 @@ async fn terminal_only_subscription_uses_the_persisted_observation_time_context(
         .is_some_and(|description| {
             description
                 .lines()
-                .any(|line| line == "Observed Issuer • Observed Corporation • Observed Alliance")
+                .any(|line| line == "issuer: [Observed Alliance] Observed Issuer")
                 && !description.contains("90000001")
                 && !description.contains("98000001")
                 && !description.contains("99000111")
@@ -5975,7 +5975,7 @@ async fn oversized_matched_bundles_produce_a_compact_embed_and_preserve_the_full
     );
     assert!(message.description.as_deref().is_some_and(|description| {
         description.lines().next().is_some_and(|line| {
-            line.starts_with("<url=\"contract:0//45\">") && line.ends_with("</url>")
+            line.starts_with("`<url=\"contract:0//45\">") && line.ends_with("</url>`")
         }) && !description.contains("Type 1000001")
     }));
     assert!(message
@@ -8012,7 +8012,7 @@ async fn contract_notifications_render_only_filter_matched_ship_items() {
         .description
         .as_deref()
         .is_some_and(|description| description
-            .starts_with("<url=\"contract:0//45\">Type 19720 - Location 60003760</url>")
+            .starts_with("`<url=\"contract:0//45\">Type 19720 - Location 60003760</url>`")
             && !description.contains("Type 587")));
     let isk_only = sent
         .iter()
@@ -8024,7 +8024,7 @@ async fn contract_notifications_render_only_filter_matched_ship_items() {
         .description
         .as_deref()
         .is_some_and(|description| description
-            .starts_with("<url=\"contract:0//45\">Public contract - Location 60003760</url>")
+            .starts_with("`<url=\"contract:0//45\">Public contract - Location 60003760</url>`")
             && !description.contains("Type 587")
             && !description.contains("Type 19720")));
     assert!(sent
