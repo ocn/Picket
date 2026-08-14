@@ -21,6 +21,7 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 const CONTRACT_COLLECTOR_USER_AGENT: &str = "killbot-rust Global Public Contract Intelligence";
 const MAX_EMBED_CONTEXT_ENRICHMENTS_PER_CYCLE: usize = 8;
 const DISCORD_NONCE_ENFORCEMENT_WINDOW: ChronoDuration = ChronoDuration::minutes(5);
+const DEFAULT_COLLECTION_RECOVERY_GAP: ChronoDuration = ChronoDuration::minutes(15);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PublicContract {
@@ -1166,6 +1167,16 @@ pub struct StorageCounts {
     pub presence_intervals: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractCollectionFailure {
+    pub id: i64,
+    pub region_id: Option<i64>,
+    pub observed_at: DateTime<Utc>,
+    pub failure_kind: String,
+    pub detail: String,
+    pub retry_after: Option<DateTime<Utc>>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ContractPartyHistory {
     pub confirmed_sales: i64,
@@ -2034,6 +2045,53 @@ impl ContractCollectionStore {
         })
     }
 
+    pub async fn prune_successful_scan_diagnostics(&self) -> Result<u64, sqlx::Error> {
+        Ok(sqlx::query(
+            "DELETE FROM regional_observations WHERE outcome = 'complete' AND observed_at < now() - interval '90 days'",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    pub async fn unresolved_collection_failures(
+        &self,
+    ) -> Result<Vec<ContractCollectionFailure>, sqlx::Error> {
+        sqlx::query("SELECT id, region_id, observed_at, failure_kind, detail, retry_after FROM contract_collection_failures WHERE resolved_at IS NULL AND classification IS NULL ORDER BY observed_at, id")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(ContractCollectionFailure {
+                    id: row.get("id"),
+                    region_id: row.get("region_id"),
+                    observed_at: row.get("observed_at"),
+                    failure_kind: row.get("failure_kind"),
+                    detail: row.get("detail"),
+                    retry_after: row.get("retry_after"),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn classify_collection_failure(
+        &self,
+        failure_id: i64,
+        classification: &str,
+    ) -> Result<bool, sqlx::Error> {
+        if classification.trim().is_empty() {
+            return Err(sqlx::Error::Protocol(
+                "collection failure classification must not be empty".to_string(),
+            ));
+        }
+        let result = sqlx::query("UPDATE contract_collection_failures SET classification = $2, resolved_at = now() WHERE id = $1 AND resolved_at IS NULL AND classification IS NULL")
+            .bind(failure_id)
+            .bind(classification)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn observed_embed_context(
         &self,
         region_id: i64,
@@ -2505,17 +2563,23 @@ impl ContractCollectionStore {
         region_id: i64,
         expected_pages: u32,
         contracts: &[ObservedContract],
+        recovery_gap: ChronoDuration,
     ) -> Result<RecordComplete, sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
         let now = Utc::now();
         sqlx::query("INSERT INTO regional_collection_metadata (region_id) VALUES ($1) ON CONFLICT (region_id) DO NOTHING").bind(region_id).execute(&mut *transaction).await?;
-        let baseline_at: Option<DateTime<Utc>> = sqlx::query(
-            "SELECT baseline_at FROM regional_collection_metadata WHERE region_id = $1 FOR UPDATE",
+        let regional_metadata = sqlx::query(
+            "SELECT baseline_at, last_complete_at FROM regional_collection_metadata WHERE region_id = $1 FOR UPDATE",
         )
         .bind(region_id)
         .fetch_one(&mut *transaction)
-        .await?
-        .get("baseline_at");
+        .await?;
+        let baseline_at: Option<DateTime<Utc>> = regional_metadata.get("baseline_at");
+        let last_complete_at: Option<DateTime<Utc>> = regional_metadata.get("last_complete_at");
+        let recovery_baseline = baseline_at.is_some()
+            && last_complete_at.is_some_and(|last_complete_at| {
+                now.signed_duration_since(last_complete_at) > recovery_gap
+            });
         let mut newly_observed = Vec::new();
         for observed in contracts {
             let previously_observed = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM presence_intervals WHERE region_id = $1 AND contract_id = $2)")
@@ -2523,7 +2587,7 @@ impl ContractCollectionStore {
                 .bind(observed.contract.contract_id)
                 .fetch_one(&mut *transaction)
                 .await?;
-            if baseline_at.is_some() && !previously_observed {
+            if baseline_at.is_some() && !recovery_baseline && !previously_observed {
                 newly_observed.push(observed.clone());
             }
             let facts = serde_json::to_value(&observed.contract).map_err(json_to_sqlx)?;
@@ -2566,7 +2630,14 @@ impl ContractCollectionStore {
             let next_probe_at = cached_probe_at
                 .map(|expires_at| std::cmp::min(expires_at, contract.date_expired))
                 .unwrap_or(now);
-            let inserted = sqlx::query_scalar::<_, i64>("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$6,$7,'awaiting_resolution') ON CONFLICT (region_id, contract_id) DO NOTHING RETURNING contract_id")
+            if recovery_baseline {
+                sqlx::query("UPDATE contract_resolution_cases SET suppresses_nonfinancial_notification = TRUE, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution'")
+                    .bind(region_id)
+                    .bind(contract_id)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            let inserted = sqlx::query_scalar::<_, i64>("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state, suppresses_nonfinancial_notification) VALUES ($1,$2,$3,$4,$5,$6,$7,'awaiting_resolution',$8) ON CONFLICT (region_id, contract_id) DO NOTHING RETURNING contract_id")
                 .bind(region_id)
                 .bind(contract_id)
                 .bind(serde_json::to_value(&contract).map_err(json_to_sqlx)?)
@@ -2574,6 +2645,7 @@ impl ContractCollectionStore {
                 .bind(last_public_observed_at)
                 .bind(now)
                 .bind(next_probe_at)
+                .bind(recovery_baseline)
                 .fetch_optional(&mut *transaction)
                 .await?;
             if inserted.is_some() {
@@ -2590,10 +2662,12 @@ impl ContractCollectionStore {
             }
         }
         sqlx::query("INSERT INTO regional_observations (region_id, observed_at, outcome, expected_pages) VALUES ($1,$2,'complete',$3)").bind(region_id).bind(now).bind(expected_pages as i32).execute(&mut *transaction).await?;
-        sqlx::query("UPDATE regional_collection_metadata SET baseline_at = COALESCE(baseline_at, $2), complete_observations = complete_observations + 1, last_complete_at = $2 WHERE region_id = $1").bind(region_id).bind(now).execute(&mut *transaction).await?;
+        sqlx::query("UPDATE contract_collection_failures SET resolved_at = $2 WHERE region_id = $1 AND failure_kind = 'inconclusive_observation' AND resolved_at IS NULL AND classification IS NULL").bind(region_id).bind(now).execute(&mut *transaction).await?;
+        sqlx::query("UPDATE regional_collection_metadata SET baseline_at = COALESCE(baseline_at, $2), complete_observations = complete_observations + 1, last_complete_at = $2, recovery_baseline_at = CASE WHEN $3 THEN $2 ELSE recovery_baseline_at END WHERE region_id = $1").bind(region_id).bind(now).bind(recovery_baseline).execute(&mut *transaction).await?;
         transaction.commit().await?;
         Ok(RecordComplete {
             baseline_established: baseline_at.is_none(),
+            recovery_baseline,
             observed_contracts: contracts.len(),
             newly_observed,
             observed: contracts.to_vec(),
@@ -2629,10 +2703,23 @@ impl ContractCollectionStore {
         Ok(())
     }
 
+    async fn resolve_collection_failures(
+        &self,
+        region_id: Option<i64>,
+        failure_kind: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE contract_collection_failures SET resolved_at = now() WHERE region_id IS NOT DISTINCT FROM $1 AND failure_kind = $2 AND resolved_at IS NULL AND classification IS NULL")
+            .bind(region_id)
+            .bind(failure_kind)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn awaiting_resolution_cases(
         &self,
     ) -> Result<Vec<AwaitingContractResolution>, sqlx::Error> {
-        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at FROM contract_resolution_cases WHERE state = 'awaiting_resolution' AND next_probe_at <= now() ORDER BY region_id, contract_id")
+        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, suppresses_nonfinancial_notification FROM contract_resolution_cases WHERE state = 'awaiting_resolution' AND next_probe_at <= now() ORDER BY region_id, contract_id")
             .fetch_all(&self.pool)
             .await?
             .into_iter()
@@ -2644,6 +2731,8 @@ impl ContractCollectionStore {
                     manifest: serde_json::from_value(row.get("manifest")).map_err(json_to_sqlx)?,
                     last_public_observed_at: row.get("last_public_observed_at"),
                     absence_observed_at: row.get("absence_observed_at"),
+                    suppresses_nonfinancial_notification: row
+                        .get("suppresses_nonfinancial_notification"),
                 })
             })
             .collect()
@@ -2740,7 +2829,7 @@ impl ContractCollectionStore {
             }
         };
         let mut transaction = self.pool.begin().await?;
-        let resolved = sqlx::query_scalar::<_, i64>("UPDATE contract_resolution_cases SET state = $3, notification_pending = TRUE, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution' RETURNING contract_id")
+        let resolved = sqlx::query_scalar::<_, i64>("UPDATE contract_resolution_cases SET state = $3, notification_pending = NOT suppresses_nonfinancial_notification, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution' RETURNING contract_id")
             .bind(resolution.region_id)
             .bind(resolution.contract_id)
             .bind(state_name)
@@ -2903,6 +2992,7 @@ struct AwaitingContractResolution {
     manifest: ItemManifest,
     last_public_observed_at: DateTime<Utc>,
     absence_observed_at: DateTime<Utc>,
+    suppresses_nonfinancial_notification: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2926,6 +3016,7 @@ struct ResolutionCaseKey {
 #[derive(Clone, Debug)]
 struct RecordComplete {
     baseline_established: bool,
+    recovery_baseline: bool,
     observed_contracts: usize,
     newly_observed: Vec<ObservedContract>,
     observed: Vec<ObservedContract>,
@@ -2973,6 +3064,9 @@ pub enum CollectionOutcome {
     BaselineEstablished {
         region_id: i64,
     },
+    RecoveryBaselineEstablished {
+        region_id: i64,
+    },
     Complete {
         region_id: i64,
         observed_contracts: usize,
@@ -3017,6 +3111,7 @@ pub struct ContractCollector {
     esi: Arc<dyn PublicContractEsi>,
     notifications: Option<ContractNotifications>,
     delivery_clock: Arc<dyn ContractDeliveryClock>,
+    recovery_gap: ChronoDuration,
 }
 
 struct ContractNotifications {
@@ -3066,6 +3161,7 @@ impl ContractCollector {
             esi,
             notifications: None,
             delivery_clock: Arc::new(SystemContractDeliveryClock),
+            recovery_gap: DEFAULT_COLLECTION_RECOVERY_GAP,
         }
     }
 
@@ -3100,13 +3196,23 @@ impl ContractCollector {
         self
     }
 
+    pub fn with_recovery_gap(mut self, recovery_gap: ChronoDuration) -> Self {
+        self.recovery_gap = recovery_gap.max(ChronoDuration::zero());
+        self
+    }
+
     pub async fn collect_cycle(&self) -> Result<CollectionReport, ContractCollectionError> {
         if let Some(notifications) = &self.notifications {
             self.deliver_prepared_notifications(notifications).await?;
         }
         self.ensure_esi_limiter_allows_requests().await?;
         let regions = match self.regions().await {
-            Ok(regions) => regions,
+            Ok(regions) => {
+                self.store
+                    .resolve_collection_failures(None, "region_discovery")
+                    .await?;
+                regions
+            }
             Err(error) => {
                 self.store
                     .record_failure(
@@ -3150,6 +3256,8 @@ impl ContractCollector {
                     }));
                     outcomes.push(if recorded.baseline_established {
                         CollectionOutcome::BaselineEstablished { region_id }
+                    } else if recorded.recovery_baseline {
+                        CollectionOutcome::RecoveryBaselineEstablished { region_id }
                     } else {
                         CollectionOutcome::Complete {
                             region_id,
@@ -3260,7 +3368,7 @@ impl ContractCollector {
         }
         Ok(self
             .store
-            .record_complete(region_id, expected_pages, &observed)
+            .record_complete(region_id, expected_pages, &observed, self.recovery_gap)
             .await?)
     }
 
@@ -3473,6 +3581,7 @@ impl ContractCollector {
             .store
             .resolve_nonfinancial_terminal(resolution, state, observed_at)
             .await?
+            && !resolution.suppresses_nonfinancial_notification
         {
             return Ok(nonfinancial_terminal_event(resolution, state));
         }
@@ -4321,6 +4430,7 @@ fn terminal_resolution_event(resolution: &TerminalContractResolution) -> Option<
                     manifest: resolution.manifest.clone(),
                     last_public_observed_at: resolution.last_public_observed_at,
                     absence_observed_at: resolution.absence_observed_at,
+                    suppresses_nonfinancial_notification: false,
                 },
                 resolution.state,
             )
@@ -5417,6 +5527,7 @@ pub async fn run_contract_collection_loop_with_notifications(
             }
         }
     };
+    let mut consecutive_failures = 0_u32;
     loop {
         let mut delay = interval;
         match ContractCollectionStore::connect(&database_url).await {
@@ -5428,22 +5539,43 @@ pub async fn run_contract_collection_loop_with_notifications(
                         notifications.ship_groups.clone(),
                         notifications.delivery.clone(),
                         notifications.ping_limiter.clone(),
-                    );
+                    )
+                    .with_recovery_gap(collection_recovery_gap(interval));
                 match collector.collect_cycle().await {
                     Ok(report) => {
-                        delay = collection_retry_delay(interval, report.retry_after);
+                        if report.retry_after.is_some()
+                            || report.regions.iter().any(|outcome| {
+                                matches!(outcome, CollectionOutcome::Inconclusive { .. })
+                            })
+                        {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            delay = collection_retry_delay(
+                                interval,
+                                report.retry_after,
+                                consecutive_failures,
+                            );
+                        } else {
+                            consecutive_failures = 0;
+                        }
                         info!(
                             regions = report.regions.len(),
                             "contract collection cycle finished"
                         )
                     }
                     Err(error) => {
-                        delay = collection_retry_delay(interval, error.retry_after());
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        delay = collection_retry_delay(
+                            interval,
+                            error.retry_after(),
+                            consecutive_failures,
+                        );
                         warn!("contract collection paused after failure: {error}")
                     }
                 }
             }
             Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                delay = collection_retry_delay(interval, None, consecutive_failures);
                 *store_handle.write().await = None;
                 warn!("contract collection database unavailable; retrying without an in-memory fallback: {error}")
             }
@@ -5467,6 +5599,7 @@ async fn run_contract_collection_loop_inner(
             }
         }
     };
+    let mut consecutive_failures = 0_u32;
     loop {
         let mut delay = interval;
         match ContractCollectionStore::connect(&database_url).await {
@@ -5478,28 +5611,72 @@ async fn run_contract_collection_loop_inner(
                         notifications.delivery.clone(),
                     );
                 }
+                collector = collector.with_recovery_gap(collection_recovery_gap(interval));
                 match collector.collect_cycle().await {
                     Ok(report) => {
-                        delay = collection_retry_delay(interval, report.retry_after);
-                        info!(regions = report.regions.len(), "contract collection cycle finished")
+                        if report.retry_after.is_some()
+                            || report.regions.iter().any(|outcome| {
+                                matches!(outcome, CollectionOutcome::Inconclusive { .. })
+                            })
+                        {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            delay = collection_retry_delay(
+                                interval,
+                                report.retry_after,
+                                consecutive_failures,
+                            );
+                        } else {
+                            consecutive_failures = 0;
+                        }
+                        info!(
+                            regions = report.regions.len(),
+                            "contract collection cycle finished"
+                        )
                     }
                     Err(error) => {
-                        delay = collection_retry_delay(interval, error.retry_after());
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        delay = collection_retry_delay(
+                            interval,
+                            error.retry_after(),
+                            consecutive_failures,
+                        );
                         warn!("contract collection paused after failure: {error}")
                     }
                 }
             }
-            Err(error) => warn!("contract collection database unavailable; retrying without an in-memory fallback: {error}"),
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                delay = collection_retry_delay(interval, None, consecutive_failures);
+                warn!("contract collection database unavailable; retrying without an in-memory fallback: {error}")
+            }
         }
         tokio::time::sleep(delay).await;
     }
 }
 
-fn collection_retry_delay(interval: Duration, retry_after: Option<DateTime<Utc>>) -> Duration {
+pub fn collection_retry_delay(
+    interval: Duration,
+    retry_after: Option<DateTime<Utc>>,
+    consecutive_failures: u32,
+) -> Duration {
+    const MAX_COLLECTION_RETRY_DELAY: Duration = Duration::from_secs(300);
+    let base_delay = interval
+        .max(Duration::from_millis(10))
+        .min(MAX_COLLECTION_RETRY_DELAY);
+    let multiplier = 1_u32 << consecutive_failures.saturating_sub(1).min(16);
+    let exponential_delay = base_delay
+        .checked_mul(multiplier)
+        .unwrap_or(MAX_COLLECTION_RETRY_DELAY)
+        .min(MAX_COLLECTION_RETRY_DELAY);
     let retry_delay = retry_after
         .and_then(|retry_after| (retry_after - Utc::now()).to_std().ok())
         .unwrap_or_default();
-    interval.max(retry_delay)
+    exponential_delay.max(retry_delay)
+}
+
+fn collection_recovery_gap(interval: Duration) -> ChronoDuration {
+    let interval_seconds = i64::try_from(interval.as_secs()).unwrap_or(i64::MAX);
+    ChronoDuration::seconds(interval_seconds.saturating_mul(3).max(15 * 60))
 }
 
 #[cfg(test)]
