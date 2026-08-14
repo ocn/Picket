@@ -12,7 +12,7 @@ use killbot_rust::contract_intelligence::{
     ContractPingType, ContractResolutionState, ContractSubscription, DeliveryFailureKind,
     DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HttpPublicContractEsi,
     PreparedContractDelivery, PublicContract, PublicContractEsi, PublicContractItem,
-    ShipGroupLookup, ShipGroupResolver,
+    ShipGroupLookup, ShipGroupResolver, SolarSystemPosition,
 };
 use killbot_rust::esi::EsiClient;
 use killbot_rust::feed::{FeedError, KillmailFeed};
@@ -254,6 +254,23 @@ struct FakeEsi {
 struct ContextualFakeEsi {
     inner: FakeEsi,
     context: ContractObservationContext,
+}
+
+struct PositionEsi {
+    inner: FakeEsi,
+    contexts: HashMap<i64, ContractObservationContext>,
+    positions: HashMap<u32, SolarSystemPosition>,
+    position_calls: StdMutex<Vec<u32>>,
+}
+
+struct PositionedResolutionEsi {
+    inner: ResolutionEsi,
+    positions: HashMap<u32, SolarSystemPosition>,
+    position_calls: StdMutex<Vec<u32>>,
+}
+
+struct LimitedPositionEsi {
+    inner: PositionEsi,
 }
 
 struct CountingContextEsi {
@@ -587,6 +604,160 @@ impl PublicContractEsi for ContextualFakeEsi {
             self.context.clone(),
             CacheMetadata::cached_for_seconds(0),
         ))
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for PositionEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+
+    async fn observed_contract_context(
+        &self,
+        contract: &PublicContract,
+        _requirements: ContractContextRequirements,
+    ) -> Result<EsiResponse<ContractObservationContext>, EsiError> {
+        Ok(EsiResponse::fresh(
+            self.contexts
+                .get(&contract.contract_id)
+                .cloned()
+                .unwrap_or_default(),
+            CacheMetadata::cached_for_seconds(60),
+        ))
+    }
+
+    async fn solar_system_position(
+        &self,
+        solar_system_id: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<SolarSystemPosition>, EsiError> {
+        self.position_calls.lock().unwrap().push(solar_system_id);
+        self.positions
+            .get(&solar_system_id)
+            .copied()
+            .map(|position| EsiResponse::fresh(position, CacheMetadata::cached_for_seconds(60)))
+            .ok_or_else(|| EsiError::retryable("position unavailable", None))
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for PositionedResolutionEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+
+    async fn public_contract_items_probe(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<ContractItemProbe, EsiError> {
+        self.inner
+            .public_contract_items_probe(contract_id, etag)
+            .await
+    }
+
+    async fn solar_system_position(
+        &self,
+        solar_system_id: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<SolarSystemPosition>, EsiError> {
+        self.position_calls.lock().unwrap().push(solar_system_id);
+        self.positions
+            .get(&solar_system_id)
+            .copied()
+            .map(|position| EsiResponse::fresh(position, CacheMetadata::cached_for_seconds(60)))
+            .ok_or_else(|| EsiError::retryable("position unavailable", None))
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for LimitedPositionEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+
+    async fn observed_contract_context(
+        &self,
+        contract: &PublicContract,
+        requirements: ContractContextRequirements,
+    ) -> Result<EsiResponse<ContractObservationContext>, EsiError> {
+        self.inner
+            .observed_contract_context(contract, requirements)
+            .await
+    }
+
+    async fn solar_system_position(
+        &self,
+        solar_system_id: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<SolarSystemPosition>, EsiError> {
+        let mut response = self
+            .inner
+            .solar_system_position(solar_system_id, etag)
+            .await?;
+        if self.inner.position_calls.lock().unwrap().len() == 1 {
+            response.metadata.rate_limit_limit = Some("1/1m".to_string());
+            response.metadata.rate_limit_remaining = Some(0);
+        }
+        Ok(response)
     }
 }
 
@@ -1042,6 +1213,14 @@ fn regional_esi(
             Ok(EsiResponse::fresh(contracts, expiring_page(1))),
         )]),
         items,
+    }
+}
+
+fn position_at_light_years(x: f64) -> SolarSystemPosition {
+    SolarSystemPosition {
+        x: x * 9_460_730_472_580_800.0,
+        y: 0.0,
+        z: 0.0,
     }
 }
 
@@ -2556,6 +2735,399 @@ async fn resolve_candidate_branch_after_unknown_location(
         .collect();
     database.destroy().await;
     (first_context_calls, first_deliveries, titles)
+}
+
+#[tokio::test]
+async fn light_year_ranges_match_either_center_include_the_boundary_and_cache_centers() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let baseline = item_exchange_contract(44);
+    let listed = (45..49).map(item_exchange_contract).collect::<Vec<_>>();
+    let mut all_contracts = vec![baseline.clone()];
+    all_contracts.extend(listed.clone());
+    let items = all_contracts
+        .iter()
+        .map(|contract| {
+            (
+                contract.contract_id,
+                Ok(EsiResponse::fresh(
+                    vec![offered_ship(contract.contract_id)],
+                    expiring_cache(),
+                )),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![baseline], expiring_page(1))),
+            )]),
+            items: items.clone(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "near-either-center".to_string(),
+            description: "within eight light-years of either center".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                    config::SystemRange {
+                        system_id: 30_002_086,
+                        range: 8.0,
+                    },
+                    config::SystemRange {
+                        system_id: 30_003_089,
+                        range: 8.0,
+                    },
+                ])),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist the range subscription");
+    let persisted = store
+        .contract_subscriptions_for_channel(42, 77)
+        .await
+        .expect("read the persisted range subscription");
+    assert!(matches!(
+        persisted[0].filter.root,
+        ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(ref ranges))
+            if ranges == &vec![
+                config::SystemRange { system_id: 30_002_086, range: 8.0 },
+                config::SystemRange { system_id: 30_003_089, range: 8.0 },
+            ]
+    ));
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let positions = HashMap::from([
+        (30_002_086, position_at_light_years(0.0)),
+        (30_003_089, position_at_light_years(20.0)),
+        (30_000_045, position_at_light_years(0.0)),
+        (30_000_046, position_at_light_years(20.0)),
+        (30_000_047, position_at_light_years(10.0)),
+        (30_000_048, position_at_light_years(8.0)),
+    ]);
+    let contexts = HashMap::from([
+        (
+            45,
+            ContractObservationContext {
+                solar_system_id: Some(30_000_045),
+                ..ContractObservationContext::default()
+            },
+        ),
+        (
+            46,
+            ContractObservationContext {
+                solar_system_id: Some(30_000_046),
+                ..ContractObservationContext::default()
+            },
+        ),
+        (
+            47,
+            ContractObservationContext {
+                solar_system_id: Some(30_000_047),
+                ..ContractObservationContext::default()
+            },
+        ),
+        (
+            48,
+            ContractObservationContext {
+                solar_system_id: Some(30_000_048),
+                ..ContractObservationContext::default()
+            },
+        ),
+    ]);
+    let esi = Arc::new(PositionEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(all_contracts, expiring_page(1))),
+            )]),
+            items,
+        },
+        contexts,
+        positions,
+        position_calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), esi.clone())
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+        .collect_cycle()
+        .await
+        .expect("evaluate range positions");
+
+    let sent_contract_ids = delivery
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|delivery| delivery.contract_id)
+        .collect::<Vec<_>>();
+    assert_eq!(sent_contract_ids, vec![45, 46, 48]);
+    let position_calls = esi.position_calls.lock().unwrap();
+    assert_eq!(
+        position_calls
+            .iter()
+            .filter(|system_id| **system_id == 30_002_086)
+            .count(),
+        1
+    );
+    assert_eq!(
+        position_calls
+            .iter()
+            .filter(|system_id| **system_id == 30_003_089)
+            .count(),
+        1
+    );
+    drop(position_calls);
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn light_year_ranges_do_not_fetch_positions_after_a_cheap_local_miss() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let baseline = item_exchange_contract(44);
+    let listed = item_exchange_contract(45);
+    let items = HashMap::from([
+        (
+            44,
+            Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+        ),
+        (
+            45,
+            Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+        ),
+    ]);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(vec![baseline.clone()], items.clone())),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "sale-near-center".to_string(),
+            description: "sale events near a center".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::And(vec![
+                    ContractFilterNode::Condition(ContractFilterCondition::EventKinds(vec![
+                        ContractEventKind::SaleConfirmed,
+                    ])),
+                    ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                        config::SystemRange {
+                            system_id: 30_002_086,
+                            range: 8.0,
+                        },
+                    ])),
+                ]),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist the cheap-miss subscription");
+    let esi = Arc::new(PositionEsi {
+        inner: regional_esi(vec![baseline, listed], items),
+        contexts: HashMap::new(),
+        positions: HashMap::new(),
+        position_calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), esi.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::new())),
+            Arc::new(RecordingDelivery {
+                store: store.clone(),
+                sent: StdMutex::new(Vec::new()),
+            }),
+        )
+        .collect_cycle()
+        .await
+        .expect("skip range enrichment after the local event-kind miss");
+    assert!(esi.position_calls.lock().unwrap().is_empty());
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn unavailable_light_year_positions_remain_deferred_even_through_not() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let baseline = item_exchange_contract(44);
+    let listed = item_exchange_contract(45);
+    let items = HashMap::from([
+        (
+            44,
+            Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+        ),
+        (
+            45,
+            Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+        ),
+    ]);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(vec![baseline.clone()], items.clone())),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+    let range = ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+        config::SystemRange {
+            system_id: 30_002_086,
+            range: 8.0,
+        },
+    ]));
+    for (id, root) in [
+        ("unknown-center", range.clone()),
+        (
+            "not-unknown-center",
+            ContractFilterNode::Not(Box::new(range)),
+        ),
+    ] {
+        store
+            .upsert_contract_subscription(&ContractSubscription {
+                guild_id: 42,
+                channel_id: 77,
+                id: id.to_string(),
+                description: id.to_string(),
+                filter: ContractFilter { root },
+                event_actions: ContractEventActions {
+                    listed: ContractEventAction::Post,
+                    ..ContractEventActions::default()
+                },
+            })
+            .await
+            .expect("persist the unavailable-position subscription");
+    }
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let esi = Arc::new(PositionEsi {
+        inner: regional_esi(vec![baseline, listed], items),
+        contexts: HashMap::from([(
+            45,
+            ContractObservationContext {
+                solar_system_id: Some(30_000_045),
+                ..ContractObservationContext::default()
+            },
+        )]),
+        positions: HashMap::from([(30_000_045, position_at_light_years(0.0))]),
+        position_calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), esi.clone())
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+        .collect_cycle()
+        .await
+        .expect("defer incomplete positions");
+    assert!(delivery.sent.lock().unwrap().is_empty());
+    assert!(esi.position_calls.lock().unwrap().contains(&30_002_086));
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn persisted_limiter_stops_the_next_light_year_reference_lookup() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let baseline = item_exchange_contract(44);
+    let listed = item_exchange_contract(45);
+    let items = HashMap::from([
+        (
+            44,
+            Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+        ),
+        (
+            45,
+            Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+        ),
+    ]);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(vec![baseline.clone()], items.clone())),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "limiter-bounded-centers".to_string(),
+            description: "range lookups stop at the persisted limiter".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                    config::SystemRange {
+                        system_id: 30_002_086,
+                        range: 8.0,
+                    },
+                    config::SystemRange {
+                        system_id: 30_003_089,
+                        range: 8.0,
+                    },
+                ])),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist the two-center subscription");
+    let esi = Arc::new(LimitedPositionEsi {
+        inner: PositionEsi {
+            inner: regional_esi(vec![baseline, listed], items),
+            contexts: HashMap::from([(
+                45,
+                ContractObservationContext {
+                    solar_system_id: Some(30_000_045),
+                    solar_system_position: Some(position_at_light_years(0.0)),
+                    ..ContractObservationContext::default()
+                },
+            )]),
+            positions: HashMap::from([
+                (30_002_086, position_at_light_years(0.0)),
+                (30_003_089, position_at_light_years(20.0)),
+            ]),
+            position_calls: StdMutex::new(Vec::new()),
+        },
+    });
+    ContractCollector::new(store.clone(), esi.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::new())),
+            Arc::new(RecordingDelivery {
+                store: store.clone(),
+                sent: StdMutex::new(Vec::new()),
+            }),
+        )
+        .collect_cycle()
+        .await
+        .expect("defer second center after the limiter boundary");
+    assert_eq!(
+        esi.inner.position_calls.lock().unwrap().as_slice(),
+        &[30_000_045],
+        "the limiter records the event-position request and prevents either reference lookup"
+    );
+    database.destroy().await;
 }
 
 #[tokio::test]
@@ -4933,6 +5505,89 @@ async fn terminal_only_subscription_uses_the_persisted_observation_time_context(
         .all(|field| !matches!(field.name.as_str(), "Buyer" | "Counterparty")));
     drop(sent);
 
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_light_year_range_uses_the_observation_snapshot_after_restart() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let contract = item_exchange_contract(44);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(SnapshottingEsi {
+            inner: regional_esi(
+                vec![contract.clone()],
+                HashMap::from([(
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            ),
+            contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+                ContractEmbedContext {
+                    location: killbot_rust::contract_intelligence::ContractLocationContext {
+                        solar_system_id: Some(30_000_044),
+                        solar_system_position: Some(position_at_light_years(0.0)),
+                        ..Default::default()
+                    },
+                    ..ContractEmbedContext::default()
+                },
+                CacheMetadata::cached_for_seconds(60),
+            ))]),
+            calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("persist the observation-time solar-system position");
+
+    let mut subscription = confirmed_ship_subscription(
+        "terminal-near-turnur",
+        ContractEventKind::SaleConfirmed,
+        ContractItemDirection::Offered,
+        ContractEventAction::Post,
+    );
+    subscription.filter.root = ContractFilterNode::And(vec![
+        subscription.filter.root,
+        ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+            config::SystemRange {
+                system_id: 30_002_086,
+                range: 8.0,
+            },
+        ])),
+    ]);
+    store
+        .upsert_contract_subscription(&subscription)
+        .await
+        .expect("persist the terminal range subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let restarted_esi = Arc::new(PositionedResolutionEsi {
+        inner: ResolutionEsi {
+            inner: regional_esi(vec![], HashMap::new()),
+            probes: StdMutex::new(vec![Ok(ContractItemProbe::NoContent(expiring_cache()))]),
+            probe_calls: StdMutex::new(Vec::new()),
+        },
+        positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+        position_calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), restarted_esi.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+            delivery.clone(),
+        )
+        .collect_cycle()
+        .await
+        .expect("resolve the terminal event after restart");
+
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+    assert_eq!(
+        restarted_esi.position_calls.lock().unwrap().as_slice(),
+        &[30_002_086],
+        "terminal filtering may load the static center but never the event's current location"
+    );
     database.destroy().await;
 }
 
@@ -7973,6 +8628,12 @@ fn contract_filter_validation_rejects_invalid_trees_ranges_money_and_identifiers
             value: f64::NAN,
         }),
         ContractFilterNode::Condition(ContractFilterCondition::LocationIds(vec![0])),
+        ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+            config::SystemRange {
+                system_id: 30_002_086,
+                range: f64::NAN,
+            },
+        ])),
     ] {
         assert!(ContractFilter { root }.validate().is_err());
     }
@@ -7987,7 +8648,44 @@ fn contract_filter_validation_rejects_invalid_trees_ranges_money_and_identifiers
             solar_system: true,
             security_status: false,
             observed_affiliation: false,
+            ly_ranges: vec![],
         }
+    );
+}
+
+#[test]
+fn light_year_range_filters_use_a_durable_backwards_compatible_serde_grammar() {
+    let legacy: ContractFilter =
+        serde_json::from_str(r#"{"root":{"condition":{"event_kinds":["listed"]}}}"#)
+            .expect("existing persisted subscriptions remain readable");
+    assert!(matches!(
+        legacy.root,
+        ContractFilterNode::Condition(ContractFilterCondition::EventKinds(_))
+    ));
+    let filter = ContractFilter {
+        root: ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+            config::SystemRange {
+                system_id: 30_002_086,
+                range: 8.0,
+            },
+        ])),
+    };
+    assert_eq!(
+        serde_json::to_value(&filter).expect("serialize the range filter"),
+        serde_json::json!({
+            "root": {
+                "condition": {
+                    "ly_range_from": [{"system_id": 30002086, "range": 8.0}]
+                }
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<ContractFilter>(
+            serde_json::to_value(&filter).expect("round-trip range filter"),
+        )
+        .expect("deserialize range filter"),
+        filter
     );
 }
 
@@ -8045,6 +8743,11 @@ async fn http_esi_resolves_context_facts_independently_for_filters() {
             headers: vec![],
             body: r#"[{"alliance_id":99000111}]"#,
         },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: r#"{"position":{"x":9460730472580800.0,"y":0.0,"z":0.0}}"#,
+        },
     ]);
     let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
         .expect("construct local HTTP ESI client");
@@ -8072,6 +8775,14 @@ async fn http_esi_resolves_context_facts_independently_for_filters() {
     assert_eq!(
         affiliation.value.expect("affiliation response"),
         ContractContextValue::Resolved(99_000_111)
+    );
+    assert_eq!(
+        esi.solar_system_position(30_000_142, None)
+            .await
+            .expect("resolve the solar-system position")
+            .value
+            .expect("solar-system position response"),
+        position_at_light_years(1.0)
     );
     server.finish();
 }

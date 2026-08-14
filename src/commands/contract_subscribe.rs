@@ -1,9 +1,9 @@
 use crate::commands::contract_command::{defer_then_edit, SerenityContractCommandResponder};
 use crate::commands::{get_option_value, Command};
-use crate::config::AppState;
+use crate::config::{AppState, SystemRange};
 use crate::contract_intelligence::{
-    available_contract_store, ContractEventActions, ContractFilter, ContractPingType,
-    ContractSubscription,
+    available_contract_store, ContractEventActions, ContractFilter, ContractFilterCondition,
+    ContractFilterNode, ContractPingType, ContractSubscription,
 };
 use crate::ContractStoreContainer;
 use serenity::async_trait;
@@ -17,6 +17,15 @@ use std::sync::Arc;
 use tracing::error;
 
 pub struct ContractSubscribeCommand;
+
+struct ContractSubscriptionDocuments<'a> {
+    id: &'a str,
+    description: &'a str,
+    filter: &'a str,
+    event_actions: &'a str,
+    ping_type: Option<&'a str>,
+    ly_ranges_json: Option<&'a str>,
+}
 
 impl ContractSubscribeCommand {
     fn subscription(
@@ -33,17 +42,26 @@ impl ContractSubscribeCommand {
             None => None,
             _ => return Err("ping_type must be a string option".to_string()),
         };
-        Self::subscription_from_documents(
+        let ly_ranges_json = match get_option_value(&command.data.options, "ly_ranges_json") {
+            Some(CommandDataOptionValue::String(value)) => Some(value.as_str()),
+            None => None,
+            _ => return Err("ly_ranges_json must be a string option".to_string()),
+        };
+        Self::subscription_from_documents_with_ranges(
             guild_id,
             channel_id,
-            option("id")?,
-            option("description")?,
-            option("filter")?,
-            option("event_actions")?,
-            ping_type,
+            ContractSubscriptionDocuments {
+                id: option("id")?,
+                description: option("description")?,
+                filter: option("filter")?,
+                event_actions: option("event_actions")?,
+                ping_type,
+                ly_ranges_json,
+            },
         )
     }
 
+    #[cfg(test)]
     fn subscription_from_documents(
         guild_id: u64,
         channel_id: u64,
@@ -53,10 +71,29 @@ impl ContractSubscribeCommand {
         event_actions_document: &str,
         ping_type: Option<&str>,
     ) -> Result<ContractSubscription, String> {
+        Self::subscription_from_documents_with_ranges(
+            guild_id,
+            channel_id,
+            ContractSubscriptionDocuments {
+                id,
+                description,
+                filter: filter_document,
+                event_actions: event_actions_document,
+                ping_type,
+                ly_ranges_json: None,
+            },
+        )
+    }
+
+    fn subscription_from_documents_with_ranges(
+        guild_id: u64,
+        channel_id: u64,
+        documents: ContractSubscriptionDocuments<'_>,
+    ) -> Result<ContractSubscription, String> {
         let mut event_actions =
-            serde_json::from_str::<ContractEventActions>(event_actions_document)
+            serde_json::from_str::<ContractEventActions>(documents.event_actions)
                 .map_err(|error| format!("invalid event actions JSON: {error}"))?;
-        if let Some(ping_type) = ping_type {
+        if let Some(ping_type) = documents.ping_type {
             let ping_type = match ping_type {
                 "here" => ContractPingType::Here,
                 "everyone" => ContractPingType::Everyone,
@@ -64,18 +101,44 @@ impl ContractSubscribeCommand {
             };
             event_actions.configure_ping_type(ping_type);
         }
+        let mut filter = serde_json::from_str::<ContractFilter>(documents.filter)
+            .map_err(|error| format!("invalid filter JSON: {error}"))?;
+        if let Some(json) = documents.ly_ranges_json {
+            let ranges = serde_json::from_str::<Vec<SystemRange>>(json)
+                .map_err(|error| format!("Invalid JSON format for ly_ranges_json: {error}"))?;
+            validate_system_ranges(&ranges)?;
+            filter.root = ContractFilterNode::And(vec![
+                filter.root,
+                ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(ranges)),
+            ]);
+        }
         let subscription = ContractSubscription {
             guild_id,
             channel_id,
-            id: id.to_string(),
-            description: description.to_string(),
-            filter: serde_json::from_str::<ContractFilter>(filter_document)
-                .map_err(|error| format!("invalid filter JSON: {error}"))?,
+            id: documents.id.to_string(),
+            description: documents.description.to_string(),
+            filter,
             event_actions,
         };
         subscription.validate()?;
         Ok(subscription)
     }
+}
+
+fn validate_system_ranges(ranges: &[SystemRange]) -> Result<(), String> {
+    if ranges.is_empty() {
+        return Err("ly_ranges_json must include at least one system range".to_string());
+    }
+    if ranges.iter().any(|range| range.system_id == 0) {
+        return Err("ly range system IDs must be positive integers".to_string());
+    }
+    if ranges
+        .iter()
+        .any(|range| !range.range.is_finite() || range.range <= 0.0)
+    {
+        return Err("ly ranges must be finite, positive light-year values".to_string());
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -118,6 +181,14 @@ impl Command for ContractSubscribeCommand {
                     .description("Event action JSON, for example {\"listed\":\"post\"}.")
                     .kind(CommandOptionType::String)
                     .required(true)
+            })
+            .create_option(|option| {
+                option
+                    .name("ly_ranges_json")
+                    .description(
+                        "System range JSON, e.g. [{\"system_id\":30002086,\"range\":8.0}].",
+                    )
+                    .kind(CommandOptionType::String)
             })
             .create_option(|option| {
                 option
@@ -221,6 +292,60 @@ mod tests {
     }
 
     #[test]
+    fn contract_subscribe_composes_compact_light_year_ranges_with_the_filter_root() {
+        let subscription = ContractSubscribeCommand::subscription_from_documents_with_ranges(
+            42,
+            77,
+            ContractSubscriptionDocuments {
+                id: "capitals-near-turnur-or-kurniainen",
+                description: "capital contracts near either center",
+                filter: FILTER,
+                event_actions: r#"{"listed":"post"}"#,
+                ping_type: None,
+                ly_ranges_json: Some(
+                    r#"[{"system_id":30002086,"range":8.0},{"system_id":30003089,"range":8.0}]"#,
+                ),
+            },
+        )
+        .expect("valid compact range document");
+        assert!(matches!(
+            subscription.filter.root,
+            ContractFilterNode::And(ref nodes)
+                if matches!(nodes[1], ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(ref ranges)) if ranges == &vec![
+                    SystemRange { system_id: 30_002_086, range: 8.0 },
+                    SystemRange { system_id: 30_003_089, range: 8.0 },
+                ])
+        ));
+    }
+
+    #[test]
+    fn contract_subscribe_rejects_invalid_light_year_range_documents_before_persistence() {
+        for ranges in [
+            "not json",
+            "[]",
+            r#"[{"system_id":0,"range":8.0}]"#,
+            r#"[{"system_id":30002086,"range":0.0}]"#,
+            r#"[{"system_id":30002086,"range":1e999}]"#,
+        ] {
+            assert!(
+                ContractSubscribeCommand::subscription_from_documents_with_ranges(
+                    42,
+                    77,
+                    ContractSubscriptionDocuments {
+                        id: "capitals",
+                        description: "capital contracts",
+                        filter: FILTER,
+                        event_actions: r#"{"listed":"post"}"#,
+                        ping_type: None,
+                        ly_ranges_json: Some(ranges),
+                    },
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn sale_only_event_actions_default_listed_to_ignore_and_preserve_explicit_legacy_actions() {
         let sale_only = ContractSubscribeCommand::subscription_from_documents(
             42,
@@ -277,6 +402,11 @@ mod tests {
             ping_type["choices"].as_array().expect("ping choices").len(),
             2
         );
+        let ranges = options
+            .iter()
+            .find(|option| option["name"] == "ly_ranges_json")
+            .expect("configured light-year ranges option");
+        assert_eq!(ranges["type"], CommandOptionType::String.num());
     }
 
     #[test]

@@ -40,7 +40,13 @@ Create or replace a subscription in the target guild channel with `/contract_sub
 /contract_subscribe id:super-sales description:public super sales filter:{"root":{"and":[{"condition":{"event_kinds":["listed","sale_confirmed"]}},{"condition":{"item_types":{"direction":"offered","ids":[12345]}}}]}} event_actions:{"listed":"post","sale_confirmed":"post_and_ping"} ping_type:here
 ```
 
-Filter nodes are `condition`, `and`, `or`, and `not`. Conditions support event kinds, offered/requested item presence, item type, ship group, ISK bounds, region, solar system, security range, location ID, issuer character/corporation, observed issuer alliance, issuance type, and title fragment. IDs must be positive. The maximum filter depth is 16 and the maximum node count is 128.
+For a proximity feed, pass the same compact `ly_ranges_json` shape as `/subscribe`. The supplied ranges are combined with the required `filter` root using `AND`; multiple centers are a union. This exact example matches contracts within 8.0 light-years of Turnur or Kurniainen:
+
+```text
+/contract_subscribe id:supercaps-near-turnur description:Supercapital contracts near Turnur or Kurniainen filter:{"root":{"or":[{"condition":{"ship_groups":{"direction":"offered","ids":[30,659]}}},{"condition":{"ship_groups":{"direction":"requested","ids":[30,659]}}}]}} event_actions:{"listed":"post","sale_confirmed":"post","purchase_confirmed":"post"} ly_ranges_json:[{"system_id":30002086,"range":8.0},{"system_id":30003089,"range":8.0}]
+```
+
+`ly_ranges_json` must be a non-empty JSON array of positive system IDs and finite positive ranges. Contract proximity uses the ESI solar-system Cartesian position in metres, includes a distance exactly on the boundary, and defers an alert if an observation-time event position or a center position is unavailable. Filter nodes are `condition`, `and`, `or`, and `not`. Conditions support event kinds, offered/requested item presence, item type, ship group, ISK bounds, region, solar system, light-year ranges, security range, location ID, issuer character/corporation, observed issuer alliance, issuance type, and title fragment. IDs must be positive. The maximum filter depth is 16 and the maximum node count is 128.
 
 Each action is `ignore`, `post`, or `post_and_ping`. Omitted actions, including `listed`, default to `ignore`, so `{"sale_confirmed":"post"}` is valid. `ping_type:here` uses `@here`; `ping_type:everyone` changes all pinging actions in that subscription to `@everyone`. A contract ping shares the existing per-channel five-minute limiter with killmail pings. Delivery still posts if a requested ping is rate-limited.
 
@@ -86,6 +92,7 @@ This release has no authenticated-contract feed, counterparty tracking, provisio
 ## External references
 
 - [ESI best practices](https://developers.eveonline.com/docs/services/esi/best-practices/)
+- [ESI map data and solar-system endpoints](https://developers.eveonline.com/docs/guides/map-data/)
 - [ESI rate limiting](https://developers.eveonline.com/docs/services/esi/rate-limiting/)
 - [Discord interaction responses](https://docs.discord.com/developers/interactions/receiving-and-responding)
 - [Discord message creation and nonce enforcement](https://docs.discord.com/developers/resources/message)

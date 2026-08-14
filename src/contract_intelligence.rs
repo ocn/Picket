@@ -1,3 +1,4 @@
+use crate::config::SystemRange;
 use crate::discord_bot::SHIP_GROUP_PRIORITY;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -25,6 +26,7 @@ const MAX_EMBED_CONTEXT_ENRICHMENTS_PER_CYCLE: usize = 8;
 const DISCORD_NONCE_ENFORCEMENT_WINDOW: ChronoDuration = ChronoDuration::minutes(5);
 const DEFAULT_COLLECTION_RECOVERY_GAP: ChronoDuration = ChronoDuration::minutes(15);
 const REGION_DISCOVERY_RESOURCE_KEY: &str = "esi:regions";
+const METERS_PER_LIGHT_YEAR: f64 = 9_460_730_472_580_800.0;
 
 fn regional_snapshot_resource_key(region_id: i64) -> String {
     format!("esi:public-contracts:region:{region_id}")
@@ -209,6 +211,28 @@ pub enum ContractContextValue<T> {
     Resolved(T),
     DefinitivelyAbsent,
     Indeterminate,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SolarSystemPosition {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl Eq for SolarSystemPosition {}
+
+impl SolarSystemPosition {
+    fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
+    }
+
+    fn distance_in_light_years(self, other: Self) -> f64 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        let dz = self.z - other.z;
+        (dx * dx + dy * dy + dz * dz).sqrt() / METERS_PER_LIGHT_YEAR
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -409,6 +433,19 @@ pub trait PublicContractEsi: Send + Sync {
             metadata: response.metadata,
             not_modified: response.not_modified,
         })
+    }
+
+    /// The public ESI solar-system endpoint exposes immutable Cartesian coordinates in metres.
+    /// The collector owns durable caching and limiter accounting for these lookups.
+    async fn solar_system_position(
+        &self,
+        _solar_system_id: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<SolarSystemPosition>, EsiError> {
+        Err(EsiError::retryable(
+            "solar-system position lookup is unavailable",
+            None,
+        ))
     }
 
     async fn observed_contract_context(
@@ -854,6 +891,37 @@ impl PublicContractEsi for HttpPublicContractEsi {
         }
     }
 
+    async fn solar_system_position(
+        &self,
+        solar_system_id: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<SolarSystemPosition>, EsiError> {
+        #[derive(Deserialize)]
+        struct SolarSystem {
+            position: Option<SolarSystemPosition>,
+        }
+
+        let response = self
+            .get::<SolarSystem>(&format!("universe/systems/{solar_system_id}/"), etag)
+            .await?;
+        let metadata = response.metadata;
+        if response.not_modified {
+            return Ok(EsiResponse::not_modified(metadata));
+        }
+        let position = response
+            .value
+            .and_then(|system| system.position)
+            .filter(|position| position.is_finite())
+            .ok_or_else(|| {
+                EsiError::from_metadata(
+                    "ESI solar-system response omitted a finite position",
+                    None,
+                    metadata.clone(),
+                )
+            })?;
+        Ok(EsiResponse::fresh(position, metadata))
+    }
+
     async fn observed_issuer_affiliation(
         &self,
         contract: &PublicContract,
@@ -927,6 +995,7 @@ impl PublicContractEsi for HttpPublicContractEsi {
             name: String,
             security_status: f64,
             constellation_id: i64,
+            position: Option<SolarSystemPosition>,
         }
         #[derive(Deserialize)]
         struct Constellation {
@@ -987,6 +1056,8 @@ impl PublicContractEsi for HttpPublicContractEsi {
                         .security_status
                         .is_finite()
                         .then_some(system.security_status);
+                    context.location.solar_system_position =
+                        system.position.filter(|position| position.is_finite());
                     if let Some(response) = self
                         .cached_context_get::<Constellation>(
                             &format!("universe/constellations/{}", system.constellation_id),
@@ -1582,6 +1653,7 @@ pub enum ContractFilterCondition {
     },
     Regions(Vec<i64>),
     SolarSystems(Vec<i64>),
+    LyRangeFrom(Vec<SystemRange>),
     SecurityRange {
         min: f64,
         max: f64,
@@ -1612,6 +1684,7 @@ impl ContractFilterCondition {
             }
             Self::Regions(ids) => validate_i64_ids(ids, "region ID"),
             Self::SolarSystems(ids) => validate_i64_ids(ids, "solar system ID"),
+            Self::LyRangeFrom(ranges) => validate_contract_system_ranges(ranges),
             Self::SecurityRange { min, max } => {
                 if !min.is_finite() || !max.is_finite() || min > max {
                     Err(
@@ -1646,6 +1719,11 @@ impl ContractFilterCondition {
                 solar_system: true,
                 ..ContractContextRequirements::default()
             },
+            Self::LyRangeFrom(ranges) => ContractContextRequirements {
+                solar_system: true,
+                ly_ranges: ranges.clone(),
+                ..ContractContextRequirements::default()
+            },
             Self::SecurityRange { .. } => ContractContextRequirements {
                 solar_system: true,
                 security_status: true,
@@ -1658,6 +1736,22 @@ impl ContractFilterCondition {
             _ => ContractContextRequirements::default(),
         }
     }
+}
+
+fn validate_contract_system_ranges(ranges: &[SystemRange]) -> Result<(), String> {
+    if ranges.is_empty() {
+        return Err("provide at least one light-year system range".to_string());
+    }
+    if ranges.iter().any(|range| range.system_id == 0) {
+        return Err("light-year range system IDs must be positive integers".to_string());
+    }
+    if ranges
+        .iter()
+        .any(|range| !range.range.is_finite() || range.range <= 0.0)
+    {
+        return Err("light-year ranges must be finite, positive values".to_string());
+    }
+    Ok(())
 }
 
 fn validate_ids<T>(ids: &[T], label: &str) -> Result<(), String> {
@@ -1685,24 +1779,35 @@ fn validate_money(value: f64) -> Result<(), String> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ContractContextRequirements {
     pub solar_system: bool,
     pub security_status: bool,
     pub observed_affiliation: bool,
+    pub ly_ranges: Vec<SystemRange>,
 }
 
 impl ContractContextRequirements {
     fn union(self, other: Self) -> Self {
+        let mut ly_ranges = self.ly_ranges;
+        for range in other.ly_ranges {
+            if !ly_ranges.contains(&range) {
+                ly_ranges.push(range);
+            }
+        }
         Self {
             solar_system: self.solar_system || other.solar_system,
             security_status: self.security_status || other.security_status,
             observed_affiliation: self.observed_affiliation || other.observed_affiliation,
+            ly_ranges,
         }
     }
 
-    fn is_empty(self) -> bool {
-        !self.solar_system && !self.security_status && !self.observed_affiliation
+    fn is_empty(&self) -> bool {
+        !self.solar_system
+            && !self.security_status
+            && !self.observed_affiliation
+            && self.ly_ranges.is_empty()
     }
 }
 
@@ -1722,6 +1827,12 @@ pub struct ContractObservationContext {
     pub solar_system_id: Option<i64>,
     #[serde(default)]
     pub solar_system_resolution: ContractContextResolution,
+    #[serde(default)]
+    pub solar_system_position: Option<SolarSystemPosition>,
+    #[serde(default)]
+    pub solar_system_position_resolution: ContractContextResolution,
+    #[serde(default)]
+    pub range_center_positions: BTreeMap<u32, SolarSystemPosition>,
     pub security_status: Option<f64>,
     #[serde(default)]
     pub security_status_resolution: ContractContextResolution,
@@ -1737,6 +1848,8 @@ pub struct ContractLocationContext {
     pub location_kind: Option<String>,
     pub solar_system_id: Option<i64>,
     pub solar_system_name: Option<String>,
+    #[serde(default)]
+    pub solar_system_position: Option<SolarSystemPosition>,
     pub security_status: Option<f64>,
     pub region_id: Option<i64>,
     pub region_name: Option<String>,
@@ -1778,6 +1891,10 @@ impl ContractEmbedContext {
             .solar_system_name
             .clone()
             .or_else(|| source.location.solar_system_name.clone());
+        self.location.solar_system_position = self
+            .location
+            .solar_system_position
+            .or(source.location.solar_system_position);
         self.location.security_status = self
             .location
             .security_status
@@ -1811,6 +1928,12 @@ impl ContractObservationContext {
     fn normalize_resolutions(&mut self) {
         if self.solar_system_id.is_some() {
             self.solar_system_resolution = ContractContextResolution::Resolved;
+        }
+        if self
+            .solar_system_position
+            .is_some_and(SolarSystemPosition::is_finite)
+        {
+            self.solar_system_position_resolution = ContractContextResolution::Resolved;
         }
         if self.security_status.is_some_and(f64::is_finite) {
             self.security_status_resolution = ContractContextResolution::Resolved;
@@ -4025,6 +4148,8 @@ impl ContractCollector {
         event.context.normalize_resolutions();
 
         if !matches!(event.kind, ContractEventKind::Listed) {
+            self.load_range_center_positions(&mut event, &requirements)
+                .await?;
             mark_terminal_context_unavailable(&mut event.context, requirements);
             return Ok(event);
         }
@@ -4093,6 +4218,33 @@ impl ContractCollector {
             }
         }
 
+        if !requirements.ly_ranges.is_empty() {
+            if event.context.solar_system_position.is_none() {
+                if let Some(system_id) = event
+                    .context
+                    .solar_system_id
+                    .and_then(|system_id| u32::try_from(system_id).ok())
+                {
+                    if let Some(position) = self
+                        .cached_solar_system_position(event.contract.contract_id, system_id)
+                        .await?
+                    {
+                        event.context.solar_system_position = Some(position);
+                        event.context.solar_system_position_resolution =
+                            ContractContextResolution::Resolved;
+                    } else {
+                        event.context.solar_system_position_resolution =
+                            ContractContextResolution::TemporarilyUnavailable;
+                    }
+                } else {
+                    event.context.solar_system_position_resolution =
+                        ContractContextResolution::TemporarilyUnavailable;
+                }
+            }
+            self.load_range_center_positions(&mut event, &requirements)
+                .await?;
+        }
+
         if requirements.observed_affiliation
             && event.context.observed_affiliation_alliance_id.is_none()
             && !matches!(
@@ -4138,6 +4290,10 @@ impl ContractCollector {
                 .location
                 .security_status
                 .filter(|value| value.is_finite()));
+            observed.context.solar_system_position = observed
+                .context
+                .solar_system_position
+                .or(snapshot.location.solar_system_position);
             observed.context.observed_affiliation_alliance_id = observed
                 .context
                 .observed_affiliation_alliance_id
@@ -4145,6 +4301,67 @@ impl ContractCollector {
         }
         observed.context.normalize_resolutions();
         Ok(observed)
+    }
+
+    async fn load_range_center_positions(
+        &self,
+        event: &mut ContractEvent,
+        requirements: &ContractContextRequirements,
+    ) -> Result<(), ContractCollectionError> {
+        if requirements.ly_ranges.is_empty() || event.context.solar_system_position.is_none() {
+            return Ok(());
+        }
+        for range in &requirements.ly_ranges {
+            if event
+                .context
+                .range_center_positions
+                .contains_key(&range.system_id)
+            {
+                continue;
+            }
+            let Some(position) = self
+                .cached_solar_system_position(event.contract.contract_id, range.system_id)
+                .await?
+            else {
+                continue;
+            };
+            event
+                .context
+                .range_center_positions
+                .insert(range.system_id, position);
+        }
+        Ok(())
+    }
+
+    async fn cached_solar_system_position(
+        &self,
+        contract_id: i64,
+        solar_system_id: u32,
+    ) -> Result<Option<SolarSystemPosition>, ContractCollectionError> {
+        let key = format!("universe/systems/{solar_system_id}");
+        let cached = self.store.cache(&key).await?;
+        if let Some((position, _)) = self.fresh_cached::<SolarSystemPosition>(&key, &cached)? {
+            return Ok(position.is_finite().then_some(position));
+        }
+        if !self.context_request_allowed(contract_id).await? {
+            return Ok(None);
+        }
+        let etag = cached
+            .as_ref()
+            .and_then(|cached| cached.metadata.etag.clone());
+        let Some(response) = self
+            .record_context_esi_result(
+                contract_id,
+                self.esi
+                    .solar_system_position(solar_system_id, etag.as_deref())
+                    .await,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let (position, _) = self.resolve_response(&key, cached, response).await?;
+        Ok(position.is_finite().then_some(position))
     }
 
     async fn context_request_allowed(
@@ -4357,6 +4574,11 @@ impl ContractCollector {
                 .context
                 .security_status
                 .filter(|value| value.is_finite()));
+        enriched.embed_context.location.solar_system_position = enriched
+            .embed_context
+            .location
+            .solar_system_position
+            .or(enriched.context.solar_system_position);
         enriched.embed_context.issuer_alliance_id = enriched
             .embed_context
             .issuer_alliance_id
@@ -5004,10 +5226,11 @@ fn plan_contract_filter_context<'borrow, 'event>(
                     return ContractFilterContextPlan::resolved(result);
                 }
                 let requirements = condition.context_requirements();
+                let waits_for_non_context = requirements.is_empty();
                 ContractFilterContextPlan {
                     result,
                     requirements,
-                    waits_for_non_context: requirements.is_empty(),
+                    waits_for_non_context,
                     confirmed_ship_items: HashSet::new(),
                     potential_ship_items: HashSet::new(),
                 }
@@ -5318,6 +5541,36 @@ async fn evaluate_contract_filter_condition(
             event.context.solar_system_resolution,
             |system_id| ids.contains(&system_id),
         ),
+        ContractFilterCondition::LyRangeFrom(ranges) => {
+            let Some(event_position) = event
+                .context
+                .solar_system_position
+                .filter(|position| position.is_finite())
+            else {
+                return ContractFilterMatch::Deferred;
+            };
+            let mut deferred = false;
+            for range in ranges {
+                let Some(center_position) = event
+                    .context
+                    .range_center_positions
+                    .get(&range.system_id)
+                    .copied()
+                    .filter(|position| position.is_finite())
+                else {
+                    deferred = true;
+                    continue;
+                };
+                if event_position.distance_in_light_years(center_position) <= range.range {
+                    return ContractFilterMatch::Matched;
+                }
+            }
+            if deferred {
+                ContractFilterMatch::Deferred
+            } else {
+                ContractFilterMatch::Unmatched
+            }
+        }
         ContractFilterCondition::SecurityRange { min, max } => context_match(
             event.context.security_status,
             event.context.security_status_resolution,
@@ -6138,6 +6391,7 @@ mod embed_tests {
                     location_kind: Some("Station".to_string()),
                     solar_system_id: Some(30_000_142),
                     solar_system_name: Some("Jita".to_string()),
+                    solar_system_position: None,
                     security_status: Some(0.945_913_136_005_401_6),
                     region_id: Some(10_000_002),
                     region_name: Some("The Forge".to_string()),
