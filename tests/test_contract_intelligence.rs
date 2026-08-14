@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use killbot_rust::config::{self, AppConfig, AppState};
 use killbot_rust::contract_intelligence::{
-    available_contract_store, new_contract_store_handle,
+    available_contract_store, collection_retry_delay, new_contract_store_handle,
     spawn_contract_collection_loop_with_notifications, AppStateContractPingLimiter, CacheMetadata,
     CollectionOutcome, ContractCollectionStore, ContractCollector, ContractContextLimiter,
     ContractContextRequirements, ContractContextValue, ContractDelivery, ContractDeliveryClock,
@@ -955,6 +955,22 @@ fn requested_ship(record_id: i64) -> PublicContractItem {
         is_included: false,
         ..offered_ship(record_id)
     }
+}
+
+#[test]
+fn collection_failures_use_bounded_exponential_backoff_without_violating_retry_after() {
+    let interval = Duration::from_secs(1);
+    assert_eq!(collection_retry_delay(interval, None, 1), interval);
+    assert_eq!(
+        collection_retry_delay(interval, None, 2),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        collection_retry_delay(interval, None, 99),
+        Duration::from_secs(300)
+    );
+    let retry_after = Utc::now() + chrono::Duration::seconds(30);
+    assert!(collection_retry_delay(interval, Some(retry_after), 1) >= Duration::from_secs(29));
 }
 
 #[tokio::test]
@@ -4459,6 +4475,440 @@ async fn prepared_delivery_replays_before_region_discovery_outage() {
             .status,
         DeliveryStatus::Sent
     );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_material_collection_gap_reestablishes_a_silent_recovery_baseline() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let prior_contract = item_exchange_contract(44);
+    let new_contract = item_exchange_contract(45);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![prior_contract], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(
+                    vec![offered_ship(1)],
+                    cached_item_metadata("prior-items", 3_600),
+                )),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the initial regional baseline");
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "ships",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the listing subscription");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to make the regional state stale");
+    sqlx::query(
+        "UPDATE regional_collection_metadata SET last_complete_at = now() - interval '2 hours' WHERE region_id = 10000002",
+    )
+    .execute(&pool)
+    .await
+    .expect("simulate an outage-spanning collection gap");
+    pool.close().await;
+
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let report = ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![new_contract], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                45,
+                Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+            )]),
+        }),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .with_recovery_gap(chrono::Duration::minutes(30))
+    .collect_cycle()
+    .await
+    .expect("recover a complete regional baseline");
+
+    assert_eq!(
+        report.regions,
+        vec![CollectionOutcome::RecoveryBaselineEstablished {
+            region_id: 10_000_002
+        }]
+    );
+    assert!(report.events.is_empty());
+    assert!(delivery.sent.lock().unwrap().is_empty());
+    assert_eq!(
+        store
+            .region_contracts(10_000_002)
+            .await
+            .expect("read recovered contracts")
+            .iter()
+            .map(|contract| contract.contract_id)
+            .collect::<Vec<_>>(),
+        vec![44, 45]
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn recovery_retains_stale_nonfinancial_closures_without_discord_delivery() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut expired = item_exchange_contract(44);
+    expired.date_expired = Utc::now() - chrono::Duration::minutes(1);
+    let mut unknown = item_exchange_contract(45);
+    unknown.date_expired = Utc::now() + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![expired.clone(), unknown.clone()],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(
+                        vec![offered_ship(1)],
+                        cached_item_metadata("expired-items", 3_600),
+                    )),
+                ),
+                (
+                    45,
+                    Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                ),
+            ]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the initial regional baseline");
+    for (id, kind) in [
+        ("expired", ContractEventKind::Expired),
+        ("unknown", ContractEventKind::ClosedOutcomeUnknown),
+    ] {
+        store
+            .upsert_contract_subscription(&terminal_ship_subscription(
+                id,
+                kind,
+                ContractEventAction::Post,
+            ))
+            .await
+            .expect("persist terminal-state subscription");
+    }
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to make the regional state stale");
+    sqlx::query(
+        "UPDATE regional_collection_metadata SET last_complete_at = now() - interval '2 hours' WHERE region_id = 10000002",
+    )
+    .execute(&pool)
+    .await
+    .expect("simulate an outage-spanning collection gap");
+    pool.close().await;
+
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let report = ContractCollector::new(
+        store.clone(),
+        Arc::new(ResolutionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                )]),
+                items: HashMap::new(),
+            },
+            probes: StdMutex::new(vec![Ok(ContractItemProbe::NotFound(expiring_cache()))]),
+            probe_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .with_recovery_gap(chrono::Duration::minutes(30))
+    .collect_cycle()
+    .await
+    .expect("retain stale terminal lifecycle facts during recovery");
+
+    assert!(report.events.is_empty());
+    assert!(delivery.sent.lock().unwrap().is_empty());
+    assert_eq!(
+        store
+            .contract_resolution_records()
+            .await
+            .expect("read stale terminal lifecycle facts")
+            .iter()
+            .map(|record| record.state)
+            .collect::<Vec<_>>(),
+        vec![
+            ContractResolutionState::Expired,
+            ContractResolutionState::ClosedOutcomeUnknown,
+        ]
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn recovery_still_notifies_fresh_pre_expiry_acceptance_evidence() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut contract = item_exchange_contract(44);
+    contract.date_expired = Utc::now() + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the initial regional baseline");
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "sales",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist sale confirmation subscription");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to make the regional state stale");
+    sqlx::query(
+        "UPDATE regional_collection_metadata SET last_complete_at = now() - interval '2 hours' WHERE region_id = 10000002",
+    )
+    .execute(&pool)
+    .await
+    .expect("simulate an outage-spanning collection gap");
+    pool.close().await;
+
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let report = ContractCollector::new(
+        store.clone(),
+        Arc::new(ResolutionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                )]),
+                items: HashMap::new(),
+            },
+            probes: StdMutex::new(vec![Ok(ContractItemProbe::NoContent(expiring_cache()))]),
+            probe_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .with_recovery_gap(chrono::Duration::minutes(30))
+    .collect_cycle()
+    .await
+    .expect("confirm fresh acceptance evidence after recovery");
+
+    assert_eq!(
+        report
+            .events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        vec![ContractEventKind::SaleConfirmed]
+    );
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn cleaning_expired_successful_scan_diagnostics_preserves_contract_facts_and_failures() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![item_exchange_contract(44)],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("persist a contract fact and presence interval");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed retained diagnostics");
+    sqlx::query("INSERT INTO regional_observations (region_id, observed_at, outcome, expected_pages) VALUES (100000002, now() - interval '91 days', 'complete', 1)")
+        .execute(&pool)
+        .await
+        .expect("seed an expired successful scan diagnostic");
+    sqlx::query("INSERT INTO regional_observations (region_id, observed_at, outcome, detail) VALUES (100000002, now() - interval '91 days', 'inconclusive', 'retain this failure diagnostic')")
+        .execute(&pool)
+        .await
+        .expect("seed an inconclusive scan diagnostic");
+    sqlx::query("INSERT INTO contract_collection_failures (region_id, observed_at, failure_kind, detail) VALUES (100000002, now() - interval '91 days', 'resolution_probe', 'retain this unresolved failure')")
+        .execute(&pool)
+        .await
+        .expect("seed an unresolved collection failure");
+    pool.close().await;
+
+    assert_eq!(
+        store
+            .prune_successful_scan_diagnostics()
+            .await
+            .expect("clean only expired successful scan diagnostics"),
+        1
+    );
+    assert_eq!(
+        store
+            .storage_counts()
+            .await
+            .expect("contract facts survive diagnostic cleanup"),
+        killbot_rust::contract_intelligence::StorageCounts {
+            contract_facts: 1,
+            manifests: 1,
+            presence_intervals: 1,
+        }
+    );
+    let failures = store
+        .unresolved_collection_failures()
+        .await
+        .expect("unresolved failures survive diagnostic cleanup");
+    assert_eq!(failures.len(), 1);
+    assert!(store
+        .classify_collection_failure(failures[0].id, "operator-reviewed")
+        .await
+        .expect("classify a retained collection failure"));
+    assert!(store
+        .unresolved_collection_failures()
+        .await
+        .expect("classified failure is no longer unresolved")
+        .is_empty());
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_successful_regional_scan_resolves_its_prior_inconclusive_failure() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let failed = ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![item_exchange_contract(44)],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([(
+                44,
+                Err(EsiError::retryable("temporary manifest outage", None)),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("retain the incomplete regional observation");
+    assert!(matches!(
+        failed.regions.as_slice(),
+        [CollectionOutcome::Inconclusive { .. }]
+    ));
+    assert_eq!(
+        store
+            .unresolved_collection_failures()
+            .await
+            .expect("read unresolved collection failure")
+            .len(),
+        1
+    );
+
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![item_exchange_contract(44)],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("complete the regional scan after recovery");
+    assert!(store
+        .unresolved_collection_failures()
+        .await
+        .expect("the successful scan resolves the regional failure")
+        .is_empty());
 
     database.destroy().await;
 }
