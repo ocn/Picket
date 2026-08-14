@@ -14,7 +14,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -1184,6 +1184,32 @@ pub trait ShipGroupResolver: Send + Sync {
     async fn group_for_type(&self, type_id: i64) -> ShipGroupLookup;
 }
 
+struct CycleShipGroupResolver<'a> {
+    inner: &'a dyn ShipGroupResolver,
+    cache: Mutex<HashMap<i64, ShipGroupLookup>>,
+}
+
+impl<'a> CycleShipGroupResolver<'a> {
+    fn new(inner: &'a dyn ShipGroupResolver) -> Self {
+        Self {
+            inner,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ShipGroupResolver for CycleShipGroupResolver<'_> {
+    async fn group_for_type(&self, type_id: i64) -> ShipGroupLookup {
+        if let Some(group) = self.cache.lock().await.get(&type_id).copied() {
+            return group;
+        }
+        let group = self.inner.group_for_type(type_id).await;
+        self.cache.lock().await.insert(type_id, group);
+        group
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShipGroupLookup {
     Resolved(Option<i64>),
@@ -1888,6 +1914,7 @@ impl ContractCollector {
         let Some(notifications) = &self.notifications else {
             return Ok(());
         };
+        let ship_groups = CycleShipGroupResolver::new(&*notifications.ship_groups);
         let deferred_matches = self.store.deferred_contract_matches().await?;
         let subscriptions = self.store.all_contract_subscriptions().await?;
         for deferred in deferred_matches {
@@ -1895,10 +1922,11 @@ impl ContractCollector {
                 .event_with_observed_context(
                     &deferred.event,
                     std::slice::from_ref(&deferred.subscription),
+                    &ship_groups,
                 )
                 .await?;
             match self
-                .notify_subscription(&deferred.subscription, &event, notifications)
+                .notify_subscription(&deferred.subscription, &event, &ship_groups, notifications)
                 .await?
             {
                 NotificationResolution::Complete => {
@@ -1911,11 +1939,11 @@ impl ContractCollector {
         }
         for event in events {
             let event = self
-                .event_with_observed_context(event, &subscriptions)
+                .event_with_observed_context(event, &subscriptions, &ship_groups)
                 .await?;
             for subscription in &subscriptions {
                 if matches!(
-                    self.notify_subscription(subscription, &event, notifications)
+                    self.notify_subscription(subscription, &event, &ship_groups, notifications)
                         .await?,
                     NotificationResolution::Deferred
                 ) {
@@ -1932,23 +1960,21 @@ impl ContractCollector {
         &self,
         event: &ContractEvent,
         subscriptions: &[ContractSubscription],
+        ship_groups: &dyn ShipGroupResolver,
     ) -> Result<ContractEvent, ContractCollectionError> {
-        let requirements = subscriptions.iter().fold(
-            ContractContextRequirements::default(),
-            |requirements, subscription| {
-                if matches!(
-                    contract_event_action(subscription, &event.kind),
-                    ContractEventAction::Ignore
-                ) || matches!(
-                    local_contract_filter_match(&subscription.filter.root, event),
-                    ContractFilterMatch::Unmatched
-                ) {
-                    requirements
-                } else {
-                    requirements.union(subscription.filter.context_requirements())
-                }
-            },
-        );
+        let mut requirements = ContractContextRequirements::default();
+        for subscription in subscriptions {
+            if matches!(
+                contract_event_action(subscription, &event.kind),
+                ContractEventAction::Ignore
+            ) {
+                continue;
+            }
+            let mut evaluator = ContractFilterEvaluator::new(event, ship_groups);
+            let plan =
+                plan_contract_filter_context(&subscription.filter.root, &mut evaluator).await;
+            requirements = requirements.union(plan.requirements);
+        }
         if requirements.is_empty() {
             return Ok(event.clone());
         }
@@ -2087,13 +2113,14 @@ impl ContractCollector {
         &self,
         subscription: &ContractSubscription,
         event: &ContractEvent,
+        ship_groups: &dyn ShipGroupResolver,
         notifications: &ContractNotifications,
     ) -> Result<NotificationResolution, ContractCollectionError> {
         let action = contract_event_action(subscription, &event.kind);
         if matches!(action, ContractEventAction::Ignore) {
             return Ok(NotificationResolution::Complete);
         }
-        let mut evaluator = ContractFilterEvaluator::new(event, &*notifications.ship_groups);
+        let mut evaluator = ContractFilterEvaluator::new(event, ship_groups);
         match evaluator.matches(&subscription.filter.root).await {
             ContractFilterMatch::Matched => {}
             ContractFilterMatch::Unmatched => return Ok(NotificationResolution::Complete),
@@ -2356,6 +2383,7 @@ struct ContractFilterEvaluator<'a> {
     ship_groups: &'a dyn ShipGroupResolver,
     group_cache: HashMap<i64, ShipGroupLookup>,
     matching_ship_items: HashSet<(ContractItemDirection, i64)>,
+    matching_ship_items_deferred: bool,
 }
 
 impl<'a> ContractFilterEvaluator<'a> {
@@ -2365,11 +2393,13 @@ impl<'a> ContractFilterEvaluator<'a> {
             ship_groups,
             group_cache: HashMap::new(),
             matching_ship_items: HashSet::new(),
+            matching_ship_items_deferred: false,
         }
     }
 
     async fn matches(&mut self, node: &ContractFilterNode) -> ContractFilterMatch {
         self.matching_ship_items.clear();
+        self.matching_ship_items_deferred = false;
         evaluate_contract_filter_node(node.clone(), self, true).await
     }
 
@@ -2383,6 +2413,9 @@ impl<'a> ContractFilterEvaluator<'a> {
     }
 
     async fn primary_display_item(&mut self) -> PrimaryDisplayItem<'a> {
+        if self.matching_ship_items_deferred {
+            return PrimaryDisplayItem::Deferred;
+        }
         let mut primary: Option<(&PublicContractItem, usize)> = None;
         for (direction, item) in contract_items_with_direction(self.event) {
             if !self
@@ -2415,6 +2448,128 @@ enum PrimaryDisplayItem<'a> {
     Deferred,
 }
 
+#[derive(Clone, Copy)]
+struct ContractFilterContextPlan {
+    result: ContractFilterMatch,
+    requirements: ContractContextRequirements,
+    waits_for_non_context: bool,
+}
+
+impl ContractFilterContextPlan {
+    fn resolved(result: ContractFilterMatch) -> Self {
+        Self {
+            result,
+            requirements: ContractContextRequirements::default(),
+            waits_for_non_context: false,
+        }
+    }
+}
+
+fn plan_contract_filter_context<'borrow, 'event>(
+    node: &'borrow ContractFilterNode,
+    evaluator: &'borrow mut ContractFilterEvaluator<'event>,
+) -> Pin<Box<dyn Future<Output = ContractFilterContextPlan> + Send + 'borrow>> {
+    Box::pin(async move {
+        match node {
+            ContractFilterNode::Condition(condition) => {
+                let result = evaluate_contract_filter_condition(condition, evaluator, false).await;
+                if !matches!(result, ContractFilterMatch::Deferred) {
+                    return ContractFilterContextPlan::resolved(result);
+                }
+                let requirements = condition.context_requirements();
+                ContractFilterContextPlan {
+                    result,
+                    requirements,
+                    waits_for_non_context: requirements.is_empty(),
+                }
+            }
+            ContractFilterNode::And(nodes) => {
+                let mut requirements = ContractContextRequirements::default();
+                let mut deferred = false;
+                let mut waits_for_non_context = false;
+                for node in nodes {
+                    let plan = plan_contract_filter_context(node, evaluator).await;
+                    match plan.result {
+                        ContractFilterMatch::Matched => {}
+                        ContractFilterMatch::Unmatched => {
+                            return ContractFilterContextPlan::resolved(
+                                ContractFilterMatch::Unmatched,
+                            );
+                        }
+                        ContractFilterMatch::Deferred => {
+                            deferred = true;
+                            requirements = requirements.union(plan.requirements);
+                            waits_for_non_context |= plan.waits_for_non_context;
+                        }
+                    }
+                }
+                if !deferred {
+                    ContractFilterContextPlan::resolved(ContractFilterMatch::Matched)
+                } else if waits_for_non_context {
+                    ContractFilterContextPlan {
+                        result: ContractFilterMatch::Deferred,
+                        requirements: ContractContextRequirements::default(),
+                        waits_for_non_context,
+                    }
+                } else {
+                    ContractFilterContextPlan {
+                        result: ContractFilterMatch::Deferred,
+                        requirements,
+                        waits_for_non_context,
+                    }
+                }
+            }
+            ContractFilterNode::Or(nodes) => {
+                let mut requirements = ContractContextRequirements::default();
+                let mut deferred = false;
+                let mut waits_for_non_context = false;
+                for node in nodes {
+                    let plan = plan_contract_filter_context(node, evaluator).await;
+                    match plan.result {
+                        ContractFilterMatch::Matched => {
+                            return ContractFilterContextPlan::resolved(
+                                ContractFilterMatch::Matched,
+                            );
+                        }
+                        ContractFilterMatch::Unmatched => {}
+                        ContractFilterMatch::Deferred => {
+                            deferred = true;
+                            requirements = requirements.union(plan.requirements);
+                            waits_for_non_context |= plan.waits_for_non_context;
+                        }
+                    }
+                }
+                if !deferred {
+                    ContractFilterContextPlan::resolved(ContractFilterMatch::Unmatched)
+                } else if waits_for_non_context {
+                    ContractFilterContextPlan {
+                        result: ContractFilterMatch::Deferred,
+                        requirements: ContractContextRequirements::default(),
+                        waits_for_non_context,
+                    }
+                } else {
+                    ContractFilterContextPlan {
+                        result: ContractFilterMatch::Deferred,
+                        requirements,
+                        waits_for_non_context,
+                    }
+                }
+            }
+            ContractFilterNode::Not(node) => {
+                let plan = plan_contract_filter_context(node, evaluator).await;
+                ContractFilterContextPlan {
+                    result: match plan.result {
+                        ContractFilterMatch::Matched => ContractFilterMatch::Unmatched,
+                        ContractFilterMatch::Unmatched => ContractFilterMatch::Matched,
+                        ContractFilterMatch::Deferred => ContractFilterMatch::Deferred,
+                    },
+                    ..plan
+                }
+            }
+        }
+    })
+}
+
 fn evaluate_contract_filter_node<'borrow, 'event>(
     node: ContractFilterNode,
     evaluator: &'borrow mut ContractFilterEvaluator<'event>,
@@ -2432,6 +2587,7 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
             }
             ContractFilterNode::And(nodes) => {
                 let initial_matches = evaluator.matching_ship_items.clone();
+                let initial_matches_deferred = evaluator.matching_ship_items_deferred;
                 let mut deferred = false;
                 for node in nodes {
                     match evaluate_contract_filter_node(
@@ -2444,13 +2600,19 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
                         ContractFilterMatch::Matched => {}
                         ContractFilterMatch::Unmatched => {
                             evaluator.matching_ship_items = initial_matches;
+                            evaluator.matching_ship_items_deferred = initial_matches_deferred;
                             return ContractFilterMatch::Unmatched;
                         }
                         ContractFilterMatch::Deferred => deferred = true,
                     }
                 }
                 if deferred {
+                    let branch_may_add_ship_items = collect_matching_ship_items
+                        && evaluator.matching_ship_items != initial_matches;
                     evaluator.matching_ship_items = initial_matches;
+                    evaluator.matching_ship_items_deferred = initial_matches_deferred
+                        || evaluator.matching_ship_items_deferred
+                        || branch_may_add_ship_items;
                     ContractFilterMatch::Deferred
                 } else {
                     ContractFilterMatch::Matched
@@ -2458,9 +2620,14 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
             }
             ContractFilterNode::Or(nodes) => {
                 let initial_matches = evaluator.matching_ship_items.clone();
+                let initial_matches_deferred = evaluator.matching_ship_items_deferred;
+                let mut matching_ship_items = initial_matches.clone();
+                let mut matching_ship_items_deferred = initial_matches_deferred;
+                let mut matched = false;
                 let mut deferred = false;
                 for node in nodes {
                     evaluator.matching_ship_items = initial_matches.clone();
+                    evaluator.matching_ship_items_deferred = initial_matches_deferred;
                     match evaluate_contract_filter_node(
                         node,
                         evaluator,
@@ -2468,15 +2635,32 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
                     )
                     .await
                     {
-                        ContractFilterMatch::Matched => return ContractFilterMatch::Matched,
+                        ContractFilterMatch::Matched => {
+                            matched = true;
+                            matching_ship_items
+                                .extend(evaluator.matching_ship_items.iter().copied());
+                            matching_ship_items_deferred |= evaluator.matching_ship_items_deferred;
+                        }
                         ContractFilterMatch::Unmatched => {}
-                        ContractFilterMatch::Deferred => deferred = true,
+                        ContractFilterMatch::Deferred => {
+                            deferred = true;
+                            matching_ship_items_deferred |= evaluator.matching_ship_items_deferred
+                                || (collect_matching_ship_items
+                                    && evaluator.matching_ship_items != initial_matches);
+                        }
                     }
                 }
-                evaluator.matching_ship_items = initial_matches;
-                if deferred {
+                if matched {
+                    evaluator.matching_ship_items = matching_ship_items;
+                    evaluator.matching_ship_items_deferred = matching_ship_items_deferred;
+                    ContractFilterMatch::Matched
+                } else if deferred {
+                    evaluator.matching_ship_items = initial_matches;
+                    evaluator.matching_ship_items_deferred = matching_ship_items_deferred;
                     ContractFilterMatch::Deferred
                 } else {
+                    evaluator.matching_ship_items = initial_matches;
+                    evaluator.matching_ship_items_deferred = initial_matches_deferred;
                     ContractFilterMatch::Unmatched
                 }
             }
@@ -2516,6 +2700,7 @@ async fn evaluate_contract_filter_condition(
             bool_match(!matching_items.is_empty())
         }
         ContractFilterCondition::ShipGroups { direction, ids } => {
+            let mut matched = false;
             let mut deferred = false;
             for item in items_for_direction(event, *direction) {
                 match evaluator.group_for_type(item.type_id).await {
@@ -2525,13 +2710,18 @@ async fn evaluate_contract_filter_condition(
                                 .matching_ship_items
                                 .insert((*direction, item.record_id));
                         }
-                        return ContractFilterMatch::Matched;
+                        matched = true;
                     }
                     ShipGroupLookup::TemporarilyUnavailable => deferred = true,
                     ShipGroupLookup::Resolved(Some(_)) | ShipGroupLookup::Resolved(None) => {}
                 }
             }
-            if deferred {
+            if collect_matching_ship_items && deferred {
+                evaluator.matching_ship_items_deferred = true;
+            }
+            if matched {
+                ContractFilterMatch::Matched
+            } else if deferred {
                 ContractFilterMatch::Deferred
             } else {
                 ContractFilterMatch::Unmatched
@@ -2587,96 +2777,6 @@ fn bool_match(matches: bool) -> ContractFilterMatch {
         ContractFilterMatch::Matched
     } else {
         ContractFilterMatch::Unmatched
-    }
-}
-
-fn local_contract_filter_match(
-    node: &ContractFilterNode,
-    event: &ContractEvent,
-) -> ContractFilterMatch {
-    match node {
-        ContractFilterNode::Condition(condition) => match condition {
-            ContractFilterCondition::EventKinds(kinds) => bool_match(kinds.contains(&event.kind)),
-            ContractFilterCondition::OfferedItems => bool_match(!event.offered_items.is_empty()),
-            ContractFilterCondition::RequestedItems => {
-                bool_match(!event.requested_items.is_empty())
-            }
-            ContractFilterCondition::ItemTypes { direction, ids } => bool_match(
-                items_for_direction(event, *direction)
-                    .iter()
-                    .any(|item| ids.contains(&item.type_id)),
-            ),
-            ContractFilterCondition::ShipGroups { .. }
-            | ContractFilterCondition::SolarSystems(_)
-            | ContractFilterCondition::SecurityRange { .. }
-            | ContractFilterCondition::ObservedAffiliationAlliances(_) => {
-                ContractFilterMatch::Deferred
-            }
-            ContractFilterCondition::MinimumIsk { direction, value } => {
-                money_match(relevant_isk(event, *direction), |amount| amount >= *value)
-            }
-            ContractFilterCondition::MaximumIsk { direction, value } => {
-                money_match(relevant_isk(event, *direction), |amount| amount <= *value)
-            }
-            ContractFilterCondition::Regions(ids) => bool_match(ids.contains(&event.region_id)),
-            ContractFilterCondition::LocationIds(ids) => {
-                bool_match(ids.contains(&event.contract.start_location_id))
-            }
-            ContractFilterCondition::IssuerCharacters(ids) => {
-                bool_match(ids.contains(&event.contract.issuer_id))
-            }
-            ContractFilterCondition::IssuerCorporations(ids) => {
-                bool_match(ids.contains(&event.contract.issuer_corporation_id))
-            }
-            ContractFilterCondition::PersonalIssuance => {
-                bool_match(!event.contract.for_corporation)
-            }
-            ContractFilterCondition::CorporationIssuance => {
-                bool_match(event.contract.for_corporation)
-            }
-            ContractFilterCondition::TitleFragment(fragment) => {
-                bool_match(
-                    event.contract.title.as_deref().is_some_and(|title| {
-                        title.to_lowercase().contains(&fragment.to_lowercase())
-                    }),
-                )
-            }
-        },
-        ContractFilterNode::And(nodes) => {
-            let mut deferred = false;
-            for node in nodes {
-                match local_contract_filter_match(node, event) {
-                    ContractFilterMatch::Matched => {}
-                    ContractFilterMatch::Unmatched => return ContractFilterMatch::Unmatched,
-                    ContractFilterMatch::Deferred => deferred = true,
-                }
-            }
-            if deferred {
-                ContractFilterMatch::Deferred
-            } else {
-                ContractFilterMatch::Matched
-            }
-        }
-        ContractFilterNode::Or(nodes) => {
-            let mut deferred = false;
-            for node in nodes {
-                match local_contract_filter_match(node, event) {
-                    ContractFilterMatch::Matched => return ContractFilterMatch::Matched,
-                    ContractFilterMatch::Unmatched => {}
-                    ContractFilterMatch::Deferred => deferred = true,
-                }
-            }
-            if deferred {
-                ContractFilterMatch::Deferred
-            } else {
-                ContractFilterMatch::Unmatched
-            }
-        }
-        ContractFilterNode::Not(node) => match local_contract_filter_match(node, event) {
-            ContractFilterMatch::Matched => ContractFilterMatch::Unmatched,
-            ContractFilterMatch::Unmatched => ContractFilterMatch::Matched,
-            ContractFilterMatch::Deferred => ContractFilterMatch::Deferred,
-        },
     }
 }
 
