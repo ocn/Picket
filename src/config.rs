@@ -724,7 +724,8 @@ pub fn save_subscriptions_for_guild(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[tokio::test]
     async fn channel_ping_limiter_is_keyed_by_channel_and_uses_a_five_minute_window() {
@@ -746,29 +747,21 @@ mod tests {
 
     #[test]
     fn test_load_subscription_file() {
-        let path = Path::new("config/888224317991706685.json");
-        assert!(
-            path.exists(),
-            "Subscription file does not exist at {:?}",
-            path
-        );
+        let mut file = NamedTempFile::new().expect("create subscription fixture");
+        file.write_all(
+            br#"[{"id":"fixture-subscription","description":"Sanitized test subscription","filter":{"Condition":{"Simple":{"IsNpc":true}}},"action":{"channel_id":"123456789","ping_type":null}}]"#,
+        )
+        .expect("write subscription fixture");
 
-        // Use the correct function that handles array-based JSON
-        let result = load_vec_from_json_file::<Subscription>(path);
-        assert!(
-            result.is_ok(),
-            "Failed to parse subscription file: {:?}",
-            result.err()
+        let subscriptions = load_vec_from_json_file::<Subscription>(file.path())
+            .expect("parse subscription fixture");
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].id, "fixture-subscription");
+        assert_eq!(subscriptions[0].action.channel_id, "123456789");
+        assert_eq!(
+            subscriptions[0].root_filter,
+            FilterNode::Condition(Filter::Simple(SimpleFilter::IsNpc(true)))
         );
-
-        let subscriptions = result.unwrap();
-        assert!(
-            !subscriptions.is_empty(),
-            "Expected non-empty subscriptions"
-        );
-        assert_eq!(subscriptions[0].id, "8128");
-        assert_eq!(subscriptions[0].action.channel_id, "1115072714340827167");
-        println!("{:#?}", subscriptions);
     }
 
     #[test]
