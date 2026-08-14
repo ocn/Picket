@@ -836,11 +836,11 @@ async fn pre_expiry_no_content_confirms_only_pure_matched_ship_sales_and_purchas
             items: HashMap::new(),
         },
         probes: StdMutex::new(vec![
-            Ok(ContractItemProbe::Accepted(expiring_cache())),
-            Ok(ContractItemProbe::Accepted(expiring_cache())),
-            Ok(ContractItemProbe::Accepted(expiring_cache())),
-            Ok(ContractItemProbe::Accepted(expiring_cache())),
-            Ok(ContractItemProbe::Accepted(expiring_cache())),
+            Ok(ContractItemProbe::NoContent(expiring_cache())),
+            Ok(ContractItemProbe::NoContent(expiring_cache())),
+            Ok(ContractItemProbe::NoContent(expiring_cache())),
+            Ok(ContractItemProbe::NoContent(expiring_cache())),
+            Ok(ContractItemProbe::NoContent(expiring_cache())),
         ]),
         probe_calls: StdMutex::new(Vec::new()),
     };
@@ -952,6 +952,132 @@ async fn pre_expiry_no_content_confirms_only_pure_matched_ship_sales_and_purchas
         .expect("leave positive acceptance evidence terminal");
     assert!(repeated.events.is_empty());
     assert_eq!(delivery.sent.lock().unwrap().len(), 2);
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_resolution_probe_failure_does_not_discard_prior_listings_or_confirmations() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut accepted_sale = item_exchange_contract(44);
+    accepted_sale.date_expired = Utc::now() + chrono::Duration::hours(1);
+    let mut retryable_resolution = item_exchange_contract(45);
+    retryable_resolution.date_expired = Utc::now() + chrono::Duration::hours(1);
+    let listed = item_exchange_contract(46);
+
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![accepted_sale.clone(), retryable_resolution.clone()],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    45,
+                    Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                ),
+            ]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "listed",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist listed subscription");
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "sale",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist sale subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let resolver = Arc::new(ResolutionEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![listed.clone()], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                46,
+                Ok(EsiResponse::fresh(vec![offered_ship(3)], expiring_cache())),
+            )]),
+        },
+        probes: StdMutex::new(vec![
+            Ok(ContractItemProbe::NoContent(expiring_cache())),
+            Err(EsiError::retryable("transient item probe failure", None)),
+            Ok(ContractItemProbe::Available(EsiResponse::fresh(
+                vec![offered_ship(2)],
+                cached_item_metadata("items-45-v2", 60),
+            ))),
+        ]),
+        probe_calls: StdMutex::new(Vec::new()),
+    });
+    let collector = ContractCollector::new(store.clone(), resolver.clone()).with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    );
+
+    let first = collector
+        .collect_cycle()
+        .await
+        .expect("the independent resolution failure must not abort the cycle");
+    assert_eq!(
+        first
+            .events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        vec![ContractEventKind::Listed, ContractEventKind::SaleConfirmed]
+    );
+    assert_eq!(delivery.sent.lock().unwrap().len(), 2);
+    let resolutions = store
+        .contract_resolution_records()
+        .await
+        .expect("read resolution retry state");
+    assert_eq!(resolutions.len(), 2);
+    assert_eq!(
+        resolutions[0].state,
+        ContractResolutionState::AcceptanceConfirmed
+    );
+    assert_eq!(
+        resolutions[1].state,
+        ContractResolutionState::AwaitingResolution
+    );
+
+    let second = collector
+        .collect_cycle()
+        .await
+        .expect("retry the unresolved independent case");
+    assert!(second.events.is_empty());
+    assert_eq!(delivery.sent.lock().unwrap().len(), 2);
+    assert_eq!(
+        resolver.probe_calls.lock().unwrap().as_slice(),
+        [(44, None), (45, None), (45, None)]
+    );
     database.destroy().await;
 }
 
@@ -1278,7 +1404,7 @@ async fn http_esi_distinguishes_a_no_content_item_probe_from_a_json_item_respons
         .await
         .expect("decode the positive acceptance probe");
 
-    assert!(matches!(probe, ContractItemProbe::Accepted(_)));
+    assert!(matches!(probe, ContractItemProbe::NoContent(_)));
     server.finish();
 }
 

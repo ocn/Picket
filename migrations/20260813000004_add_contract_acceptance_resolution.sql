@@ -9,6 +9,7 @@ CREATE TABLE contract_resolution_cases (
     state TEXT NOT NULL CHECK (state IN ('awaiting_resolution', 'acceptance_confirmed')),
     acceptance_evidence_at TIMESTAMPTZ,
     acceptance_response_metadata JSONB,
+    notification_pending BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (region_id, contract_id)
