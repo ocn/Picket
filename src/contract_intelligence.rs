@@ -1972,7 +1972,7 @@ impl ContractCollector {
             }
             let mut evaluator = ContractFilterEvaluator::new(event, ship_groups);
             let plan =
-                plan_contract_filter_context(&subscription.filter.root, &mut evaluator).await;
+                plan_contract_filter_context(&subscription.filter.root, &mut evaluator, true).await;
             requirements = requirements.union(plan.requirements);
         }
         if requirements.is_empty() {
@@ -2448,11 +2448,12 @@ enum PrimaryDisplayItem<'a> {
     Deferred,
 }
 
-#[derive(Clone, Copy)]
 struct ContractFilterContextPlan {
     result: ContractFilterMatch,
     requirements: ContractContextRequirements,
     waits_for_non_context: bool,
+    confirmed_ship_items: HashSet<(ContractItemDirection, i64)>,
+    potential_ship_items: HashSet<(ContractItemDirection, i64)>,
 }
 
 impl ContractFilterContextPlan {
@@ -2461,17 +2462,82 @@ impl ContractFilterContextPlan {
             result,
             requirements: ContractContextRequirements::default(),
             waits_for_non_context: false,
+            confirmed_ship_items: HashSet::new(),
+            potential_ship_items: HashSet::new(),
         }
+    }
+
+    fn all_ship_items(&self) -> HashSet<(ContractItemDirection, i64)> {
+        self.confirmed_ship_items
+            .union(&self.potential_ship_items)
+            .copied()
+            .collect()
     }
 }
 
 fn plan_contract_filter_context<'borrow, 'event>(
     node: &'borrow ContractFilterNode,
     evaluator: &'borrow mut ContractFilterEvaluator<'event>,
+    collect_matching_ship_items: bool,
 ) -> Pin<Box<dyn Future<Output = ContractFilterContextPlan> + Send + 'borrow>> {
     Box::pin(async move {
         match node {
             ContractFilterNode::Condition(condition) => {
+                if collect_matching_ship_items {
+                    match condition {
+                        ContractFilterCondition::ItemTypes { direction, ids } => {
+                            let confirmed_ship_items =
+                                items_for_direction(evaluator.event, *direction)
+                                    .iter()
+                                    .filter(|item| ids.contains(&item.type_id))
+                                    .map(|item| (*direction, item.record_id))
+                                    .collect::<HashSet<_>>();
+                            return ContractFilterContextPlan {
+                                result: if confirmed_ship_items.is_empty() {
+                                    ContractFilterMatch::Unmatched
+                                } else {
+                                    ContractFilterMatch::Matched
+                                },
+                                requirements: ContractContextRequirements::default(),
+                                waits_for_non_context: false,
+                                confirmed_ship_items,
+                                potential_ship_items: HashSet::new(),
+                            };
+                        }
+                        ContractFilterCondition::ShipGroups { direction, ids } => {
+                            let mut confirmed_ship_items = HashSet::new();
+                            let mut potential_ship_items = HashSet::new();
+                            for item in items_for_direction(evaluator.event, *direction) {
+                                match evaluator.group_for_type(item.type_id).await {
+                                    ShipGroupLookup::Resolved(Some(group_id))
+                                        if ids.contains(&group_id) =>
+                                    {
+                                        confirmed_ship_items.insert((*direction, item.record_id));
+                                    }
+                                    ShipGroupLookup::TemporarilyUnavailable => {
+                                        potential_ship_items.insert((*direction, item.record_id));
+                                    }
+                                    ShipGroupLookup::Resolved(Some(_))
+                                    | ShipGroupLookup::Resolved(None) => {}
+                                }
+                            }
+                            return ContractFilterContextPlan {
+                                result: if !confirmed_ship_items.is_empty() {
+                                    ContractFilterMatch::Matched
+                                } else if !potential_ship_items.is_empty() {
+                                    ContractFilterMatch::Deferred
+                                } else {
+                                    ContractFilterMatch::Unmatched
+                                },
+                                requirements: ContractContextRequirements::default(),
+                                waits_for_non_context: !potential_ship_items.is_empty(),
+                                confirmed_ship_items,
+                                potential_ship_items,
+                            };
+                        }
+                        _ => {}
+                    }
+                }
                 let result = evaluate_contract_filter_condition(condition, evaluator, false).await;
                 if !matches!(result, ContractFilterMatch::Deferred) {
                     return ContractFilterContextPlan::resolved(result);
@@ -2481,16 +2547,27 @@ fn plan_contract_filter_context<'borrow, 'event>(
                     result,
                     requirements,
                     waits_for_non_context: requirements.is_empty(),
+                    confirmed_ship_items: HashSet::new(),
+                    potential_ship_items: HashSet::new(),
                 }
             }
             ContractFilterNode::And(nodes) => {
                 let mut requirements = ContractContextRequirements::default();
                 let mut deferred = false;
                 let mut waits_for_non_context = false;
+                let mut confirmed_ship_items = HashSet::new();
+                let mut potential_ship_items = HashSet::new();
                 for node in nodes {
-                    let plan = plan_contract_filter_context(node, evaluator).await;
+                    let plan =
+                        plan_contract_filter_context(node, evaluator, collect_matching_ship_items)
+                            .await;
                     match plan.result {
-                        ContractFilterMatch::Matched => {}
+                        ContractFilterMatch::Matched => {
+                            requirements = requirements.union(plan.requirements);
+                            waits_for_non_context |= plan.waits_for_non_context;
+                            confirmed_ship_items.extend(plan.confirmed_ship_items);
+                            potential_ship_items.extend(plan.potential_ship_items);
+                        }
                         ContractFilterMatch::Unmatched => {
                             return ContractFilterContextPlan::resolved(
                                 ContractFilterMatch::Unmatched,
@@ -2500,70 +2577,111 @@ fn plan_contract_filter_context<'borrow, 'event>(
                             deferred = true;
                             requirements = requirements.union(plan.requirements);
                             waits_for_non_context |= plan.waits_for_non_context;
+                            potential_ship_items.extend(plan.confirmed_ship_items);
+                            potential_ship_items.extend(plan.potential_ship_items);
                         }
                     }
                 }
-                if !deferred {
-                    ContractFilterContextPlan::resolved(ContractFilterMatch::Matched)
-                } else if waits_for_non_context {
-                    ContractFilterContextPlan {
-                        result: ContractFilterMatch::Deferred,
-                        requirements: ContractContextRequirements::default(),
-                        waits_for_non_context,
-                    }
-                } else {
-                    ContractFilterContextPlan {
-                        result: ContractFilterMatch::Deferred,
-                        requirements,
-                        waits_for_non_context,
-                    }
+                if deferred {
+                    potential_ship_items.extend(confirmed_ship_items.drain());
+                }
+                ContractFilterContextPlan {
+                    result: if deferred {
+                        ContractFilterMatch::Deferred
+                    } else {
+                        ContractFilterMatch::Matched
+                    },
+                    requirements: if waits_for_non_context {
+                        ContractContextRequirements::default()
+                    } else {
+                        requirements
+                    },
+                    waits_for_non_context,
+                    confirmed_ship_items,
+                    potential_ship_items,
                 }
             }
             ContractFilterNode::Or(nodes) => {
-                let mut requirements = ContractContextRequirements::default();
-                let mut deferred = false;
-                let mut waits_for_non_context = false;
+                let mut matched_plans = Vec::new();
+                let mut deferred_plans = Vec::new();
                 for node in nodes {
-                    let plan = plan_contract_filter_context(node, evaluator).await;
+                    let plan =
+                        plan_contract_filter_context(node, evaluator, collect_matching_ship_items)
+                            .await;
                     match plan.result {
-                        ContractFilterMatch::Matched => {
-                            return ContractFilterContextPlan::resolved(
-                                ContractFilterMatch::Matched,
-                            );
-                        }
+                        ContractFilterMatch::Matched => matched_plans.push(plan),
                         ContractFilterMatch::Unmatched => {}
-                        ContractFilterMatch::Deferred => {
-                            deferred = true;
-                            requirements = requirements.union(plan.requirements);
-                            waits_for_non_context |= plan.waits_for_non_context;
-                        }
+                        ContractFilterMatch::Deferred => deferred_plans.push(plan),
                     }
                 }
-                if !deferred {
-                    ContractFilterContextPlan::resolved(ContractFilterMatch::Unmatched)
-                } else if waits_for_non_context {
-                    ContractFilterContextPlan {
-                        result: ContractFilterMatch::Deferred,
-                        requirements: ContractContextRequirements::default(),
-                        waits_for_non_context,
+                if matched_plans.is_empty() {
+                    if deferred_plans.is_empty() {
+                        return ContractFilterContextPlan::resolved(ContractFilterMatch::Unmatched);
                     }
-                } else {
-                    ContractFilterContextPlan {
-                        result: ContractFilterMatch::Deferred,
-                        requirements,
-                        waits_for_non_context,
+                    let mut requirements = ContractContextRequirements::default();
+                    let mut waits_for_non_context = false;
+                    let mut potential_ship_items = HashSet::new();
+                    for plan in deferred_plans {
+                        requirements = requirements.union(plan.requirements);
+                        waits_for_non_context |= plan.waits_for_non_context;
+                        potential_ship_items.extend(plan.confirmed_ship_items);
+                        potential_ship_items.extend(plan.potential_ship_items);
                     }
+                    return ContractFilterContextPlan {
+                        result: ContractFilterMatch::Deferred,
+                        requirements: if waits_for_non_context {
+                            ContractContextRequirements::default()
+                        } else {
+                            requirements
+                        },
+                        waits_for_non_context,
+                        confirmed_ship_items: HashSet::new(),
+                        potential_ship_items,
+                    };
+                }
+
+                let mut requirements = ContractContextRequirements::default();
+                let mut waits_for_non_context = false;
+                let mut confirmed_ship_items = HashSet::new();
+                let mut potential_ship_items = HashSet::new();
+                for plan in matched_plans {
+                    requirements = requirements.union(plan.requirements);
+                    waits_for_non_context |= plan.waits_for_non_context;
+                    confirmed_ship_items.extend(plan.confirmed_ship_items);
+                    potential_ship_items.extend(plan.potential_ship_items);
+                }
+                for plan in deferred_plans {
+                    let candidate_items = plan.all_ship_items();
+                    if !candidate_items.is_subset(&confirmed_ship_items) {
+                        requirements = requirements.union(plan.requirements);
+                        waits_for_non_context |= plan.waits_for_non_context;
+                        potential_ship_items.extend(candidate_items);
+                    }
+                }
+                ContractFilterContextPlan {
+                    result: ContractFilterMatch::Matched,
+                    requirements: if waits_for_non_context {
+                        ContractContextRequirements::default()
+                    } else {
+                        requirements
+                    },
+                    waits_for_non_context,
+                    confirmed_ship_items,
+                    potential_ship_items,
                 }
             }
             ContractFilterNode::Not(node) => {
-                let plan = plan_contract_filter_context(node, evaluator).await;
+                let plan = plan_contract_filter_context(node, evaluator, false).await;
                 ContractFilterContextPlan {
                     result: match plan.result {
                         ContractFilterMatch::Matched => ContractFilterMatch::Unmatched,
                         ContractFilterMatch::Unmatched => ContractFilterMatch::Matched,
                         ContractFilterMatch::Deferred => ContractFilterMatch::Deferred,
                     },
-                    ..plan
+                    requirements: plan.requirements,
+                    waits_for_non_context: plan.waits_for_non_context,
+                    confirmed_ship_items: HashSet::new(),
+                    potential_ship_items: HashSet::new(),
                 }
             }
         }
