@@ -19,6 +19,7 @@ use tracing::{info, warn};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 const CONTRACT_COLLECTOR_USER_AGENT: &str = "killbot-rust Global Public Contract Intelligence";
+const MAX_EMBED_CONTEXT_ENRICHMENTS_PER_CYCLE: usize = 8;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PublicContract {
@@ -280,6 +281,17 @@ pub trait PublicContractEsi: Send + Sync {
         ))
     }
 
+    /// The collector supplies a persisted rate-limit boundary for the HTTP implementation.
+    /// Test and alternate implementations can retain the aggregate-only default.
+    async fn observed_contract_embed_context_limited(
+        &self,
+        contract: &PublicContract,
+        items: &[PublicContractItem],
+        _limiter: &dyn ContractContextLimiter,
+    ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
+        self.observed_contract_embed_context(contract, items).await
+    }
+
     async fn observed_contract_solar_system(
         &self,
         contract: &PublicContract,
@@ -396,9 +408,29 @@ pub trait PublicContractEsi: Send + Sync {
     }
 }
 
+#[async_trait]
+pub trait ContractContextLimiter: Send + Sync {
+    async fn request_allowed(&self) -> Result<bool, EsiError>;
+    async fn record_response(&self, metadata: &CacheMetadata) -> Result<(), EsiError>;
+}
+
+struct NoopContractContextLimiter;
+
+#[async_trait]
+impl ContractContextLimiter for NoopContractContextLimiter {
+    async fn request_allowed(&self) -> Result<bool, EsiError> {
+        Ok(true)
+    }
+
+    async fn record_response(&self, _metadata: &CacheMetadata) -> Result<(), EsiError> {
+        Ok(())
+    }
+}
+
 pub struct HttpPublicContractEsi {
     client: Client,
     base_url: String,
+    context_cache: Mutex<HashMap<String, CachedResponse>>,
 }
 
 impl HttpPublicContractEsi {
@@ -416,6 +448,7 @@ impl HttpPublicContractEsi {
                 .user_agent(CONTRACT_COLLECTOR_USER_AGENT)
                 .build()?,
             base_url: base_url.into(),
+            context_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -501,17 +534,130 @@ impl HttpPublicContractEsi {
         Ok(EsiResponse::fresh(value, metadata))
     }
 
-    async fn optional_get<T: DeserializeOwned>(
+    async fn guarded_context_get<T: DeserializeOwned>(
         &self,
         path: &str,
-    ) -> Result<Option<EsiResponse<T>>, EsiError> {
-        match self.get(path, None).await {
-            Ok(response) => Ok(Some(response)),
-            Err(error) if error.is_not_found() || error.status == Some(StatusCode::FORBIDDEN) => {
-                Ok(None)
-            }
-            Err(error) => Err(error),
+        etag: Option<&str>,
+        limiter: &dyn ContractContextLimiter,
+    ) -> Result<EsiResponse<T>, EsiError> {
+        if !limiter.request_allowed().await? {
+            return Err(EsiError::retryable(
+                "persisted global ESI limiter boundary remains active",
+                None,
+            ));
         }
+        let response = self.get(path, etag).await;
+        match &response {
+            Ok(response) => limiter.record_response(&response.metadata).await?,
+            Err(error) => limiter.record_response(&error.metadata).await?,
+        }
+        response
+    }
+
+    async fn guarded_context_post<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        limiter: &dyn ContractContextLimiter,
+    ) -> Result<EsiResponse<T>, EsiError> {
+        if !limiter.request_allowed().await? {
+            return Err(EsiError::retryable(
+                "persisted global ESI limiter boundary remains active",
+                None,
+            ));
+        }
+        let response = self.post_json(path, body).await;
+        match &response {
+            Ok(response) => limiter.record_response(&response.metadata).await?,
+            Err(error) => limiter.record_response(&error.metadata).await?,
+        }
+        response
+    }
+
+    async fn cached_context_get<T: DeserializeOwned>(
+        &self,
+        cache_key: &str,
+        path: &str,
+        limiter: &dyn ContractContextLimiter,
+    ) -> Result<Option<EsiResponse<T>>, EsiError> {
+        let cached = self.context_cache.lock().await.get(cache_key).cloned();
+        if let Some(cached) = cached.as_ref().filter(|cached| cached.metadata.is_fresh()) {
+            return cached_context_response(cached.clone())
+                .map(Some)
+                .map_err(|error| EsiError::retryable(error.to_string(), None));
+        }
+        let etag = cached
+            .as_ref()
+            .and_then(|cached| cached.metadata.etag.as_deref());
+        let response = match self.guarded_context_get::<Value>(path, etag, limiter).await {
+            Ok(response) => response,
+            Err(error)
+                if error.is_not_found()
+                    || matches!(
+                        error.status,
+                        Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                    ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let cached = if response.not_modified {
+            let cached = cached.ok_or_else(|| {
+                EsiError::retryable(
+                    format!("{path} returned 304 without a cached representation"),
+                    None,
+                )
+            })?;
+            CachedResponse {
+                response: cached.response,
+                metadata: merge_cache_metadata(&cached.metadata, response.metadata),
+            }
+        } else {
+            CachedResponse {
+                response: response.value.ok_or_else(|| {
+                    EsiError::retryable(format!("{path} returned no representation"), None)
+                })?,
+                metadata: response.metadata,
+            }
+        };
+        self.context_cache
+            .lock()
+            .await
+            .insert(cache_key.to_string(), cached.clone());
+        cached_context_response(cached)
+            .map(Some)
+            .map_err(|error| EsiError::retryable(error.to_string(), None))
+    }
+
+    async fn cached_context_post<T: DeserializeOwned, B: Serialize>(
+        &self,
+        cache_key: &str,
+        path: &str,
+        body: &B,
+        limiter: &dyn ContractContextLimiter,
+    ) -> Result<EsiResponse<T>, EsiError> {
+        if let Some(cached) = self.context_cache.lock().await.get(cache_key).cloned() {
+            if cached.metadata.is_fresh() {
+                return cached_context_response(cached)
+                    .map_err(|error| EsiError::retryable(error.to_string(), None));
+            }
+        }
+        let response = self
+            .guarded_context_post::<Value, _>(path, body, limiter)
+            .await?;
+        let cached = CachedResponse {
+            response: response.value.ok_or_else(|| {
+                EsiError::retryable(format!("{path} returned no representation"), None)
+            })?,
+            metadata: response.metadata,
+        };
+        self.context_cache
+            .lock()
+            .await
+            .insert(cache_key.to_string(), cached.clone());
+        cached_context_response(cached)
+            .map_err(|error| EsiError::retryable(error.to_string(), None))
     }
 
     async fn public_contract_items_probe(
@@ -725,15 +871,20 @@ impl PublicContractEsi for HttpPublicContractEsi {
         contract: &PublicContract,
         items: &[PublicContractItem],
     ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
+        self.observed_contract_embed_context_limited(contract, items, &NoopContractContextLimiter)
+            .await
+    }
+
+    async fn observed_contract_embed_context_limited(
+        &self,
+        contract: &PublicContract,
+        items: &[PublicContractItem],
+        limiter: &dyn ContractContextLimiter,
+    ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
         #[derive(Deserialize)]
         struct Station {
             name: String,
             system_id: i64,
-        }
-        #[derive(Deserialize)]
-        struct Structure {
-            name: String,
-            solar_system_id: i64,
         }
         #[derive(Deserialize)]
         struct SolarSystem {
@@ -769,7 +920,11 @@ impl PublicContractEsi for HttpPublicContractEsi {
             if (30_000_000..33_000_000).contains(&system_id) {
                 context.location.solar_system_id = Some(i64::from(system_id));
             } else if let Some(response) = self
-                .optional_get::<Station>(&format!("universe/stations/{system_id}/"))
+                .cached_context_get::<Station>(
+                    &format!("universe/stations/{system_id}"),
+                    &format!("universe/stations/{system_id}/"),
+                    limiter,
+                )
                 .await?
             {
                 metadata = merge_cache_metadata(&metadata, response.metadata);
@@ -780,22 +935,13 @@ impl PublicContractEsi for HttpPublicContractEsi {
                 }
             }
         }
-        if context.location.solar_system_id.is_none() {
-            if let Some(response) = self
-                .optional_get::<Structure>(&format!("universe/structures/{location_id}/"))
-                .await?
-            {
-                metadata = merge_cache_metadata(&metadata, response.metadata);
-                if let Some(structure) = response.value {
-                    context.location.location_name = Some(structure.name);
-                    context.location.location_kind = Some("Structure".to_string());
-                    context.location.solar_system_id = Some(structure.solar_system_id);
-                }
-            }
-        }
         if let Some(system_id) = context.location.solar_system_id {
             if let Some(response) = self
-                .optional_get::<SolarSystem>(&format!("universe/systems/{system_id}/"))
+                .cached_context_get::<SolarSystem>(
+                    &format!("universe/systems/{system_id}"),
+                    &format!("universe/systems/{system_id}/"),
+                    limiter,
+                )
                 .await?
             {
                 metadata = merge_cache_metadata(&metadata, response.metadata);
@@ -806,20 +952,22 @@ impl PublicContractEsi for HttpPublicContractEsi {
                         .is_finite()
                         .then_some(system.security_status);
                     if let Some(response) = self
-                        .optional_get::<Constellation>(&format!(
-                            "universe/constellations/{}/",
-                            system.constellation_id
-                        ))
+                        .cached_context_get::<Constellation>(
+                            &format!("universe/constellations/{}", system.constellation_id),
+                            &format!("universe/constellations/{}/", system.constellation_id),
+                            limiter,
+                        )
                         .await?
                     {
                         metadata = merge_cache_metadata(&metadata, response.metadata);
                         if let Some(constellation) = response.value {
                             context.location.region_id = Some(constellation.region_id);
                             if let Some(response) = self
-                                .optional_get::<Region>(&format!(
-                                    "universe/regions/{}/",
-                                    constellation.region_id
-                                ))
+                                .cached_context_get::<Region>(
+                                    &format!("universe/regions/{}", constellation.region_id),
+                                    &format!("universe/regions/{}/", constellation.region_id),
+                                    limiter,
+                                )
                                 .await?
                             {
                                 metadata = merge_cache_metadata(&metadata, response.metadata);
@@ -832,8 +980,14 @@ impl PublicContractEsi for HttpPublicContractEsi {
                 }
             }
         }
+        let affiliation_ids = vec![contract.issuer_id];
         let affiliation = self
-            .post_json::<Vec<Affiliation>, _>("characters/affiliation/", &vec![contract.issuer_id])
+            .cached_context_post::<Vec<Affiliation>, _>(
+                &format!("characters/affiliation/{}", contract.issuer_id),
+                "characters/affiliation/",
+                &affiliation_ids,
+                limiter,
+            )
             .await?;
         metadata = merge_cache_metadata(&metadata, affiliation.metadata);
         context.issuer_alliance_id = affiliation
@@ -849,10 +1003,21 @@ impl PublicContractEsi for HttpPublicContractEsi {
         }
         names.extend(items.iter().map(|item| item.type_id));
         if !names.is_empty() {
+            let name_ids = names.into_iter().collect::<Vec<_>>();
+            let names_key = format!(
+                "universe/names/{}",
+                name_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
             let response = self
-                .post_json::<Vec<Name>, _>(
+                .cached_context_post::<Vec<Name>, _>(
+                    &names_key,
                     "universe/names/",
-                    &names.into_iter().collect::<Vec<_>>(),
+                    &name_ids,
+                    limiter,
                 )
                 .await?;
             metadata = merge_cache_metadata(&metadata, response.metadata);
@@ -1669,6 +1834,13 @@ struct CachedResponse {
     metadata: CacheMetadata,
 }
 
+fn cached_context_response<T: DeserializeOwned>(
+    cached: CachedResponse,
+) -> Result<EsiResponse<T>, serde_json::Error> {
+    let value = serde_json::from_value(cached.response)?;
+    Ok(EsiResponse::fresh(value, cached.metadata))
+}
+
 impl ContractCollectionStore {
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
         let pool = PgPoolOptions::new()
@@ -2199,6 +2371,7 @@ impl ContractCollectionStore {
             baseline_established: baseline_at.is_none(),
             observed_contracts: contracts.len(),
             newly_observed,
+            observed: contracts.to_vec(),
         })
     }
 
@@ -2489,6 +2662,7 @@ struct RecordComplete {
     baseline_established: bool,
     observed_contracts: usize,
     newly_observed: Vec<ObservedContract>,
+    observed: Vec<ObservedContract>,
 }
 
 #[derive(Debug)]
@@ -2595,6 +2769,28 @@ struct ResolutionBatch {
     retry_after: Option<DateTime<Utc>>,
 }
 
+struct PersistedContractContextLimiter {
+    store: ContractCollectionStore,
+}
+
+#[async_trait]
+impl ContractContextLimiter for PersistedContractContextLimiter {
+    async fn request_allowed(&self) -> Result<bool, EsiError> {
+        self.store
+            .active_esi_limiter_deadline()
+            .await
+            .map(|deadline| deadline.is_none())
+            .map_err(|error| EsiError::retryable(error.to_string(), None))
+    }
+
+    async fn record_response(&self, metadata: &CacheMetadata) -> Result<(), EsiError> {
+        self.store
+            .record_esi_limiter(metadata)
+            .await
+            .map_err(|error| EsiError::retryable(error.to_string(), None))
+    }
+}
+
 impl ContractCollector {
     pub fn new(store: ContractCollectionStore, esi: Arc<dyn PublicContractEsi>) -> Self {
         Self {
@@ -2635,10 +2831,20 @@ impl ContractCollector {
         let mut outcomes = Vec::with_capacity(regions.len());
         let mut events = Vec::new();
         let mut retry_after = None;
+        let mut remaining_embed_context_enrichments = MAX_EMBED_CONTEXT_ENRICHMENTS_PER_CYCLE;
         for region_id in regions {
             match self.collect_region(region_id).await {
                 Ok(recorded) => {
                     let observed_contracts = recorded.observed_contracts;
+                    let consumed = self
+                        .snapshot_observed_contracts(
+                            region_id,
+                            &recorded.observed,
+                            remaining_embed_context_enrichments,
+                        )
+                        .await?;
+                    remaining_embed_context_enrichments =
+                        remaining_embed_context_enrichments.saturating_sub(consumed);
                     events.extend(recorded.newly_observed.into_iter().map(|observed| {
                         ContractEvent {
                             region_id,
@@ -3034,6 +3240,7 @@ impl ContractCollector {
         subscriptions: &[ContractSubscription],
         ship_groups: &dyn ShipGroupResolver,
     ) -> Result<ContractEvent, ContractCollectionError> {
+        let mut event = self.event_with_persisted_observation_context(event).await?;
         let mut requirements = ContractContextRequirements::default();
         for subscription in subscriptions {
             if matches!(
@@ -3042,16 +3249,20 @@ impl ContractCollector {
             ) {
                 continue;
             }
-            let mut evaluator = ContractFilterEvaluator::new(event, ship_groups);
+            let mut evaluator = ContractFilterEvaluator::new(&event, ship_groups);
             let plan =
                 plan_contract_filter_context(&subscription.filter.root, &mut evaluator, true).await;
             requirements = requirements.union(plan.requirements);
         }
         if requirements.is_empty() {
-            return Ok(event.clone());
+            return Ok(event);
         }
-        let mut event = event.clone();
         event.context.normalize_resolutions();
+
+        if !matches!(event.kind, ContractEventKind::Listed) {
+            mark_terminal_context_unavailable(&mut event.context, requirements);
+            return Ok(event);
+        }
 
         if (requirements.solar_system || requirements.security_status)
             && event.context.solar_system_id.is_none()
@@ -3143,6 +3354,34 @@ impl ContractCollector {
         Ok(event)
     }
 
+    async fn event_with_persisted_observation_context(
+        &self,
+        event: &ContractEvent,
+    ) -> Result<ContractEvent, ContractCollectionError> {
+        let mut observed = event.clone();
+        if let Some(snapshot) = self
+            .store
+            .observed_embed_context(event.region_id, event.contract.contract_id)
+            .await?
+        {
+            observed.embed_context.merge_missing_from(&snapshot);
+            observed.context.solar_system_id = observed
+                .context
+                .solar_system_id
+                .or(snapshot.location.solar_system_id);
+            observed.context.security_status = observed.context.security_status.or(snapshot
+                .location
+                .security_status
+                .filter(|value| value.is_finite()));
+            observed.context.observed_affiliation_alliance_id = observed
+                .context
+                .observed_affiliation_alliance_id
+                .or(snapshot.issuer_alliance_id);
+        }
+        observed.context.normalize_resolutions();
+        Ok(observed)
+    }
+
     async fn context_request_allowed(
         &self,
         contract_id: i64,
@@ -3174,7 +3413,7 @@ impl ContractCollector {
                 self.store.record_esi_limiter(&error.metadata).await?;
                 warn!(
                     contract_id,
-                    "contract context will be retried before context-dependent notifications: {error}"
+                    "contract context will be retried during a later complete observation: {error}"
                 );
                 Ok(None)
             }
@@ -3254,36 +3493,12 @@ impl ContractCollector {
         event: &ContractEvent,
     ) -> Result<ContractEvent, ContractCollectionError> {
         let mut enriched = event.clone();
-        let mut snapshot_obtained = false;
         if let Some(snapshot) = self
             .store
             .observed_embed_context(event.region_id, event.contract.contract_id)
             .await?
         {
             enriched.embed_context.merge_missing_from(&snapshot);
-            snapshot_obtained = true;
-        } else if matches!(event.kind, ContractEventKind::Listed) {
-            let items = contract_items_with_direction(event)
-                .map(|(_, item)| item.clone())
-                .collect::<Vec<_>>();
-            if self
-                .context_request_allowed(event.contract.contract_id)
-                .await?
-            {
-                if let Some(response) = self
-                    .record_context_esi_result(
-                        event.contract.contract_id,
-                        self.esi
-                            .observed_contract_embed_context(&event.contract, &items)
-                            .await,
-                    )
-                    .await?
-                {
-                    let context = response.value.unwrap_or_default();
-                    enriched.embed_context.merge_missing_from(&context);
-                    snapshot_obtained = true;
-                }
-            }
         }
         enriched.embed_context.location.solar_system_id = enriched
             .embed_context
@@ -3299,16 +3514,80 @@ impl ContractCollector {
             .embed_context
             .issuer_alliance_id
             .or(enriched.context.observed_affiliation_alliance_id);
-        if snapshot_obtained && matches!(event.kind, ContractEventKind::Listed) {
-            self.store
-                .save_observed_embed_context(
-                    event.region_id,
-                    event.contract.contract_id,
-                    &enriched.embed_context,
-                )
-                .await?;
-        }
         Ok(enriched)
+    }
+
+    async fn snapshot_observed_contracts(
+        &self,
+        region_id: i64,
+        observed: &[ObservedContract],
+        remaining: usize,
+    ) -> Result<usize, ContractCollectionError> {
+        let mut consumed = 0;
+        for observed in observed.iter().take(remaining) {
+            if self
+                .store
+                .observed_embed_context(region_id, observed.contract.contract_id)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            consumed += 1;
+            if !self
+                .context_request_allowed(observed.contract.contract_id)
+                .await?
+            {
+                break;
+            }
+            let items = observed
+                .manifest
+                .offered_items
+                .iter()
+                .chain(&observed.manifest.requested_items)
+                .cloned()
+                .collect::<Vec<_>>();
+            let limiter = PersistedContractContextLimiter {
+                store: self.store.clone(),
+            };
+            match self
+                .record_context_esi_result(
+                    observed.contract.contract_id,
+                    self.esi
+                        .observed_contract_embed_context_limited(
+                            &observed.contract,
+                            &items,
+                            &limiter,
+                        )
+                        .await,
+                )
+                .await?
+            {
+                Some(response) => {
+                    self.store
+                        .save_observed_embed_context(
+                            region_id,
+                            observed.contract.contract_id,
+                            &response.value.unwrap_or_default(),
+                        )
+                        .await?;
+                }
+                None => {
+                    self.store
+                        .record_failure(
+                            Some(region_id),
+                            "embed_context_enrichment",
+                            "observation-time contract embed enrichment will be retried",
+                            self.store.active_esi_limiter_deadline().await?,
+                        )
+                        .await?;
+                }
+            }
+            if self.store.active_esi_limiter_deadline().await?.is_some() {
+                break;
+            }
+        }
+        Ok(consumed)
     }
 
     async fn regions(&self) -> Result<Vec<i64>, ContractCollectionError> {
@@ -3532,6 +3811,40 @@ fn apply_observed_affiliation_context(
             context.observed_affiliation_alliance_resolution =
                 ContractContextResolution::Indeterminate;
         }
+    }
+}
+
+fn mark_terminal_context_unavailable(
+    context: &mut ContractObservationContext,
+    requirements: ContractContextRequirements,
+) {
+    if requirements.solar_system
+        && context.solar_system_id.is_none()
+        && !matches!(
+            context.solar_system_resolution,
+            ContractContextResolution::DefinitivelyAbsent
+        )
+    {
+        context.solar_system_resolution = ContractContextResolution::TemporarilyUnavailable;
+    }
+    if requirements.security_status
+        && context.security_status.is_none()
+        && !matches!(
+            context.security_status_resolution,
+            ContractContextResolution::DefinitivelyAbsent
+        )
+    {
+        context.security_status_resolution = ContractContextResolution::TemporarilyUnavailable;
+    }
+    if requirements.observed_affiliation
+        && context.observed_affiliation_alliance_id.is_none()
+        && !matches!(
+            context.observed_affiliation_alliance_resolution,
+            ContractContextResolution::DefinitivelyAbsent
+        )
+    {
+        context.observed_affiliation_alliance_resolution =
+            ContractContextResolution::TemporarilyUnavailable;
     }
 }
 
@@ -4414,6 +4727,7 @@ const MAX_EMBED_DESCRIPTION_CHARACTERS: usize = 4096;
 const MAX_EMBED_FIELD_NAME_CHARACTERS: usize = 256;
 const MAX_EMBED_FIELD_VALUE_CHARACTERS: usize = 1024;
 const MAX_EMBED_CHARACTERS: usize = 6000;
+const MAX_EMBED_FIELDS: usize = 25;
 const MAX_BUNDLE_ITEMS_IN_EMBED: usize = 8;
 
 fn compact_bundle_summary(items: &[PublicContractItem], context: &ContractEmbedContext) -> String {
@@ -4542,7 +4856,64 @@ fn bound_embed_message(message: &mut ContractNotificationMessage) {
         .footer
         .as_deref()
         .map(|footer| bounded_text(footer, 2048));
-    let fixed_characters = message.title.chars().count()
+    if message.fields.len() > MAX_EMBED_FIELDS {
+        let contract_address = message
+            .fields
+            .iter()
+            .position(|field| field.name == "Contract Address")
+            .map(|index| message.fields.remove(index));
+        message
+            .fields
+            .truncate(MAX_EMBED_FIELDS - usize::from(contract_address.is_some()));
+        if let Some(contract_address) = contract_address {
+            message.fields.push(contract_address);
+        }
+    }
+    if embed_character_count(message) <= MAX_EMBED_CHARACTERS {
+        return;
+    }
+
+    message.description = None;
+    if embed_character_count(message) <= MAX_EMBED_CHARACTERS {
+        return;
+    }
+
+    let excess = embed_character_count(message).saturating_sub(MAX_EMBED_CHARACTERS);
+    if let Some(footer) = &message.footer {
+        let footer_budget = footer.chars().count().saturating_sub(excess);
+        message.footer = (footer_budget > 0).then(|| bounded_text(footer, footer_budget));
+    }
+    while embed_character_count(message) > MAX_EMBED_CHARACTERS {
+        let Some(index) = message
+            .fields
+            .iter()
+            .rposition(|field| field.name != "Contract Address")
+        else {
+            break;
+        };
+        message.fields.remove(index);
+    }
+    if embed_character_count(message) > MAX_EMBED_CHARACTERS {
+        message.footer = None;
+    }
+    if embed_character_count(message) > MAX_EMBED_CHARACTERS {
+        let title_budget = message
+            .title
+            .chars()
+            .count()
+            .saturating_sub(embed_character_count(message) - MAX_EMBED_CHARACTERS);
+        message.title = bounded_text(&message.title, title_budget);
+    }
+}
+
+fn embed_character_count(message: &ContractNotificationMessage) -> usize {
+    message.title.chars().count()
+        + message
+            .description
+            .as_deref()
+            .map(str::chars)
+            .map(Iterator::count)
+            .unwrap_or(0)
         + message
             .footer
             .as_deref()
@@ -4553,13 +4924,7 @@ fn bound_embed_message(message: &mut ContractNotificationMessage) {
             .fields
             .iter()
             .map(|field| field.name.chars().count() + field.value.chars().count())
-            .sum::<usize>();
-    let description_budget = MAX_EMBED_CHARACTERS.saturating_sub(fixed_characters);
-    message.description = message
-        .description
-        .as_deref()
-        .filter(|_| description_budget > 0)
-        .map(|description| bounded_text(description, description_budget));
+            .sum::<usize>()
 }
 
 fn bounded_text(value: &str, limit: usize) -> String {
@@ -4584,14 +4949,13 @@ fn sanitize_contract_title(value: &str) -> String {
     for character in value.chars() {
         match character {
             '@' => sanitized.push_str("@\u{200b}"),
-            '\\' | '`' | '*' | '_' | '~' | '>' | '[' | ']' | '(' | ')' => {
-                sanitized.push('\\');
-                sanitized.push(character);
-            }
+            '\\' | '`' | '*' | '_' | '~' | '>' | '<' | '[' | ']' | '(' | ')' | '#' | '+' | '-'
+            | '.' | '!' | '|' | '{' | '}' => sanitized.push(' '),
+            character if character.is_whitespace() || character.is_control() => sanitized.push(' '),
             _ => sanitized.push(character),
         }
     }
-    sanitized
+    sanitized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn merge_cache_metadata(cached: &CacheMetadata, response: CacheMetadata) -> CacheMetadata {
@@ -4876,6 +5240,37 @@ mod embed_tests {
             field(&fallback, "Observed Location"),
             Some("System ID: 30000142\nLocation ID: 60003760")
         );
+
+        let mut station_only = event(ContractEventKind::Listed);
+        station_only.embed_context.location = ContractLocationContext {
+            location_name: Some("Jita IV - Moon 4".to_string()),
+            location_kind: Some("Station".to_string()),
+            ..ContractLocationContext::default()
+        };
+        let station_only = contract_notification_message(&station_only, None, &history, &history);
+        assert_eq!(
+            field(&station_only, "Observed Location"),
+            Some("Station: Jita IV - Moon 4\nLocation ID: 60003760")
+        );
+
+        let mut region_only = event(ContractEventKind::Listed);
+        region_only.embed_context.location = ContractLocationContext {
+            region_id: Some(10_000_002),
+            ..ContractLocationContext::default()
+        };
+        let region_only = contract_notification_message(&region_only, None, &history, &history);
+        assert_eq!(
+            field(&region_only, "Observed Location"),
+            Some("Region ID: 10000002\nLocation ID: 60003760")
+        );
+
+        let mut raw_only = event(ContractEventKind::Listed);
+        raw_only.embed_context.location = ContractLocationContext::default();
+        let raw_only = contract_notification_message(&raw_only, None, &history, &history);
+        assert_eq!(
+            field(&raw_only, "Observed Location"),
+            Some("Location ID: 60003760")
+        );
     }
 
     #[test]
@@ -4954,5 +5349,76 @@ mod embed_tests {
             .as_deref()
             .expect("footer")
             .contains("Contract 45"));
+    }
+
+    #[test]
+    fn aggregate_embed_limit_trims_optional_content_before_contract_address() {
+        let mut message = ContractNotificationMessage {
+            title: "T".repeat(MAX_EMBED_TITLE_CHARACTERS),
+            description: Some("D".repeat(MAX_EMBED_DESCRIPTION_CHARACTERS)),
+            fields: (0..24)
+                .map(|index| ContractEmbedField {
+                    name: format!("Field {index} {}", "N".repeat(240)),
+                    value: "V".repeat(MAX_EMBED_FIELD_VALUE_CHARACTERS),
+                    inline: false,
+                })
+                .chain(std::iter::once(ContractEmbedField {
+                    name: "Contract Address".to_string(),
+                    value: "```\ncontract:0//45\n```".to_string(),
+                    inline: false,
+                }))
+                .collect(),
+            thumbnail_url: None,
+            footer: Some("F".repeat(2048)),
+        };
+
+        bound_embed_message(&mut message);
+
+        assert!(
+            message.title.chars().count()
+                + message
+                    .description
+                    .as_deref()
+                    .map(str::chars)
+                    .map(Iterator::count)
+                    .unwrap_or(0)
+                + message
+                    .footer
+                    .as_deref()
+                    .map(str::chars)
+                    .map(Iterator::count)
+                    .unwrap_or(0)
+                + message
+                    .fields
+                    .iter()
+                    .map(|field| field.name.chars().count() + field.value.chars().count())
+                    .sum::<usize>()
+                <= MAX_EMBED_CHARACTERS
+        );
+        assert!(message.fields.len() <= MAX_EMBED_FIELDS);
+        assert_eq!(
+            field(&message, "Contract Address"),
+            Some("```\ncontract:0//45\n```")
+        );
+    }
+
+    #[test]
+    fn contract_titles_are_single_line_plain_text_without_discord_markdown() {
+        let mut event = event(ContractEventKind::Listed);
+        event.contract.title = Some("# heading\n- list ||spoiler|| **bold** <@1234>".to_string());
+        let history = ContractPartyHistory::default();
+
+        let message = contract_notification_message(&event, None, &history, &history);
+        let description = message.description.expect("sanitized contract title");
+
+        assert!(!description.contains('\n'));
+        assert!(!description.contains("# heading"));
+        assert!(!description.contains("- list"));
+        assert!(!description.contains("||spoiler||"));
+        assert!(!description.contains("**bold**"));
+        assert!(!description.contains("<@1234>"));
+        assert!(description.contains("heading"));
+        assert!(description.contains("spoiler"));
+        assert!(description.contains("bold"));
     }
 }
