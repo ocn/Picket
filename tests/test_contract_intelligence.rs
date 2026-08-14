@@ -1417,6 +1417,191 @@ async fn a_resolution_probe_failure_does_not_discard_prior_listings_or_confirmat
 }
 
 #[tokio::test]
+async fn fresh_cached_item_evidence_resolves_only_its_matching_probe_failure_after_restart() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut contract = item_exchange_contract(44);
+    contract.date_expired = Utc::now() + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(
+                    vec![offered_ship(1)],
+                    cached_item_metadata("items-44-v1", 3_600),
+                )),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish a cached public contract baseline");
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("record a disappearance deferred by fresh cached item evidence");
+
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed restart state");
+    for (contract_id, resource_key) in [
+        (44_i64, "contracts/public/items/44"),
+        (99_i64, "contracts/public/items/99"),
+    ] {
+        sqlx::query("INSERT INTO contract_collection_failures (region_id, contract_id, resource_key, observed_at, failure_kind, detail) VALUES (10000002,$1,$2,now(),'resolution_probe','simulated crash before resolution cleanup')")
+            .bind(contract_id)
+            .bind(resource_key)
+            .execute(&raw_pool)
+            .await
+            .expect("seed scoped probe failure");
+    }
+    sqlx::query("UPDATE contract_resolution_cases SET next_probe_at = now() - interval '1 second' WHERE region_id = 10000002 AND contract_id = 44")
+        .execute(&raw_pool)
+        .await
+        .expect("make the cached evidence immediately eligible after restart");
+    raw_pool.close().await;
+
+    let restarted_esi = Arc::new(ResolutionEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        },
+        probes: StdMutex::new(vec![]),
+        probe_calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), restarted_esi.clone())
+        .collect_cycle()
+        .await
+        .expect("reuse the persisted 200/304 representation after restart");
+
+    assert!(restarted_esi.probe_calls.lock().unwrap().is_empty());
+    let failures = store
+        .unresolved_collection_failures()
+        .await
+        .expect("successful cached evidence resolves only the matching failure");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].contract_id, Some(99));
+    assert_eq!(
+        failures[0].resource_key.as_deref(),
+        Some("contracts/public/items/99")
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn persisted_no_content_evidence_resolves_only_its_matching_probe_failure_after_restart() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut contract = item_exchange_contract(44);
+    contract.date_expired = Utc::now() + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(
+                    vec![offered_ship(1)],
+                    cached_item_metadata("items-44-v1", 3_600),
+                )),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish a public contract baseline");
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("record an awaiting resolution");
+
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed persisted 204 restart state");
+    sqlx::query("UPDATE contract_resolution_cases SET state = 'acceptance_confirmed', acceptance_evidence_at = now(), acceptance_response_metadata = '{}'::jsonb, notification_pending = FALSE WHERE region_id = 10000002 AND contract_id = 44")
+        .execute(&raw_pool)
+        .await
+        .expect("simulate committed 204 evidence before failure cleanup");
+    for (contract_id, resource_key) in [
+        (44_i64, "contracts/public/items/44"),
+        (99_i64, "contracts/public/items/99"),
+    ] {
+        sqlx::query("INSERT INTO contract_collection_failures (region_id, contract_id, resource_key, observed_at, failure_kind, detail) VALUES (10000002,$1,$2,now(),'resolution_probe','simulated crash before resolution cleanup')")
+            .bind(contract_id)
+            .bind(resource_key)
+            .execute(&raw_pool)
+            .await
+            .expect("seed scoped probe failure");
+    }
+    raw_pool.close().await;
+
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("reconcile persisted 204 acceptance evidence after restart");
+
+    let failures = store
+        .unresolved_collection_failures()
+        .await
+        .expect("persisted 204 evidence resolves only the matching failure");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].contract_id, Some(99));
+    assert_eq!(
+        failures[0].resource_key.as_deref(),
+        Some("contracts/public/items/99")
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn cached_item_evidence_defers_resolution_for_200_and_conditional_304() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
@@ -3397,6 +3582,91 @@ async fn missing_embed_context_is_backfilled_and_retried_after_a_transient_failu
         Some("contract-embed-context:45")
     );
 
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn saved_embed_context_resolves_only_its_matching_failure_after_restart() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let contract = item_exchange_contract(44);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(SnapshottingEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+                ContractEmbedContext {
+                    issuer_character_name: Some("Persisted Issuer".to_string()),
+                    ..ContractEmbedContext::default()
+                },
+                CacheMetadata::cached_for_seconds(60),
+            ))]),
+            calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("persist observation-time context before the simulated crash");
+
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed restart failures");
+    for (contract_id, resource_key) in [
+        (44_i64, "contract-embed-context:44"),
+        (45_i64, "contract-embed-context:45"),
+    ] {
+        sqlx::query("INSERT INTO contract_collection_failures (region_id, contract_id, resource_key, observed_at, failure_kind, detail) VALUES (10000002,$1,$2,now(),'embed_context_enrichment','simulated crash before resolution cleanup')")
+            .bind(contract_id)
+            .bind(resource_key)
+            .execute(&raw_pool)
+            .await
+            .expect("seed scoped enrichment failure");
+    }
+    raw_pool.close().await;
+
+    let restarted_esi = Arc::new(SnapshottingEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![contract], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        },
+        contexts: StdMutex::new(vec![]),
+        calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), restarted_esi.clone())
+        .collect_cycle()
+        .await
+        .expect("reuse the saved embed context after restart");
+
+    assert!(restarted_esi.calls.lock().unwrap().is_empty());
+    let failures = store
+        .unresolved_collection_failures()
+        .await
+        .expect("saved context resolves only its matching failure");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].contract_id, Some(45));
+    assert_eq!(
+        failures[0].resource_key.as_deref(),
+        Some("contract-embed-context:45")
+    );
     database.destroy().await;
 }
 

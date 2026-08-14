@@ -2144,13 +2144,21 @@ impl ContractCollectionStore {
         let mut context = context.clone();
         let observed_at = context.observed_at.unwrap_or_else(Utc::now);
         context.observed_at = Some(observed_at);
+        let mut transaction = self.pool.begin().await?;
         sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,$4) ON CONFLICT (region_id, contract_id) DO NOTHING")
             .bind(region_id)
             .bind(contract_id)
             .bind(serde_json::to_value(context).map_err(json_to_sqlx)?)
             .bind(observed_at)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
+        sqlx::query("UPDATE contract_collection_failures SET resolved_at = now() WHERE region_id = $1 AND contract_id = $2 AND resource_key = $3 AND failure_kind = 'embed_context_enrichment' AND resolved_at IS NULL AND classification IS NULL")
+            .bind(region_id)
+            .bind(contract_id)
+            .bind(embed_context_resource_key(contract_id))
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -2858,10 +2866,25 @@ impl ContractCollectionStore {
         contract_id: i64,
         next_probe_at: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
         sqlx::query("UPDATE contract_resolution_cases SET next_probe_at = $3, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution'")
             .bind(region_id)
             .bind(contract_id)
             .bind(next_probe_at)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE contract_collection_failures SET resolved_at = now() WHERE region_id = $1 AND contract_id = $2 AND resource_key = $3 AND failure_kind = 'resolution_probe' AND resolved_at IS NULL AND classification IS NULL")
+            .bind(region_id)
+            .bind(contract_id)
+            .bind(format!("contracts/public/items/{contract_id}"))
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn resolve_terminal_resolution_failures(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE contract_collection_failures AS failure SET resolved_at = now() FROM contract_resolution_cases AS resolution WHERE resolution.state <> 'awaiting_resolution' AND failure.region_id = resolution.region_id AND failure.contract_id = resolution.contract_id AND failure.resource_key = 'contracts/public/items/' || resolution.contract_id::text AND failure.failure_kind = 'resolution_probe' AND failure.resolved_at IS NULL AND failure.classification IS NULL")
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -2894,6 +2917,15 @@ impl ContractCollectionStore {
                     "evidence_response_at": evidence_response_at,
                     "response": "204_no_content",
                 }))
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("UPDATE contract_collection_failures SET resolved_at = now() WHERE region_id = $1 AND contract_id = $2 AND resource_key = $3 AND failure_kind = 'resolution_probe' AND resolved_at IS NULL AND classification IS NULL")
+                .bind(resolution.region_id)
+                .bind(resolution.contract_id)
+                .bind(format!(
+                    "contracts/public/items/{}",
+                    resolution.contract_id
+                ))
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -2937,6 +2969,15 @@ impl ContractCollectionStore {
                     "last_public_observed_at": resolution.last_public_observed_at,
                     "absence_observed_at": resolution.absence_observed_at,
                 }))
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("UPDATE contract_collection_failures SET resolved_at = now() WHERE region_id = $1 AND contract_id = $2 AND resource_key = $3 AND failure_kind = 'resolution_probe' AND resolved_at IS NULL AND classification IS NULL")
+                .bind(resolution.region_id)
+                .bind(resolution.contract_id)
+                .bind(format!(
+                    "contracts/public/items/{}",
+                    resolution.contract_id
+                ))
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -3487,6 +3528,7 @@ impl ContractCollector {
         &self,
     ) -> Result<ResolutionBatch, ContractCollectionError> {
         let mut batch = ResolutionBatch::default();
+        self.store.resolve_terminal_resolution_failures().await?;
         for resolution in self.store.pending_terminal_notifications().await? {
             if let Some(event) = terminal_resolution_event(&resolution) {
                 batch.events.push(event);
@@ -3596,14 +3638,6 @@ impl ContractCollector {
                 self.esi
                     .public_contract_items_probe(resolution.contract_id, etag.as_deref())
                     .await,
-            )
-            .await?;
-        self.store
-            .resolve_collection_failures(
-                Some(resolution.region_id),
-                Some(resolution.contract_id),
-                Some(&key),
-                "resolution_probe",
             )
             .await?;
         match probe {
@@ -4138,6 +4172,14 @@ impl ContractCollector {
                 .await?
                 .is_some()
             {
+                self.store
+                    .resolve_collection_failures(
+                        Some(region_id),
+                        Some(observed.contract.contract_id),
+                        Some(&embed_context_resource_key(observed.contract.contract_id)),
+                        "embed_context_enrichment",
+                    )
+                    .await?;
                 continue;
             }
             if consumed >= remaining {
@@ -4179,14 +4221,6 @@ impl ContractCollector {
                             region_id,
                             observed.contract.contract_id,
                             &response.value.unwrap_or_default(),
-                        )
-                        .await?;
-                    self.store
-                        .resolve_collection_failures(
-                            Some(region_id),
-                            Some(observed.contract.contract_id),
-                            Some(&embed_context_resource_key(observed.contract.contract_id)),
-                            "embed_context_enrichment",
                         )
                         .await?;
                 }
