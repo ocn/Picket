@@ -46,7 +46,7 @@ Each action is `ignore`, `post`, or `post_and_ping`. Omitted actions, including 
 
 ## Recovery, storage, and operation
 
-The collector records public facts, manifests, presence intervals, lifecycle evidence, subscriptions, prepared deliveries, and collection failures in PostgreSQL. Prepared deliveries are replayed after restart and carry an idempotency nonce. A prolonged collection gap creates a silent recovery baseline to prevent notification floods; fresh pre-expiry acceptance evidence can still be confirmed.
+The collector records public facts, manifests, presence intervals, lifecycle evidence, subscriptions, prepared deliveries, and collection failures in PostgreSQL. Prepared deliveries are replayed after restart and carry an idempotency nonce. Discord nonce enforcement is applied only during the implemented five-minute recent-message window. After an ambiguous failure, a retry after that window disables nonce enforcement; the resulting rare duplicate is intentionally accepted over silently losing a contract alert. A prolonged collection gap creates a silent recovery baseline to prevent notification floods; fresh pre-expiry acceptance evidence can still be confirmed.
 
 Monitor the bot logs for `contract collection cycle finished`, rate-limit pauses, database unavailability, and unresolved delivery failures. Useful local checks are:
 
@@ -88,5 +88,6 @@ This release has no authenticated-contract feed, counterparty tracking, provisio
 - [ESI best practices](https://developers.eveonline.com/docs/services/esi/best-practices/)
 - [ESI rate limiting](https://developers.eveonline.com/docs/services/esi/rate-limiting/)
 - [Discord interaction responses](https://docs.discord.com/developers/interactions/receiving-and-responding)
+- [Discord message creation and nonce enforcement](https://docs.discord.com/developers/resources/message)
 - [Docker Compose variable interpolation](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/)
 - [PostgreSQL connection strings](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING)
