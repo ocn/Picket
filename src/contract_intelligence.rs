@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -405,6 +406,18 @@ fn rate_limit_window_seconds(value: &str) -> Option<i64> {
 #[derive(Clone)]
 pub struct ContractCollectionStore {
     pool: PgPool,
+}
+
+pub type ContractStoreHandle = Arc<RwLock<Option<Arc<ContractCollectionStore>>>>;
+
+pub fn new_contract_store_handle() -> ContractStoreHandle {
+    Arc::new(RwLock::new(None))
+}
+
+pub async fn available_contract_store(
+    store_handle: &ContractStoreHandle,
+) -> Option<Arc<ContractCollectionStore>> {
+    store_handle.read().await.clone()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1717,8 +1730,27 @@ pub async fn run_contract_collection_loop(
     run_contract_collection_loop_inner(database_url, interval, esi_timeout, None).await;
 }
 
+pub fn spawn_contract_collection_loop_with_notifications(
+    database_url: String,
+    store_handle: ContractStoreHandle,
+    interval: Duration,
+    esi_timeout: Duration,
+    ship_groups: Arc<dyn ShipGroupResolver>,
+    delivery: Arc<dyn ContractDelivery>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_contract_collection_loop_with_notifications(
+        database_url,
+        store_handle,
+        interval,
+        esi_timeout,
+        ship_groups,
+        delivery,
+    ))
+}
+
 pub async fn run_contract_collection_loop_with_notifications(
-    store: Arc<ContractCollectionStore>,
+    database_url: String,
+    store_handle: ContractStoreHandle,
     interval: Duration,
     esi_timeout: Duration,
     ship_groups: Arc<dyn ShipGroupResolver>,
@@ -1730,28 +1762,38 @@ pub async fn run_contract_collection_loop_with_notifications(
     };
     loop {
         let mut delay = interval;
-        match HttpPublicContractEsi::new(esi_timeout) {
-            Ok(esi) => {
-                let collector = ContractCollector::new((*store).clone(), Arc::new(esi))
-                    .with_notifications(
-                        notifications.ship_groups.clone(),
-                        notifications.delivery.clone(),
-                    );
-                match collector.collect_cycle().await {
-                    Ok(report) => {
-                        delay = collection_retry_delay(interval, report.retry_after);
-                        info!(
-                            regions = report.regions.len(),
-                            "contract collection cycle finished"
-                        )
+        match ContractCollectionStore::connect(&database_url).await {
+            Ok(store) => {
+                let store = Arc::new(store);
+                *store_handle.write().await = Some(store.clone());
+                match HttpPublicContractEsi::new(esi_timeout) {
+                    Ok(esi) => {
+                        let collector = ContractCollector::new((*store).clone(), Arc::new(esi))
+                            .with_notifications(
+                                notifications.ship_groups.clone(),
+                                notifications.delivery.clone(),
+                            );
+                        match collector.collect_cycle().await {
+                            Ok(report) => {
+                                delay = collection_retry_delay(interval, report.retry_after);
+                                info!(
+                                    regions = report.regions.len(),
+                                    "contract collection cycle finished"
+                                )
+                            }
+                            Err(error) => {
+                                delay = collection_retry_delay(interval, error.retry_after());
+                                warn!("contract collection paused after failure: {error}")
+                            }
+                        }
                     }
-                    Err(error) => {
-                        delay = collection_retry_delay(interval, error.retry_after());
-                        warn!("contract collection paused after failure: {error}")
-                    }
+                    Err(error) => warn!("contract collection HTTP client unavailable: {error}"),
                 }
             }
-            Err(error) => warn!("contract collection HTTP client unavailable: {error}"),
+            Err(error) => {
+                *store_handle.write().await = None;
+                warn!("contract collection database unavailable; retrying without an in-memory fallback: {error}")
+            }
         }
         tokio::time::sleep(delay).await;
     }

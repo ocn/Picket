@@ -1,10 +1,12 @@
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use killbot_rust::contract_intelligence::{
-    CacheMetadata, CollectionOutcome, ContractCollectionStore, ContractCollector, ContractDelivery,
-    ContractDeliveryError, ContractEventAction, ContractEventActions, ContractEventKind,
-    ContractFilter, ContractItemDirection, ContractSubscription, DeliveryRecord, DeliveryStatus,
-    EsiError, EsiResponse, HttpPublicContractEsi, PreparedContractDelivery, PublicContract,
+    available_contract_store, new_contract_store_handle,
+    spawn_contract_collection_loop_with_notifications, CacheMetadata, CollectionOutcome,
+    ContractCollectionStore, ContractCollector, ContractDelivery, ContractDeliveryError,
+    ContractEventAction, ContractEventActions, ContractEventKind, ContractFilter,
+    ContractItemDirection, ContractSubscription, DeliveryRecord, DeliveryStatus, EsiError,
+    EsiResponse, HttpPublicContractEsi, PreparedContractDelivery, PublicContract,
     PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
 };
 use sha2::{Digest, Sha384};
@@ -126,6 +128,12 @@ struct TemporaryDatabase {
 
 impl TemporaryDatabase {
     async fn new() -> Self {
+        let database = Self::unavailable().await;
+        database.create().await;
+        database
+    }
+
+    async fn unavailable() -> Self {
         let admin_url =
             std::env::var("CONTRACT_TEST_DATABASE_URL").expect("CONTRACT_TEST_DATABASE_URL must point to a PostgreSQL instance for contract integration tests (for example postgres://killbot_contracts:killbot_contracts@127.0.0.1:5433/killbot_contracts)");
         let sequence = DATABASE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -134,17 +142,6 @@ impl TemporaryDatabase {
             std::process::id(),
             sequence
         );
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&admin_url)
-            .await
-            .expect("connect to contract test PostgreSQL");
-        sqlx::query(&format!("CREATE DATABASE {database_name}"))
-            .execute(&admin)
-            .await
-            .expect("create temporary contract test database");
-        admin.close().await;
-
         let mut url = Url::parse(&admin_url).expect("valid CONTRACT_TEST_DATABASE_URL");
         url.set_path(&format!("/{database_name}"));
         Self {
@@ -152,6 +149,19 @@ impl TemporaryDatabase {
             database_name,
             url: url.to_string(),
         }
+    }
+
+    async fn create(&self) {
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&self.admin_url)
+            .await
+            .expect("connect to contract test PostgreSQL");
+        sqlx::query(&format!("CREATE DATABASE {}", self.database_name))
+            .execute(&admin)
+            .await
+            .expect("create temporary contract test database");
+        admin.close().await;
     }
 
     async fn store(&self) -> ContractCollectionStore {
@@ -352,6 +362,8 @@ struct RecordingDelivery {
     sent: StdMutex<Vec<PreparedContractDelivery>>,
 }
 
+struct NoopDelivery;
+
 struct RemovingDelivery {
     store: ContractCollectionStore,
     sent: StdMutex<Vec<PreparedContractDelivery>>,
@@ -392,6 +404,16 @@ impl ContractDelivery for RecordingDelivery {
         assert_eq!(record.status, DeliveryStatus::Prepared);
         self.sent.lock().unwrap().push(delivery);
         Ok("discord-message-id".to_string())
+    }
+}
+
+#[async_trait]
+impl ContractDelivery for NoopDelivery {
+    async fn send(
+        &self,
+        _delivery: PreparedContractDelivery,
+    ) -> Result<String, ContractDeliveryError> {
+        Ok("ignored".to_string())
     }
 }
 
@@ -1967,5 +1989,70 @@ async fn a_listing_without_a_manifest_cannot_match_or_notify_a_ship_subscription
         .expect("read absent deliveries")
         .is_empty());
 
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn contract_runtime_recovers_the_shared_store_after_postgres_becomes_available() {
+    let database = TemporaryDatabase::unavailable().await;
+    let store_handle = new_contract_store_handle();
+    let collection_task = spawn_contract_collection_loop_with_notifications(
+        database.url.clone(),
+        store_handle.clone(),
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+        Arc::new(StaticShipGroups(HashMap::new())),
+        Arc::new(NoopDelivery),
+    );
+
+    let (processing_started, processing_complete) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = processing_started.send(());
+    });
+    tokio::time::timeout(Duration::from_millis(50), processing_complete)
+        .await
+        .expect("the existing runtime can start processing while PostgreSQL is unavailable")
+        .expect("the existing runtime completes its work");
+    assert!(available_contract_store(&store_handle).await.is_none());
+
+    database.create().await;
+    let store = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(store) = available_contract_store(&store_handle).await {
+                return store;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background contract runtime reconnects after PostgreSQL recovery");
+
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "ships",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("recovered commands can persist a contract subscription");
+    let report = ContractCollector::new(
+        (*store).clone(),
+        Arc::new(FakeEsi {
+            regions: vec![],
+            ..FakeEsi::default()
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("recovered collector can use the shared store");
+    assert!(report.regions.is_empty());
+
+    collection_task.abort();
+    assert!(collection_task
+        .await
+        .expect_err("background contract runtime is cancelled")
+        .is_cancelled());
     database.destroy().await;
 }
