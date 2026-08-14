@@ -1401,12 +1401,12 @@ async fn pre_expiry_no_content_confirms_only_pure_matched_ship_sales_and_purchas
             .message
             .fields
             .iter()
-            .any(|field| field.name == "Acceptance Evidence")
+            .any(|field| field.name == "Evidence")
             && message
                 .message
                 .fields
                 .iter()
-                .any(|field| field.name == "Observed Notification Latency")
+                .any(|field| field.name == "Delay")
     }));
     drop(sent);
 
@@ -2363,21 +2363,22 @@ async fn expired_and_unknown_terminal_outcomes_use_independent_actions_and_are_i
     assert!(sent.iter().any(|message| message.ping));
     assert!(sent.iter().any(|message| !message.ping));
     for message in sent.iter() {
-        let event_field = message
-            .message
-            .fields
-            .iter()
-            .find(|field| field.name == "Event")
-            .expect("canonical terminal event field");
-        assert!(matches!(
-            event_field.value.as_str(),
-            "Expired" | "Closed — Outcome Unknown"
-        ));
+        let expected_title = match message.event_kind {
+            ContractEventKind::Expired => "expired",
+            ContractEventKind::ClosedOutcomeUnknown => "closed (outcome unknown)",
+            _ => panic!("expected a nonfinancial terminal event"),
+        };
+        assert!(message.message.title.contains(expected_title));
         assert!(message
             .message
             .fields
             .iter()
-            .all(|field| field.name != "Acceptance Evidence"));
+            .all(|field| !matches!(field.name.as_str(), "Event" | "Delay")));
+        assert!(message
+            .message
+            .fields
+            .iter()
+            .any(|field| field.name == "Evidence"));
     }
     drop(sent);
     assert_eq!(
@@ -4931,15 +4932,22 @@ async fn new_listed_ship_contracts_notify_each_matching_subscription_once_after_
     );
     assert!(sent.iter().any(|delivery| delivery.ping));
     assert!(sent.iter().all(|delivery| {
-        delivery.message.fields.iter().any(|field| {
-            field.name == "Contract Address" && field.value == "```\ncontract:0//45\n```"
-        }) && delivery
+        delivery
             .message
-            .fields
-            .iter()
-            .any(|field| field.name == "Issuer" && field.value == "90000001")
-            && delivery.message.description.as_deref()
-                == Some("Contract title: @\u{200b}everyone offers @\u{200b}1234 a ship")
+            .description
+            .as_deref()
+            .is_some_and(|description| {
+                description.lines().next().is_some_and(|line| {
+                    line.starts_with("<url=\"contract:0//45\">") && line.ends_with("</url>")
+                }) && !description.contains("@everyone")
+                    && !description.contains("<@1234>")
+            })
+            && delivery.message.fields.iter().all(|field| {
+                !matches!(
+                    field.name.as_str(),
+                    "Event" | "Contract Address" | "Issuer" | "Offered" | "Requested"
+                )
+            })
     }));
     drop(sent);
     assert!(store
@@ -5339,14 +5347,14 @@ async fn snapshot_backfill_cap_counts_missing_contexts_and_terminal_delivery_use
     let sent = delivery.sent.lock().unwrap();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].contract_id, last_contract.contract_id);
-    assert!(sent[0].message.fields.iter().any(|field| {
-        field.name == "Issuer"
-            && field.value
-                == format!(
-                    "Backfilled Issuer {} ({})",
-                    last_contract.contract_id, last_contract.issuer_id
-                )
-    }));
+    assert!(sent[0]
+        .message
+        .description
+        .as_deref()
+        .is_some_and(|description| description
+            .lines()
+            .any(|line| { line == format!("Backfilled Issuer {}", last_contract.contract_id) })
+            && !description.contains(&last_contract.issuer_id.to_string())));
     drop(sent);
 
     database.destroy().await;
@@ -5490,14 +5498,21 @@ async fn terminal_only_subscription_uses_the_persisted_observation_time_context(
     assert_eq!(sent.len(), 1);
     assert!(sent[0]
         .message
+        .description
+        .as_deref()
+        .is_some_and(|description| {
+            description
+                .lines()
+                .any(|line| line == "Observed Issuer • Observed Corporation • Observed Alliance")
+                && !description.contains("90000001")
+                && !description.contains("98000001")
+                && !description.contains("99000111")
+        }));
+    assert!(sent[0]
+        .message
         .fields
         .iter()
-        .any(|field| { field.name == "Issuer" && field.value == "Observed Issuer (90000001)" }));
-    assert!(sent[0].message.fields.iter().any(|field| {
-        field.name == "Observed Affiliation"
-            && field.value
-                == "At observation: Observed Corporation (98000001)\nAlliance: Observed Alliance (99000111)"
-    }));
+        .all(|field| field.name != "Observed Affiliation"));
     assert!(sent[0]
         .message
         .fields
@@ -5943,6 +5958,12 @@ async fn oversized_matched_bundles_produce_a_compact_embed_and_preserve_the_full
     assert!(
         message.title.chars().count()
             + message
+                .description
+                .as_deref()
+                .map(str::chars)
+                .map(Iterator::count)
+                .unwrap_or(0)
+            + message
                 .footer
                 .as_deref()
                 .map(str::chars)
@@ -5952,14 +5973,15 @@ async fn oversized_matched_bundles_produce_a_compact_embed_and_preserve_the_full
             + field_value_lengths
             <= 6000
     );
-    assert!(message.fields.iter().any(|field| {
-        field.name == "Offered"
-            && field.value.contains("Type 1000000 ×1")
-            && field.value.contains("+232 more")
+    assert!(message.description.as_deref().is_some_and(|description| {
+        description.lines().next().is_some_and(|line| {
+            line.starts_with("<url=\"contract:0//45\">") && line.ends_with("</url>")
+        }) && !description.contains("Type 1000001")
     }));
-    assert!(message.fields.iter().any(|field| {
-        field.name == "Contract Address" && field.value == "```\ncontract:0//45\n```"
-    }));
+    assert!(message
+        .fields
+        .iter()
+        .all(|field| !matches!(field.name.as_str(), "Offered" | "Contract Address")));
     let delivery_id = sent[0].delivery_id;
     drop(sent);
     let persisted_event = store
@@ -7752,7 +7774,7 @@ async fn a_deferred_or_candidate_context_match_selects_the_higher_priority_ship(
 
     assert_eq!(first_context_calls, 1);
     assert_eq!(first_deliveries, 0);
-    assert_eq!(titles, vec!["Type 19720 listed"]);
+    assert_eq!(titles, vec!["Type 19720 listed for 1.5B"]);
 }
 
 #[tokio::test]
@@ -7762,7 +7784,7 @@ async fn a_deferred_or_candidate_context_miss_keeps_the_local_primary_ship() {
 
     assert_eq!(first_context_calls, 1);
     assert_eq!(first_deliveries, 0);
-    assert_eq!(titles, vec!["Type 587 listed"]);
+    assert_eq!(titles, vec!["Type 587 listed for 1.5B"]);
 }
 
 #[tokio::test]
@@ -7848,7 +7870,7 @@ async fn a_context_rate_boundary_stops_later_context_requests_for_the_same_event
 }
 
 #[tokio::test]
-async fn contract_notifications_render_both_sides_for_cross_direction_and_isk_filters() {
+async fn contract_notifications_render_only_filter_matched_ship_items() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let baseline = item_exchange_contract(44);
@@ -7980,28 +8002,39 @@ async fn contract_notifications_render_both_sides_for_cross_direction_and_isk_fi
 
     let sent = delivery.sent.lock().unwrap();
     assert_eq!(sent.len(), 2);
-    for delivery in sent.iter() {
-        assert!(delivery
-            .message
-            .fields
-            .iter()
-            .any(|field| field.name == "Offered" && field.value.contains("Type 587")));
-        assert!(delivery
-            .message
-            .fields
-            .iter()
-            .any(|field| { field.name == "Requested" && field.value.contains("Type 19720") }));
-        assert!(delivery
-            .message
-            .fields
-            .iter()
-            .any(|field| { field.name == "Requested ISK" && field.value == "1.5b ISK" }));
-        assert!(delivery
-            .message
-            .fields
-            .iter()
-            .any(|field| { field.name == "Offered ISK" && field.value == "2.5b ISK" }));
-    }
+    let requested = sent
+        .iter()
+        .find(|delivery| delivery.subscription_id == "requested-branch")
+        .expect("requested-item delivery");
+    assert_eq!(requested.message.title, "Type 19720 listed for 2.5B");
+    assert!(requested
+        .message
+        .description
+        .as_deref()
+        .is_some_and(|description| description
+            .starts_with("<url=\"contract:0//45\">Type 19720 - Location 60003760</url>")
+            && !description.contains("Type 587")));
+    let isk_only = sent
+        .iter()
+        .find(|delivery| delivery.subscription_id == "offered-isk")
+        .expect("ISK-only delivery");
+    assert_eq!(isk_only.message.title, "Public contract listed for 2.5B");
+    assert!(isk_only
+        .message
+        .description
+        .as_deref()
+        .is_some_and(|description| description
+            .starts_with("<url=\"contract:0//45\">Public contract - Location 60003760</url>")
+            && !description.contains("Type 587")
+            && !description.contains("Type 19720")));
+    assert!(sent
+        .iter()
+        .all(|delivery| delivery.message.fields.iter().all(|field| {
+            !matches!(
+                field.name.as_str(),
+                "Offered" | "Requested" | "Requested ISK" | "Offered ISK"
+            )
+        })));
     drop(sent);
 
     database.destroy().await;
@@ -8111,7 +8144,7 @@ async fn primary_display_ship_is_selected_only_from_matching_ship_items() {
 
     assert_eq!(
         delivery.sent.lock().unwrap()[0].message.title,
-        "Type 587 listed"
+        "Type 587 listed for 1.5B"
     );
 
     database.destroy().await;
@@ -8230,7 +8263,7 @@ async fn primary_display_ship_uses_all_matching_or_branches_independent_of_branc
     assert_eq!(sent.len(), 2);
     assert!(sent
         .iter()
-        .all(|delivery| delivery.message.title == "Type 19720 listed"));
+        .all(|delivery| delivery.message.title == "Type 19720 listed for 1.5B"));
     drop(sent);
 
     database.destroy().await;
@@ -8351,7 +8384,7 @@ async fn primary_display_ship_uses_all_group_matches_independent_of_manifest_ord
     assert_eq!(sent.len(), 2);
     assert!(sent
         .iter()
-        .all(|delivery| delivery.message.title == "Type 19720 listed"));
+        .all(|delivery| delivery.message.title == "Type 19720 listed for 1.5B"));
     drop(sent);
 
     database.destroy().await;
@@ -8492,7 +8525,7 @@ async fn a_transient_additional_group_candidate_defers_primary_selection() {
 
     let sent = delivery.sent.lock().unwrap();
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].message.title, "Type 19720 listed");
+    assert_eq!(sent[0].message.title, "Type 19720 listed for 1.5B");
     drop(sent);
 
     database.destroy().await;
@@ -8609,7 +8642,7 @@ async fn a_transient_primary_ship_lookup_defers_instead_of_committing_a_fallback
     assert_eq!(delivery.sent.lock().unwrap().len(), 1);
     assert_eq!(
         delivery.sent.lock().unwrap()[0].message.title,
-        "Type 587 listed"
+        "Type 587 listed for 1.5B"
     );
 
     database.destroy().await;
