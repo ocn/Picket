@@ -1,17 +1,21 @@
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use killbot_rust::config::{self, AppConfig, AppState};
 use killbot_rust::contract_intelligence::{
     available_contract_store, new_contract_store_handle,
-    spawn_contract_collection_loop_with_notifications, CacheMetadata, CollectionOutcome,
-    ContractCollectionStore, ContractCollector, ContractContextLimiter,
+    spawn_contract_collection_loop_with_notifications, AppStateContractPingLimiter, CacheMetadata,
+    CollectionOutcome, ContractCollectionStore, ContractCollector, ContractContextLimiter,
     ContractContextRequirements, ContractContextValue, ContractDelivery, ContractDeliveryClock,
     ContractDeliveryError, ContractEmbedContext, ContractEventAction, ContractEventActions,
     ContractEventKind, ContractFilter, ContractFilterCondition, ContractFilterNode,
     ContractItemDirection, ContractItemProbe, ContractObservationContext, ContractPingLimiter,
-    ContractResolutionState, ContractSubscription, DeliveryFailureKind, DeliveryRecord,
-    DeliveryStatus, EsiError, EsiResponse, HttpPublicContractEsi, PreparedContractDelivery,
-    PublicContract, PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
+    ContractPingType, ContractResolutionState, ContractSubscription, DeliveryFailureKind,
+    DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HttpPublicContractEsi,
+    PreparedContractDelivery, PublicContract, PublicContractEsi, PublicContractItem,
+    ShipGroupLookup, ShipGroupResolver,
 };
+use killbot_rust::esi::EsiClient;
+use moka::future::Cache;
 use sha2::{Digest, Sha384};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Executor;
@@ -23,9 +27,52 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use url::Url;
 
 static DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn app_state_for_ping_limiter() -> Arc<AppState> {
+    Arc::new(AppState {
+        systems: Arc::new(Default::default()),
+        ships: Arc::new(Default::default()),
+        names: Arc::new(Default::default()),
+        tickers: Arc::new(Default::default()),
+        group_names: Arc::new(Default::default()),
+        subscriptions: Arc::new(Default::default()),
+        app_config: Arc::new(AppConfig {
+            discord_bot_token: String::new(),
+            discord_client_id: 0,
+            eve_client_id: String::new(),
+            eve_client_secret: String::new(),
+            esi_http_timeout_secs: 15,
+            killmail_process_timeout_secs: 60,
+            redisq_connect_timeout_secs: 10,
+            redisq_request_timeout_secs: 60,
+            r2z2_connect_timeout_secs: 10,
+            r2z2_request_timeout_secs: 15,
+            r2z2_poll_interval_secs: 6,
+            r2z2_max_consecutive_404s: 10,
+            r2z2_resync_timeout_secs: 300,
+            killmail_feed_provider: Default::default(),
+            killmail_post_process_sleep_ms: 0,
+            killmail_workers: 4,
+            killmail_queue_size: 512,
+        }),
+        esi_client: EsiClient::default(),
+        celestial_cache: Cache::new(10),
+        systems_file_lock: Mutex::new(()),
+        ships_file_lock: Mutex::new(()),
+        names_file_lock: Mutex::new(()),
+        tickers_file_lock: Mutex::new(()),
+        group_names_file_lock: Mutex::new(()),
+        subscriptions_file_lock: Mutex::new(()),
+        last_ping_times: Mutex::new(HashMap::new()),
+        user_standings: Arc::new(Default::default()),
+        user_standings_file_lock: Mutex::new(()),
+        sso_states: Arc::new(Default::default()),
+    })
+}
 
 struct OneShotHttpServer {
     base_url: String,
@@ -329,6 +376,32 @@ impl PublicContractEsi for FakeEsi {
             .get(&contract_id)
             .expect("fake ESI manifest configured")
             .clone()
+    }
+}
+
+struct FailingContractEsi;
+
+#[async_trait]
+impl PublicContractEsi for FailingContractEsi {
+    async fn regions(&self, _etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        Err(EsiError::retryable("ESI is unavailable", None))
+    }
+
+    async fn public_contracts_page(
+        &self,
+        _region_id: i64,
+        _page: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        Err(EsiError::retryable("ESI is unavailable", None))
+    }
+
+    async fn public_contract_items(
+        &self,
+        _contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        Err(EsiError::retryable("ESI is unavailable", None))
     }
 }
 
@@ -2799,6 +2872,106 @@ async fn contract_delivery_migration_replaces_the_subscription_cascade_with_rest
 }
 
 #[tokio::test]
+async fn contract_delivery_ping_type_migration_defaults_legacy_rows_to_here() {
+    let database = TemporaryDatabase::new().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to pre-ping-type database");
+    pool.execute("CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), success BOOLEAN NOT NULL, checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL)")
+        .await
+        .expect("create migration ledger for the pre-ping-type database");
+    for (version, sql) in [
+        (
+            20260813000000_i64,
+            include_str!("../migrations/20260813000000_create_contract_intelligence.sql"),
+        ),
+        (
+            20260813000001_i64,
+            include_str!(
+                "../migrations/20260813000001_add_contract_collection_representation_metadata.sql"
+            ),
+        ),
+        (
+            20260813000002_i64,
+            include_str!(
+                "../migrations/20260813000002_add_contract_subscriptions_and_deliveries.sql"
+            ),
+        ),
+        (
+            20260813000003_i64,
+            include_str!("../migrations/20260813000003_preserve_contract_delivery_history.sql"),
+        ),
+        (
+            20260813000004_i64,
+            include_str!("../migrations/20260813000004_add_contract_acceptance_resolution.sql"),
+        ),
+        (
+            20260813000005_i64,
+            include_str!(
+                "../migrations/20260813000005_add_contract_nonfinancial_terminal_states.sql"
+            ),
+        ),
+        (
+            20260813000006_i64,
+            include_str!("../migrations/20260813000006_add_contract_embed_context.sql"),
+        ),
+        (
+            20260813000007_i64,
+            include_str!("../migrations/20260813000007_make_contract_delivery_restart_safe.sql"),
+        ),
+    ] {
+        pool.execute(sql)
+            .await
+            .expect("apply pre-ping-type migration");
+        sqlx::query("INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES ($1, 'pre-ping-type migration', TRUE, $2, 0)")
+            .bind(version)
+            .bind(Sha384::digest(sql.as_bytes()).to_vec())
+            .execute(&pool)
+            .await
+            .expect("record pre-ping-type migration");
+    }
+    sqlx::query("INSERT INTO contract_subscriptions (guild_id, channel_id, subscription_id, description, filter, event_actions) VALUES (42, 77, 'legacy', 'legacy subscription', '{\"root\":{\"condition\":{\"event_kinds\":[\"listed\"]}}}', '{\"listed\":\"post_and_ping\"}')")
+        .execute(&pool)
+        .await
+        .expect("insert legacy subscription");
+    sqlx::query("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, delivery_nonce) VALUES (42, 77, 'legacy', 45, 'listed', '{}', '{\"title\":\"legacy\",\"fields\":[]}', TRUE, 'prepared', 'ci-legacy')")
+        .execute(&pool)
+        .await
+        .expect("insert legacy prepared delivery");
+    pool.close().await;
+
+    let store = database.store().await;
+    assert_eq!(
+        store
+            .contract_subscriptions_for_channel(42, 77)
+            .await
+            .expect("read legacy subscription")[0]
+            .event_actions
+            .listed,
+        ContractEventAction::PostAndPing
+    );
+    let verify_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to upgraded database");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT ping_type FROM contract_outbound_deliveries WHERE subscription_id = 'legacy'",
+        )
+        .fetch_one(&verify_pool)
+        .await
+        .expect("read migrated legacy ping type"),
+        "here"
+    );
+    verify_pool.close().await;
+
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn new_listed_ship_contracts_notify_each_matching_subscription_once_after_baseline() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
@@ -3887,14 +4060,18 @@ async fn contract_delivery_retries_with_a_stable_nonce_and_retains_permanent_fai
     .await
     .expect("establish the silent baseline");
 
-    for id in ["a-transient", "b-ambiguous", "c-permanent"] {
+    for (id, action) in [
+        ("a-transient", ContractEventAction::PostAndPingEveryone),
+        ("b-ambiguous", ContractEventAction::PostAndPing),
+        ("c-permanent", ContractEventAction::PostAndPing),
+    ] {
         store
             .upsert_contract_subscription(&contract_subscription(
                 id,
                 ContractItemDirection::Offered,
                 vec![587],
                 vec![],
-                ContractEventAction::PostAndPing,
+                action,
             ))
             .await
             .expect("persist matching contract subscription");
@@ -3912,10 +4089,8 @@ async fn contract_delivery_retries_with_a_stable_nonce_and_retains_permanent_fai
             )),
         ]),
     });
-    let ping_limiter = Arc::new(RecordingContractPingLimiter {
-        outcomes: StdMutex::new(vec![true, false, false, false, false]),
-        channels: StdMutex::new(Vec::new()),
-    });
+    let app_state = app_state_for_ping_limiter();
+    let ping_limiter = Arc::new(AppStateContractPingLimiter::new(app_state.clone()));
     let clock = Arc::new(FixedDeliveryClock(StdMutex::new(
         Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0).unwrap(),
     )));
@@ -3956,11 +4131,14 @@ async fn contract_delivery_retries_with_a_stable_nonce_and_retains_permanent_fai
     assert!(attempts[0].enforce_nonce);
     assert!(attempts[1].enforce_nonce);
     assert!(attempts[0].ping);
+    assert_eq!(attempts[0].ping_type, ContractPingType::Everyone);
+    assert_eq!(attempts[1].ping_type, ContractPingType::Everyone);
+    assert_eq!(attempts[2].ping_type, ContractPingType::Here);
     assert!(attempts[1..].iter().all(|attempt| !attempt.ping));
     drop(attempts);
-    assert_eq!(
-        ping_limiter.channels.lock().unwrap().as_slice(),
-        &[77, 77, 77, 77, 77]
+    assert!(
+        !config::try_acquire_channel_ping(&app_state.last_ping_times, 77).await,
+        "the first failed contract send consumes the shared killmail ping window"
     );
 
     let records = store.delivery_records().await.expect("read deliveries");
@@ -3985,6 +4163,92 @@ async fn contract_delivery_retries_with_a_stable_nonce_and_retains_permanent_fai
             DeliveryFailureKind::Permanent,
             "missing Send Messages permission".to_string()
         )
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn killmail_ping_window_suppresses_contract_ping_without_suppressing_delivery() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let baseline_contract = item_exchange_contract(44);
+    let listed_contract = item_exchange_contract(45);
+    let ship = offered_ship(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![baseline_contract.clone()],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(vec![ship.clone()], expiring_cache())),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "ships",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::PostAndPing,
+        ))
+        .await
+        .expect("persist matching subscription");
+
+    let app_state = app_state_for_ping_limiter();
+    assert!(
+        config::try_acquire_channel_ping(&app_state.last_ping_times, 77).await,
+        "a killmail ping acquires the shared channel window first"
+    );
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![baseline_contract, listed_contract],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(vec![ship.clone()], expiring_cache())),
+                ),
+                (45, Ok(EsiResponse::fresh(vec![ship], expiring_cache()))),
+            ]),
+        }),
+    )
+    .with_notifications_and_ping_limiter(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+        delivery.clone(),
+        Arc::new(AppStateContractPingLimiter::new(app_state)),
+    )
+    .collect_cycle()
+    .await
+    .expect("send the contract embed even though the shared ping window is occupied");
+
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(
+        !sent[0].ping,
+        "the occupied killmail window suppresses only the contract mention"
     );
 
     database.destroy().await;
@@ -4024,7 +4288,7 @@ async fn prepared_contract_delivery_survives_restart_and_retries_without_nonce_e
             ContractItemDirection::Offered,
             vec![587],
             vec![],
-            ContractEventAction::Post,
+            ContractEventAction::PostAndPingEveryone,
         ))
         .await
         .expect("persist matching subscription");
@@ -4064,7 +4328,7 @@ async fn prepared_contract_delivery_survives_restart_and_retries_without_nonce_e
         Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
         first_delivery.clone(),
         Arc::new(RecordingContractPingLimiter {
-            outcomes: StdMutex::new(Vec::new()),
+            outcomes: StdMutex::new(vec![true, false]),
             channels: StdMutex::new(Vec::new()),
         }),
     )
@@ -4077,6 +4341,11 @@ async fn prepared_contract_delivery_survives_restart_and_retries_without_nonce_e
     assert_eq!(first_attempts.len(), 2);
     assert_eq!(first_attempts[0].nonce, first_attempts[1].nonce);
     assert!(first_attempts.iter().all(|attempt| attempt.enforce_nonce));
+    assert!(first_attempts[0].ping);
+    assert!(!first_attempts[1].ping);
+    assert!(first_attempts
+        .iter()
+        .all(|attempt| attempt.ping_type == ContractPingType::Everyone));
     let nonce = first_attempts[0].nonce.clone();
     drop(first_attempts);
     assert_eq!(
@@ -4089,54 +4358,105 @@ async fn prepared_contract_delivery_survives_restart_and_retries_without_nonce_e
     );
 
     *clock.0.lock().unwrap() += chrono::Duration::minutes(6);
+    let limiter_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to set the persisted ESI limiter boundary");
+    sqlx::query(
+        "INSERT INTO esi_collection_limiter_state (limiter_scope, pause_until) VALUES (TRUE, now() + interval '1 hour') ON CONFLICT (limiter_scope) DO UPDATE SET pause_until = EXCLUDED.pause_until",
+    )
+    .execute(&limiter_pool)
+    .await
+    .expect("activate the persisted ESI limiter boundary");
+    limiter_pool.close().await;
     let restarted_delivery = Arc::new(ScriptedDelivery {
         store: store.clone(),
         attempts: StdMutex::new(Vec::new()),
         outcomes: StdMutex::new(vec![Ok("post-window-message".to_string())]),
     });
-    ContractCollector::new(
-        store.clone(),
-        Arc::new(FakeEsi {
-            regions: vec![10_000_002],
-            pages: HashMap::from([(
-                (10_000_002, 1),
-                Ok(EsiResponse::fresh(
-                    vec![item_exchange_contract(44), item_exchange_contract(45)],
-                    expiring_page(1),
-                )),
-            )]),
-            items: HashMap::from([
-                (
-                    44,
-                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
-                ),
-                (
-                    45,
-                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
-                ),
-            ]),
-        }),
-    )
-    .with_notifications_and_ping_limiter(
-        Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
-        restarted_delivery.clone(),
-        Arc::new(RecordingContractPingLimiter {
-            outcomes: StdMutex::new(Vec::new()),
-            channels: StdMutex::new(Vec::new()),
-        }),
-    )
-    .with_delivery_clock(clock)
-    .collect_cycle()
-    .await
-    .expect("retry pending delivery after restart");
+    let restart_error = ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+        .with_notifications_and_ping_limiter(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+            restarted_delivery.clone(),
+            Arc::new(RecordingContractPingLimiter {
+                outcomes: StdMutex::new(vec![true]),
+                channels: StdMutex::new(Vec::new()),
+            }),
+        )
+        .with_delivery_clock(clock)
+        .collect_cycle()
+        .await
+        .expect_err(
+            "the persisted ESI limiter remains active after replaying the prepared delivery",
+        );
+    assert!(restart_error
+        .to_string()
+        .contains("persisted global ESI limiter"));
 
     let restarted_attempts = restarted_delivery.attempts.lock().unwrap();
     assert_eq!(restarted_attempts.len(), 1);
     assert_eq!(restarted_attempts[0].nonce, nonce);
     assert!(!restarted_attempts[0].enforce_nonce);
+    assert!(restarted_attempts[0].ping);
+    assert_eq!(restarted_attempts[0].ping_type, ContractPingType::Everyone);
     drop(restarted_attempts);
     assert_eq!(
         store.delivery_records().await.expect("read sent delivery")[0].status,
+        DeliveryStatus::Sent
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn prepared_delivery_replays_before_region_discovery_outage() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "prepared",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the subscription that owned the prior prepared delivery");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to create the prior prepared delivery");
+    sqlx::query("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce) VALUES (42, 77, 'prepared', 45, 'listed', '{}', '{\"title\":\"prior contract notification\",\"fields\":[]}', FALSE, 'here', 'prepared', 'ci-prepared')")
+        .execute(&pool)
+        .await
+        .expect("persist the delivery from the prior process");
+    pool.close().await;
+
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let error = ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+            delivery.clone(),
+        )
+        .collect_cycle()
+        .await
+        .expect_err("the simulated ESI region outage still follows prepared delivery replay");
+    assert!(error.to_string().contains("ESI is unavailable"));
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].nonce, "ci-prepared");
+    drop(sent);
+    assert_eq!(
+        store
+            .delivery_records()
+            .await
+            .expect("read delivered record")[0]
+            .status,
         DeliveryStatus::Sent
     );
 

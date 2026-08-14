@@ -226,7 +226,7 @@ fn configure_contract_delivery_message<'a, 'builder>(
     delivery: &PreparedContractDelivery,
 ) -> &'builder mut CreateMessage<'a> {
     if delivery.ping {
-        builder.content("@here");
+        builder.content(delivery.ping_type.content());
     }
     let builder = builder
         .allowed_mentions(|mentions| {
@@ -252,15 +252,29 @@ fn contract_delivery_error(error: serenity::Error) -> ContractDeliveryError {
     if let serenity::Error::Http(http_error) = &error {
         if let serenity::http::error::Error::UnsuccessfulRequest(response) = &**http_error {
             let status = response.status_code.as_u16();
-            let detail = format!("Discord HTTP {status}: {message}");
-            return if (400..500).contains(&status) && status != 429 {
-                ContractDeliveryError::permanent(detail)
-            } else {
-                ContractDeliveryError::transient(detail)
-            };
+            let code = response.error.code;
+            let detail = format!(
+                "Discord HTTP {status}, JSON code {code}: {}",
+                response.error.message
+            );
+            if status == 429 || status >= 500 || is_temporary_discord_delivery_code(code) {
+                return ContractDeliveryError::transient(detail);
+            }
+            if status == 401 || is_permanent_discord_delivery_code(code) {
+                return ContractDeliveryError::permanent(detail);
+            }
+            return ContractDeliveryError::ambiguous(detail);
         }
     }
     ContractDeliveryError::ambiguous(message)
+}
+
+fn is_temporary_discord_delivery_code(code: isize) -> bool {
+    matches!(code, 20016 | 20028 | 20029 | 40004 | 40006 | 40062 | 130000)
+}
+
+fn is_permanent_discord_delivery_code(code: isize) -> bool {
+    matches!(code, 10003 | 50001 | 50008 | 50013 | 50014 | 50025 | 50035)
 }
 
 pub struct DiscordShipGroupResolver {
@@ -1948,6 +1962,7 @@ mod tests {
             contract_id: 4,
             event_kind: crate::contract_intelligence::ContractEventKind::Listed,
             ping: true,
+            ping_type: crate::contract_intelligence::ContractPingType::Here,
             nonce: "ci-1".to_string(),
             enforce_nonce: true,
             message: message.clone(),
@@ -1968,7 +1983,7 @@ mod tests {
             &PreparedContractDelivery {
                 ping: false,
                 enforce_nonce: false,
-                ..delivery
+                ..delivery.clone()
             },
         );
         assert!(non_pinging_builder.0.get("content").is_none());
@@ -1980,6 +1995,74 @@ mod tests {
             non_pinging_builder.0["allowed_mentions"]["parse"],
             serde_json::json!([])
         );
+
+        let mut everyone_builder = CreateMessage::default();
+        configure_contract_delivery_message(
+            &mut everyone_builder,
+            &PreparedContractDelivery {
+                ping_type: crate::contract_intelligence::ContractPingType::Everyone,
+                ..delivery
+            },
+        );
+        assert_eq!(everyone_builder.0["content"].as_str(), Some("@everyone"));
+        assert_eq!(
+            everyone_builder.0["allowed_mentions"]["parse"],
+            serde_json::json!(["everyone"])
+        );
     }
 
+    fn discord_http_error(
+        status_code: serenity::http::StatusCode,
+        code: isize,
+        message: &str,
+    ) -> serenity::Error {
+        serenity::Error::Http(Box::new(serenity::http::error::Error::UnsuccessfulRequest(
+            serenity::http::error::ErrorResponse {
+                status_code,
+                url: url::Url::parse("https://discord.com/api/v10/channels/3/messages")
+                    .expect("valid Discord API URL"),
+                error: serde_json::from_value(serde_json::json!({
+                    "code": code,
+                    "message": message,
+                }))
+                .expect("valid Discord JSON error"),
+            },
+        )))
+    }
+
+    #[test]
+    fn contract_delivery_http_errors_keep_temporary_discord_errors_prepared() {
+        assert!(matches!(
+            contract_delivery_error(discord_http_error(
+                serenity::http::StatusCode::BAD_REQUEST,
+                40004,
+                "Send messages has been temporarily disabled",
+            )),
+            ContractDeliveryError::Transient(_)
+        ));
+        assert!(matches!(
+            contract_delivery_error(discord_http_error(
+                serenity::http::StatusCode::FORBIDDEN,
+                50013,
+                "Missing Permissions",
+            )),
+            ContractDeliveryError::Permanent(_)
+        ));
+        assert!(matches!(
+            contract_delivery_error(discord_http_error(
+                serenity::http::StatusCode::BAD_REQUEST,
+                0,
+                "General error",
+            )),
+            ContractDeliveryError::Ambiguous(_)
+        ));
+        assert!(matches!(
+            contract_delivery_error(discord_http_error(
+                serenity::http::StatusCode::TOO_MANY_REQUESTS,
+                0,
+                "You are being rate limited.",
+            )),
+            ContractDeliveryError::Transient(_)
+        ));
+    }
 }

@@ -2,7 +2,8 @@ use crate::commands::contract_command::{defer_then_edit, SerenityContractCommand
 use crate::commands::{get_option_value, Command};
 use crate::config::AppState;
 use crate::contract_intelligence::{
-    available_contract_store, ContractEventActions, ContractFilter, ContractSubscription,
+    available_contract_store, ContractEventActions, ContractFilter, ContractPingType,
+    ContractSubscription,
 };
 use crate::ContractStoreContainer;
 use serenity::async_trait;
@@ -27,6 +28,11 @@ impl ContractSubscribeCommand {
             Some(CommandDataOptionValue::String(value)) => Ok(value.as_str()),
             _ => Err(format!("missing required option: {name}")),
         };
+        let ping_type = match get_option_value(&command.data.options, "ping_type") {
+            Some(CommandDataOptionValue::String(value)) => Some(value.as_str()),
+            None => None,
+            _ => return Err("ping_type must be a string option".to_string()),
+        };
         Self::subscription_from_documents(
             guild_id,
             channel_id,
@@ -34,6 +40,7 @@ impl ContractSubscribeCommand {
             option("description")?,
             option("filter")?,
             option("event_actions")?,
+            ping_type,
         )
     }
 
@@ -44,7 +51,19 @@ impl ContractSubscribeCommand {
         description: &str,
         filter_document: &str,
         event_actions_document: &str,
+        ping_type: Option<&str>,
     ) -> Result<ContractSubscription, String> {
+        let mut event_actions =
+            serde_json::from_str::<ContractEventActions>(event_actions_document)
+                .map_err(|error| format!("invalid event actions JSON: {error}"))?;
+        if let Some(ping_type) = ping_type {
+            let ping_type = match ping_type {
+                "here" => ContractPingType::Here,
+                "everyone" => ContractPingType::Everyone,
+                value => return Err(format!("invalid ping type: {value}")),
+            };
+            event_actions.configure_ping_type(ping_type);
+        }
         let subscription = ContractSubscription {
             guild_id,
             channel_id,
@@ -52,8 +71,7 @@ impl ContractSubscribeCommand {
             description: description.to_string(),
             filter: serde_json::from_str::<ContractFilter>(filter_document)
                 .map_err(|error| format!("invalid filter JSON: {error}"))?,
-            event_actions: serde_json::from_str::<ContractEventActions>(event_actions_document)
-                .map_err(|error| format!("invalid event actions JSON: {error}"))?,
+            event_actions,
         };
         subscription.validate()?;
         Ok(subscription)
@@ -100,6 +118,14 @@ impl Command for ContractSubscribeCommand {
                     .description("Event action JSON, for example {\"listed\":\"post\"}.")
                     .kind(CommandOptionType::String)
                     .required(true)
+            })
+            .create_option(|option| {
+                option
+                    .name("ping_type")
+                    .description("Use @here or @everyone when an event action is post_and_ping.")
+                    .kind(CommandOptionType::String)
+                    .add_string_choice("Here", "here")
+                    .add_string_choice("Everyone", "everyone")
             })
     }
 
@@ -179,6 +205,7 @@ mod tests {
             "capital contracts",
             FILTER,
             r#"{"listed":"post_and_ping"}"#,
+            Some("everyone"),
         )
         .expect("valid recursive subscription document");
         assert_eq!(subscription.guild_id, 42);
@@ -187,6 +214,28 @@ mod tests {
             subscription.filter.root,
             crate::contract_intelligence::ContractFilterNode::And(_)
         ));
+        assert_eq!(
+            subscription.event_actions.listed,
+            crate::contract_intelligence::ContractEventAction::PostAndPingEveryone
+        );
+    }
+
+    #[test]
+    fn contract_subscribe_exposes_a_bounded_ping_type_option() {
+        let mut command = CreateApplicationCommand::default();
+        ContractSubscribeCommand.register(&mut command);
+        let options = command.0["options"]
+            .as_array()
+            .expect("contract subscribe options");
+        assert!(options.len() <= 25);
+        let ping_type = options
+            .iter()
+            .find(|option| option["name"] == "ping_type")
+            .expect("configured ping type option");
+        assert_eq!(
+            ping_type["choices"].as_array().expect("ping choices").len(),
+            2
+        );
     }
 
     #[test]
@@ -207,6 +256,7 @@ mod tests {
                 "capital contracts",
                 filter,
                 actions,
+                None,
             )
             .is_err());
         }

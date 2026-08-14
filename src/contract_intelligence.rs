@@ -1233,11 +1233,51 @@ pub enum ContractEventAction {
     Ignore,
     Post,
     PostAndPing,
+    PostAndPingEveryone,
 }
 
 impl Default for ContractEventAction {
     fn default() -> Self {
         Self::Ignore
+    }
+}
+
+impl ContractEventAction {
+    pub fn ping_type(&self) -> Option<ContractPingType> {
+        match self {
+            Self::PostAndPing => Some(ContractPingType::Here),
+            Self::PostAndPingEveryone => Some(ContractPingType::Everyone),
+            Self::Ignore | Self::Post => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractPingType {
+    Here,
+    Everyone,
+}
+
+impl Default for ContractPingType {
+    fn default() -> Self {
+        Self::Here
+    }
+}
+
+impl ContractPingType {
+    pub fn content(self) -> &'static str {
+        match self {
+            Self::Here => "@here",
+            Self::Everyone => "@everyone",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Here => "here",
+            Self::Everyone => "everyone",
+        }
     }
 }
 
@@ -1270,6 +1310,24 @@ impl Default for ContractEventActions {
 impl ContractEventActions {
     pub fn validate(&self) -> Result<(), String> {
         Ok(())
+    }
+
+    pub fn configure_ping_type(&mut self, ping_type: ContractPingType) {
+        let configured_action = match ping_type {
+            ContractPingType::Here => ContractEventAction::PostAndPing,
+            ContractPingType::Everyone => ContractEventAction::PostAndPingEveryone,
+        };
+        for action in [
+            &mut self.listed,
+            &mut self.sale_confirmed,
+            &mut self.purchase_confirmed,
+            &mut self.expired,
+            &mut self.closed_outcome_unknown,
+        ] {
+            if action.ping_type().is_some() {
+                *action = configured_action;
+            }
+        }
     }
 }
 
@@ -1751,6 +1809,7 @@ pub struct PreparedContractDelivery {
     pub contract_id: i64,
     pub event_kind: ContractEventKind,
     pub ping: bool,
+    pub ping_type: ContractPingType,
     pub nonce: String,
     pub enforce_nonce: bool,
     pub message: ContractNotificationMessage,
@@ -2281,10 +2340,11 @@ impl ContractCollectionStore {
         event: &ContractEvent,
         message: &ContractNotificationMessage,
         ping: bool,
+        ping_type: ContractPingType,
         ordering: DeliveryOrdering,
     ) -> Result<(), sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
-        let delivery_id = sqlx::query_scalar::<_, i64>("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, delivery_nonce, strategic_priority, relevant_isk, confirmed_at) SELECT $1,$2,$3,$4,$5,$6,$7,$8,'prepared',$9,$10,$11,$12 WHERE EXISTS (SELECT 1 FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND deleted_at IS NULL) ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind) DO NOTHING RETURNING id")
+        let delivery_id = sqlx::query_scalar::<_, i64>("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, strategic_priority, relevant_isk, confirmed_at) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,'prepared',$10,$11,$12,$13 WHERE EXISTS (SELECT 1 FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND deleted_at IS NULL) ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind) DO NOTHING RETURNING id")
             .bind(subscription.guild_id as i64)
             .bind(subscription.channel_id as i64)
             .bind(&subscription.id)
@@ -2293,6 +2353,7 @@ impl ContractCollectionStore {
             .bind(serde_json::to_value(event).map_err(json_to_sqlx)?)
             .bind(serde_json::to_value(message).map_err(json_to_sqlx)?)
             .bind(ping)
+            .bind(ping_type.as_str())
             .bind("pending")
             .bind(i64::try_from(ordering.strategic_priority).unwrap_or(i64::MAX))
             .bind(ordering.relevant_isk)
@@ -2312,7 +2373,7 @@ impl ContractCollectionStore {
     }
 
     async fn prepared_deliveries(&self) -> Result<Vec<PreparedContractDelivery>, sqlx::Error> {
-        sqlx::query("SELECT id, guild_id, channel_id, subscription_id, contract_id, event_kind, message, ping, delivery_nonce, nonce_window_until FROM contract_outbound_deliveries WHERE status = 'prepared' ORDER BY strategic_priority ASC, relevant_isk DESC, confirmed_at ASC, id ASC")
+        sqlx::query("SELECT id, guild_id, channel_id, subscription_id, contract_id, event_kind, message, ping, ping_type, delivery_nonce, nonce_window_until FROM contract_outbound_deliveries WHERE status = 'prepared' ORDER BY strategic_priority ASC, relevant_isk DESC, confirmed_at ASC, id ASC")
             .fetch_all(&self.pool)
             .await?
             .into_iter()
@@ -2326,7 +2387,7 @@ impl ContractCollectionStore {
         attempted_at: DateTime<Utc>,
     ) -> Result<Option<PreparedContractDelivery>, sqlx::Error> {
         let nonce_window_until = attempted_at + DISCORD_NONCE_ENFORCEMENT_WINDOW;
-        let row = sqlx::query("UPDATE contract_outbound_deliveries SET attempt_count = attempt_count + 1, first_attempt_at = COALESCE(first_attempt_at, $2), last_attempt_at = $2, nonce_window_until = COALESCE(nonce_window_until, $3) WHERE id = $1 AND status = 'prepared' RETURNING id, guild_id, channel_id, subscription_id, contract_id, event_kind, message, ping, delivery_nonce, nonce_window_until")
+        let row = sqlx::query("UPDATE contract_outbound_deliveries SET attempt_count = attempt_count + 1, first_attempt_at = COALESCE(first_attempt_at, $2), last_attempt_at = $2, nonce_window_until = COALESCE(nonce_window_until, $3) WHERE id = $1 AND status = 'prepared' RETURNING id, guild_id, channel_id, subscription_id, contract_id, event_kind, message, ping, ping_type, delivery_nonce, nonce_window_until")
             .bind(delivery_id)
             .bind(attempted_at)
             .bind(nonce_window_until)
@@ -2771,10 +2832,21 @@ fn prepared_contract_delivery_from_row(
         contract_id: row.get("contract_id"),
         event_kind,
         ping: row.get("ping"),
+        ping_type: contract_ping_type_from_str(&row.get::<String, _>("ping_type"))?,
         nonce: row.get("delivery_nonce"),
         enforce_nonce: false,
         message: serde_json::from_value(row.get("message")).map_err(json_to_sqlx)?,
     })
+}
+
+fn contract_ping_type_from_str(value: &str) -> Result<ContractPingType, sqlx::Error> {
+    match value {
+        "here" => Ok(ContractPingType::Here),
+        "everyone" => Ok(ContractPingType::Everyone),
+        value => Err(sqlx::Error::Protocol(format!(
+            "unknown contract delivery ping type: {value}"
+        ))),
+    }
 }
 
 fn contract_resolution_record_from_row(
@@ -3029,6 +3101,9 @@ impl ContractCollector {
     }
 
     pub async fn collect_cycle(&self) -> Result<CollectionReport, ContractCollectionError> {
+        if let Some(notifications) = &self.notifications {
+            self.deliver_prepared_notifications(notifications).await?;
+        }
         self.ensure_esi_limiter_allows_requests().await?;
         let regions = match self.regions().await {
             Ok(regions) => regions,
@@ -3684,7 +3759,8 @@ impl ContractCollector {
             &issuer_history,
             &corporation_history,
         );
-        let ping = matches!(action, ContractEventAction::PostAndPing);
+        let ping_type = action.ping_type();
+        let ping = ping_type.is_some();
         let relevant_isk = event.contract.price.max(event.contract.reward);
         let confirmed_at = match event.kind {
             ContractEventKind::SaleConfirmed | ContractEventKind::PurchaseConfirmed => event
@@ -3703,6 +3779,7 @@ impl ContractCollector {
                 &event,
                 &message,
                 ping,
+                ping_type.unwrap_or_default(),
                 DeliveryOrdering {
                     strategic_priority,
                     relevant_isk,
