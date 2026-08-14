@@ -22,6 +22,15 @@ const CONTRACT_COLLECTOR_USER_AGENT: &str = "killbot-rust Global Public Contract
 const MAX_EMBED_CONTEXT_ENRICHMENTS_PER_CYCLE: usize = 8;
 const DISCORD_NONCE_ENFORCEMENT_WINDOW: ChronoDuration = ChronoDuration::minutes(5);
 const DEFAULT_COLLECTION_RECOVERY_GAP: ChronoDuration = ChronoDuration::minutes(15);
+const REGION_DISCOVERY_RESOURCE_KEY: &str = "esi:regions";
+
+fn regional_snapshot_resource_key(region_id: i64) -> String {
+    format!("esi:public-contracts:region:{region_id}")
+}
+
+fn embed_context_resource_key(contract_id: i64) -> String {
+    format!("contract-embed-context:{contract_id}")
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PublicContract {
@@ -1171,6 +1180,8 @@ pub struct StorageCounts {
 pub struct ContractCollectionFailure {
     pub id: i64,
     pub region_id: Option<i64>,
+    pub contract_id: Option<i64>,
+    pub resource_key: Option<String>,
     pub observed_at: DateTime<Utc>,
     pub failure_kind: String,
     pub detail: String,
@@ -1846,9 +1857,23 @@ pub struct DeliveryRecord {
     pub discord_message_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeliveryFailureKind {
+    Transient,
+    Ambiguous,
     Permanent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractDeliveryFailure {
+    pub delivery_id: i64,
+    pub subscription_id: String,
+    pub contract_id: i64,
+    pub status: DeliveryStatus,
+    pub failure_kind: DeliveryFailureKind,
+    pub detail: String,
+    pub attempt_count: i32,
+    pub last_attempt_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2057,7 +2082,7 @@ impl ContractCollectionStore {
     pub async fn unresolved_collection_failures(
         &self,
     ) -> Result<Vec<ContractCollectionFailure>, sqlx::Error> {
-        sqlx::query("SELECT id, region_id, observed_at, failure_kind, detail, retry_after FROM contract_collection_failures WHERE resolved_at IS NULL AND classification IS NULL ORDER BY observed_at, id")
+        sqlx::query("SELECT id, region_id, contract_id, resource_key, observed_at, failure_kind, detail, retry_after FROM contract_collection_failures WHERE resolved_at IS NULL AND classification IS NULL ORDER BY observed_at, id")
             .fetch_all(&self.pool)
             .await?
             .into_iter()
@@ -2065,6 +2090,8 @@ impl ContractCollectionStore {
                 Ok(ContractCollectionFailure {
                     id: row.get("id"),
                     region_id: row.get("region_id"),
+                    contract_id: row.get("contract_id"),
+                    resource_key: row.get("resource_key"),
                     observed_at: row.get("observed_at"),
                     failure_kind: row.get("failure_kind"),
                     detail: row.get("detail"),
@@ -2301,23 +2328,38 @@ impl ContractCollectionStore {
         delivery_id: i64,
     ) -> Result<Option<(DeliveryFailureKind, String)>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT failure_kind, last_error FROM contract_outbound_deliveries WHERE id = $1 AND status = 'failed'",
+            "SELECT failure_kind, last_error FROM contract_outbound_deliveries WHERE id = $1 AND failure_kind IS NOT NULL AND failure_resolved_at IS NULL",
         )
         .bind(delivery_id)
         .fetch_optional(&self.pool)
         .await?;
         row.map(|row| {
-            let kind = match row.get::<String, _>("failure_kind").as_str() {
-                "permanent" => DeliveryFailureKind::Permanent,
-                value => {
-                    return Err(sqlx::Error::Protocol(format!(
-                        "unknown contract delivery failure kind: {value}"
-                    )))
-                }
-            };
+            let kind = delivery_failure_kind_from_str(&row.get::<String, _>("failure_kind"))?;
             Ok((kind, row.get("last_error")))
         })
         .transpose()
+    }
+
+    pub async fn unresolved_delivery_failures(
+        &self,
+    ) -> Result<Vec<ContractDeliveryFailure>, sqlx::Error> {
+        sqlx::query("SELECT id, subscription_id, contract_id, status, failure_kind, last_error, attempt_count, last_attempt_at FROM contract_outbound_deliveries WHERE failure_kind IS NOT NULL AND failure_resolved_at IS NULL ORDER BY last_attempt_at, id")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(ContractDeliveryFailure {
+                    delivery_id: row.get("id"),
+                    subscription_id: row.get("subscription_id"),
+                    contract_id: row.get("contract_id"),
+                    status: delivery_status_from_str(&row.get::<String, _>("status"))?,
+                    failure_kind: delivery_failure_kind_from_str(&row.get::<String, _>("failure_kind"))?,
+                    detail: row.get("last_error"),
+                    attempt_count: row.get("attempt_count"),
+                    last_attempt_at: row.get("last_attempt_at"),
+                })
+            })
+            .collect()
     }
 
     async fn all_contract_subscriptions(&self) -> Result<Vec<ContractSubscription>, sqlx::Error> {
@@ -2465,7 +2507,7 @@ impl ContractCollectionStore {
         delivery_id: i64,
         discord_message_id: &str,
     ) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("UPDATE contract_outbound_deliveries SET status = 'sent', discord_message_id = $2, sent_at = now() WHERE id = $1 AND status = 'prepared'")
+        let result = sqlx::query("UPDATE contract_outbound_deliveries SET status = 'sent', discord_message_id = $2, sent_at = now(), failure_resolved_at = CASE WHEN failure_kind IS NULL THEN failure_resolved_at ELSE now() END WHERE id = $1 AND status = 'prepared'")
             .bind(delivery_id)
             .bind(discord_message_id)
             .execute(&self.pool)
@@ -2484,15 +2526,43 @@ impl ContractCollectionStore {
         error: &ContractDeliveryError,
         failed_at: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("UPDATE contract_outbound_deliveries SET status = 'failed', failure_kind = 'permanent', last_error = $2, failed_at = $3 WHERE id = $1 AND status = 'prepared'")
+        let result = sqlx::query("UPDATE contract_outbound_deliveries SET status = 'failed', failure_kind = 'permanent', last_error = $2, failed_at = $3, failure_resolved_at = NULL WHERE id = $1 AND status = 'prepared'")
             .bind(delivery_id)
-            .bind(error.message())
+            .bind(sanitize_contract_failure_detail(error.message()))
             .bind(failed_at)
             .execute(&self.pool)
             .await?;
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol(format!(
                 "contract delivery {delivery_id} was not prepared when Discord returned a permanent failure"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn mark_delivery_retryable(
+        &self,
+        delivery_id: i64,
+        error: &ContractDeliveryError,
+    ) -> Result<(), sqlx::Error> {
+        let failure_kind = match error {
+            ContractDeliveryError::Transient(_) => "transient",
+            ContractDeliveryError::Ambiguous(_) => "ambiguous",
+            ContractDeliveryError::Permanent(_) => {
+                return Err(sqlx::Error::Protocol(
+                    "permanent contract delivery failure cannot remain prepared".to_string(),
+                ))
+            }
+        };
+        let result = sqlx::query("UPDATE contract_outbound_deliveries SET failure_kind = $2, last_error = $3, failure_resolved_at = NULL WHERE id = $1 AND status = 'prepared'")
+            .bind(delivery_id)
+            .bind(failure_kind)
+            .bind(sanitize_contract_failure_detail(error.message()))
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol(format!(
+                "contract delivery {delivery_id} was not prepared when Discord returned a retryable failure"
             )));
         }
         Ok(())
@@ -2662,7 +2732,12 @@ impl ContractCollectionStore {
             }
         }
         sqlx::query("INSERT INTO regional_observations (region_id, observed_at, outcome, expected_pages) VALUES ($1,$2,'complete',$3)").bind(region_id).bind(now).bind(expected_pages as i32).execute(&mut *transaction).await?;
-        sqlx::query("UPDATE contract_collection_failures SET resolved_at = $2 WHERE region_id = $1 AND failure_kind = 'inconclusive_observation' AND resolved_at IS NULL AND classification IS NULL").bind(region_id).bind(now).execute(&mut *transaction).await?;
+        sqlx::query("UPDATE contract_collection_failures SET resolved_at = $2 WHERE region_id = $1 AND resource_key = $3 AND failure_kind = 'inconclusive_observation' AND resolved_at IS NULL AND classification IS NULL")
+            .bind(region_id)
+            .bind(now)
+            .bind(regional_snapshot_resource_key(region_id))
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query("UPDATE regional_collection_metadata SET baseline_at = COALESCE(baseline_at, $2), complete_observations = complete_observations + 1, last_complete_at = $2, recovery_baseline_at = CASE WHEN $3 THEN $2 ELSE recovery_baseline_at END WHERE region_id = $1").bind(region_id).bind(now).bind(recovery_baseline).execute(&mut *transaction).await?;
         transaction.commit().await?;
         Ok(RecordComplete {
@@ -2684,6 +2759,8 @@ impl ContractCollectionStore {
         sqlx::query("INSERT INTO regional_observations (region_id, observed_at, outcome, detail) VALUES ($1,$2,'inconclusive',$3)").bind(region_id).bind(now).bind(detail).execute(&self.pool).await?;
         self.record_failure(
             Some(region_id),
+            None,
+            Some(&regional_snapshot_resource_key(region_id)),
             "inconclusive_observation",
             detail,
             retry_after,
@@ -2694,22 +2771,37 @@ impl ContractCollectionStore {
     async fn record_failure(
         &self,
         region_id: Option<i64>,
+        contract_id: Option<i64>,
+        resource_key: Option<&str>,
         failure_kind: &str,
         detail: &str,
         retry_after: Option<DateTime<Utc>>,
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
-        sqlx::query("INSERT INTO contract_collection_failures (region_id, observed_at, failure_kind, detail, retry_after) VALUES ($1,$2,$3,$4,$5)").bind(region_id).bind(now).bind(failure_kind).bind(detail).bind(retry_after).execute(&self.pool).await?;
+        sqlx::query("INSERT INTO contract_collection_failures (region_id, contract_id, resource_key, observed_at, failure_kind, detail, retry_after) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+            .bind(region_id)
+            .bind(contract_id)
+            .bind(resource_key)
+            .bind(now)
+            .bind(failure_kind)
+            .bind(sanitize_contract_failure_detail(detail))
+            .bind(retry_after)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     async fn resolve_collection_failures(
         &self,
         region_id: Option<i64>,
+        contract_id: Option<i64>,
+        resource_key: Option<&str>,
         failure_kind: &str,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE contract_collection_failures SET resolved_at = now() WHERE region_id IS NOT DISTINCT FROM $1 AND failure_kind = $2 AND resolved_at IS NULL AND classification IS NULL")
+        sqlx::query("UPDATE contract_collection_failures SET resolved_at = now() WHERE region_id IS NOT DISTINCT FROM $1 AND contract_id IS NOT DISTINCT FROM $2 AND resource_key IS NOT DISTINCT FROM $3 AND failure_kind = $4 AND resolved_at IS NULL AND classification IS NULL")
             .bind(region_id)
+            .bind(contract_id)
+            .bind(resource_key)
             .bind(failure_kind)
             .execute(&self.pool)
             .await?;
@@ -2881,21 +2973,33 @@ fn contract_subscription_from_row(
 }
 
 fn delivery_record_from_row(row: sqlx::postgres::PgRow) -> Result<DeliveryRecord, sqlx::Error> {
-    let status = match row.get::<String, _>("status").as_str() {
-        "prepared" => DeliveryStatus::Prepared,
-        "sent" => DeliveryStatus::Sent,
-        "failed" => DeliveryStatus::Failed,
-        value => {
-            return Err(sqlx::Error::Protocol(format!(
-                "unknown delivery status: {value}"
-            )))
-        }
-    };
     Ok(DeliveryRecord {
         id: row.get("id"),
-        status,
+        status: delivery_status_from_str(&row.get::<String, _>("status"))?,
         discord_message_id: row.get("discord_message_id"),
     })
+}
+
+fn delivery_status_from_str(value: &str) -> Result<DeliveryStatus, sqlx::Error> {
+    match value {
+        "prepared" => Ok(DeliveryStatus::Prepared),
+        "sent" => Ok(DeliveryStatus::Sent),
+        "failed" => Ok(DeliveryStatus::Failed),
+        value => Err(sqlx::Error::Protocol(format!(
+            "unknown delivery status: {value}"
+        ))),
+    }
+}
+
+fn delivery_failure_kind_from_str(value: &str) -> Result<DeliveryFailureKind, sqlx::Error> {
+    match value {
+        "transient" => Ok(DeliveryFailureKind::Transient),
+        "ambiguous" => Ok(DeliveryFailureKind::Ambiguous),
+        "permanent" => Ok(DeliveryFailureKind::Permanent),
+        value => Err(sqlx::Error::Protocol(format!(
+            "unknown contract delivery failure kind: {value}"
+        ))),
+    }
 }
 
 fn prepared_contract_delivery_from_row(
@@ -3209,7 +3313,12 @@ impl ContractCollector {
         let regions = match self.regions().await {
             Ok(regions) => {
                 self.store
-                    .resolve_collection_failures(None, "region_discovery")
+                    .resolve_collection_failures(
+                        None,
+                        None,
+                        Some(REGION_DISCOVERY_RESOURCE_KEY),
+                        "region_discovery",
+                    )
                     .await?;
                 regions
             }
@@ -3217,6 +3326,8 @@ impl ContractCollector {
                 self.store
                     .record_failure(
                         None,
+                        None,
+                        Some(REGION_DISCOVERY_RESOURCE_KEY),
                         "region_discovery",
                         &error.to_string(),
                         error.retry_after(),
@@ -3413,6 +3524,11 @@ impl ContractCollector {
                         .store
                         .record_failure(
                             Some(resolution.region_id),
+                            Some(resolution.contract_id),
+                            Some(&format!(
+                                "contracts/public/items/{}",
+                                resolution.contract_id
+                            )),
                             "resolution_probe",
                             &error.to_string(),
                             retry_after,
@@ -3480,6 +3596,14 @@ impl ContractCollector {
                 self.esi
                     .public_contract_items_probe(resolution.contract_id, etag.as_deref())
                     .await,
+            )
+            .await?;
+        self.store
+            .resolve_collection_failures(
+                Some(resolution.region_id),
+                Some(resolution.contract_id),
+                Some(&key),
+                "resolution_probe",
             )
             .await?;
         match probe {
@@ -3957,6 +4081,9 @@ impl ContractCollector {
             Err(
                 error @ (ContractDeliveryError::Transient(_) | ContractDeliveryError::Ambiguous(_)),
             ) => {
+                self.store
+                    .mark_delivery_retryable(prepared.delivery_id, &error)
+                    .await?;
                 warn!(
                     delivery_id = prepared.delivery_id,
                     subscription_id = %prepared.subscription_id,
@@ -4054,11 +4181,21 @@ impl ContractCollector {
                             &response.value.unwrap_or_default(),
                         )
                         .await?;
+                    self.store
+                        .resolve_collection_failures(
+                            Some(region_id),
+                            Some(observed.contract.contract_id),
+                            Some(&embed_context_resource_key(observed.contract.contract_id)),
+                            "embed_context_enrichment",
+                        )
+                        .await?;
                 }
                 None => {
                     self.store
                         .record_failure(
                             Some(region_id),
+                            Some(observed.contract.contract_id),
+                            Some(&embed_context_resource_key(observed.contract.contract_id)),
                             "embed_context_enrichment",
                             "observation-time contract embed enrichment will be retried",
                             self.store.active_esi_limiter_deadline().await?,
@@ -5428,6 +5565,23 @@ fn bounded_text(value: &str, limit: usize) -> String {
         return "…".repeat(limit);
     }
     format!("{}…", value.chars().take(limit - 1).collect::<String>())
+}
+
+fn sanitize_contract_failure_detail(value: &str) -> String {
+    let normalized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() || character.is_whitespace() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    bounded_text(
+        &sanitize_discord_text(&normalized.split_whitespace().collect::<Vec<_>>().join(" ")),
+        512,
+    )
 }
 
 pub fn sanitize_discord_text(value: &str) -> String {
