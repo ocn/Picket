@@ -1944,6 +1944,36 @@ async fn wire_304_responses_preserve_last_modified_for_paginated_snapshot_valida
             body: "[]",
         },
         WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"{"name":"Jita IV - Moon 4","system_id":30000142}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"{"name":"Jita","security_status":0.9,"constellation_id":20000020}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"{"region_id":10000002}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"{"name":"The Forge"}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"[{"alliance_id":99000111}]"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"[{"id":90000001,"name":"Issuer"},{"id":98000001,"name":"Issuer Corp"},{"id":99000111,"name":"Issuer Alliance"}]"#,
+        },
+        WireReply {
             status: 304,
             headers: vec![("Cache-Control", "max-age=0")],
             body: "",
@@ -1994,7 +2024,7 @@ async fn wire_304_responses_preserve_last_modified_for_paginated_snapshot_valida
             observed_contracts: 2,
         }]
     );
-    assert!(server.requests.lock().unwrap()[5]
+    assert!(server.requests.lock().unwrap()[11]
         .to_ascii_lowercase()
         .contains("if-none-match: \"regions-v1\""));
     server.finish();
@@ -3028,6 +3058,135 @@ async fn missing_embed_context_is_backfilled_and_retried_after_a_transient_failu
 }
 
 #[tokio::test]
+async fn snapshot_backfill_cap_counts_missing_contexts_and_terminal_delivery_uses_last_snapshot() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let contracts = (44..54).map(item_exchange_contract).collect::<Vec<_>>();
+    let items = contracts
+        .iter()
+        .map(|contract| {
+            (
+                contract.contract_id,
+                Ok(EsiResponse::fresh(
+                    vec![offered_ship(contract.contract_id)],
+                    expiring_cache(),
+                )),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let contexts = contracts
+        .iter()
+        .map(|contract| {
+            Ok(EsiResponse::fresh(
+                ContractEmbedContext {
+                    issuer_character_name: Some(format!(
+                        "Backfilled Issuer {}",
+                        contract.contract_id
+                    )),
+                    ..ContractEmbedContext::default()
+                },
+                CacheMetadata::cached_for_seconds(60),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let esi = Arc::new(SnapshottingEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(contracts.clone(), expiring_page(1))),
+            )]),
+            items: items.clone(),
+        },
+        contexts: StdMutex::new(contexts),
+        calls: StdMutex::new(Vec::new()),
+    });
+    let collector = ContractCollector::new(store.clone(), esi.clone());
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("snapshot the first bounded context batch");
+    collector
+        .collect_cycle()
+        .await
+        .expect("backfill stable contracts after the first bounded batch");
+
+    assert_eq!(
+        esi.calls.lock().unwrap().as_slice(),
+        contracts
+            .iter()
+            .map(|contract| contract.contract_id)
+            .collect::<Vec<_>>()
+    );
+    for contract in &contracts {
+        assert!(
+            store
+                .observed_embed_context(10_000_002, contract.contract_id)
+                .await
+                .expect("read backfilled observation context")
+                .is_some(),
+            "contract {} was not backfilled",
+            contract.contract_id
+        );
+    }
+
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "terminal-after-backfill",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist a terminal-only subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let last_contract = contracts.last().expect("last stable contract");
+    let resolver = ResolutionEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    contracts[..contracts.len() - 1].to_vec(),
+                    expiring_page(1),
+                )),
+            )]),
+            items,
+        },
+        probes: StdMutex::new(vec![Ok(ContractItemProbe::NoContent(expiring_cache()))]),
+        probe_calls: StdMutex::new(Vec::new()),
+    };
+
+    ContractCollector::new(store.clone(), Arc::new(resolver))
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+            delivery.clone(),
+        )
+        .collect_cycle()
+        .await
+        .expect("deliver the terminal event with backfilled observation context");
+
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].contract_id, last_contract.contract_id);
+    assert!(sent[0].message.fields.iter().any(|field| {
+        field.name == "Issuer"
+            && field.value
+                == format!(
+                    "Backfilled Issuer {} ({})",
+                    last_contract.contract_id, last_contract.issuer_id
+                )
+    }));
+    drop(sent);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn observation_context_enrichment_stops_at_the_persisted_limiter_boundary() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
@@ -3170,7 +3329,8 @@ async fn terminal_only_subscription_uses_the_persisted_observation_time_context(
         .any(|field| { field.name == "Issuer" && field.value == "Observed Issuer (90000001)" }));
     assert!(sent[0].message.fields.iter().any(|field| {
         field.name == "Observed Affiliation"
-            && field.value == "At observation: Observed Corporation (98000001)"
+            && field.value
+                == "At observation: Observed Corporation (98000001)\nAlliance: Observed Alliance (99000111)"
     }));
     assert!(sent[0]
         .message
@@ -5415,6 +5575,116 @@ async fn http_esi_revalidates_expired_context_with_an_etag() {
         .contains("if-none-match: system-v1"));
     drop(requests);
     server.finish();
+}
+
+#[tokio::test]
+async fn collection_cycles_retain_context_representations_and_etags_after_a_late_failure() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let contract = item_exchange_contract(44);
+    let page = r#"[{"collateral":0.0,"contract_id":44,"date_expired":"2026-08-14T12:00:00Z","date_issued":"2026-08-13T12:00:00Z","days_to_complete":0,"issuer_corporation_id":98000001,"issuer_id":90000001,"price":1500000000.0,"reward":0.0,"start_location_id":60003760,"type":"item_exchange","volume":115000.0}]"#;
+    let server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: "[10000002]",
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60"), ("X-Pages", "1")],
+            body: page,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"[{"is_included":true,"is_singleton":true,"quantity":1,"record_id":1,"type_id":587}]"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("ETag", "station-v1"), ("Cache-Control", "max-age=0")],
+            body: r#"{"name":"Jita IV - Moon 4","system_id":30000142}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"{"name":"Jita","security_status":0.9,"constellation_id":20000020}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"{"region_id":10000002}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"{"name":"The Forge"}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"[{"alliance_id":99000111}]"#,
+        },
+        WireReply {
+            status: 500,
+            headers: vec![],
+            body: "{}",
+        },
+        WireReply {
+            status: 304,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: "",
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: r#"[{"id":90000001,"name":"Issuer"},{"id":98000001,"name":"Issuer Corp"},{"id":99000111,"name":"Issuer Alliance"},{"id":587,"name":"Rifter"}]"#,
+        },
+    ]);
+    let esi = Arc::new(
+        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+            .expect("construct local HTTP ESI client"),
+    );
+    let collector = ContractCollector::new(store.clone(), esi);
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("retain the complete observation after late context failure");
+    assert!(store
+        .observed_embed_context(10_000_002, contract.contract_id)
+        .await
+        .expect("read absent context after late failure")
+        .is_none());
+    collector
+        .collect_cycle()
+        .await
+        .expect("retry context enrichment using retained representations");
+
+    assert_eq!(
+        store
+            .observed_embed_context(10_000_002, contract.contract_id)
+            .await
+            .expect("read context after cross-cycle retry")
+            .and_then(|context| context.location.solar_system_name),
+        Some("Jita".to_string())
+    );
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 11);
+    assert!(requests[3].starts_with("GET /universe/stations/60003760/"));
+    assert!(requests[9].starts_with("GET /universe/stations/60003760/"));
+    assert!(requests[9]
+        .to_ascii_lowercase()
+        .contains("if-none-match: station-v1"));
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("GET /universe/systems/30000142/"))
+            .count(),
+        1
+    );
+    drop(requests);
+    server.finish();
+    database.destroy().await;
 }
 
 #[tokio::test]
