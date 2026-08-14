@@ -671,6 +671,45 @@ fn confirmed_ship_subscription(
             } else {
                 ContractEventAction::Ignore
             },
+            ..ContractEventActions::default()
+        },
+    }
+}
+
+fn terminal_ship_subscription(
+    id: &str,
+    event_kind: ContractEventKind,
+    action: ContractEventAction,
+) -> ContractSubscription {
+    ContractSubscription {
+        guild_id: 42,
+        channel_id: 77,
+        id: id.to_string(),
+        description: format!("{id} subscription"),
+        filter: ContractFilter {
+            root: ContractFilterNode::And(vec![
+                ContractFilterNode::Condition(ContractFilterCondition::EventKinds(vec![
+                    event_kind,
+                ])),
+                ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                    direction: ContractItemDirection::Offered,
+                    ids: vec![587],
+                }),
+            ]),
+        },
+        event_actions: ContractEventActions {
+            listed: ContractEventAction::Ignore,
+            expired: if event_kind == ContractEventKind::Expired {
+                action
+            } else {
+                ContractEventAction::Ignore
+            },
+            closed_outcome_unknown: if event_kind == ContractEventKind::ClosedOutcomeUnknown {
+                action
+            } else {
+                ContractEventAction::Ignore
+            },
+            ..ContractEventActions::default()
         },
     }
 }
@@ -1186,6 +1225,341 @@ async fn cached_item_evidence_defers_resolution_for_200_and_conditional_304() {
     database.destroy().await;
 }
 
+#[tokio::test]
+async fn expired_and_unknown_terminal_outcomes_use_independent_actions_and_are_idempotent() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut expired = item_exchange_contract(44);
+    expired.date_expired = Utc::now() - chrono::Duration::minutes(1);
+    let mut unresolved = item_exchange_contract(45);
+    unresolved.date_expired = Utc::now() + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![expired.clone(), unresolved.clone()],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(
+                        vec![offered_ship(1)],
+                        cached_item_metadata("expired-v1", 3_600),
+                    )),
+                ),
+                (
+                    45,
+                    Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                ),
+            ]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline");
+    store
+        .upsert_contract_subscription(&terminal_ship_subscription(
+            "expired",
+            ContractEventKind::Expired,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist expiry subscription");
+    store
+        .upsert_contract_subscription(&terminal_ship_subscription(
+            "unknown",
+            ContractEventKind::ClosedOutcomeUnknown,
+            ContractEventAction::PostAndPing,
+        ))
+        .await
+        .expect("persist unknown-outcome subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let resolver = Arc::new(ResolutionEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        },
+        probes: StdMutex::new(vec![Ok(ContractItemProbe::NotFound(expiring_cache()))]),
+        probe_calls: StdMutex::new(Vec::new()),
+    });
+    let report = ContractCollector::new(store.clone(), resolver.clone())
+        .collect_cycle()
+        .await
+        .expect("classify only the evidence available to public collection");
+    assert_eq!(
+        report
+            .events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            ContractEventKind::Expired,
+            ContractEventKind::ClosedOutcomeUnknown,
+        ]
+    );
+    assert!(delivery.sent.lock().unwrap().is_empty());
+    assert_eq!(
+        store
+            .contract_resolution_records()
+            .await
+            .expect("read terminal resolution records")
+            .iter()
+            .map(|record| record.state)
+            .collect::<Vec<_>>(),
+        vec![
+            ContractResolutionState::Expired,
+            ContractResolutionState::ClosedOutcomeUnknown,
+        ]
+    );
+
+    let collector = ContractCollector::new(store.clone(), resolver).with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    );
+    let recovered = collector
+        .collect_cycle()
+        .await
+        .expect("restart and deliver the pending terminal outcomes");
+    assert_eq!(
+        recovered
+            .events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            ContractEventKind::Expired,
+            ContractEventKind::ClosedOutcomeUnknown,
+        ]
+    );
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert!(sent.iter().any(|message| message.ping));
+    assert!(sent.iter().any(|message| !message.ping));
+    for message in sent.iter() {
+        let event_field = message
+            .message
+            .fields
+            .iter()
+            .find(|field| field.name == "Event")
+            .expect("canonical terminal event field");
+        assert!(matches!(
+            event_field.value.as_str(),
+            "Expired" | "Closed — Outcome Unknown"
+        ));
+        assert!(message
+            .message
+            .fields
+            .iter()
+            .all(|field| field.name != "Acceptance Evidence"));
+    }
+    drop(sent);
+    assert_eq!(
+        store
+            .contract_resolution_records()
+            .await
+            .expect("read terminal resolution records")
+            .iter()
+            .map(|record| record.state)
+            .collect::<Vec<_>>(),
+        vec![
+            ContractResolutionState::Expired,
+            ContractResolutionState::ClosedOutcomeUnknown,
+        ]
+    );
+
+    let repeated = collector
+        .collect_cycle()
+        .await
+        .expect("terminal lifecycle processing is locally idempotent");
+    assert!(repeated.events.is_empty());
+    assert_eq!(delivery.sent.lock().unwrap().len(), 2);
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn no_content_at_or_after_expiry_is_expired_not_acceptance_confirmed() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut contract = item_exchange_contract(44);
+    contract.date_expired = Utc::now() + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(
+                    vec![offered_ship(1)],
+                    cached_item_metadata("items-v1", 3_600),
+                )),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish public baseline");
+
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("record disappearance while contract evidence is still unresolved");
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to temporary contract database");
+    let expired_at = Utc::now() - chrono::Duration::minutes(1);
+    sqlx::query(
+        "UPDATE contract_resolution_cases SET contract = jsonb_set(contract, '{date_expired}', to_jsonb($1::text), true), next_probe_at = now() - interval '1 second' WHERE contract_id = 44",
+    )
+    .bind(expired_at.to_rfc3339())
+    .execute(&raw_pool)
+    .await
+    .expect("move pending resolution to its known expiry boundary");
+    sqlx::query(
+        "UPDATE esi_cache_metadata SET expires_at = now() - interval '1 second' WHERE resource_key = 'contracts/public/items/44'",
+    )
+    .execute(&raw_pool)
+    .await
+    .expect("require a fresh item probe at the expiry boundary");
+    let resolver = Arc::new(ResolutionEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        },
+        probes: StdMutex::new(vec![Ok(ContractItemProbe::NoContent(expiring_cache()))]),
+        probe_calls: StdMutex::new(Vec::new()),
+    });
+    let report = ContractCollector::new(store.clone(), resolver.clone())
+        .collect_cycle()
+        .await
+        .expect("classify the expiry-boundary no-content response");
+    assert_eq!(
+        report
+            .events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        vec![ContractEventKind::Expired]
+    );
+    assert_eq!(
+        resolver.probe_calls.lock().unwrap().as_slice(),
+        [(44, Some("items-v1".to_string()))]
+    );
+    assert_eq!(
+        store
+            .contract_resolution_records()
+            .await
+            .expect("read expiry record")[0]
+            .state,
+        ContractResolutionState::Expired
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn reappearing_awaiting_contract_returns_to_observed_without_a_terminal_event() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut contract = item_exchange_contract(44);
+    contract.date_expired = Utc::now() + chrono::Duration::hours(1);
+    let baseline_items = HashMap::from([(
+        44,
+        Ok(EsiResponse::fresh(
+            vec![offered_ship(1)],
+            cached_item_metadata("items-v1", 3_600),
+        )),
+    )]);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+            )]),
+            items: baseline_items.clone(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish public baseline");
+    let disappeared = ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("record an unresolved disappearance");
+    assert!(disappeared.events.is_empty());
+    assert_eq!(
+        store
+            .contract_resolution_records()
+            .await
+            .expect("read awaiting state")[0]
+            .state,
+        ContractResolutionState::AwaitingResolution
+    );
+    let reappeared = ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![contract], expiring_page(1))),
+            )]),
+            items: baseline_items,
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("return a reappearing contract to observed");
+    assert!(reappeared.events.is_empty());
+    assert!(store
+        .contract_resolution_records()
+        .await
+        .expect("read cleared awaiting state")
+        .is_empty());
+    database.destroy().await;
+}
+
 async fn resolve_candidate_branch_after_unknown_location(
     resolved_solar_system_id: i64,
 ) -> (usize, usize, Vec<String>) {
@@ -1405,6 +1779,21 @@ async fn http_esi_distinguishes_a_no_content_item_probe_from_a_json_item_respons
         .expect("decode the positive acceptance probe");
 
     assert!(matches!(probe, ContractItemProbe::NoContent(_)));
+    server.finish();
+}
+
+#[tokio::test]
+async fn http_esi_distinguishes_not_found_from_acceptance_evidence() {
+    let server = OneShotHttpServer::start(404, &[("Cache-Control", "max-age=60")], "");
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("construct HTTP ESI client");
+
+    let probe = esi
+        .public_contract_items_probe(44, Some("\"items-v1\""))
+        .await
+        .expect("decode the unavailable public contract probe");
+
+    assert!(matches!(probe, ContractItemProbe::NotFound(_)));
     server.finish();
 }
 
