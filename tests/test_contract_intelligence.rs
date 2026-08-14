@@ -956,7 +956,7 @@ fn item_exchange_contract(contract_id: i64) -> PublicContract {
         buyout: None,
         collateral: Some(0.0),
         contract_type: "item_exchange".to_string(),
-        date_expired: Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0).unwrap(),
+        date_expired: Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 59).unwrap(),
         date_issued: Utc.with_ymd_and_hms(2026, 8, 13, 12, 0, 0).unwrap(),
         days_to_complete: 0,
         end_location_id: Some(60_003_760),
