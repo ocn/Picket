@@ -55,8 +55,9 @@ impl KillmailFeed for RedisQFeed {
             ));
         }
 
-        let wrapper: RedisQResponse = serde_json::from_str(&text)
-            .map_err(|e| FeedError::Parse(format!("JSON parsing error: {}. Response: '{}'", e, text)))?;
+        let wrapper: RedisQResponse = serde_json::from_str(&text).map_err(|e| {
+            FeedError::Parse(format!("JSON parsing error: {}. Response: '{}'", e, text))
+        })?;
 
         Ok(wrapper.package)
     }

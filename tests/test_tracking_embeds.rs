@@ -22,10 +22,22 @@ use std::sync::Arc;
 
 /// Test fixtures for tracking mode
 const TRACKING_FIXTURES: &[(&str, &str)] = &[
-    ("132235921_supers_involved.json", "Naglfar FI killed by fleet with Ragnarok"),
-    ("131501165_drill_kill.json", "Metenox drill killed in lowsec"),
-    ("132302304_caps_attacking.json", "Revelation killed by 4 Dreads + BS fleet"),
-    ("131126432_keepstar_kill.json", "Keepstar kill with 3753 attackers"),
+    (
+        "132235921_supers_involved.json",
+        "Naglfar FI killed by fleet with Ragnarok",
+    ),
+    (
+        "131501165_drill_kill.json",
+        "Metenox drill killed in lowsec",
+    ),
+    (
+        "132302304_caps_attacking.json",
+        "Revelation killed by 4 Dreads + BS fleet",
+    ),
+    (
+        "131126432_keepstar_kill.json",
+        "Keepstar kill with 3753 attackers",
+    ),
 ];
 
 /// Create tracking-focused test subscriptions
@@ -187,6 +199,9 @@ async fn send_tracking_embeds() {
     }
 
     println!("{}", "=".repeat(70));
-    println!("=== Test complete: {} tracking embeds sent ===", total_embeds);
+    println!(
+        "=== Test complete: {} tracking embeds sent ===",
+        total_embeds
+    );
     println!("{}", "=".repeat(70));
 }

@@ -40,17 +40,20 @@ pub enum ProcessedResult {
 impl ProcessedResult {
     fn dispatch_sequence(&self) -> u64 {
         match self {
-            ProcessedResult::Matched { dispatch_sequence, .. } => *dispatch_sequence,
-            ProcessedResult::NoMatch { dispatch_sequence, .. } => *dispatch_sequence,
-            ProcessedResult::Failed { dispatch_sequence, .. } => *dispatch_sequence,
+            ProcessedResult::Matched {
+                dispatch_sequence, ..
+            } => *dispatch_sequence,
+            ProcessedResult::NoMatch {
+                dispatch_sequence, ..
+            } => *dispatch_sequence,
+            ProcessedResult::Failed {
+                dispatch_sequence, ..
+            } => *dispatch_sequence,
         }
     }
 }
 
-async fn process_work_item(
-    work_item: WorkItem,
-    app_state: Arc<AppState>,
-) -> ProcessedResult {
+async fn process_work_item(work_item: WorkItem, app_state: Arc<AppState>) -> ProcessedResult {
     let kill_id = work_item.kill_id;
     let dispatch_sequence = work_item.dispatch_sequence;
     let zk_data_no_esi = work_item.zk_data_no_esi;
@@ -60,10 +63,17 @@ async fn process_work_item(
         debug!("[Kill: {}] Using inline ESI data (skipping fetch)", kill_id);
         km
     } else {
-        match app_state.esi_client.load_killmail(zk_data_no_esi.zkb.esi.clone()).await {
+        match app_state
+            .esi_client
+            .load_killmail(zk_data_no_esi.zkb.esi.clone())
+            .await
+        {
             Ok(km) => km,
             Err(e) => {
-                error!("[Kill: {}] Error loading killmail data from ESI: {}", kill_id, e);
+                error!(
+                    "[Kill: {}] Error loading killmail data from ESI: {}",
+                    kill_id, e
+                );
                 return ProcessedResult::Failed {
                     dispatch_sequence,
                     kill_id,
@@ -82,7 +92,10 @@ async fn process_work_item(
     let matched = processor::process_killmail(&app_state, &zk_data).await;
 
     if matched.is_empty() {
-        return ProcessedResult::NoMatch { dispatch_sequence, kill_id };
+        return ProcessedResult::NoMatch {
+            dispatch_sequence,
+            kill_id,
+        };
     }
 
     let mut dispatches = Vec::with_capacity(matched.len());
@@ -91,13 +104,9 @@ async fn process_work_item(
             "[Kill: {}] Matched subscription '{}' for channel {}, filter: {}",
             kill_id, subscription.description, subscription.action.channel_id, filter_result.name
         );
-        let embed = discord_bot::build_killmail_embed(
-            &app_state,
-            &zk_data,
-            &filter_result,
-            &subscription,
-        )
-        .await;
+        let embed =
+            discord_bot::build_killmail_embed(&app_state, &zk_data, &filter_result, &subscription)
+                .await;
 
         dispatches.push(PreparedDispatch {
             guild_id,
@@ -131,7 +140,11 @@ pub async fn run_producer(
                 let kill_id = zk_data_no_esi.kill_id;
                 debug!("[Kill: {}] Received (seq: {})", kill_id, dispatch_sequence);
 
-                let permit = semaphore.clone().acquire_owned().await.expect("semaphore closed");
+                let permit = semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore closed");
 
                 let work_item = WorkItem {
                     dispatch_sequence,
@@ -155,7 +168,10 @@ pub async fn run_producer(
                     let processed = match result {
                         Ok(r) => r,
                         Err(_) => {
-                            error!("[Kill: {}] Processing timed out after {}s", kill_id, timeout_secs);
+                            error!(
+                                "[Kill: {}] Processing timed out after {}s",
+                                kill_id, timeout_secs
+                            );
                             ProcessedResult::Failed {
                                 dispatch_sequence: seq,
                                 kill_id,
@@ -259,18 +275,35 @@ async fn dispatch_single(
     http_client: &Arc<Http>,
 ) {
     match result {
-        ProcessedResult::Matched { dispatch_sequence, kill_id, dispatches } => {
+        ProcessedResult::Matched {
+            dispatch_sequence,
+            kill_id,
+            dispatches,
+        } => {
             for dispatch in dispatches {
                 send_prepared_dispatch(dispatch, app_state, http_client).await;
             }
-            debug!("[Kill: {}] Dispatched (seq: {})", kill_id, dispatch_sequence);
+            debug!(
+                "[Kill: {}] Dispatched (seq: {})",
+                kill_id, dispatch_sequence
+            );
         }
-        ProcessedResult::NoMatch { dispatch_sequence, kill_id } => {
+        ProcessedResult::NoMatch {
+            dispatch_sequence,
+            kill_id,
+        } => {
             debug!("[Kill: {}] No match (seq: {})", kill_id, dispatch_sequence);
         }
-        ProcessedResult::Failed { dispatch_sequence, kill_id, error } => {
+        ProcessedResult::Failed {
+            dispatch_sequence,
+            kill_id,
+            error,
+        } => {
             if kill_id >= 0 {
-                error!("[Kill: {}] Failed (seq: {}): {}", kill_id, dispatch_sequence, error);
+                error!(
+                    "[Kill: {}] Failed (seq: {}): {}",
+                    kill_id, dispatch_sequence, error
+                );
             } else {
                 warn!("[Seq: {}] Gap timeout — skipping", dispatch_sequence);
             }
@@ -616,7 +649,10 @@ mod tests {
         // Insert another out-of-order result — deadline should NOT reset
         buf.insert(no_match(2));
         let deadline3 = buf.gap_deadline().expect("should still have deadline");
-        assert_eq!(deadline1, deadline3, "deadline must not reset on new out-of-order arrival");
+        assert_eq!(
+            deadline1, deadline3,
+            "deadline must not reset on new out-of-order arrival"
+        );
 
         // Drain advances past gap — deadline resets
         buf.insert(no_match(0));
@@ -646,13 +682,17 @@ mod tests {
 
             // Deadline must remain the same (not reset)
             let current_deadline = buf.gap_deadline().expect("deadline should persist");
-            assert_eq!(current_deadline, deadline,
-                "deadline must not reset when receiving out-of-order result at seq {seq}");
+            assert_eq!(
+                current_deadline, deadline,
+                "deadline must not reset when receiving out-of-order result at seq {seq}"
+            );
         }
 
         // After 20s (40 * 500ms), deadline (set at 10s) should have passed
-        assert!(tokio::time::Instant::now() >= deadline,
-            "should be past the gap deadline now");
+        assert!(
+            tokio::time::Instant::now() >= deadline,
+            "should be past the gap deadline now"
+        );
 
         // Skip the gap for seq 0
         let skipped = buf.skip_gap();

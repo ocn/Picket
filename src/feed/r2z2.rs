@@ -80,7 +80,10 @@ impl R2z2Feed {
         match std::fs::read_to_string(path) {
             Ok(contents) => match serde_json::from_str::<R2z2Checkpoint>(&contents) {
                 Ok(checkpoint) => {
-                    info!("R2Z2: resuming from persisted checkpoint {}", checkpoint.sequence);
+                    info!(
+                        "R2Z2: resuming from persisted checkpoint {}",
+                        checkpoint.sequence
+                    );
                     checkpoint.sequence
                 }
                 Err(_) => {
@@ -123,21 +126,32 @@ impl R2z2Feed {
                     let status = response.status();
                     if status == StatusCode::TOO_MANY_REQUESTS {
                         let wait = jittered_wait(FIXED_429_BASE_SECS);
-                        warn!("R2Z2: 429 fetching sequence.json, waiting {:.1}s", wait.as_secs_f64());
+                        warn!(
+                            "R2Z2: 429 fetching sequence.json, waiting {:.1}s",
+                            wait.as_secs_f64()
+                        );
                         tokio::time::sleep(wait).await;
                         continue;
                     }
                     if status.is_server_error() {
                         let wait = exponential_backoff(state.backoff_exp);
                         state.backoff_exp += 1;
-                        error!("R2Z2: {} fetching sequence.json, backoff {:.1}s", status, wait.as_secs_f64());
+                        error!(
+                            "R2Z2: {} fetching sequence.json, backoff {:.1}s",
+                            status,
+                            wait.as_secs_f64()
+                        );
                         tokio::time::sleep(wait).await;
                         continue;
                     }
                     if !status.is_success() {
                         let wait = exponential_backoff(state.backoff_exp);
                         state.backoff_exp += 1;
-                        error!("R2Z2: unexpected {} fetching sequence.json, backoff {:.1}s", status, wait.as_secs_f64());
+                        error!(
+                            "R2Z2: unexpected {} fetching sequence.json, backoff {:.1}s",
+                            status,
+                            wait.as_secs_f64()
+                        );
                         tokio::time::sleep(wait).await;
                         continue;
                     }
@@ -152,7 +166,11 @@ impl R2z2Feed {
                         Err(e) => {
                             let wait = exponential_backoff(state.backoff_exp);
                             state.backoff_exp += 1;
-                            error!("R2Z2: parse error fetching sequence.json: {}, backoff {:.1}s", e, wait.as_secs_f64());
+                            error!(
+                                "R2Z2: parse error fetching sequence.json: {}, backoff {:.1}s",
+                                e,
+                                wait.as_secs_f64()
+                            );
                             tokio::time::sleep(wait).await;
                             continue;
                         }
@@ -161,7 +179,11 @@ impl R2z2Feed {
                 Err(e) => {
                     let wait = exponential_backoff(state.backoff_exp);
                     state.backoff_exp += 1;
-                    error!("R2Z2: transport error fetching sequence.json: {}, backoff {:.1}s", e, wait.as_secs_f64());
+                    error!(
+                        "R2Z2: transport error fetching sequence.json: {}, backoff {:.1}s",
+                        e,
+                        wait.as_secs_f64()
+                    );
                     tokio::time::sleep(wait).await;
                     continue;
                 }
@@ -222,7 +244,11 @@ impl KillmailFeed for R2z2Feed {
 
                 if status == StatusCode::TOO_MANY_REQUESTS {
                     let wait = jittered_wait(FIXED_429_BASE_SECS);
-                    warn!("R2Z2: 429 on sequence {}, waiting {:.1}s", state.sequence, wait.as_secs_f64());
+                    warn!(
+                        "R2Z2: 429 on sequence {}, waiting {:.1}s",
+                        state.sequence,
+                        wait.as_secs_f64()
+                    );
                     tokio::time::sleep(wait).await;
                     return Ok(None);
                 }
@@ -230,7 +256,12 @@ impl KillmailFeed for R2z2Feed {
                 if status.is_server_error() {
                     let wait = exponential_backoff(state.backoff_exp);
                     state.backoff_exp += 1;
-                    error!("R2Z2: {} on sequence {}, backoff {:.1}s", status, state.sequence, wait.as_secs_f64());
+                    error!(
+                        "R2Z2: {} on sequence {}, backoff {:.1}s",
+                        status,
+                        state.sequence,
+                        wait.as_secs_f64()
+                    );
                     tokio::time::sleep(wait).await;
                     return Ok(None);
                 }
@@ -273,7 +304,8 @@ impl KillmailFeed for R2z2Feed {
                     }
 
                     // Wait poll_interval before returning
-                    tokio::time::sleep(Duration::from_secs(self.config.r2z2_poll_interval_secs)).await;
+                    tokio::time::sleep(Duration::from_secs(self.config.r2z2_poll_interval_secs))
+                        .await;
                     return Ok(None);
                 }
 
@@ -306,11 +338,12 @@ impl KillmailFeed for R2z2Feed {
                     return Ok(None);
                 }
 
-                let km: R2z2KillmailResponse = serde_json::from_str(&body)
-                    .map_err(|e| FeedError::Parse(format!(
+                let km: R2z2KillmailResponse = serde_json::from_str(&body).map_err(|e| {
+                    FeedError::Parse(format!(
                         "R2Z2: JSON error on sequence {}: {}",
                         state.sequence, e
-                    )))?;
+                    ))
+                })?;
 
                 // Advance sequence and save checkpoint
                 state.sequence += 1;
@@ -330,7 +363,12 @@ impl KillmailFeed for R2z2Feed {
             Err(e) => {
                 let wait = exponential_backoff(state.backoff_exp);
                 state.backoff_exp += 1;
-                error!("R2Z2: transport error on sequence {}: {}, backoff {:.1}s", state.sequence, e, wait.as_secs_f64());
+                error!(
+                    "R2Z2: transport error on sequence {}: {}, backoff {:.1}s",
+                    state.sequence,
+                    e,
+                    wait.as_secs_f64()
+                );
                 tokio::time::sleep(wait).await;
                 Ok(None)
             }
@@ -382,10 +420,16 @@ mod tests {
     #[test]
     fn test_r2z2_urls_use_ephemeral_path() {
         let seq_url = format!("{}/ephemeral/sequence.json", R2Z2_BASE_URL);
-        assert_eq!(seq_url, "https://r2z2.zkillboard.com/ephemeral/sequence.json");
+        assert_eq!(
+            seq_url,
+            "https://r2z2.zkillboard.com/ephemeral/sequence.json"
+        );
 
         let km_url = format!("{}/ephemeral/{}.json", R2Z2_BASE_URL, 96128620);
-        assert_eq!(km_url, "https://r2z2.zkillboard.com/ephemeral/96128620.json");
+        assert_eq!(
+            km_url,
+            "https://r2z2.zkillboard.com/ephemeral/96128620.json"
+        );
     }
 
     #[test]

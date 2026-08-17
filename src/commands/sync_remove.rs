@@ -54,7 +54,7 @@ impl Command for SyncRemoveCommand {
         };
 
         let command_channel_id_str = command.channel_id.to_string();
-        
+
         let response_content = {
             let _lock = app_state.subscriptions_file_lock.lock().await;
             let mut subs_map = app_state.subscriptions.write().unwrap();
@@ -89,7 +89,8 @@ impl Command for SyncRemoveCommand {
                             }
                             Err(e) => {
                                 error!("Failed to save subscriptions after removing sync: {}", e);
-                                "An error occurred while saving the updated subscription.".to_string()
+                                "An error occurred while saving the updated subscription."
+                                    .to_string()
                             }
                         }
                     } else {

@@ -66,7 +66,10 @@ pub async fn run() {
 
     info!("Feed provider: {}", app_config.killmail_feed_provider);
     info!("ESI HTTP timeout: {}s", app_config.esi_http_timeout_secs);
-    info!("Killmail process timeout: {}s", app_config.killmail_process_timeout_secs);
+    info!(
+        "Killmail process timeout: {}s",
+        app_config.killmail_process_timeout_secs
+    );
     info!(
         "RedisQ connect timeout: {}s / request timeout: {}s",
         app_config.redisq_connect_timeout_secs, app_config.redisq_request_timeout_secs
@@ -258,17 +261,25 @@ pub async fn run() {
 
     // --- Validate pipeline config ---
     if app_config.killmail_workers < 1 {
-        error!("KILLMAIL_WORKERS must be >= 1 (got {})", app_config.killmail_workers);
+        error!(
+            "KILLMAIL_WORKERS must be >= 1 (got {})",
+            app_config.killmail_workers
+        );
         return;
     }
     if app_config.killmail_queue_size < 1 || app_config.killmail_queue_size > 4096 {
-        error!("KILLMAIL_QUEUE_SIZE must be 1..=4096 (got {})", app_config.killmail_queue_size);
+        error!(
+            "KILLMAIL_QUEUE_SIZE must be 1..=4096 (got {})",
+            app_config.killmail_queue_size
+        );
         return;
     }
 
     info!(
         "Pipeline: workers={}, queue_size={}, post_process_sleep_ms={}",
-        app_config.killmail_workers, app_config.killmail_queue_size, app_config.killmail_post_process_sleep_ms
+        app_config.killmail_workers,
+        app_config.killmail_queue_size,
+        app_config.killmail_post_process_sleep_ms
     );
 
     // --- Start concurrent pipeline ---

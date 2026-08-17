@@ -95,9 +95,7 @@ impl Command for FindUnsubscribedChannelsCommand {
                 let category_name = guild_channel
                     .parent_id
                     .as_ref()
-                    .and_then(|cat_id| {
-                        channels.get(cat_id).map(|c| c.name.clone())
-                    })
+                    .and_then(|cat_id| channels.get(cat_id).map(|c| c.name.clone()))
                     .unwrap_or_else(|| "No Category".to_string());
 
                 unsubscribed_channels.push(format!(
