@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use killbot_rust::config::{self, AppConfig, AppState};
 use killbot_rust::contract_intelligence::{
     available_contract_store, collection_retry_delay, new_contract_store_handle,
@@ -19,9 +19,10 @@ use killbot_rust::feed::{FeedError, KillmailFeed};
 use killbot_rust::models::{ZkData, ZkDataNoEsi};
 use killbot_rust::pipeline::{run_producer, ProcessedResult};
 use moka::future::Cache;
+use serde_json::Value;
 use sha2::{Digest, Sha384};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::Executor;
+use sqlx::{Executor, Row};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -3518,6 +3519,32 @@ async fn wire_rate_limit_headers_stop_the_collector_before_the_next_request() {
         }]
     ));
     assert_eq!(server.requests.lock().unwrap().len(), 1);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect the limiter-boundary batch");
+    let batch = sqlx::query("SELECT pages_attempted, pages_observed, observed_contract_count, resolved_contract_count, manifest_failure_count, consistency_evidence, failure_classification, failure_detail, retry_after FROM regional_observation_batches WHERE region_id = 10000002")
+        .fetch_one(&pool)
+        .await
+        .expect("retain the limiter-boundary attempt");
+    assert_eq!(batch.get::<i32, _>("pages_attempted"), 1);
+    assert_eq!(batch.get::<i32, _>("pages_observed"), 0);
+    assert_eq!(batch.get::<i64, _>("observed_contract_count"), 0);
+    assert_eq!(batch.get::<i64, _>("resolved_contract_count"), 0);
+    assert_eq!(batch.get::<i64, _>("manifest_failure_count"), 0);
+    assert_eq!(batch.get::<String, _>("failure_classification"), "esi");
+    assert!(batch
+        .get::<String, _>("failure_detail")
+        .contains("persisted global ESI limiter"));
+    assert!(batch
+        .get::<Option<DateTime<Utc>>, _>("retry_after")
+        .is_some());
+    let evidence: Value = batch.get("consistency_evidence");
+    assert!(evidence["failure_response"]["retry_after"]
+        .as_str()
+        .is_some());
+    pool.close().await;
     server.finish();
     database.destroy().await;
 }
@@ -3673,6 +3700,31 @@ async fn exhausted_manifest_retries_defer_only_that_contract_and_preserve_the_ba
             .expect("count pending manifests"),
         1
     );
+    let batch = sqlx::query("SELECT outcome, expected_pages, pages_attempted, pages_observed, observed_contract_count, resolved_contract_count, manifest_failure_count, consistency_evidence, failure_classification, failure_detail, retry_after FROM regional_observation_batches WHERE region_id = 10000002 ORDER BY id")
+        .fetch_one(&validation_pool)
+        .await
+        .expect("read compact manifest-failure batch evidence");
+    assert_eq!(batch.get::<String, _>("outcome"), "complete");
+    assert_eq!(batch.get::<Option<i32>, _>("expected_pages"), Some(1));
+    assert_eq!(batch.get::<i32, _>("pages_attempted"), 1);
+    assert_eq!(batch.get::<i32, _>("pages_observed"), 1);
+    assert_eq!(batch.get::<i64, _>("observed_contract_count"), 2);
+    assert_eq!(batch.get::<i64, _>("resolved_contract_count"), 1);
+    assert_eq!(batch.get::<i64, _>("manifest_failure_count"), 1);
+    assert_eq!(
+        batch.get::<Option<String>, _>("failure_classification"),
+        Some("manifest_collection".to_string())
+    );
+    assert!(batch
+        .get::<Option<String>, _>("failure_detail")
+        .expect("compact failure detail")
+        .contains("1 manifest failures"));
+    assert!(batch
+        .get::<Option<DateTime<Utc>>, _>("retry_after")
+        .is_none());
+    let evidence: Value = batch.get("consistency_evidence");
+    assert_eq!(evidence["manifest_failure_count"], serde_json::json!(1));
+    assert!(evidence.get("manifest_failure_contract_ids").is_none());
 
     let recovered = ContractCollector::new(
         store.clone(),
@@ -4051,6 +4103,48 @@ async fn inconsistent_pagination_is_inconclusive_and_creates_no_presence_or_base
         0
     );
 
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect the partial pagination batch");
+    let batch = sqlx::query("SELECT outcome, expected_pages, pages_attempted, pages_observed, observed_contract_count, resolved_contract_count, manifest_failure_count, consistency_evidence, failure_classification, failure_detail, retry_after FROM regional_observation_batches WHERE region_id = 10000002")
+        .fetch_one(&pool)
+        .await
+        .expect("retain the inconsistent pagination attempt");
+    assert_eq!(batch.get::<String, _>("outcome"), "inconclusive");
+    assert_eq!(batch.get::<Option<i32>, _>("expected_pages"), Some(2));
+    assert_eq!(batch.get::<i32, _>("pages_attempted"), 2);
+    assert_eq!(batch.get::<i32, _>("pages_observed"), 2);
+    assert_eq!(batch.get::<i64, _>("observed_contract_count"), 2);
+    assert_eq!(batch.get::<i64, _>("resolved_contract_count"), 0);
+    assert_eq!(batch.get::<i64, _>("manifest_failure_count"), 0);
+    assert_eq!(
+        batch.get::<String, _>("failure_classification"),
+        "consistency"
+    );
+    assert!(batch.get::<String, _>("failure_detail").contains("X-Pages"));
+    assert!(batch
+        .get::<Option<DateTime<Utc>>, _>("retry_after")
+        .is_none());
+    let evidence: Value = batch.get("consistency_evidence");
+    assert_eq!(evidence["pages_attempted"], serde_json::json!(2));
+    assert_eq!(evidence["pages_observed"], serde_json::json!(2));
+    assert_eq!(evidence["expected_pages"], serde_json::json!(2));
+    assert_eq!(
+        evidence["consistency"]["expected_pages_matches_first"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        evidence["first_page"]["expected_pages"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        evidence["last_page"]["expected_pages"],
+        serde_json::json!(3)
+    );
+    pool.close().await;
+
     database.destroy().await;
 }
 
@@ -4158,6 +4252,35 @@ async fn duplicated_contract_ids_across_pages_are_inconclusive() {
             .presence_intervals,
         0
     );
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect the duplicate-id batch");
+    let batch = sqlx::query("SELECT expected_pages, pages_attempted, pages_observed, observed_contract_count, resolved_contract_count, manifest_failure_count, consistency_evidence, failure_classification, retry_after FROM regional_observation_batches WHERE region_id = 10000002")
+        .fetch_one(&pool)
+        .await
+        .expect("retain the duplicate-id attempt");
+    assert_eq!(batch.get::<Option<i32>, _>("expected_pages"), Some(2));
+    assert_eq!(batch.get::<i32, _>("pages_attempted"), 2);
+    assert_eq!(batch.get::<i32, _>("pages_observed"), 2);
+    assert_eq!(batch.get::<i64, _>("observed_contract_count"), 2);
+    assert_eq!(batch.get::<i64, _>("resolved_contract_count"), 0);
+    assert_eq!(batch.get::<i64, _>("manifest_failure_count"), 0);
+    assert_eq!(
+        batch.get::<String, _>("failure_classification"),
+        "consistency"
+    );
+    assert!(batch
+        .get::<Option<DateTime<Utc>>, _>("retry_after")
+        .is_none());
+    let evidence: Value = batch.get("consistency_evidence");
+    assert_eq!(
+        evidence["consistency"]["duplicate_contract_count"],
+        serde_json::json!(1)
+    );
+    pool.close().await;
 
     database.destroy().await;
 }
@@ -6615,7 +6738,7 @@ async fn a_material_collection_gap_reestablishes_a_silent_recovery_baseline() {
         .await
         .expect("connect to make the regional state stale");
     sqlx::query(
-        "UPDATE regional_collection_metadata SET last_complete_at = now() - interval '2 hours' WHERE region_id = 10000002",
+        "UPDATE regional_observation_batches SET attempt_started_at = now() - interval '2 hours', completed_at = now() - interval '2 hours' WHERE region_id = 10000002",
     )
     .execute(&pool)
     .await
@@ -6725,7 +6848,7 @@ async fn recovery_retains_stale_nonfinancial_closures_without_discord_delivery()
         .await
         .expect("connect to make the regional state stale");
     sqlx::query(
-        "UPDATE regional_collection_metadata SET last_complete_at = now() - interval '2 hours' WHERE region_id = 10000002",
+        "UPDATE regional_observation_batches SET attempt_started_at = now() - interval '2 hours', completed_at = now() - interval '2 hours' WHERE region_id = 10000002",
     )
     .execute(&pool)
     .await
@@ -6815,7 +6938,7 @@ async fn recovery_still_notifies_fresh_pre_expiry_acceptance_evidence() {
         .await
         .expect("connect to make the regional state stale");
     sqlx::query(
-        "UPDATE regional_collection_metadata SET last_complete_at = now() - interval '2 hours' WHERE region_id = 10000002",
+        "UPDATE regional_observation_batches SET attempt_started_at = now() - interval '2 hours', completed_at = now() - interval '2 hours' WHERE region_id = 10000002",
     )
     .execute(&pool)
     .await
@@ -9206,4 +9329,966 @@ async fn http_esi_station_not_found_keeps_location_context_indeterminate() {
         ContractContextValue::Indeterminate
     );
     server.finish();
+}
+
+#[tokio::test]
+async fn regional_observation_batch_migration_applies_to_clean_and_current_databases() {
+    let clean_database = TemporaryDatabase::new().await;
+    let clean_store = clean_database.store().await;
+    let clean_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&clean_database.url)
+        .await
+        .expect("connect to clean migrated database");
+    let clean_migration_count: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
+        .fetch_one(&clean_pool)
+        .await
+        .expect("read clean migration ledger");
+    assert_eq!(clean_migration_count, 13);
+    let batch_table_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind("regional_observation_batches")
+        .fetch_one(&clean_pool)
+        .await
+        .expect("read clean regional batch table");
+    assert!(
+        batch_table_exists,
+        "clean migration creates regional batch ledger"
+    );
+    let clean_batch_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM regional_observation_batches")
+            .fetch_one(&clean_pool)
+            .await
+            .expect("read clean regional batch ledger");
+    assert_eq!(clean_batch_count, 0);
+    assert_eq!(
+        clean_store
+            .storage_counts()
+            .await
+            .expect("read clean contract state")
+            .presence_intervals,
+        0
+    );
+    clean_pool.close().await;
+    clean_database.destroy().await;
+
+    let current_database = TemporaryDatabase::unavailable().await;
+    current_database.create().await;
+    let current_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&current_database.url)
+        .await
+        .expect("connect to current production migration database");
+    current_pool
+        .execute("CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), success BOOLEAN NOT NULL, checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL)")
+        .await
+        .expect("create current production migration ledger");
+    for (version, sql) in [
+        (
+            20260813000000_i64,
+            include_str!("../migrations/20260813000000_create_contract_intelligence.sql"),
+        ),
+        (
+            20260813000001_i64,
+            include_str!(
+                "../migrations/20260813000001_add_contract_collection_representation_metadata.sql"
+            ),
+        ),
+        (
+            20260813000002_i64,
+            include_str!(
+                "../migrations/20260813000002_add_contract_subscriptions_and_deliveries.sql"
+            ),
+        ),
+        (
+            20260813000003_i64,
+            include_str!("../migrations/20260813000003_preserve_contract_delivery_history.sql"),
+        ),
+        (
+            20260813000004_i64,
+            include_str!("../migrations/20260813000004_add_contract_acceptance_resolution.sql"),
+        ),
+        (
+            20260813000005_i64,
+            include_str!(
+                "../migrations/20260813000005_add_contract_nonfinancial_terminal_states.sql"
+            ),
+        ),
+        (
+            20260813000006_i64,
+            include_str!("../migrations/20260813000006_add_contract_embed_context.sql"),
+        ),
+        (
+            20260813000007_i64,
+            include_str!("../migrations/20260813000007_make_contract_delivery_restart_safe.sql"),
+        ),
+        (
+            20260813000008_i64,
+            include_str!("../migrations/20260813000008_persist_contract_delivery_ping_type.sql"),
+        ),
+        (
+            20260814000000_i64,
+            include_str!("../migrations/20260814000000_recover_contract_collection.sql"),
+        ),
+        (
+            20260814000001_i64,
+            include_str!("../migrations/20260814000001_record_contract_failure_lifecycles.sql"),
+        ),
+        (
+            20260814000002_i64,
+            include_str!("../migrations/20260814000002_defer_contract_manifests.sql"),
+        ),
+    ] {
+        current_pool
+            .execute(sql)
+            .await
+            .expect("apply current production migration");
+        sqlx::query("INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES ($1, 'current production migration', TRUE, $2, 0)")
+            .bind(version)
+            .bind(Sha384::digest(sql.as_bytes()).to_vec())
+            .execute(&current_pool)
+            .await
+            .expect("record current production migration");
+    }
+    current_pool
+        .execute("INSERT INTO regional_collection_metadata (region_id, baseline_at, complete_observations, last_complete_at) VALUES (10000002, '2026-08-17T00:00:00Z', 4, '2026-08-17T01:00:00Z'), (10000003, '2026-08-17T00:00:00Z', 0, NULL)")
+        .await
+        .expect("seed trustworthy and insufficient regional metadata");
+    let resolved_current_contract = item_exchange_contract(44);
+    let pending_only_contract = item_exchange_contract(46);
+    sqlx::query("INSERT INTO public_contract_facts (fact_hash, contract_id, facts) VALUES ($1,$2,$3),($4,$5,$6),($7,$8,$9)")
+        .bind("legacy-fact-current")
+        .bind(44_i64)
+        .bind(serde_json::to_value(&resolved_current_contract).expect("serialize current contract"))
+        .bind("legacy-fact-historic")
+        .bind(45_i64)
+        .bind(serde_json::json!({}))
+        .bind("legacy-fact-pending")
+        .bind(46_i64)
+        .bind(serde_json::to_value(&pending_only_contract).expect("serialize pending contract"))
+        .execute(&current_pool)
+        .await
+        .expect("seed current production contract facts");
+    current_pool
+        .execute("INSERT INTO contract_item_manifests (manifest_hash, manifest) VALUES ('legacy-manifest-current', '{\"offered_items\":[],\"requested_items\":[]}'::jsonb), ('legacy-manifest-historic', '{\"offered_items\":[],\"requested_items\":[]}'::jsonb); INSERT INTO presence_intervals (region_id, contract_id, fact_hash, manifest_hash, first_observed_at, last_observed_at) VALUES (10000002, 44, 'legacy-fact-current', 'legacy-manifest-current', '2026-08-17T00:00:00Z', '2026-08-17T01:00:00Z'), (10000002, 45, 'legacy-fact-historic', 'legacy-manifest-historic', '2026-08-16T22:00:00Z', '2026-08-16T23:00:00Z'); INSERT INTO contract_manifest_pending (region_id, contract_id, fact_hash, first_observed_at, last_observed_at) VALUES (10000002, 46, 'legacy-fact-pending', '2026-08-17T00:00:00Z', '2026-08-17T01:00:00Z'); INSERT INTO contract_collection_failures (region_id, contract_id, resource_key, observed_at, failure_kind, detail) VALUES (10000002, 46, 'contracts/public/items/46', '2026-08-17T01:00:00Z', 'manifest_collection', 'legacy unresolved manifest'); INSERT INTO contract_subscriptions (guild_id, channel_id, subscription_id, description, filter, event_actions) VALUES (42, 77, 'legacy', 'legacy subscription', '{}'::jsonb, '{}'::jsonb); INSERT INTO contract_deferred_subscription_matches (guild_id, channel_id, subscription_id, contract_id, event_kind, event) VALUES (42, 77, 'legacy', 44, 'listed', '{}'::jsonb); INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, status, delivery_nonce) VALUES (42, 77, 'legacy', 44, 'listed', '{}'::jsonb, '{}'::jsonb, 'prepared', 'ci-legacy')")
+        .await
+        .expect("seed current production contract state");
+    current_pool.close().await;
+
+    let upgraded_store = current_database.store().await;
+    let upgraded_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&current_database.url)
+        .await
+        .expect("connect to upgraded production database");
+    let upgraded_batch_table_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind("regional_observation_batches")
+            .fetch_one(&upgraded_pool)
+            .await
+            .expect("read upgraded regional batch table");
+    assert!(
+        upgraded_batch_table_exists,
+        "current production migration creates regional batch ledger"
+    );
+    let trusted_initialized: bool = sqlx::query_scalar("SELECT current_recovery_epoch_id IS NOT NULL AND NOT requires_silent_baseline FROM regional_collection_metadata WHERE region_id = 10000002")
+        .fetch_one(&upgraded_pool)
+        .await
+        .expect("read trusted regional continuity");
+    assert!(trusted_initialized);
+    let initialized_recovery_epoch_id: i64 = sqlx::query_scalar(
+        "SELECT current_recovery_epoch_id FROM regional_collection_metadata WHERE region_id = 10000002",
+    )
+    .fetch_one(&upgraded_pool)
+    .await
+    .expect("read migration-initialized recovery epoch");
+    let insufficient_requires_baseline: bool = sqlx::query_scalar("SELECT current_recovery_epoch_id IS NULL AND requires_silent_baseline FROM regional_collection_metadata WHERE region_id = 10000003")
+        .fetch_one(&upgraded_pool)
+        .await
+        .expect("read insufficient regional continuity");
+    assert!(insufficient_requires_baseline);
+    for (table, expected_count) in [
+        ("public_contract_facts", 3),
+        ("presence_intervals", 2),
+        ("contract_subscriptions", 1),
+        ("contract_deferred_subscription_matches", 1),
+        ("contract_outbound_deliveries", 1),
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&upgraded_pool)
+            .await
+            .expect("read preserved current production state");
+        assert_eq!(count, expected_count, "migration preserves {table}");
+    }
+    let seeded_epoch_contracts: Vec<i64> = sqlx::query_scalar("SELECT presence.contract_id FROM regional_epoch_contract_presence AS presence JOIN regional_collection_metadata AS metadata ON metadata.current_recovery_epoch_id = presence.recovery_epoch_id WHERE metadata.region_id = 10000002 ORDER BY presence.contract_id")
+        .fetch_all(&upgraded_pool)
+        .await
+        .expect("seed only the final complete snapshot into the epoch");
+    assert_eq!(seeded_epoch_contracts, vec![44, 46]);
+    assert_eq!(
+        upgraded_store
+            .storage_counts()
+            .await
+            .expect("read upgraded contract state")
+            .presence_intervals,
+        2
+    );
+
+    let disappearance = Arc::new(ResolutionEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        },
+        probes: StdMutex::new(vec![Ok(ContractItemProbe::NotPublic(expiring_cache()))]),
+        probe_calls: StdMutex::new(Vec::new()),
+    });
+    let disappearance_report =
+        ContractCollector::new(upgraded_store.clone(), disappearance.clone())
+            .with_recovery_gap(chrono::Duration::milliseconds(i64::MAX))
+            .collect_cycle()
+            .await
+            .expect("resolve an upgraded same-epoch disappearance");
+    assert_eq!(
+        disappearance_report
+            .events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        vec![ContractEventKind::ClosedOutcomeUnknown]
+    );
+    assert_eq!(
+        disappearance.probe_calls.lock().unwrap().as_slice(),
+        &[(44, None)]
+    );
+    let epoch_presence_after_disappearance: Vec<i64> = sqlx::query_scalar("SELECT presence.contract_id FROM regional_epoch_contract_presence AS presence JOIN regional_collection_metadata AS metadata ON metadata.current_recovery_epoch_id = presence.recovery_epoch_id WHERE metadata.region_id = 10000002 ORDER BY presence.contract_id")
+        .fetch_all(&upgraded_pool)
+        .await
+        .expect("retain migration-seeded same-epoch presence after disappearance");
+    assert_eq!(epoch_presence_after_disappearance, vec![44, 46]);
+    let pending_only_fact_retained: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM public_contract_facts WHERE fact_hash = 'legacy-fact-pending' AND contract_id = 46)",
+    )
+    .fetch_one(&upgraded_pool)
+    .await
+    .expect("retain the pending-only contract fact after disappearance");
+    assert!(pending_only_fact_retained);
+    let pending_only_failure_resolved: bool = sqlx::query_scalar(
+        "SELECT resolved_at IS NOT NULL FROM contract_collection_failures WHERE region_id = 10000002 AND contract_id = 46 AND resource_key = 'contracts/public/items/46' AND failure_kind = 'manifest_collection'",
+    )
+    .fetch_one(&upgraded_pool)
+    .await
+    .expect("record the pending-only disappearance through its manifest failure lifecycle");
+    assert!(pending_only_failure_resolved);
+    let pending_only_absence_batch = sqlx::query("SELECT recovery_epoch_id = $1 AS migration_epoch, outcome, observed_contract_count FROM regional_observation_batches WHERE region_id = 10000002 ORDER BY id DESC LIMIT 1")
+        .bind(initialized_recovery_epoch_id)
+        .fetch_one(&upgraded_pool)
+        .await
+        .expect("record the pending-only absence in the regional batch ledger");
+    assert!(pending_only_absence_batch.get::<bool, _>("migration_epoch"));
+    assert_eq!(
+        pending_only_absence_batch.get::<String, _>("outcome"),
+        "complete"
+    );
+    assert_eq!(
+        pending_only_absence_batch.get::<i64, _>("observed_contract_count"),
+        0
+    );
+    let upgraded_resolution_records = upgraded_store
+        .contract_resolution_records()
+        .await
+        .expect("read upgraded same-epoch resolution");
+    assert_eq!(upgraded_resolution_records.len(), 1);
+    assert_eq!(upgraded_resolution_records[0].region_id, 10_000_002);
+    assert_eq!(upgraded_resolution_records[0].contract_id, 44);
+    assert_eq!(
+        upgraded_resolution_records[0].state,
+        ContractResolutionState::ClosedOutcomeUnknown
+    );
+
+    upgraded_pool.close().await;
+    current_database.destroy().await;
+}
+
+#[tokio::test]
+async fn regional_recovery_epochs_isolate_stale_and_healthy_regions_before_and_after_restart() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let stale_region = 10_000_002;
+    let healthy_region = 10_000_003;
+    let stale_prior = item_exchange_contract(44);
+    let healthy_prior = item_exchange_contract(55);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![stale_region, healthy_region],
+            pages: HashMap::from([
+                (
+                    (stale_region, 1),
+                    Ok(EsiResponse::fresh(
+                        vec![stale_prior.clone()],
+                        expiring_page(1),
+                    )),
+                ),
+                (
+                    (healthy_region, 1),
+                    Ok(EsiResponse::fresh(
+                        vec![healthy_prior.clone()],
+                        expiring_page(1),
+                    )),
+                ),
+            ]),
+            items: HashMap::from([
+                (
+                    stale_prior.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    healthy_prior.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                ),
+            ]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish independent regional baselines");
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "ships",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist listing subscription");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to age only the stale region");
+    sqlx::query("UPDATE regional_observation_batches SET attempt_started_at = now() - interval '2 hours', completed_at = now() - interval '2 hours' WHERE region_id = $1")
+        .bind(stale_region)
+        .execute(&pool)
+        .await
+        .expect("create a stale regional continuity gap");
+    pool.close().await;
+
+    let stale_recovery_contract = item_exchange_contract(45);
+    let healthy_listed_contract = item_exchange_contract(56);
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let recovery = ContractCollector::new(
+        store.clone(),
+        Arc::new(ResolutionEsi {
+            inner: FakeEsi {
+                regions: vec![stale_region, healthy_region],
+                pages: HashMap::from([
+                    (
+                        (stale_region, 1),
+                        Ok(EsiResponse::fresh(
+                            vec![stale_recovery_contract.clone()],
+                            expiring_page(1),
+                        )),
+                    ),
+                    (
+                        (healthy_region, 1),
+                        Ok(EsiResponse::fresh(
+                            vec![healthy_prior.clone(), healthy_listed_contract.clone()],
+                            expiring_page(1),
+                        )),
+                    ),
+                ]),
+                items: HashMap::from([
+                    (
+                        stale_recovery_contract.contract_id,
+                        Ok(EsiResponse::fresh(vec![offered_ship(3)], expiring_cache())),
+                    ),
+                    (
+                        healthy_prior.contract_id,
+                        Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                    ),
+                    (
+                        healthy_listed_contract.contract_id,
+                        Ok(EsiResponse::fresh(vec![offered_ship(4)], expiring_cache())),
+                    ),
+                ]),
+            },
+            probes: StdMutex::new(vec![Ok(ContractItemProbe::NotFound(expiring_cache()))]),
+            probe_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .with_recovery_gap(chrono::Duration::minutes(30))
+    .collect_cycle()
+    .await
+    .expect("recover only the stale region");
+    assert_eq!(
+        recovery.regions,
+        vec![
+            CollectionOutcome::RecoveryBaselineEstablished {
+                region_id: stale_region
+            },
+            CollectionOutcome::Complete {
+                region_id: healthy_region,
+                observed_contracts: 2
+            },
+        ]
+    );
+    assert_eq!(
+        recovery
+            .events
+            .iter()
+            .map(|event| (event.region_id, event.contract.contract_id, event.kind))
+            .collect::<Vec<_>>(),
+        vec![(
+            healthy_region,
+            healthy_listed_contract.contract_id,
+            ContractEventKind::Listed,
+        )]
+    );
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+
+    let epoch_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect regional batch evidence");
+    let stale_epochs: Vec<i64> = sqlx::query_scalar("SELECT recovery_epoch_id FROM regional_observation_batches WHERE region_id = $1 ORDER BY id")
+        .bind(stale_region)
+        .fetch_all(&epoch_pool)
+        .await
+        .expect("read stale regional batch epochs");
+    let healthy_epochs: Vec<i64> = sqlx::query_scalar("SELECT recovery_epoch_id FROM regional_observation_batches WHERE region_id = $1 ORDER BY id")
+        .bind(healthy_region)
+        .fetch_all(&epoch_pool)
+        .await
+        .expect("read healthy regional batch epochs");
+    assert_eq!(stale_epochs.len(), 2);
+    assert_eq!(healthy_epochs.len(), 2);
+    assert_ne!(stale_epochs[0], stale_epochs[1]);
+    assert_eq!(healthy_epochs[0], healthy_epochs[1]);
+    epoch_pool.close().await;
+
+    drop(delivery);
+    drop(store);
+    let restarted_store = database.store().await;
+    let stale_continuous_contract = item_exchange_contract(46);
+    let healthy_continuous_contract = item_exchange_contract(57);
+    let restarted_delivery = Arc::new(RecordingDelivery {
+        store: restarted_store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let restarted = ContractCollector::new(
+        restarted_store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![stale_region, healthy_region],
+            pages: HashMap::from([
+                (
+                    (stale_region, 1),
+                    Ok(EsiResponse::fresh(
+                        vec![
+                            stale_recovery_contract.clone(),
+                            stale_continuous_contract.clone(),
+                        ],
+                        expiring_page(1),
+                    )),
+                ),
+                (
+                    (healthy_region, 1),
+                    Ok(EsiResponse::fresh(
+                        vec![
+                            healthy_prior.clone(),
+                            healthy_listed_contract.clone(),
+                            healthy_continuous_contract.clone(),
+                        ],
+                        expiring_page(1),
+                    )),
+                ),
+            ]),
+            items: HashMap::from([
+                (
+                    stale_recovery_contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(3)], expiring_cache())),
+                ),
+                (
+                    stale_continuous_contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(5)], expiring_cache())),
+                ),
+                (
+                    healthy_prior.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                ),
+                (
+                    healthy_listed_contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(4)], expiring_cache())),
+                ),
+                (
+                    healthy_continuous_contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(6)], expiring_cache())),
+                ),
+            ]),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::new())),
+        restarted_delivery.clone(),
+    )
+    .with_recovery_gap(chrono::Duration::minutes(30))
+    .collect_cycle()
+    .await
+    .expect("continue both regions after restart");
+    assert_eq!(
+        restarted.regions,
+        vec![
+            CollectionOutcome::Complete {
+                region_id: stale_region,
+                observed_contracts: 2
+            },
+            CollectionOutcome::Complete {
+                region_id: healthy_region,
+                observed_contracts: 3
+            },
+        ]
+    );
+    assert_eq!(
+        restarted
+            .events
+            .iter()
+            .map(|event| (event.region_id, event.contract.contract_id, event.kind))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                stale_region,
+                stale_continuous_contract.contract_id,
+                ContractEventKind::Listed,
+            ),
+            (
+                healthy_region,
+                healthy_continuous_contract.contract_id,
+                ContractEventKind::Listed,
+            ),
+        ]
+    );
+    assert_eq!(restarted_delivery.sent.lock().unwrap().len(), 2);
+
+    let epoch_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("reconnect to inspect restarted regional batch evidence");
+    let stale_epochs: Vec<i64> = sqlx::query_scalar("SELECT recovery_epoch_id FROM regional_observation_batches WHERE region_id = $1 ORDER BY id")
+        .bind(stale_region)
+        .fetch_all(&epoch_pool)
+        .await
+        .expect("read restarted stale regional batch epochs");
+    let healthy_epochs: Vec<i64> = sqlx::query_scalar("SELECT recovery_epoch_id FROM regional_observation_batches WHERE region_id = $1 ORDER BY id")
+        .bind(healthy_region)
+        .fetch_all(&epoch_pool)
+        .await
+        .expect("read restarted healthy regional batch epochs");
+    assert_eq!(stale_epochs.len(), 3);
+    assert_eq!(healthy_epochs.len(), 3);
+    assert_ne!(stale_epochs[0], stale_epochs[1]);
+    assert_eq!(stale_epochs[1], stale_epochs[2]);
+    assert!(healthy_epochs
+        .windows(2)
+        .all(|epochs| epochs[0] == epochs[1]));
+    epoch_pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn http_esi_classifies_only_exact_public_contract_forbidden_bodies() {
+    let accepted_server = OneShotHttpServer::start(
+        403,
+        &[("Cache-Control", "max-age=60")],
+        r#"{"error":"Contract accepted by player, requires authorization"}"#,
+    );
+    let accepted_esi =
+        HttpPublicContractEsi::with_base_url(&accepted_server.base_url, Duration::from_secs(1))
+            .expect("construct accepted-player ESI client");
+    assert!(matches!(
+        accepted_esi
+            .public_contract_items_probe(44, None)
+            .await
+            .expect("classify exact accepted-player response"),
+        ContractItemProbe::AcceptedByPlayer(_)
+    ));
+    accepted_server.finish();
+
+    let unavailable_server = OneShotHttpServer::start(
+        403,
+        &[("Cache-Control", "max-age=60")],
+        r#"{"error":"Contract not public"}"#,
+    );
+    let unavailable_esi =
+        HttpPublicContractEsi::with_base_url(&unavailable_server.base_url, Duration::from_secs(1))
+            .expect("construct unavailable-contract ESI client");
+    assert!(matches!(
+        unavailable_esi
+            .public_contract_items_probe(44, None)
+            .await
+            .expect("classify exact unavailable-contract response"),
+        ContractItemProbe::NotPublic(_)
+    ));
+    unavailable_server.finish();
+
+    let unrelated_server = OneShotHttpServer::start(
+        403,
+        &[("Cache-Control", "max-age=60")],
+        r#"{"error":"forbidden for another reason"}"#,
+    );
+    let unrelated_esi =
+        HttpPublicContractEsi::with_base_url(&unrelated_server.base_url, Duration::from_secs(1))
+            .expect("construct unrelated-forbidden ESI client");
+    assert!(unrelated_esi
+        .public_contract_items_probe(44, None)
+        .await
+        .is_err());
+    unrelated_server.finish();
+}
+
+#[tokio::test]
+async fn accepted_player_evidence_confirms_only_before_contract_expiry() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut expired_contract = item_exchange_contract(44);
+    expired_contract.date_expired = Utc::now() - chrono::Duration::minutes(1);
+    let mut fresh_contract = item_exchange_contract(45);
+    fresh_contract.date_expired = Utc::now() + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![expired_contract.clone(), fresh_contract.clone()],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    expired_contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    fresh_contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                ),
+            ]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish public contract baseline");
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "sales",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist sale subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let report = ContractCollector::new(
+        store.clone(),
+        Arc::new(ResolutionEsi {
+            inner: regional_esi(vec![], HashMap::new()),
+            probes: StdMutex::new(vec![
+                Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())),
+                Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())),
+            ]),
+            probe_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .collect_cycle()
+    .await
+    .expect("classify exact public contract evidence");
+
+    assert_eq!(
+        report
+            .events
+            .iter()
+            .map(|event| (event.contract.contract_id, event.kind))
+            .collect::<Vec<_>>(),
+        vec![
+            (expired_contract.contract_id, ContractEventKind::Expired),
+            (fresh_contract.contract_id, ContractEventKind::SaleConfirmed),
+        ]
+    );
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+    assert_eq!(
+        store
+            .contract_resolution_records()
+            .await
+            .expect("read terminal states")
+            .iter()
+            .map(|record| (record.contract_id, record.state))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                expired_contract.contract_id,
+                ContractResolutionState::Expired
+            ),
+            (
+                fresh_contract.contract_id,
+                ContractResolutionState::AcceptanceConfirmed,
+            ),
+        ]
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn recovery_epoch_tracks_summary_presence_through_a_failed_manifest_then_disappearance() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut contract = item_exchange_contract(44);
+    contract.date_expired = Utc::now() + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                contract.contract_id,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the initial public contract baseline");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to age the initial regional batch");
+    sqlx::query(
+        "UPDATE regional_observation_batches SET attempt_started_at = now() - interval '2 hours', completed_at = now() - interval '2 hours' WHERE region_id = 10000002",
+    )
+    .execute(&pool)
+    .await
+    .expect("create a regional recovery gap");
+    pool.close().await;
+
+    let recovery = ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+            )]),
+            items: HashMap::from([(
+                contract.contract_id,
+                Err(EsiError::retryable("manifest unavailable", None)),
+            )]),
+        }),
+    )
+    .with_recovery_gap(chrono::Duration::minutes(30))
+    .collect_cycle()
+    .await
+    .expect("retain summary-only presence during the recovery baseline");
+    assert_eq!(
+        recovery.regions,
+        vec![CollectionOutcome::RecoveryBaselineEstablished {
+            region_id: 10_000_002,
+        }]
+    );
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect recovery-epoch presence");
+    let recovery_presence_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM regional_epoch_contract_presence WHERE region_id = 10000002 AND recovery_epoch_id = (SELECT current_recovery_epoch_id FROM regional_collection_metadata WHERE region_id = 10000002)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read summary-level epoch presence");
+    assert_eq!(recovery_presence_count, 1);
+    pool.close().await;
+
+    let disappearance = ContractCollector::new(
+        store.clone(),
+        Arc::new(ResolutionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                )]),
+                items: HashMap::new(),
+            },
+            probes: StdMutex::new(vec![Ok(ContractItemProbe::NotFound(expiring_cache()))]),
+            probe_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_recovery_gap(chrono::Duration::minutes(30))
+    .collect_cycle()
+    .await
+    .expect("detect the disappearance from summary-level epoch presence");
+    assert_eq!(
+        disappearance
+            .events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        vec![ContractEventKind::ClosedOutcomeUnknown]
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn acceptance_evidence_preserves_no_content_and_accepted_player_response_kinds() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut no_content_contract = item_exchange_contract(44);
+    no_content_contract.date_expired = Utc::now() + chrono::Duration::hours(1);
+    let mut accepted_player_contract = item_exchange_contract(45);
+    accepted_player_contract.date_expired = Utc::now() + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![
+                        no_content_contract.clone(),
+                        accepted_player_contract.clone(),
+                    ],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    no_content_contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    accepted_player_contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                ),
+            ]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish public contract summaries before resolution");
+
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(ResolutionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                )]),
+                items: HashMap::new(),
+            },
+            probes: StdMutex::new(vec![
+                Ok(ContractItemProbe::NoContent(expiring_cache())),
+                Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())),
+            ]),
+            probe_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("record both pre-expiry acceptance evidence kinds");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect durable acceptance provenance");
+    let evidence_kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT detail ->> 'response' FROM contract_lifecycle_evidence WHERE evidence_kind = 'acceptance_confirmed' ORDER BY contract_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read durable acceptance response kinds");
+    assert_eq!(
+        evidence_kinds,
+        vec![
+            "204_no_content".to_string(),
+            "403_accepted_by_player".to_string(),
+        ]
+    );
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn inconclusive_attempt_evidence_rolls_back_when_failure_lifecycle_insert_is_rejected() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to reject the final inconclusive lifecycle insert");
+    sqlx::query("ALTER TABLE contract_collection_failures ADD CONSTRAINT reject_inconclusive_attempt_lifecycle CHECK (failure_kind <> 'inconclusive_observation')")
+        .execute(&pool)
+        .await
+        .expect("install deterministic rollback failure");
+    pool.close().await;
+
+    let error = ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Err(EsiError::retryable("regional page unavailable", None)),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect_err("the injected lifecycle failure aborts the regional attempt");
+    assert!(error
+        .to_string()
+        .contains("reject_inconclusive_attempt_lifecycle"));
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to verify the failed attempt left no partial evidence");
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+            (SELECT count(*) FROM regional_observations WHERE region_id = 10000002), \
+            (SELECT count(*) FROM regional_observation_batches WHERE region_id = 10000002), \
+            (SELECT count(*) FROM contract_collection_failures WHERE region_id = 10000002)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count attempt evidence after rollback");
+    assert_eq!(counts, (0, 0, 0));
+    pool.close().await;
+    database.destroy().await;
 }
