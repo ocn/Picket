@@ -19,6 +19,7 @@ pub mod processor;
 use crate::commands::contract_subscribe::ContractSubscribeCommand;
 use crate::commands::contract_unsubscribe::ContractUnsubscribeCommand;
 use crate::commands::find_unsubscribed::FindUnsubscribedChannelsCommand;
+use crate::commands::health::HealthCommand;
 use commands::diag::DiagCommand;
 use commands::subscribe::SubscribeCommand;
 use commands::sync_clear::SyncClearCommand;
@@ -154,6 +155,9 @@ pub async fn run() {
     let diag_command = Box::new(DiagCommand);
     command_map.insert(diag_command.name(), diag_command);
 
+    let health_command = Box::new(HealthCommand);
+    command_map.insert(health_command.name(), health_command);
+
     let sync_standings_command = Box::new(SyncStandingsCommand);
     command_map.insert(sync_standings_command.name(), sync_standings_command);
 
@@ -190,6 +194,8 @@ pub async fn run() {
             None
         }
     };
+    let feed_health_telemetry = Arc::new(feed::FeedHealthTelemetry::new());
+    let r2z2_health_enabled = app_config.killmail_feed_provider == FeedProvider::R2z2;
 
     // --- Start Discord Bot ---
     let discord_token = app_config.discord_bot_token.clone();
@@ -227,6 +233,14 @@ pub async fn run() {
         let delivery = Arc::new(discord_bot::DiscordContractDelivery::new(
             http_client.clone(),
         ));
+        let health_config = match contract_intelligence::HealthRuntimeConfig::from_environment() {
+            Ok(config) => Some(config),
+            Err(error) => {
+                warn!("health monitoring disabled by invalid configuration: {error}");
+                None
+            }
+        };
+        let health_database_url = database_url.clone();
         contract_intelligence::spawn_contract_collection_loop_with_notifications(
             database_url,
             store_handle,
@@ -238,6 +252,14 @@ pub async fn run() {
                 app_state.clone(),
             )),
         );
+        if let Some(health_config) = health_config {
+            contract_intelligence::spawn_health_monitor_loop(
+                health_database_url,
+                health_config,
+                feed_health_telemetry.clone(),
+                r2z2_health_enabled,
+            );
+        }
     }
 
     tokio::spawn(async move {
@@ -296,5 +318,12 @@ pub async fn run() {
     });
 
     // Run producer on current task (main loop)
-    pipeline::run_producer(feed, app_state, result_tx, semaphore).await;
+    pipeline::run_producer_with_health(
+        feed,
+        app_state,
+        result_tx,
+        semaphore,
+        feed_health_telemetry,
+    )
+    .await;
 }

@@ -1,5 +1,6 @@
 use crate::config::SystemRange;
 use crate::discord_bot::SHIP_GROUP_PRIORITY;
+use crate::feed::{FeedHealthSnapshot, FeedHealthTelemetry};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::header::{HeaderMap, ETAG, EXPIRES, IF_NONE_MATCH, LAST_MODIFIED, RETRY_AFTER};
@@ -8,7 +9,12 @@ use serde::de::{DeserializeOwned, Error as DeError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::{migrate::Migrator, postgres::PgPoolOptions, PgPool, Row};
+use sqlx::{
+    migrate::{Migrate, MigrateError, Migrator},
+    postgres::PgPoolOptions,
+    PgPool, Row,
+};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::future::Future;
@@ -19,6 +25,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+const HEALTH_MIGRATION_VERSIONS: &[i64] = &[20260817000001];
 const CONTRACT_COLLECTOR_USER_AGENT: &str = "killbot-rust Global Public Contract Intelligence";
 const ESI_BODY_MAX_ATTEMPTS: usize = 3;
 const ESI_BODY_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
@@ -30,6 +37,401 @@ const METERS_PER_LIGHT_YEAR: f64 = 9_460_730_472_580_800.0;
 const CONTRACT_ACCEPTED_BY_PLAYER_ERROR: &str =
     "Contract accepted by player, requires authorization";
 const CONTRACT_NOT_PUBLIC_ERROR: &str = "Contract not public";
+const HEALTH_SNAPSHOT_TRANSITION_LOCK_KEY: i64 = 7_142_300_993_001;
+const MAX_HEALTH_REGIONAL_DETAILS: usize = 12;
+pub const DEFAULT_HEALTH_CHANNEL_ID: u64 = 1_538_030_920_328_810_536;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthStatus {
+    Healthy,
+    Degraded,
+    Critical,
+}
+
+impl HealthStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Critical => "critical",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, sqlx::Error> {
+        match value {
+            "healthy" => Ok(Self::Healthy),
+            "degraded" => Ok(Self::Degraded),
+            "critical" => Ok(Self::Critical),
+            _ => Err(sqlx::Error::Protocol(format!(
+                "unknown health status: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HealthCheck {
+    pub key: String,
+    pub status: HealthStatus,
+    pub observed_at: DateTime<Utc>,
+    pub evidence: String,
+    pub consecutive_failures: i32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HealthSnapshot {
+    pub status: HealthStatus,
+    pub observed_at: DateTime<Utc>,
+    pub checks: Vec<HealthCheck>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthView {
+    pub channel_id: u64,
+    pub message_id: Option<String>,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthDiscordViewIdentity {
+    pub channel_id: u64,
+    pub message_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HealthThresholds {
+    pub heartbeat_degraded: ChronoDuration,
+    pub heartbeat_critical: ChronoDuration,
+    pub postgres_degraded_failures: i32,
+    pub postgres_critical_failures: i32,
+    pub contract_progress_degraded: ChronoDuration,
+    pub contract_progress_critical: ChronoDuration,
+    pub esi_progress_degraded: ChronoDuration,
+    pub esi_progress_critical: ChronoDuration,
+    pub prepared_delivery_degraded: ChronoDuration,
+    pub prepared_delivery_critical: ChronoDuration,
+    pub backlog_degraded: ChronoDuration,
+    pub backlog_critical: ChronoDuration,
+    pub r2z2_progress_degraded: ChronoDuration,
+    pub r2z2_progress_critical: ChronoDuration,
+    pub feed_validation_degraded_failures: i32,
+    pub feed_validation_critical_failures: i32,
+}
+
+impl Default for HealthThresholds {
+    fn default() -> Self {
+        Self {
+            heartbeat_degraded: ChronoDuration::minutes(5),
+            heartbeat_critical: ChronoDuration::minutes(10),
+            postgres_degraded_failures: 1,
+            postgres_critical_failures: 3,
+            contract_progress_degraded: ChronoDuration::minutes(15),
+            contract_progress_critical: ChronoDuration::minutes(30),
+            esi_progress_degraded: ChronoDuration::minutes(15),
+            esi_progress_critical: ChronoDuration::minutes(30),
+            prepared_delivery_degraded: ChronoDuration::minutes(5),
+            prepared_delivery_critical: ChronoDuration::minutes(15),
+            backlog_degraded: ChronoDuration::minutes(30),
+            backlog_critical: ChronoDuration::hours(2),
+            r2z2_progress_degraded: ChronoDuration::minutes(3),
+            r2z2_progress_critical: ChronoDuration::minutes(10),
+            feed_validation_degraded_failures: 1,
+            feed_validation_critical_failures: 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HealthRuntimeConfig {
+    pub evaluation_interval: Duration,
+    pub channel_id: u64,
+    pub thresholds: HealthThresholds,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct HealthConfigError(String);
+
+impl Display for HealthConfigError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HealthConfigError {}
+
+impl HealthRuntimeConfig {
+    pub fn from_environment() -> Result<Self, HealthConfigError> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    pub fn from_settings(settings: &HashMap<String, String>) -> Result<Self, HealthConfigError> {
+        Self::from_lookup(|name| settings.get(name).cloned())
+    }
+
+    fn from_lookup<F>(mut lookup: F) -> Result<Self, HealthConfigError>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let mut thresholds = HealthThresholds::default();
+        thresholds.heartbeat_degraded = health_duration_from_settings(
+            &mut lookup,
+            "HEALTH_HEARTBEAT_DEGRADED_SECS",
+            thresholds.heartbeat_degraded,
+        )?;
+        thresholds.heartbeat_critical = health_duration_from_settings(
+            &mut lookup,
+            "HEALTH_HEARTBEAT_CRITICAL_SECS",
+            thresholds.heartbeat_critical,
+        )?;
+        thresholds.postgres_degraded_failures = health_failure_count_from_settings(
+            &mut lookup,
+            "HEALTH_POSTGRES_DEGRADED_FAILURES",
+            thresholds.postgres_degraded_failures,
+        )?;
+        thresholds.postgres_critical_failures = health_failure_count_from_settings(
+            &mut lookup,
+            "HEALTH_POSTGRES_CRITICAL_FAILURES",
+            thresholds.postgres_critical_failures,
+        )?;
+        thresholds.contract_progress_degraded = health_duration_from_settings(
+            &mut lookup,
+            "HEALTH_CONTRACT_PROGRESS_DEGRADED_SECS",
+            thresholds.contract_progress_degraded,
+        )?;
+        thresholds.contract_progress_critical = health_duration_from_settings(
+            &mut lookup,
+            "HEALTH_CONTRACT_PROGRESS_CRITICAL_SECS",
+            thresholds.contract_progress_critical,
+        )?;
+        thresholds.esi_progress_degraded = health_duration_from_settings(
+            &mut lookup,
+            "HEALTH_ESI_PROGRESS_DEGRADED_SECS",
+            thresholds.esi_progress_degraded,
+        )?;
+        thresholds.esi_progress_critical = health_duration_from_settings(
+            &mut lookup,
+            "HEALTH_ESI_PROGRESS_CRITICAL_SECS",
+            thresholds.esi_progress_critical,
+        )?;
+        thresholds.prepared_delivery_degraded = health_duration_from_settings(
+            &mut lookup,
+            "HEALTH_PREPARED_DELIVERY_DEGRADED_SECS",
+            thresholds.prepared_delivery_degraded,
+        )?;
+        thresholds.prepared_delivery_critical = health_duration_from_settings(
+            &mut lookup,
+            "HEALTH_PREPARED_DELIVERY_CRITICAL_SECS",
+            thresholds.prepared_delivery_critical,
+        )?;
+        thresholds.backlog_degraded = health_duration_from_settings(
+            &mut lookup,
+            "HEALTH_BACKLOG_DEGRADED_SECS",
+            thresholds.backlog_degraded,
+        )?;
+        thresholds.backlog_critical = health_duration_from_settings(
+            &mut lookup,
+            "HEALTH_BACKLOG_CRITICAL_SECS",
+            thresholds.backlog_critical,
+        )?;
+        thresholds.r2z2_progress_degraded = health_duration_from_settings(
+            &mut lookup,
+            "HEALTH_R2Z2_PROGRESS_DEGRADED_SECS",
+            thresholds.r2z2_progress_degraded,
+        )?;
+        thresholds.r2z2_progress_critical = health_duration_from_settings(
+            &mut lookup,
+            "HEALTH_R2Z2_PROGRESS_CRITICAL_SECS",
+            thresholds.r2z2_progress_critical,
+        )?;
+        thresholds.feed_validation_degraded_failures = health_failure_count_from_settings(
+            &mut lookup,
+            "HEALTH_FEED_VALIDATION_DEGRADED_FAILURES",
+            thresholds.feed_validation_degraded_failures,
+        )?;
+        thresholds.feed_validation_critical_failures = health_failure_count_from_settings(
+            &mut lookup,
+            "HEALTH_FEED_VALIDATION_CRITICAL_FAILURES",
+            thresholds.feed_validation_critical_failures,
+        )?;
+        validate_threshold_order(
+            "heartbeat",
+            thresholds.heartbeat_degraded,
+            thresholds.heartbeat_critical,
+        )?;
+        validate_failure_order(
+            "PostgreSQL",
+            thresholds.postgres_degraded_failures,
+            thresholds.postgres_critical_failures,
+        )?;
+        validate_threshold_order(
+            "contract progress",
+            thresholds.contract_progress_degraded,
+            thresholds.contract_progress_critical,
+        )?;
+        validate_threshold_order(
+            "ESI progress",
+            thresholds.esi_progress_degraded,
+            thresholds.esi_progress_critical,
+        )?;
+        validate_threshold_order(
+            "prepared delivery",
+            thresholds.prepared_delivery_degraded,
+            thresholds.prepared_delivery_critical,
+        )?;
+        validate_threshold_order(
+            "backlog",
+            thresholds.backlog_degraded,
+            thresholds.backlog_critical,
+        )?;
+        validate_threshold_order(
+            "R2Z2 progress",
+            thresholds.r2z2_progress_degraded,
+            thresholds.r2z2_progress_critical,
+        )?;
+        validate_failure_order(
+            "feed validation",
+            thresholds.feed_validation_degraded_failures,
+            thresholds.feed_validation_critical_failures,
+        )?;
+        Ok(Self {
+            evaluation_interval: Duration::from_secs(health_positive_u64_from_settings(
+                &mut lookup,
+                "HEALTH_EVALUATION_INTERVAL_SECS",
+                60,
+            )?),
+            channel_id: health_positive_u64_from_settings(
+                &mut lookup,
+                "HEALTH_CHANNEL_ID",
+                DEFAULT_HEALTH_CHANNEL_ID,
+            )?,
+            thresholds,
+        })
+    }
+}
+
+fn health_duration_from_settings(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &str,
+    default: ChronoDuration,
+) -> Result<ChronoDuration, HealthConfigError> {
+    match lookup(name) {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<i64>()
+            .ok()
+            .filter(|seconds| *seconds > 0)
+            .and_then(ChronoDuration::try_seconds)
+            .ok_or_else(|| {
+                HealthConfigError(format!("{name} must be a positive integer seconds value"))
+            }),
+    }
+}
+
+fn health_failure_count_from_settings(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &str,
+    default: i32,
+) -> Result<i32, HealthConfigError> {
+    match lookup(name) {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<i32>()
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| HealthConfigError(format!("{name} must be a positive integer count"))),
+    }
+}
+
+fn health_positive_u64_from_settings(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &str,
+    default: u64,
+) -> Result<u64, HealthConfigError> {
+    match lookup(name) {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| HealthConfigError(format!("{name} must be a positive integer"))),
+    }
+}
+
+fn validate_threshold_order(
+    name: &str,
+    degraded: ChronoDuration,
+    critical: ChronoDuration,
+) -> Result<(), HealthConfigError> {
+    if degraded < critical {
+        Ok(())
+    } else {
+        Err(HealthConfigError(format!(
+            "{name} degraded threshold must be lower than its critical threshold"
+        )))
+    }
+}
+
+fn validate_failure_order(
+    name: &str,
+    degraded: i32,
+    critical: i32,
+) -> Result<(), HealthConfigError> {
+    if degraded < critical {
+        Ok(())
+    } else {
+        Err(HealthConfigError(format!(
+            "{name} degraded threshold must be lower than its critical threshold"
+        )))
+    }
+}
+
+pub trait HealthClock: Send + Sync {
+    fn now(&self) -> DateTime<Utc>;
+}
+
+struct SystemHealthClock;
+
+impl HealthClock for SystemHealthClock {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+}
+
+pub struct HealthCycle {
+    store: ContractCollectionStore,
+    clock: Arc<dyn HealthClock>,
+    thresholds: HealthThresholds,
+    feed_telemetry: Option<Arc<FeedHealthTelemetry>>,
+    r2z2_enabled: bool,
+}
+
+impl HealthCycle {
+    pub fn new(store: ContractCollectionStore, clock: Arc<dyn HealthClock>) -> Self {
+        Self {
+            store,
+            clock,
+            thresholds: HealthThresholds::default(),
+            feed_telemetry: None,
+            r2z2_enabled: false,
+        }
+    }
+
+    pub fn with_thresholds(mut self, thresholds: HealthThresholds) -> Self {
+        self.thresholds = thresholds;
+        self
+    }
+
+    pub fn with_feed_telemetry(
+        mut self,
+        feed_telemetry: Arc<FeedHealthTelemetry>,
+        r2z2_enabled: bool,
+    ) -> Self {
+        self.feed_telemetry = Some(feed_telemetry);
+        self.r2z2_enabled = r2z2_enabled;
+        self
+    }
+}
 
 fn regional_snapshot_resource_key(region_id: i64) -> String {
     format!("esi:public-contracts:region:{region_id}")
@@ -1302,6 +1704,482 @@ pub async fn available_contract_store(
     store_handle.read().await.clone()
 }
 
+#[derive(Clone, Debug)]
+struct PersistedBacklogMetric {
+    due_count: i64,
+    peak_due_count: i64,
+    growth_detected: bool,
+}
+
+#[derive(Clone, Debug)]
+struct BacklogMetric {
+    due_count: i64,
+    peak_due_count: i64,
+    growth_detected: bool,
+    oldest_due_at: Option<DateTime<Utc>>,
+}
+
+struct HealthInputs {
+    heartbeat_at: Option<DateTime<Utc>>,
+    started_at: Option<DateTime<Utc>>,
+    regional_progress: Vec<(i64, Option<DateTime<Utc>>)>,
+    esi_progress_at: Option<DateTime<Utc>>,
+    esi_pause_until: Option<DateTime<Utc>>,
+    due_backlog_count: i64,
+    oldest_due_backlog_at: Option<DateTime<Utc>>,
+    prior_backlog_metric: Option<PersistedBacklogMetric>,
+    oldest_prepared_delivery_at: Option<DateTime<Utc>>,
+    permanent_delivery_failures: i64,
+    r2z2_progress_at: Option<DateTime<Utc>>,
+    feed_validation_at: Option<DateTime<Utc>>,
+    feed_validation_failures: i32,
+}
+
+impl HealthCycle {
+    pub async fn run_once(&self) -> Result<HealthSnapshot, sqlx::Error> {
+        self.store.initialize_health_schema().await?;
+        let observed_at = self.clock.now();
+        let inputs = self.store.health_inputs(observed_at).await?;
+        let startup_at = inputs.started_at.unwrap_or(observed_at);
+        let feed_snapshot = if let Some(feed_telemetry) = &self.feed_telemetry {
+            feed_telemetry
+                .hydrate_validation_state(
+                    inputs.feed_validation_at,
+                    inputs.feed_validation_failures,
+                )
+                .await;
+            Some(feed_telemetry.snapshot().await)
+        } else {
+            None
+        };
+        let (backlog_check, backlog_metric) =
+            growing_backlog_health_check(&inputs, observed_at, &self.thresholds);
+        let mut checks = vec![
+            age_health_check(
+                "heartbeat",
+                inputs.heartbeat_at,
+                observed_at,
+                self.thresholds.heartbeat_degraded,
+                self.thresholds.heartbeat_critical,
+                "bot heartbeat",
+            ),
+            regional_progress_health_check(&inputs, startup_at, observed_at, &self.thresholds),
+            esi_progress_health_check(&inputs, startup_at, observed_at, &self.thresholds),
+            backlog_check,
+            age_health_check(
+                "prepared_delivery",
+                inputs.oldest_prepared_delivery_at,
+                observed_at,
+                self.thresholds.prepared_delivery_degraded,
+                self.thresholds.prepared_delivery_critical,
+                "oldest prepared delivery",
+            ),
+        ];
+        checks.push(permanent_delivery_health_check(
+            observed_at,
+            inputs.permanent_delivery_failures,
+        ));
+        if let Some(feed_snapshot) = &feed_snapshot {
+            if self.r2z2_enabled {
+                checks.push(progress_health_check(
+                    "r2z2_progress",
+                    feed_snapshot.r2z2_progress_at.or(inputs.r2z2_progress_at),
+                    startup_at,
+                    observed_at,
+                    self.thresholds.r2z2_progress_degraded,
+                    self.thresholds.r2z2_progress_critical,
+                    "R2Z2 progress",
+                ));
+            }
+            checks.push(feed_validation_health_check(
+                feed_snapshot
+                    .validation_success_at
+                    .or(inputs.feed_validation_at),
+                feed_snapshot.validation_failures,
+                startup_at,
+                observed_at,
+                &self.thresholds,
+            ));
+        }
+        let status = checks
+            .iter()
+            .map(|check| check.status)
+            .max()
+            .unwrap_or(HealthStatus::Healthy);
+        let snapshot = HealthSnapshot {
+            status,
+            observed_at,
+            checks,
+        };
+
+        self.store
+            .save_health_snapshot(&snapshot, &backlog_metric, feed_snapshot.as_ref())
+            .await?;
+        Ok(snapshot)
+    }
+
+    pub async fn run_observationally(&self) -> Option<HealthSnapshot> {
+        match self.run_once().await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                warn!("health cycle failed observationally: {error}");
+                None
+            }
+        }
+    }
+}
+
+pub fn spawn_health_monitor_loop(
+    database_url: String,
+    config: HealthRuntimeConfig,
+    feed_telemetry: Arc<FeedHealthTelemetry>,
+    r2z2_enabled: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_health_monitor_loop(
+        database_url,
+        config,
+        feed_telemetry,
+        r2z2_enabled,
+    ))
+}
+
+pub async fn run_health_monitor_loop(
+    database_url: String,
+    config: HealthRuntimeConfig,
+    feed_telemetry: Arc<FeedHealthTelemetry>,
+    r2z2_enabled: bool,
+) {
+    let mut session_started = false;
+    loop {
+        match ContractCollectionStore::connect(&database_url).await {
+            Ok(store) => {
+                if !session_started {
+                    match store.begin_health_monitor_session(Utc::now()).await {
+                        Ok(()) => session_started = true,
+                        Err(error) => {
+                            warn!("health monitor session failed observationally: {error}")
+                        }
+                    }
+                }
+                if session_started {
+                    HealthCycle::new(store, Arc::new(SystemHealthClock))
+                        .with_thresholds(config.thresholds.clone())
+                        .with_feed_telemetry(feed_telemetry.clone(), r2z2_enabled)
+                        .run_observationally()
+                        .await;
+                }
+            }
+            Err(error) => warn!("health store initialization failed observationally: {error}"),
+        }
+        tokio::time::sleep(config.evaluation_interval).await;
+    }
+}
+
+fn age_health_check(
+    key: &str,
+    observed_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    degraded_after: ChronoDuration,
+    critical_after: ChronoDuration,
+    label: &str,
+) -> HealthCheck {
+    let (status, evidence) = match observed_at {
+        None => (HealthStatus::Healthy, format!("no {label} recorded yet")),
+        Some(observed_at) => {
+            let age = now
+                .signed_duration_since(observed_at)
+                .max(ChronoDuration::zero());
+            let status = if age >= critical_after {
+                HealthStatus::Critical
+            } else if age >= degraded_after {
+                HealthStatus::Degraded
+            } else {
+                HealthStatus::Healthy
+            };
+            (status, format!("{label} is {}s old", age.num_seconds()))
+        }
+    };
+    HealthCheck {
+        key: key.to_string(),
+        status,
+        observed_at: now,
+        evidence,
+        consecutive_failures: 0,
+    }
+}
+
+fn regional_progress_health_check(
+    inputs: &HealthInputs,
+    startup_at: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+    thresholds: &HealthThresholds,
+) -> HealthCheck {
+    if inputs.regional_progress.is_empty() {
+        return progress_health_check(
+            "contract_progress",
+            None,
+            startup_at,
+            observed_at,
+            thresholds.contract_progress_degraded,
+            thresholds.contract_progress_critical,
+            "regional contract progress",
+        );
+    }
+    let stale_regions = inputs
+        .regional_progress
+        .iter()
+        .map(|(region_id, progress_at)| {
+            let check = age_health_check(
+                "contract_progress",
+                progress_at.or(Some(startup_at)),
+                observed_at,
+                thresholds.contract_progress_degraded,
+                thresholds.contract_progress_critical,
+                "regional contract progress",
+            );
+            (*region_id, check.status, check.evidence)
+        })
+        .collect::<Vec<_>>();
+    let status = stale_regions
+        .iter()
+        .map(|(_, status, _)| *status)
+        .max()
+        .unwrap_or(HealthStatus::Healthy);
+    let stale_count = stale_regions
+        .iter()
+        .filter(|(_, region_status, _)| *region_status != HealthStatus::Healthy)
+        .count();
+    let details = stale_regions
+        .iter()
+        .filter(|(_, region_status, _)| *region_status != HealthStatus::Healthy)
+        .take(MAX_HEALTH_REGIONAL_DETAILS)
+        .map(|(region_id, _, evidence)| format!("region {region_id}: {evidence}"))
+        .collect::<Vec<_>>();
+    HealthCheck {
+        key: "contract_progress".to_string(),
+        status,
+        observed_at,
+        evidence: if details.is_empty() {
+            format!(
+                "{} region(s) have current contract progress",
+                stale_regions.len()
+            )
+        } else {
+            let mut evidence = details.join("; ");
+            let omitted = stale_count.saturating_sub(details.len());
+            if omitted > 0 {
+                evidence.push_str(&format!("; {omitted} additional stale region(s) truncated"));
+            }
+            evidence
+        },
+        consecutive_failures: 0,
+    }
+}
+
+fn esi_progress_health_check(
+    inputs: &HealthInputs,
+    startup_at: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+    thresholds: &HealthThresholds,
+) -> HealthCheck {
+    if inputs
+        .esi_pause_until
+        .is_some_and(|until| until > observed_at)
+    {
+        return HealthCheck {
+            key: "esi_progress".to_string(),
+            status: HealthStatus::Healthy,
+            observed_at,
+            evidence: "ESI collection is within its persisted pause window".to_string(),
+            consecutive_failures: 0,
+        };
+    }
+    progress_health_check(
+        "esi_progress",
+        inputs.esi_progress_at,
+        startup_at,
+        observed_at,
+        thresholds.esi_progress_degraded,
+        thresholds.esi_progress_critical,
+        "ESI progress",
+    )
+}
+
+fn progress_health_check(
+    key: &str,
+    progress_at: Option<DateTime<Utc>>,
+    startup_at: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+    degraded_after: ChronoDuration,
+    critical_after: ChronoDuration,
+    label: &str,
+) -> HealthCheck {
+    let mut check = age_health_check(
+        key,
+        progress_at.or(Some(startup_at)),
+        observed_at,
+        degraded_after,
+        critical_after,
+        label,
+    );
+    if progress_at.is_none() {
+        check.evidence = format!("no {label} recorded since health startup");
+    }
+    check
+}
+
+fn growing_backlog_health_check(
+    inputs: &HealthInputs,
+    observed_at: DateTime<Utc>,
+    thresholds: &HealthThresholds,
+) -> (HealthCheck, BacklogMetric) {
+    let previous = inputs.prior_backlog_metric.as_ref();
+    let (peak_due_count, growth_detected, trend) = match previous {
+        None => (
+            inputs.due_backlog_count,
+            false,
+            "awaiting a bounded trend baseline".to_string(),
+        ),
+        Some(_) if inputs.due_backlog_count == 0 => (0, false, "backlog cleared".to_string()),
+        Some(previous) if inputs.due_backlog_count < previous.due_count => (
+            inputs.due_backlog_count,
+            false,
+            format!(
+                "backlog shrank from {} to {}",
+                previous.due_count, inputs.due_backlog_count
+            ),
+        ),
+        Some(previous) if inputs.due_backlog_count > previous.due_count => (
+            previous.peak_due_count.max(inputs.due_backlog_count),
+            true,
+            format!(
+                "backlog grew from {} to {}",
+                previous.due_count, inputs.due_backlog_count
+            ),
+        ),
+        Some(previous) => (
+            previous.peak_due_count,
+            previous.growth_detected,
+            if previous.growth_detected {
+                format!(
+                    "backlog remains at {} after growing to {}",
+                    inputs.due_backlog_count, previous.peak_due_count
+                )
+            } else {
+                format!("backlog remains at {}", inputs.due_backlog_count)
+            },
+        ),
+    };
+    let should_alert = inputs.due_backlog_count > 0 && growth_detected;
+    let age = inputs.oldest_due_backlog_at.map(|due_at| {
+        observed_at
+            .signed_duration_since(due_at)
+            .max(ChronoDuration::zero())
+    });
+    let status = if !should_alert {
+        HealthStatus::Healthy
+    } else if age.is_some_and(|age| age >= thresholds.backlog_critical) {
+        HealthStatus::Critical
+    } else if age.is_some_and(|age| age >= thresholds.backlog_degraded) {
+        HealthStatus::Degraded
+    } else {
+        HealthStatus::Healthy
+    };
+    let evidence = match age {
+        Some(age) => format!(
+            "{} due manifest or resolution backlog item(s); {trend}; oldest is {}s old",
+            inputs.due_backlog_count,
+            age.num_seconds()
+        ),
+        None => "no due manifest or resolution backlog".to_string(),
+    };
+    (
+        HealthCheck {
+            key: "deferred_backlog".to_string(),
+            status,
+            observed_at,
+            evidence,
+            consecutive_failures: 0,
+        },
+        BacklogMetric {
+            due_count: inputs.due_backlog_count,
+            peak_due_count,
+            growth_detected,
+            oldest_due_at: inputs.oldest_due_backlog_at,
+        },
+    )
+}
+
+fn feed_validation_health_check(
+    validation_at: Option<DateTime<Utc>>,
+    consecutive_failures: i32,
+    startup_at: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+    thresholds: &HealthThresholds,
+) -> HealthCheck {
+    let mut check = progress_health_check(
+        "feed_validation",
+        validation_at,
+        startup_at,
+        observed_at,
+        thresholds.r2z2_progress_degraded,
+        thresholds.r2z2_progress_critical,
+        "successful feed validation",
+    );
+    check.consecutive_failures = consecutive_failures;
+    if consecutive_failures >= thresholds.feed_validation_critical_failures {
+        check.status = HealthStatus::Critical;
+        check.evidence = format!("{consecutive_failures} consecutive feed validation failure(s)");
+    } else if consecutive_failures >= thresholds.feed_validation_degraded_failures {
+        check.status = HealthStatus::Degraded;
+        check.evidence = format!("{consecutive_failures} consecutive feed validation failure(s)");
+    }
+    check
+}
+
+fn permanent_delivery_health_check(
+    observed_at: DateTime<Utc>,
+    permanent_delivery_failures: i64,
+) -> HealthCheck {
+    let status = if permanent_delivery_failures > 0 {
+        HealthStatus::Critical
+    } else {
+        HealthStatus::Healthy
+    };
+    HealthCheck {
+        key: "permanent_delivery_failure".to_string(),
+        status,
+        observed_at,
+        evidence: if permanent_delivery_failures == 0 {
+            "no unresolved permanent Discord delivery failures".to_string()
+        } else {
+            format!(
+                "{permanent_delivery_failures} unresolved permanent Discord delivery failure(s)"
+            )
+        },
+        consecutive_failures: permanent_delivery_failures.clamp(0, i64::from(i32::MAX)) as i32,
+    }
+}
+
+pub fn render_health_view(snapshot: &HealthSnapshot) -> String {
+    let detail = snapshot
+        .checks
+        .iter()
+        .filter(|check| check.status != HealthStatus::Healthy)
+        .map(|check| format!("{}: {}", check.key, check.evidence))
+        .collect::<Vec<_>>();
+    let summary = if detail.is_empty() {
+        "all checks healthy".to_string()
+    } else {
+        detail.join("\n")
+    };
+    format!(
+        "Health: {}\n{}",
+        snapshot.status.as_str(),
+        summary.replace('@', "@\u{200b}")
+    )
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegionState {
     pub baseline_at: Option<DateTime<Utc>>,
@@ -2221,14 +3099,353 @@ fn cached_context_response<T: DeserializeOwned>(
     Ok(EsiResponse::fresh(value, cached.metadata))
 }
 
+fn non_health_migrator(migrator: &Migrator, health_migration_versions: &[i64]) -> Migrator {
+    // The complete source runs first so SQLx can validate every applied version and checksum.
+    // This filtered rerun is only for applying later core migrations after the one explicitly
+    // allow-listed, transactional health migration failed.
+    Migrator {
+        migrations: Cow::Owned(
+            migrator
+                .iter()
+                .filter(|migration| !health_migration_versions.contains(&migration.version))
+                .cloned()
+                .collect(),
+        ),
+        // The complete migrator already validated the full applied ledger before it
+        // failed at an allow-listed health migration. Earlier applied health versions
+        // are deliberately absent from this continuation source.
+        ignore_missing: true,
+        locking: migrator.locking,
+        no_tx: migrator.no_tx,
+    }
+}
+
+async fn run_migrator_releasing_lock_on_error(
+    pool: &PgPool,
+    migrator: &Migrator,
+) -> Result<(), MigrateError> {
+    let mut connection = pool.acquire().await?;
+    let result = migrator.run_direct(&mut *connection).await;
+    if result.is_err() {
+        if let Err(unlock_error) = (*connection).unlock().await {
+            connection.close_on_drop();
+            return Err(unlock_error);
+        }
+    }
+    result
+}
+
 impl ContractCollectionStore {
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
+        Self::connect_with_migrator(database_url, &MIGRATOR, HEALTH_MIGRATION_VERSIONS).await
+    }
+
+    #[doc(hidden)]
+    pub async fn connect_with_migrator_for_test(
+        database_url: &str,
+        migrator: &Migrator,
+        health_migration_versions: &[i64],
+    ) -> Result<Self, sqlx::Error> {
+        Self::connect_with_migrator(database_url, migrator, health_migration_versions).await
+    }
+
+    async fn connect_with_migrator(
+        database_url: &str,
+        migrator: &Migrator,
+        health_migration_versions: &[i64],
+    ) -> Result<Self, sqlx::Error> {
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(database_url)
             .await?;
-        MIGRATOR.run(&pool).await?;
+        match run_migrator_releasing_lock_on_error(&pool, migrator).await {
+            Ok(()) => {}
+            Err(MigrateError::ExecuteMigration(_, version))
+                if health_migration_versions.contains(&version) =>
+            {
+                warn!(
+                    health_migration_version = version,
+                    "health schema migration failed; applying non-health migrations before continuing contract collection"
+                );
+                let filtered_non_health_migrator =
+                    non_health_migrator(migrator, health_migration_versions);
+                run_migrator_releasing_lock_on_error(&pool, &filtered_non_health_migrator)
+                    .await
+                    .map_err(sqlx::Error::from)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
         Ok(Self { pool })
+    }
+
+    async fn initialize_health_schema(&self) -> Result<(), sqlx::Error> {
+        run_migrator_releasing_lock_on_error(&self.pool, &MIGRATOR)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn health_inputs(&self, observed_at: DateTime<Utc>) -> Result<HealthInputs, sqlx::Error> {
+        let heartbeat = sqlx::query(
+            "SELECT observed_at, started_at FROM bot_heartbeats WHERE component = 'bot'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let heartbeat_at = heartbeat.as_ref().map(|row| row.get("observed_at"));
+        let started_at = heartbeat.as_ref().map(|row| row.get("started_at"));
+        let regional_progress = sqlx::query(
+            "SELECT region_id, last_complete_at FROM regional_collection_metadata ORDER BY region_id",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| (row.get("region_id"), row.get("last_complete_at")))
+        .collect();
+        let esi_progress_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT max(updated_at) FROM esi_cache_metadata WHERE resource_key LIKE 'esi:%'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let esi_pause_until = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT pause_until FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        let due_backlog = sqlx::query(
+            "SELECT count(*)::BIGINT AS due_count, min(due_at) AS oldest_due_at FROM (SELECT last_observed_at AS due_at FROM contract_manifest_pending UNION ALL SELECT next_probe_at AS due_at FROM contract_resolution_cases WHERE state = 'awaiting_resolution' AND next_probe_at <= $1) AS due_backlog",
+        )
+        .bind(observed_at)
+        .fetch_one(&self.pool)
+        .await?;
+        let due_backlog_count = due_backlog.get("due_count");
+        let oldest_due_backlog_at = due_backlog.get("oldest_due_at");
+        let prior_backlog_metric = sqlx::query(
+            "SELECT due_count, peak_due_count, growth_detected FROM health_backlog_metrics WHERE singleton = TRUE",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| PersistedBacklogMetric {
+            due_count: row.get("due_count"),
+            peak_due_count: row.get("peak_due_count"),
+            growth_detected: row.get("growth_detected"),
+        });
+        let oldest_prepared_delivery_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT min(prepared_at) FROM contract_outbound_deliveries WHERE status = 'prepared'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let permanent_delivery_failures = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM contract_outbound_deliveries WHERE status = 'failed' AND failure_kind = 'permanent' AND failure_resolved_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let r2z2_telemetry = sqlx::query(
+            "SELECT last_progress_at FROM health_feed_telemetry WHERE source = 'r2z2_progress'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let feed_validation_telemetry = sqlx::query(
+            "SELECT last_progress_at, consecutive_failures FROM health_feed_telemetry WHERE source = 'feed_validation'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(HealthInputs {
+            heartbeat_at,
+            started_at,
+            regional_progress,
+            esi_progress_at,
+            esi_pause_until,
+            due_backlog_count,
+            oldest_due_backlog_at,
+            prior_backlog_metric,
+            oldest_prepared_delivery_at,
+            permanent_delivery_failures,
+            r2z2_progress_at: r2z2_telemetry
+                .as_ref()
+                .and_then(|row| row.get::<Option<DateTime<Utc>>, _>("last_progress_at")),
+            feed_validation_at: feed_validation_telemetry
+                .as_ref()
+                .and_then(|row| row.get::<Option<DateTime<Utc>>, _>("last_progress_at")),
+            feed_validation_failures: feed_validation_telemetry
+                .as_ref()
+                .map(|row| row.get("consecutive_failures"))
+                .unwrap_or(0),
+        })
+    }
+
+    pub async fn begin_health_monitor_session(
+        &self,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        self.initialize_health_schema().await?;
+        sqlx::query(
+            "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1) ON CONFLICT (component) DO UPDATE SET observed_at = GREATEST(bot_heartbeats.observed_at, EXCLUDED.observed_at)",
+        )
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn save_health_snapshot(
+        &self,
+        snapshot: &HealthSnapshot,
+        backlog_metric: &BacklogMetric,
+        feed_snapshot: Option<&FeedHealthSnapshot>,
+    ) -> Result<(), sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1::BIGINT)")
+            .bind(HEALTH_SNAPSHOT_TRANSITION_LOCK_KEY)
+            .execute(&mut *transaction)
+            .await?;
+        let newest_snapshot_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT observed_at FROM health_snapshots WHERE singleton = TRUE",
+        )
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if newest_snapshot_at.is_some_and(|newest_at| newest_at >= snapshot.observed_at) {
+            return transaction.commit().await;
+        }
+        sqlx::query(
+            "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1) ON CONFLICT (component) DO UPDATE SET observed_at = GREATEST(bot_heartbeats.observed_at, EXCLUDED.observed_at)",
+        )
+        .bind(snapshot.observed_at)
+        .execute(&mut *transaction)
+        .await?;
+        for check in &snapshot.checks {
+            let prior_status = sqlx::query_scalar::<_, String>(
+                "SELECT status FROM health_check_results WHERE check_key = $1",
+            )
+            .bind(&check.key)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if prior_status.as_deref() != Some(check.status.as_str()) {
+                let transition_identity = format!(
+                    "{}:{}:{}",
+                    check.key,
+                    check.status.as_str(),
+                    check
+                        .observed_at
+                        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                );
+                sqlx::query(
+                    "INSERT INTO health_transitions (transition_identity, check_key, prior_status, status, observed_at, evidence) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (transition_identity) DO NOTHING",
+                )
+                .bind(transition_identity)
+                .bind(&check.key)
+                .bind(prior_status)
+                .bind(check.status.as_str())
+                .bind(check.observed_at)
+                .bind(&check.evidence)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            sqlx::query(
+                "INSERT INTO health_check_results (check_key, status, observed_at, evidence, consecutive_failures) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (check_key) DO UPDATE SET status = EXCLUDED.status, observed_at = EXCLUDED.observed_at, evidence = EXCLUDED.evidence, consecutive_failures = EXCLUDED.consecutive_failures",
+            )
+            .bind(&check.key)
+            .bind(check.status.as_str())
+            .bind(check.observed_at)
+            .bind(&check.evidence)
+            .bind(check.consecutive_failures)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO health_snapshots (singleton, status, observed_at, evidence) VALUES (TRUE,$1,$2,$3) ON CONFLICT (singleton) DO UPDATE SET status = EXCLUDED.status, observed_at = EXCLUDED.observed_at, evidence = EXCLUDED.evidence",
+        )
+        .bind(snapshot.status.as_str())
+        .bind(snapshot.observed_at)
+        .bind(serde_json::to_value(&snapshot.checks).map_err(json_to_sqlx)?)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO health_backlog_metrics (singleton, due_count, peak_due_count, growth_detected, oldest_due_at, observed_at) VALUES (TRUE,$1,$2,$3,$4,$5) ON CONFLICT (singleton) DO UPDATE SET due_count = EXCLUDED.due_count, peak_due_count = EXCLUDED.peak_due_count, growth_detected = EXCLUDED.growth_detected, oldest_due_at = EXCLUDED.oldest_due_at, observed_at = EXCLUDED.observed_at",
+        )
+        .bind(backlog_metric.due_count)
+        .bind(backlog_metric.peak_due_count)
+        .bind(backlog_metric.growth_detected)
+        .bind(backlog_metric.oldest_due_at)
+        .bind(snapshot.observed_at)
+        .execute(&mut *transaction)
+        .await?;
+        if let Some(feed_snapshot) = feed_snapshot {
+            sqlx::query(
+                "INSERT INTO health_feed_telemetry (source, last_progress_at, consecutive_failures, updated_at) VALUES ('feed_validation',$1,$2,$3) ON CONFLICT (source) DO UPDATE SET last_progress_at = EXCLUDED.last_progress_at, consecutive_failures = EXCLUDED.consecutive_failures, updated_at = EXCLUDED.updated_at",
+            )
+            .bind(feed_snapshot.validation_success_at)
+            .bind(feed_snapshot.validation_failures)
+            .bind(snapshot.observed_at)
+            .execute(&mut *transaction)
+            .await?;
+            if let Some(r2z2_progress_at) = feed_snapshot.r2z2_progress_at {
+                sqlx::query(
+                    "INSERT INTO health_feed_telemetry (source, last_progress_at, consecutive_failures, updated_at) VALUES ('r2z2_progress',$1,0,$2) ON CONFLICT (source) DO UPDATE SET last_progress_at = EXCLUDED.last_progress_at, consecutive_failures = 0, updated_at = EXCLUDED.updated_at",
+                )
+                .bind(r2z2_progress_at)
+                .bind(snapshot.observed_at)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+        transaction.commit().await
+    }
+
+    pub async fn health_snapshot(&self) -> Result<Option<HealthSnapshot>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT status, observed_at, evidence FROM health_snapshots WHERE singleton = TRUE",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(HealthSnapshot {
+                status: HealthStatus::from_str(&row.get::<String, _>("status"))?,
+                observed_at: row.get("observed_at"),
+                checks: serde_json::from_value(row.get("evidence")).map_err(json_to_sqlx)?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn health_discord_view_identity(
+        &self,
+    ) -> Result<Option<HealthDiscordViewIdentity>, sqlx::Error> {
+        sqlx::query(
+            "SELECT channel_id, message_id FROM health_discord_views WHERE view_key = 'primary'",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| {
+            let channel_id: i64 = row.get("channel_id");
+            let channel_id = u64::try_from(channel_id).map_err(|_| {
+                sqlx::Error::Protocol("health view channel ID cannot be negative".to_string())
+            })?;
+            Ok(HealthDiscordViewIdentity {
+                channel_id,
+                message_id: row.get("message_id"),
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn save_health_discord_view_identity(
+        &self,
+        channel_id: u64,
+        message_id: &str,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let channel_id = i64::try_from(channel_id).map_err(|_| {
+            sqlx::Error::Protocol("health view channel ID exceeds PostgreSQL BIGINT".to_string())
+        })?;
+        sqlx::query(
+            "INSERT INTO health_discord_views (view_key, channel_id, message_id, updated_at) VALUES ('primary',$1,$2,$3) ON CONFLICT (view_key) DO UPDATE SET channel_id = EXCLUDED.channel_id, message_id = EXCLUDED.message_id, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(channel_id)
+        .bind(message_id)
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn region_state(&self, region_id: i64) -> Result<Option<RegionState>, sqlx::Error> {

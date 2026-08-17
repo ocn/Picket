@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
+use killbot_rust::commands::health::{render_health_response, HEALTH_OPERATOR_ID};
 use killbot_rust::config::{self, AppConfig, AppState};
 use killbot_rust::contract_intelligence::{
     available_contract_store, collection_retry_delay, new_contract_store_handle,
@@ -10,19 +11,22 @@ use killbot_rust::contract_intelligence::{
     ContractEventKind, ContractFilter, ContractFilterCondition, ContractFilterNode,
     ContractItemDirection, ContractItemProbe, ContractObservationContext, ContractPingLimiter,
     ContractPingType, ContractResolutionState, ContractSubscription, DeliveryFailureKind,
-    DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HttpPublicContractEsi,
-    PreparedContractDelivery, PublicContract, PublicContractEsi, PublicContractItem,
-    ShipGroupLookup, ShipGroupResolver, SolarSystemPosition,
+    DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HealthCheck, HealthClock, HealthCycle,
+    HealthRuntimeConfig, HealthStatus, HttpPublicContractEsi, PreparedContractDelivery,
+    PublicContract, PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
+    SolarSystemPosition,
 };
 use killbot_rust::esi::EsiClient;
-use killbot_rust::feed::{FeedError, KillmailFeed};
+use killbot_rust::feed::{FeedError, FeedHealthProvider, FeedHealthTelemetry, KillmailFeed};
 use killbot_rust::models::{ZkData, ZkDataNoEsi};
-use killbot_rust::pipeline::{run_producer, ProcessedResult};
+use killbot_rust::pipeline::{run_producer, run_producer_with_health, ProcessedResult};
 use moka::future::Cache;
 use serde_json::Value;
 use sha2::{Digest, Sha384};
+use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, Row};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -467,6 +471,43 @@ impl KillmailFeed for SingleInlineKillmailFeed {
             return Ok(Some(item));
         }
         std::future::pending().await
+    }
+
+    fn health_provider(&self) -> FeedHealthProvider {
+        FeedHealthProvider::R2z2
+    }
+}
+
+struct ParseFailingR2z2Feed;
+
+#[async_trait]
+impl KillmailFeed for ParseFailingR2z2Feed {
+    async fn next(&self) -> Result<Option<ZkDataNoEsi>, FeedError> {
+        Err(FeedError::Parse(
+            "synthetic malformed R2Z2 envelope".to_string(),
+        ))
+    }
+
+    fn health_provider(&self) -> FeedHealthProvider {
+        FeedHealthProvider::R2z2
+    }
+}
+
+struct TransportFailingR2z2Feed {
+    called: Arc<Notify>,
+}
+
+#[async_trait]
+impl KillmailFeed for TransportFailingR2z2Feed {
+    async fn next(&self) -> Result<Option<ZkDataNoEsi>, FeedError> {
+        self.called.notify_one();
+        Err(FeedError::Transport(
+            "synthetic R2Z2 connection failure".to_string(),
+        ))
+    }
+
+    fn health_provider(&self) -> FeedHealthProvider {
+        FeedHealthProvider::R2z2
     }
 }
 
@@ -939,6 +980,20 @@ struct RecordingContractPingLimiter {
 }
 
 struct FixedDeliveryClock(StdMutex<chrono::DateTime<Utc>>);
+
+struct FixedHealthClock(StdMutex<chrono::DateTime<Utc>>);
+
+impl FixedHealthClock {
+    fn advance(&self, duration: chrono::Duration) {
+        *self.0.lock().unwrap() += duration;
+    }
+}
+
+impl HealthClock for FixedHealthClock {
+    fn now(&self) -> chrono::DateTime<Utc> {
+        *self.0.lock().unwrap()
+    }
+}
 
 struct ResolutionEsi {
     inner: FakeEsi,
@@ -4595,6 +4650,187 @@ async fn contract_failures_do_not_block_the_killmail_producer_path() {
 
     producer.abort();
     database_retry.abort();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn r2z2_producer_telemetry_is_persisted_by_health_and_recovers_after_a_parse_failure() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to producer telemetry database");
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed current heartbeat");
+    sqlx::query("INSERT INTO regional_collection_metadata (region_id, baseline_at, complete_observations, last_complete_at) VALUES (10000002, $1, 1, $1)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed current regional progress");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('esi:regions', $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed current ESI progress");
+
+    let fixture: ZkData =
+        serde_json::from_str(include_str!("../resources/106140056_small_bubble.json"))
+            .expect("parse inline killmail fixture");
+    let telemetry = Arc::new(FeedHealthTelemetry::new());
+    let (success_tx, mut success_rx) = mpsc::channel(1);
+    let success_producer = tokio::spawn(run_producer_with_health(
+        Box::new(SingleInlineKillmailFeed {
+            item: Mutex::new(Some(ZkDataNoEsi {
+                kill_id: fixture.kill_id,
+                zkb: fixture.zkb.clone(),
+                inline_killmail: Some(fixture.killmail.clone()),
+            })),
+        }),
+        app_state_for_ping_limiter(),
+        success_tx,
+        Arc::new(Semaphore::new(1)),
+        telemetry.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(1), success_rx.recv())
+        .await
+        .expect("producer returns a valid R2Z2 item")
+        .expect("producer dispatches a result");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let telemetry_snapshot = telemetry.snapshot().await;
+            if telemetry_snapshot.r2z2_progress_at.is_some()
+                && telemetry_snapshot.validation_success_at.is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("producer records current R2Z2 progress and feed validation");
+
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    let cycle =
+        HealthCycle::new(store.clone(), clock.clone()).with_feed_telemetry(telemetry.clone(), true);
+    let initial_snapshot = cycle
+        .run_once()
+        .await
+        .expect("persist producer telemetry in the next health snapshot");
+    assert!(initial_snapshot
+        .checks
+        .iter()
+        .any(|check| check.key == "r2z2_progress" && check.status == HealthStatus::Healthy));
+    assert!(initial_snapshot
+        .checks
+        .iter()
+        .any(|check| check.key == "feed_validation" && check.status == HealthStatus::Healthy));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM health_feed_telemetry WHERE source IN ('r2z2_progress', 'feed_validation')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read persisted producer telemetry"),
+        2
+    );
+
+    let (failure_tx, _failure_rx) = mpsc::channel(1);
+    let failure_producer = tokio::spawn(run_producer_with_health(
+        Box::new(ParseFailingR2z2Feed),
+        app_state_for_ping_limiter(),
+        failure_tx,
+        Arc::new(Semaphore::new(1)),
+        telemetry.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if telemetry.snapshot().await.validation_failures == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("producer records a parse failure without waiting for PostgreSQL");
+    let transport_called = Arc::new(Notify::new());
+    let (transport_tx, _transport_rx) = mpsc::channel(1);
+    let transport_producer = tokio::spawn(run_producer_with_health(
+        Box::new(TransportFailingR2z2Feed {
+            called: transport_called.clone(),
+        }),
+        app_state_for_ping_limiter(),
+        transport_tx,
+        Arc::new(Semaphore::new(1)),
+        telemetry.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(1), transport_called.notified())
+        .await
+        .expect("producer reaches the transport failure");
+    assert_eq!(
+        telemetry.snapshot().await.validation_failures,
+        1,
+        "transport failures are progress/connectivity evidence, not validation failures"
+    );
+    clock.advance(chrono::Duration::seconds(1));
+    assert!(cycle
+        .run_once()
+        .await
+        .expect("persist the producer parse failure")
+        .checks
+        .iter()
+        .any(|check| check.key == "feed_validation" && check.status == HealthStatus::Degraded));
+
+    let (recovery_tx, mut recovery_rx) = mpsc::channel(1);
+    let recovery_producer = tokio::spawn(run_producer_with_health(
+        Box::new(SingleInlineKillmailFeed {
+            item: Mutex::new(Some(ZkDataNoEsi {
+                kill_id: fixture.kill_id,
+                zkb: fixture.zkb,
+                inline_killmail: Some(fixture.killmail),
+            })),
+        }),
+        app_state_for_ping_limiter(),
+        recovery_tx,
+        Arc::new(Semaphore::new(1)),
+        telemetry.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(1), recovery_rx.recv())
+        .await
+        .expect("producer returns a recovery R2Z2 item")
+        .expect("producer dispatches recovery result");
+    clock.advance(chrono::Duration::seconds(1));
+    assert!(cycle
+        .run_once()
+        .await
+        .expect("persist recovered producer validation")
+        .checks
+        .iter()
+        .any(|check| check.key == "feed_validation" && check.status == HealthStatus::Healthy));
+    clock.advance(chrono::Duration::seconds(1));
+    let redisq_cycle = HealthCycle::new(store, clock).with_feed_telemetry(telemetry.clone(), false);
+    assert!(redisq_cycle
+        .run_once()
+        .await
+        .expect("evaluate RedisQ health without a R2Z2 check")
+        .checks
+        .iter()
+        .all(|check| check.key != "r2z2_progress"));
+
+    success_producer.abort();
+    failure_producer.abort();
+    transport_producer.abort();
+    recovery_producer.abort();
+    pool.close().await;
     database.destroy().await;
 }
 
@@ -9331,8 +9567,1164 @@ async fn http_esi_station_not_found_keeps_location_context_indeterminate() {
     server.finish();
 }
 
+#[test]
+fn health_configuration_rejects_malformed_zero_and_misordered_thresholds() {
+    for (name, value) in [
+        ("HEALTH_EVALUATION_INTERVAL_SECS", "zero"),
+        ("HEALTH_HEARTBEAT_DEGRADED_SECS", "0"),
+        ("HEALTH_POSTGRES_CRITICAL_FAILURES", "0"),
+    ] {
+        assert!(
+            HealthRuntimeConfig::from_settings(&HashMap::from([(
+                name.to_string(),
+                value.to_string()
+            )]))
+            .is_err(),
+            "{name}={value} is rejected rather than silently defaulted"
+        );
+    }
+    assert!(
+        HealthRuntimeConfig::from_settings(&HashMap::from([
+            (
+                "HEALTH_ESI_PROGRESS_DEGRADED_SECS".to_string(),
+                "900".to_string()
+            ),
+            (
+                "HEALTH_ESI_PROGRESS_CRITICAL_SECS".to_string(),
+                "900".to_string()
+            ),
+        ]))
+        .is_err(),
+        "equal degraded and critical thresholds are rejected"
+    );
+    assert!(
+        HealthRuntimeConfig::from_settings(&HashMap::from([(
+            "HEALTH_HEARTBEAT_DEGRADED_SECS".to_string(),
+            i64::MAX.to_string(),
+        )]))
+        .is_err(),
+        "an extreme positive duration must disable health instead of panicking"
+    );
+    assert_eq!(
+        HealthRuntimeConfig::from_settings(&HashMap::new())
+            .expect("absent settings use the accepted defaults")
+            .thresholds
+            .postgres_critical_failures,
+        3,
+        "the Ticket 05 watchdog receives the configured PostgreSQL three-failure threshold"
+    );
+}
+
+fn synthetic_migrator(migrations: Vec<Migration>) -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(migrations),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+}
+
+fn synthetic_migration(version: i64, description: &'static str, sql: &'static str) -> Migration {
+    Migration::new(
+        version,
+        Cow::Borrowed(description),
+        MigrationType::Simple,
+        Cow::Borrowed(sql),
+        false,
+    )
+}
+
+#[test]
+fn health_command_renders_the_persisted_snapshot_only_for_the_configured_operator() {
+    let snapshot = killbot_rust::contract_intelligence::HealthSnapshot {
+        status: HealthStatus::Degraded,
+        observed_at: Utc
+            .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+            .single()
+            .expect("fixed health time"),
+        checks: vec![killbot_rust::contract_intelligence::HealthCheck {
+            key: "contract_progress".to_string(),
+            status: HealthStatus::Degraded,
+            observed_at: Utc
+                .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+                .single()
+                .expect("fixed health time"),
+            evidence: "region 10000002: regional contract progress is 960s old".to_string(),
+            consecutive_failures: 0,
+        }],
+    };
+    let response = render_health_response(HEALTH_OPERATOR_ID, &snapshot)
+        .expect("operator receives the persisted health snapshot");
+    assert!(response.contains("Health: degraded"));
+    assert!(response.contains("contract_progress: degraded"));
+    assert!(render_health_response(HEALTH_OPERATOR_ID + 1, &snapshot).is_none());
+}
+
 #[tokio::test]
-async fn regional_observation_batch_migration_applies_to_clean_and_current_databases() {
+async fn health_schema_failure_isolated_but_core_migration_failure_still_rejects_connect() {
+    let health_database = TemporaryDatabase::new().await;
+    let _ = health_database.store().await;
+    let health_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&health_database.url)
+        .await
+        .expect("connect to introduce a health-only schema conflict");
+    health_pool
+        .execute("DROP TABLE health_backlog_metrics, health_feed_telemetry, health_discord_views, health_transitions, health_check_results, health_snapshots, bot_heartbeats")
+        .await
+        .expect("remove applied health schema");
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 20260817000001")
+        .execute(&health_pool)
+        .await
+        .expect("make the health migrations pending again");
+    health_pool
+        .execute("CREATE TABLE health_snapshots (conflicting_column INTEGER)")
+        .await
+        .expect("create a health-only migration conflict");
+
+    let isolated_store = ContractCollectionStore::connect(&health_database.url)
+        .await
+        .expect("health migration failure does not reject the core store");
+    ContractCollector::new(
+        isolated_store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("health schema failure does not block contract collection");
+    let health_cycle = HealthCycle::new(
+        isolated_store,
+        Arc::new(FixedHealthClock(StdMutex::new(Utc::now()))),
+    );
+    for attempt in 0..2 {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), health_cycle.run_observationally())
+                .await
+                .expect("a failed health initialization releases SQLx's migration advisory lock")
+                .is_none(),
+            "health initialization retry {attempt} remains disabled until its own migration succeeds"
+        );
+    }
+    health_pool.close().await;
+    health_database.destroy().await;
+
+    let core_database = TemporaryDatabase::unavailable().await;
+    core_database.create().await;
+    let core_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&core_database.url)
+        .await
+        .expect("connect to introduce a core schema conflict");
+    core_pool
+        .execute("CREATE TABLE public_contract_facts (conflicting_column INTEGER)")
+        .await
+        .expect("create a core migration conflict");
+    assert!(
+        ContractCollectionStore::connect(&core_database.url)
+            .await
+            .is_err(),
+        "a non-health migration failure must still reject core store initialization"
+    );
+    core_pool.close().await;
+    core_database.destroy().await;
+
+    assert_health_migration_continuation_and_lock_release().await;
+}
+
+async fn assert_health_migration_continuation_and_lock_release() {
+    const EARLY_CORE: i64 = 70000001;
+    const EARLIER_HEALTH: i64 = 70000002;
+    const FAILING_HEALTH: i64 = 70000003;
+    const LATER_CORE: i64 = 70000004;
+    const EARLY_TABLE: &str = "synthetic_health_isolation_early_core";
+    const EARLIER_HEALTH_TABLE: &str = "synthetic_health_isolation_earlier_health";
+    const LATER_TABLE: &str = "synthetic_health_isolation_later_core";
+
+    let migrator = synthetic_migrator(vec![
+        synthetic_migration(
+            EARLY_CORE,
+            "early core",
+            "CREATE TABLE synthetic_health_isolation_early_core (id INTEGER)",
+        ),
+        synthetic_migration(
+            EARLIER_HEALTH,
+            "earlier health",
+            "CREATE TABLE synthetic_health_isolation_earlier_health (id INTEGER)",
+        ),
+        synthetic_migration(
+            FAILING_HEALTH,
+            "failing health",
+            "CREATE TABLE synthetic_health_isolation_failing_health (id INTEGER)",
+        ),
+        synthetic_migration(
+            LATER_CORE,
+            "later core",
+            "CREATE TABLE synthetic_health_isolation_later_core (id INTEGER)",
+        ),
+    ]);
+
+    let database = TemporaryDatabase::unavailable().await;
+    database.create().await;
+    let conflict_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to create the synthetic health migration conflict");
+    conflict_pool
+        .execute(
+            "CREATE TABLE synthetic_health_isolation_failing_health (conflicting_column INTEGER)",
+        )
+        .await
+        .expect("create health-only synthetic conflict");
+    conflict_pool.close().await;
+
+    let store = ContractCollectionStore::connect_with_migrator_for_test(
+        &database.url,
+        &migrator,
+        &[EARLIER_HEALTH, FAILING_HEALTH],
+    )
+    .await
+    .expect("an allow-listed health migration failure continues with later core migrations");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect synthetic migration results");
+    for table in [EARLY_TABLE, EARLIER_HEALTH_TABLE, LATER_TABLE] {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .expect("inspect synthetic core migration result");
+        assert!(
+            exists,
+            "{table} applied despite the health migration failure"
+        );
+    }
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        ContractCollectionStore::connect_with_migrator_for_test(
+            &database.url,
+            &migrator,
+            &[EARLIER_HEALTH, FAILING_HEALTH],
+        ),
+    )
+    .await
+    .expect("a subsequent migration attempt does not wait on a leaked advisory lock")
+    .expect("a subsequent migration attempt remains usable");
+    pool.close().await;
+    drop(store);
+    database.destroy().await;
+
+    let later_failure_database = TemporaryDatabase::unavailable().await;
+    later_failure_database.create().await;
+    let later_conflict_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&later_failure_database.url)
+        .await
+        .expect("connect to create synthetic health and later-core conflicts");
+    later_conflict_pool
+        .execute("CREATE TABLE synthetic_health_isolation_failing_health (conflicting_column INTEGER); CREATE TABLE synthetic_health_isolation_later_core (conflicting_column INTEGER)")
+        .await
+        .expect("create synthetic health and later-core conflicts");
+    later_conflict_pool.close().await;
+    assert!(
+        ContractCollectionStore::connect_with_migrator_for_test(
+            &later_failure_database.url,
+            &migrator,
+            &[EARLIER_HEALTH, FAILING_HEALTH],
+        )
+        .await
+        .is_err(),
+        "a later core migration failure remains fatal after an isolated health failure"
+    );
+    let later_inspection_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&later_failure_database.url)
+        .await
+        .expect("connect to inspect the later-core failure path");
+    let early_applied: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(EARLY_TABLE)
+        .fetch_one(&later_inspection_pool)
+        .await
+        .expect("inspect early core migration result");
+    assert!(
+        early_applied,
+        "the fallback reached the later core migration"
+    );
+    later_inspection_pool.close().await;
+    later_failure_database.destroy().await;
+
+    let early_failure_database = TemporaryDatabase::unavailable().await;
+    early_failure_database.create().await;
+    let early_conflict_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&early_failure_database.url)
+        .await
+        .expect("connect to create synthetic early-core conflict");
+    early_conflict_pool
+        .execute("CREATE TABLE synthetic_health_isolation_early_core (conflicting_column INTEGER)")
+        .await
+        .expect("create synthetic early-core conflict");
+    early_conflict_pool.close().await;
+    assert!(
+        ContractCollectionStore::connect_with_migrator_for_test(
+            &early_failure_database.url,
+            &migrator,
+            &[EARLIER_HEALTH, FAILING_HEALTH],
+        )
+        .await
+        .is_err(),
+        "an earlier core migration failure remains fatal and cannot enter the health fallback"
+    );
+    let early_inspection_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&early_failure_database.url)
+        .await
+        .expect("connect to inspect early-core failure path");
+    let later_applied: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(LATER_TABLE)
+        .fetch_one(&early_inspection_pool)
+        .await
+        .expect("inspect later-core absence");
+    assert!(
+        !later_applied,
+        "the fallback does not run after an earlier core migration failure"
+    );
+    early_inspection_pool.close().await;
+    early_failure_database.destroy().await;
+}
+
+#[test]
+fn health_command_response_is_below_the_discord_limit_and_reports_truncation() {
+    let snapshot = killbot_rust::contract_intelligence::HealthSnapshot {
+        status: HealthStatus::Critical,
+        observed_at: Utc
+            .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+            .single()
+            .expect("fixed health time"),
+        checks: (0..80)
+            .map(|index| HealthCheck {
+                key: format!("check-{index}"),
+                status: HealthStatus::Critical,
+                observed_at: Utc
+                    .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+                    .single()
+                    .expect("fixed health time"),
+                evidence: "x".repeat(120),
+                consecutive_failures: 1,
+            })
+            .collect(),
+    };
+
+    let response = render_health_response(HEALTH_OPERATOR_ID, &snapshot)
+        .expect("operator receives the health snapshot");
+    assert!(response.chars().count() < 2_000);
+    assert!(response.contains("additional check(s) truncated"));
+}
+
+#[tokio::test]
+async fn health_cycle_caps_regional_evidence_and_reports_the_omitted_region_count() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to the regional health-evidence database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed health time");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed current heartbeat");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('esi:regions', $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed current ESI progress");
+    for region_id in 10_000_001..10_000_041 {
+        sqlx::query("INSERT INTO regional_collection_metadata (region_id, baseline_at, complete_observations, last_complete_at) VALUES ($1, $2, 1, $2)")
+            .bind(region_id)
+            .bind(now - chrono::Duration::minutes(16))
+            .execute(&pool)
+            .await
+            .expect("seed stale regional progress");
+    }
+
+    let snapshot = HealthCycle::new(store, Arc::new(FixedHealthClock(StdMutex::new(now))))
+        .run_once()
+        .await
+        .expect("persist bounded regional health evidence");
+    let regional = snapshot
+        .checks
+        .iter()
+        .find(|check| check.key == "contract_progress")
+        .expect("contract progress check");
+    assert_eq!(regional.status, HealthStatus::Degraded);
+    assert!(regional
+        .evidence
+        .contains("additional stale region(s) truncated"));
+    assert!(regional.evidence.len() < 2_000);
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn concurrent_health_cycles_serialize_transition_comparison_and_insert() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&database.url)
+        .await
+        .expect("connect to the concurrent health-cycle database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed concurrent health time");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed a current heartbeat");
+    sqlx::query("INSERT INTO regional_collection_metadata (region_id, baseline_at, complete_observations, last_complete_at) VALUES (10000002, $1, 1, $1)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed current contract progress");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('esi:regions', $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed current ESI progress");
+    HealthCycle::new(
+        store.clone(),
+        Arc::new(FixedHealthClock(StdMutex::new(now))),
+    )
+    .run_once()
+    .await
+    .expect("persist the initial healthy snapshot");
+    sqlx::query("INSERT INTO contract_subscriptions (guild_id, channel_id, subscription_id, description, filter, event_actions) VALUES (42, 77, 'concurrent-health', 'concurrent health delivery', '{}'::jsonb, '{}'::jsonb)")
+        .execute(&pool)
+        .await
+        .expect("seed the concurrent health subscription");
+    sqlx::query("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, delivery_nonce, prepared_at) VALUES (42, 77, 'concurrent-health', 44, 'listed', '{}'::jsonb, '{}'::jsonb, FALSE, 'prepared', 'concurrent-health', $1)")
+        .bind(now - chrono::Duration::minutes(6))
+        .execute(&pool)
+        .await
+        .expect("seed an overdue prepared delivery");
+
+    let mut lock_transaction = pool.begin().await.expect("begin advisory lock transaction");
+    sqlx::query("SELECT pg_advisory_xact_lock(7_142_300_993_001)")
+        .execute(&mut *lock_transaction)
+        .await
+        .expect("hold the health transition advisory lock");
+    let first_cycle = HealthCycle::new(
+        store.clone(),
+        Arc::new(FixedHealthClock(StdMutex::new(
+            now + chrono::Duration::seconds(1),
+        ))),
+    );
+    let second_cycle = HealthCycle::new(
+        database.store().await,
+        Arc::new(FixedHealthClock(StdMutex::new(
+            now + chrono::Duration::seconds(2),
+        ))),
+    );
+    let mut first = tokio::spawn(async move { first_cycle.run_once().await });
+    let mut second = tokio::spawn(async move { second_cycle.run_once().await });
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                _ = &mut first => {},
+                _ = &mut second => {},
+            }
+        })
+        .await
+        .is_err(),
+        "both cycles wait for the transaction-scoped health transition lock"
+    );
+    lock_transaction
+        .commit()
+        .await
+        .expect("release the health transition advisory lock");
+
+    assert_eq!(
+        first
+            .await
+            .expect("join the first serialized health cycle")
+            .expect("first serialized health cycle succeeds")
+            .status,
+        HealthStatus::Degraded
+    );
+    assert_eq!(
+        second
+            .await
+            .expect("join the second serialized health cycle")
+            .expect("second serialized health cycle succeeds")
+            .status,
+        HealthStatus::Degraded
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM health_transitions WHERE check_key = 'prepared_delivery' AND status = 'degraded'")
+            .fetch_one(&pool)
+            .await
+            .expect("count the serialized prepared-delivery transition"),
+        1
+    );
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn older_health_cycle_completion_does_not_overwrite_newer_persisted_health_state() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to ordered health-cycle database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed ordered health time");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed initial heartbeat");
+    sqlx::query("INSERT INTO regional_collection_metadata (region_id, baseline_at, complete_observations, last_complete_at) VALUES (10000002, $1, 1, $1)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed regional health evidence");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('esi:regions', $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed ESI health evidence");
+    let telemetry = Arc::new(FeedHealthTelemetry::new());
+    telemetry.record_r2z2_progress_at(now).await;
+    telemetry.record_validation_success_at(now).await;
+    let newer_at = now + chrono::Duration::seconds(2);
+    let older_at = now + chrono::Duration::seconds(1);
+    HealthCycle::new(
+        store.clone(),
+        Arc::new(FixedHealthClock(StdMutex::new(newer_at))),
+    )
+    .with_feed_telemetry(telemetry, true)
+    .run_once()
+    .await
+    .expect("persist the newer health cycle first");
+    sqlx::query("INSERT INTO contract_subscriptions (guild_id, channel_id, subscription_id, description, filter, event_actions) VALUES (42, 77, 'equal-health', 'equal timestamp health delivery', '{}'::jsonb, '{}'::jsonb)")
+        .execute(&pool)
+        .await
+        .expect("seed an equal-timestamp prepared delivery");
+    sqlx::query("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, delivery_nonce, prepared_at) VALUES (42, 77, 'equal-health', 44, 'listed', '{}'::jsonb, '{}'::jsonb, FALSE, 'prepared', 'equal-health', $1)")
+        .bind(now - chrono::Duration::minutes(6))
+        .execute(&pool)
+        .await
+        .expect("make the equal-timestamp snapshot observably different");
+    assert_eq!(
+        HealthCycle::new(
+            store.clone(),
+            Arc::new(FixedHealthClock(StdMutex::new(newer_at))),
+        )
+        .with_feed_telemetry(Arc::new(FeedHealthTelemetry::new()), true)
+        .run_once()
+        .await
+        .expect("evaluate a same-time overlapping health cycle")
+        .status,
+        HealthStatus::Degraded
+    );
+    HealthCycle::new(
+        database.store().await,
+        Arc::new(FixedHealthClock(StdMutex::new(older_at))),
+    )
+    .with_feed_telemetry(Arc::new(FeedHealthTelemetry::new()), true)
+    .run_once()
+    .await
+    .expect("complete the older health cycle after the newer one");
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM health_snapshots WHERE singleton = TRUE",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("preserve the first same-timestamp health snapshot"),
+        "healthy"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT observed_at FROM health_snapshots WHERE singleton = TRUE",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read monotonic health snapshot"),
+        newer_at
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT min(observed_at) FROM health_check_results",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read monotonic health checks"),
+        newer_at
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT updated_at FROM health_feed_telemetry WHERE source = 'feed_validation'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read monotonic feed state"),
+        newer_at
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT observed_at FROM bot_heartbeats WHERE component = 'bot'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read monotonic heartbeat"),
+        newer_at
+    );
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn health_monitor_session_restart_does_not_renew_missing_evidence_grace() {
+    let database = TemporaryDatabase::new().await;
+    let start = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed health start time");
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(start)));
+    let store = database.store().await;
+
+    store
+        .begin_health_monitor_session(clock.now())
+        .await
+        .expect("begin the initial health monitor session");
+    clock.advance(chrono::Duration::minutes(16));
+    store
+        .begin_health_monitor_session(clock.now())
+        .await
+        .expect("restart the health monitor session without replacing its durable anchor");
+
+    assert_eq!(
+        HealthCycle::new(store, clock)
+            .run_once()
+            .await
+            .expect("evaluate missing evidence after a monitor restart")
+            .status,
+        HealthStatus::Degraded
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn health_cycle_applies_a_durable_startup_grace_to_missing_contract_and_esi_evidence() {
+    let database = TemporaryDatabase::new().await;
+    let start = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed health start time");
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(start)));
+    let feed_telemetry = Arc::new(FeedHealthTelemetry::new());
+
+    let cold_start_snapshot = HealthCycle::new(database.store().await, clock.clone())
+        .with_feed_telemetry(feed_telemetry.clone(), true)
+        .run_once()
+        .await
+        .expect("the cold-start health cycle persists its grace anchor");
+    assert_eq!(cold_start_snapshot.status, HealthStatus::Healthy);
+    assert!(cold_start_snapshot
+        .checks
+        .iter()
+        .any(|check| check.key == "r2z2_progress" && check.status == HealthStatus::Healthy));
+    assert!(cold_start_snapshot
+        .checks
+        .iter()
+        .any(|check| check.key == "feed_validation" && check.status == HealthStatus::Healthy));
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to update the independently refreshed heartbeat");
+    clock.advance(chrono::Duration::minutes(4));
+    sqlx::query("UPDATE bot_heartbeats SET observed_at = $1 WHERE component = 'bot'")
+        .bind(clock.now())
+        .execute(&pool)
+        .await
+        .expect("refresh the bot heartbeat without creating contract or ESI evidence");
+    let degraded_snapshot = HealthCycle::new(database.store().await, clock.clone())
+        .with_feed_telemetry(feed_telemetry.clone(), true)
+        .run_once()
+        .await
+        .expect("the restarted cycle reads the durable grace anchor");
+    assert_eq!(degraded_snapshot.status, HealthStatus::Degraded);
+    assert!(degraded_snapshot
+        .checks
+        .iter()
+        .any(|check| check.key == "r2z2_progress" && check.status == HealthStatus::Degraded));
+    assert!(degraded_snapshot
+        .checks
+        .iter()
+        .any(|check| check.key == "feed_validation" && check.status == HealthStatus::Degraded));
+
+    clock.advance(chrono::Duration::minutes(12));
+    sqlx::query("UPDATE bot_heartbeats SET observed_at = $1 WHERE component = 'bot'")
+        .bind(clock.now())
+        .execute(&pool)
+        .await
+        .expect("keep the independently refreshed heartbeat current");
+    let critical_snapshot = HealthCycle::new(database.store().await, clock.clone())
+        .with_feed_telemetry(feed_telemetry, true)
+        .run_once()
+        .await
+        .expect("missing evidence becomes critical after the startup grace");
+    assert_eq!(critical_snapshot.status, HealthStatus::Critical);
+    assert!(critical_snapshot
+        .checks
+        .iter()
+        .any(|check| check.key == "r2z2_progress" && check.status == HealthStatus::Critical));
+    assert!(critical_snapshot
+        .checks
+        .iter()
+        .any(|check| check.key == "feed_validation" && check.status == HealthStatus::Critical));
+
+    clock.advance(chrono::Duration::minutes(15));
+    sqlx::query("UPDATE bot_heartbeats SET observed_at = $1 WHERE component = 'bot'")
+        .bind(clock.now())
+        .execute(&pool)
+        .await
+        .expect("keep the independently refreshed heartbeat current through contract grace");
+    let all_missing_critical = HealthCycle::new(database.store().await, clock.clone())
+        .with_feed_telemetry(Arc::new(FeedHealthTelemetry::new()), true)
+        .run_once()
+        .await
+        .expect("missing contract and ESI evidence become critical after their startup grace");
+    assert!(all_missing_critical
+        .checks
+        .iter()
+        .any(|check| check.key == "contract_progress" && check.status == HealthStatus::Critical));
+    assert!(all_missing_critical
+        .checks
+        .iter()
+        .any(|check| check.key == "esi_progress" && check.status == HealthStatus::Critical));
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn health_cycle_persists_thresholds_recovers_after_restart_and_isolates_store_failure() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to health-cycle database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed health time");
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    let initial_progress_at = now - chrono::Duration::minutes(1);
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(initial_progress_at)
+    .execute(&pool)
+    .await
+    .expect("seed initial heartbeat");
+    sqlx::query("INSERT INTO regional_collection_metadata (region_id, baseline_at, complete_observations, last_complete_at) VALUES (10000002, $1, 1, $1)")
+        .bind(initial_progress_at)
+        .execute(&pool)
+        .await
+        .expect("seed initial contract progress");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('esi:regions', $1)",
+    )
+    .bind(initial_progress_at)
+    .execute(&pool)
+    .await
+    .expect("seed initial ESI progress");
+
+    let cycle = HealthCycle::new(store.clone(), clock.clone());
+    assert_eq!(
+        cycle
+            .run_once()
+            .await
+            .expect("persist healthy health snapshot")
+            .status,
+        HealthStatus::Healthy
+    );
+
+    clock.advance(chrono::Duration::minutes(31));
+    assert_eq!(
+        cycle
+            .run_once()
+            .await
+            .expect("persist stale heartbeat and contract progress")
+            .status,
+        HealthStatus::Critical
+    );
+    clock.advance(chrono::Duration::seconds(1));
+    let current_time = clock.now();
+    sqlx::query(
+        "UPDATE regional_collection_metadata SET last_complete_at = $1 WHERE region_id = 10000002",
+    )
+    .bind(current_time)
+    .execute(&pool)
+    .await
+    .expect("recover contract progress evidence");
+    sqlx::query("UPDATE esi_cache_metadata SET updated_at = $1 WHERE resource_key = 'esi:regions'")
+        .bind(current_time)
+        .execute(&pool)
+        .await
+        .expect("recover ESI progress evidence");
+    assert_eq!(
+        cycle
+            .run_once()
+            .await
+            .expect("persist recovered health snapshot")
+            .status,
+        HealthStatus::Healthy
+    );
+    let transitions_before_restart: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM health_transitions")
+            .fetch_one(&pool)
+            .await
+            .expect("count persisted health transitions");
+    let restarted_cycle = HealthCycle::new(database.store().await, clock.clone());
+    assert_eq!(
+        restarted_cycle
+            .run_once()
+            .await
+            .expect("read the persisted health state after restart")
+            .status,
+        HealthStatus::Healthy
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM health_transitions")
+            .fetch_one(&pool)
+            .await
+            .expect("restarted health cycle does not duplicate transitions"),
+        transitions_before_restart
+    );
+    sqlx::query("INSERT INTO contract_subscriptions (guild_id, channel_id, subscription_id, description, filter, event_actions) VALUES (42, 77, 'health', 'health delivery', '{}'::jsonb, '{}'::jsonb)")
+        .execute(&pool)
+        .await
+        .expect("seed health delivery subscription");
+    sqlx::query("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, delivery_nonce, prepared_at) VALUES (42, 77, 'health', 44, 'listed', '{}'::jsonb, '{}'::jsonb, FALSE, 'prepared', 'health-prepared', $1)")
+        .bind(clock.now() - chrono::Duration::minutes(6))
+        .execute(&pool)
+        .await
+        .expect("seed old prepared delivery");
+    clock.advance(chrono::Duration::seconds(1));
+    assert_eq!(
+        restarted_cycle
+            .run_once()
+            .await
+            .expect("evaluate prepared delivery age")
+            .status,
+        HealthStatus::Degraded
+    );
+    clock.advance(chrono::Duration::seconds(1));
+    sqlx::query("UPDATE contract_outbound_deliveries SET status = 'sent', sent_at = $1 WHERE delivery_nonce = 'health-prepared'")
+        .bind(clock.now())
+        .execute(&pool)
+        .await
+        .expect("resolve prepared delivery");
+    assert_eq!(
+        restarted_cycle
+            .run_once()
+            .await
+            .expect("recover prepared delivery health")
+            .status,
+        HealthStatus::Healthy
+    );
+    clock.advance(chrono::Duration::seconds(1));
+    sqlx::query("UPDATE contract_outbound_deliveries SET status = 'failed', failure_kind = 'permanent', failure_resolved_at = NULL WHERE delivery_nonce = 'health-prepared'")
+        .execute(&pool)
+        .await
+        .expect("seed permanent delivery failure");
+    assert_eq!(
+        restarted_cycle
+            .run_once()
+            .await
+            .expect("evaluate permanent delivery failure")
+            .status,
+        HealthStatus::Critical
+    );
+    clock.advance(chrono::Duration::seconds(1));
+    sqlx::query("UPDATE contract_outbound_deliveries SET failure_resolved_at = $1 WHERE delivery_nonce = 'health-prepared'")
+        .bind(clock.now())
+        .execute(&pool)
+        .await
+        .expect("resolve permanent delivery failure");
+    assert_eq!(
+        restarted_cycle
+            .run_once()
+            .await
+            .expect("recover permanent delivery health")
+            .status,
+        HealthStatus::Healthy
+    );
+
+    clock.advance(chrono::Duration::seconds(1));
+    sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES (10000002, 99, '{}'::jsonb, '{}'::jsonb, $1, $1, $2, 'awaiting_resolution')")
+        .bind(clock.now() - chrono::Duration::minutes(31))
+        .bind(clock.now() - chrono::Duration::minutes(31))
+        .execute(&pool)
+        .await
+        .expect("seed old due resolution backlog");
+    assert_eq!(
+        restarted_cycle
+            .run_once()
+            .await
+            .expect("evaluate due resolution backlog")
+            .status,
+        HealthStatus::Degraded
+    );
+    clock.advance(chrono::Duration::seconds(1));
+    sqlx::query("UPDATE contract_resolution_cases SET next_probe_at = $1 WHERE region_id = 10000002 AND contract_id = 99")
+        .bind(clock.now() + chrono::Duration::minutes(1))
+        .execute(&pool)
+        .await
+        .expect("defer resolved backlog probe");
+    assert_eq!(
+        restarted_cycle
+            .run_once()
+            .await
+            .expect("recover due resolution backlog health")
+            .status,
+        HealthStatus::Healthy
+    );
+    sqlx::query(
+        "DELETE FROM contract_resolution_cases WHERE region_id = 10000002 AND contract_id = 99",
+    )
+    .execute(&pool)
+    .await
+    .expect("remove synthetic health-only resolution backlog");
+
+    pool.execute("DROP TABLE health_snapshots")
+        .await
+        .expect("break health storage only");
+    assert!(restarted_cycle.run_observationally().await.is_none());
+    let collector = ContractCollector::new(
+        store,
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    );
+    collector
+        .collect_cycle()
+        .await
+        .expect("health storage failure does not block contract collection");
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn health_cycle_persists_feed_progress_validation_and_a_stable_growing_backlog_trend() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to health telemetry database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed health telemetry time");
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed current heartbeat");
+    sqlx::query("INSERT INTO regional_collection_metadata (region_id, baseline_at, complete_observations, last_complete_at) VALUES (10000002, $1, 1, $1)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed current regional progress");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('esi:regions', $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed current ESI progress");
+    sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES (10000002, 99, '{}'::jsonb, '{}'::jsonb, $1, $1, $2, 'awaiting_resolution')")
+        .bind(now - chrono::Duration::minutes(31))
+        .bind(now - chrono::Duration::minutes(31))
+        .execute(&pool)
+        .await
+        .expect("seed an aged backlog baseline");
+
+    let telemetry = Arc::new(FeedHealthTelemetry::new());
+    telemetry.record_r2z2_progress_at(now).await;
+    telemetry.record_validation_success_at(now).await;
+    let cycle =
+        HealthCycle::new(store.clone(), clock.clone()).with_feed_telemetry(telemetry.clone(), true);
+    assert_eq!(
+        cycle
+            .run_once()
+            .await
+            .expect("persist the initial bounded backlog baseline")
+            .status,
+        HealthStatus::Healthy
+    );
+
+    sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES (10000002, 100, '{}'::jsonb, '{}'::jsonb, $1, $1, $2, 'awaiting_resolution')")
+        .bind(now - chrono::Duration::minutes(31))
+        .bind(now - chrono::Duration::minutes(31))
+        .execute(&pool)
+        .await
+        .expect("grow the aged resolution backlog");
+    clock.advance(chrono::Duration::seconds(1));
+    assert_eq!(
+        cycle
+            .run_once()
+            .await
+            .expect("persist the growing backlog state")
+            .status,
+        HealthStatus::Degraded
+    );
+    clock.advance(chrono::Duration::seconds(1));
+    assert_eq!(
+        cycle
+            .run_once()
+            .await
+            .expect("keep a grown backlog unhealthy while it remains unchanged")
+            .status,
+        HealthStatus::Degraded
+    );
+    sqlx::query("UPDATE contract_resolution_cases SET next_probe_at = $1 WHERE region_id = 10000002 AND contract_id = 100")
+        .bind(now + chrono::Duration::minutes(1))
+        .execute(&pool)
+        .await
+        .expect("shrink the aged resolution backlog");
+    clock.advance(chrono::Duration::seconds(1));
+    assert_eq!(
+        cycle
+            .run_once()
+            .await
+            .expect("clear the growing backlog health state after a shrink")
+            .status,
+        HealthStatus::Healthy
+    );
+
+    telemetry.record_validation_failure_at(now).await;
+    clock.advance(chrono::Duration::seconds(1));
+    assert_eq!(
+        cycle
+            .run_once()
+            .await
+            .expect("persist a feed validation failure")
+            .status,
+        HealthStatus::Degraded
+    );
+    telemetry.record_validation_failure_at(now).await;
+    telemetry.record_validation_failure_at(now).await;
+    clock.advance(chrono::Duration::seconds(1));
+    assert_eq!(
+        cycle
+            .run_once()
+            .await
+            .expect("apply the feed validation critical threshold")
+            .status,
+        HealthStatus::Critical
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>(
+            "SELECT consecutive_failures FROM health_feed_telemetry WHERE source = 'feed_validation'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read persisted validation failures"),
+        3
+    );
+
+    let restarted_cycle = HealthCycle::new(database.store().await, clock.clone())
+        .with_feed_telemetry(Arc::new(FeedHealthTelemetry::new()), true);
+    clock.advance(chrono::Duration::seconds(1));
+    assert_eq!(
+        restarted_cycle
+            .run_once()
+            .await
+            .expect("retain feed validation evidence over a process restart")
+            .status,
+        HealthStatus::Critical
+    );
+    telemetry.record_validation_success_at(now).await;
+    clock.advance(chrono::Duration::minutes(4));
+    assert_eq!(
+        cycle
+            .run_once()
+            .await
+            .expect("apply the R2Z2 progress threshold")
+            .checks
+            .iter()
+            .find(|check| check.key == "r2z2_progress")
+            .expect("R2Z2 progress check")
+            .status,
+        HealthStatus::Degraded
+    );
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clean_and_current_databases(
+) {
     let clean_database = TemporaryDatabase::new().await;
     let clean_store = clean_database.store().await;
     let clean_pool = PgPoolOptions::new()
@@ -9344,7 +10736,7 @@ async fn regional_observation_batch_migration_applies_to_clean_and_current_datab
         .fetch_one(&clean_pool)
         .await
         .expect("read clean migration ledger");
-    assert_eq!(clean_migration_count, 13);
+    assert_eq!(clean_migration_count, 14);
     let batch_table_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
         .bind("regional_observation_batches")
         .fetch_one(&clean_pool)
@@ -9354,6 +10746,29 @@ async fn regional_observation_batch_migration_applies_to_clean_and_current_datab
         batch_table_exists,
         "clean migration creates regional batch ledger"
     );
+    for table in [
+        "bot_heartbeats",
+        "health_snapshots",
+        "health_check_results",
+        "health_transitions",
+        "health_discord_views",
+        "health_feed_telemetry",
+        "health_backlog_metrics",
+    ] {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(table)
+            .fetch_one(&clean_pool)
+            .await
+            .expect("read clean health table");
+        assert!(exists, "clean migration creates {table}");
+    }
+    let clean_started_at_is_not_null: bool = sqlx::query_scalar(
+        "SELECT is_nullable = 'NO' FROM information_schema.columns WHERE table_name = 'bot_heartbeats' AND column_name = 'started_at'",
+    )
+    .fetch_one(&clean_pool)
+    .await
+    .expect("read clean heartbeat startup anchor");
+    assert!(clean_started_at_is_not_null);
     let clean_batch_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM regional_observation_batches")
             .fetch_one(&clean_pool)
@@ -9490,6 +10905,29 @@ async fn regional_observation_batch_migration_applies_to_clean_and_current_datab
         upgraded_batch_table_exists,
         "current production migration creates regional batch ledger"
     );
+    for table in [
+        "bot_heartbeats",
+        "health_snapshots",
+        "health_check_results",
+        "health_transitions",
+        "health_discord_views",
+        "health_feed_telemetry",
+        "health_backlog_metrics",
+    ] {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(table)
+            .fetch_one(&upgraded_pool)
+            .await
+            .expect("read upgraded health table");
+        assert!(exists, "current production migration creates {table}");
+    }
+    let upgraded_started_at_is_not_null: bool = sqlx::query_scalar(
+        "SELECT is_nullable = 'NO' FROM information_schema.columns WHERE table_name = 'bot_heartbeats' AND column_name = 'started_at'",
+    )
+    .fetch_one(&upgraded_pool)
+    .await
+    .expect("read upgraded heartbeat startup anchor");
+    assert!(upgraded_started_at_is_not_null);
     let trusted_initialized: bool = sqlx::query_scalar("SELECT current_recovery_epoch_id IS NOT NULL AND NOT requires_silent_baseline FROM regional_collection_metadata WHERE region_id = 10000002")
         .fetch_one(&upgraded_pool)
         .await

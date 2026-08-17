@@ -1,6 +1,6 @@
 use crate::config::{self, AppState};
 use crate::discord_bot::{self, PreparedDispatch};
-use crate::feed::KillmailFeed;
+use crate::feed::{FeedError, FeedHealthProvider, FeedHealthTelemetry, KillmailFeed};
 use crate::models::{ZkData, ZkDataNoEsi};
 use crate::processor;
 use chrono::{DateTime, Utc};
@@ -130,13 +130,41 @@ pub async fn run_producer(
     result_tx: mpsc::Sender<ProcessedResult>,
     semaphore: Arc<Semaphore>,
 ) {
+    run_producer_inner(feed, app_state, result_tx, semaphore, None).await;
+}
+
+pub async fn run_producer_with_health(
+    feed: Box<dyn KillmailFeed>,
+    app_state: Arc<AppState>,
+    result_tx: mpsc::Sender<ProcessedResult>,
+    semaphore: Arc<Semaphore>,
+    feed_health: Arc<FeedHealthTelemetry>,
+) {
+    run_producer_inner(feed, app_state, result_tx, semaphore, Some(feed_health)).await;
+}
+
+async fn run_producer_inner(
+    feed: Box<dyn KillmailFeed>,
+    app_state: Arc<AppState>,
+    result_tx: mpsc::Sender<ProcessedResult>,
+    semaphore: Arc<Semaphore>,
+    feed_health: Option<Arc<FeedHealthTelemetry>>,
+) {
     let mut dispatch_sequence: u64 = 0;
     let timeout_secs = app_state.app_config.killmail_process_timeout_secs;
     let sleep_ms = app_state.app_config.killmail_post_process_sleep_ms;
+    let provider = feed.health_provider();
 
     loop {
         match feed.next().await {
             Ok(Some(zk_data_no_esi)) => {
+                if let Some(feed_health) = &feed_health {
+                    let observed_at = Utc::now();
+                    feed_health.record_validation_success_at(observed_at).await;
+                    if provider == FeedHealthProvider::R2z2 {
+                        feed_health.record_r2z2_progress_at(observed_at).await;
+                    }
+                }
                 let kill_id = zk_data_no_esi.kill_id;
                 debug!("[Kill: {}] Received (seq: {})", kill_id, dispatch_sequence);
 
@@ -193,8 +221,16 @@ pub async fn run_producer(
             }
             Ok(None) => {
                 // Feed already handled its own wait/backoff
+                if provider == FeedHealthProvider::Redisq {
+                    if let Some(feed_health) = &feed_health {
+                        feed_health.record_validation_success_at(Utc::now()).await;
+                    }
+                }
             }
             Err(e) => {
+                if let (Some(feed_health), FeedError::Parse(_)) = (&feed_health, &e) {
+                    feed_health.record_validation_failure_at(Utc::now()).await;
+                }
                 error!("Feed error: {}", e);
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
