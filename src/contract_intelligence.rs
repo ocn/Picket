@@ -27,6 +27,9 @@ const DISCORD_NONCE_ENFORCEMENT_WINDOW: ChronoDuration = ChronoDuration::minutes
 const DEFAULT_COLLECTION_RECOVERY_GAP: ChronoDuration = ChronoDuration::minutes(15);
 const REGION_DISCOVERY_RESOURCE_KEY: &str = "esi:regions";
 const METERS_PER_LIGHT_YEAR: f64 = 9_460_730_472_580_800.0;
+const CONTRACT_ACCEPTED_BY_PLAYER_ERROR: &str =
+    "Contract accepted by player, requires authorization";
+const CONTRACT_NOT_PUBLIC_ERROR: &str = "Contract not public";
 
 fn regional_snapshot_resource_key(region_id: i64) -> String {
     format!("esi:public-contracts:region:{region_id}")
@@ -193,6 +196,8 @@ impl<T> EsiResponse<T> {
 pub enum ContractItemProbe {
     Available(EsiResponse<Vec<PublicContractItem>>),
     NoContent(CacheMetadata),
+    AcceptedByPlayer(CacheMetadata),
+    NotPublic(CacheMetadata),
     NotFound(CacheMetadata),
 }
 
@@ -201,7 +206,17 @@ impl ContractItemProbe {
         match self {
             Self::Available(response) => &response.metadata,
             Self::NoContent(metadata) => metadata,
+            Self::AcceptedByPlayer(metadata) => metadata,
+            Self::NotPublic(metadata) => metadata,
             Self::NotFound(metadata) => metadata,
+        }
+    }
+
+    fn acceptance_response_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::NoContent(_) => Some("204_no_content"),
+            Self::AcceptedByPlayer(_) => Some("403_accepted_by_player"),
+            Self::Available(_) | Self::NotPublic(_) | Self::NotFound(_) => None,
         }
     }
 }
@@ -750,6 +765,29 @@ impl HttpPublicContractEsi {
         let metadata = cache_metadata(response.headers());
         match response.status() {
             StatusCode::NO_CONTENT => Ok(ContractItemProbe::NoContent(metadata)),
+            StatusCode::FORBIDDEN => {
+                #[derive(Deserialize)]
+                struct ContractProbeError {
+                    error: String,
+                }
+
+                let error = response
+                    .json::<ContractProbeError>()
+                    .await
+                    .map(|body| body.error)
+                    .unwrap_or_default();
+                match error.as_str() {
+                    CONTRACT_ACCEPTED_BY_PLAYER_ERROR => {
+                        Ok(ContractItemProbe::AcceptedByPlayer(metadata))
+                    }
+                    CONTRACT_NOT_PUBLIC_ERROR => Ok(ContractItemProbe::NotPublic(metadata)),
+                    _ => Err(EsiError::from_metadata(
+                        "ESI returned 403 Forbidden",
+                        Some(StatusCode::FORBIDDEN),
+                        metadata,
+                    )),
+                }
+            }
             StatusCode::NOT_FOUND => Ok(ContractItemProbe::NotFound(metadata)),
             StatusCode::NOT_MODIFIED => Ok(ContractItemProbe::Available(
                 EsiResponse::not_modified(metadata),
@@ -2802,27 +2840,81 @@ impl ContractCollectionStore {
     async fn record_complete(
         &self,
         region_id: i64,
-        expected_pages: u32,
-        summaries: &[SummaryObservedContract],
-        resolved_contracts: &[ObservedContract],
-        manifest_failures: &[ManifestCollectionFailure],
+        observation: CompleteRegionalObservation<'_>,
         recovery_gap: ChronoDuration,
     ) -> Result<RecordComplete, sqlx::Error> {
+        let CompleteRegionalObservation {
+            evidence,
+            summaries,
+            resolved_contracts,
+            manifest_failures,
+        } = observation;
+        let expected_pages = evidence.expected_pages.ok_or_else(|| {
+            sqlx::Error::Protocol(
+                "complete regional observation omitted expected pages".to_string(),
+            )
+        })?;
         let mut transaction = self.pool.begin().await?;
         let now = Utc::now();
         sqlx::query("INSERT INTO regional_collection_metadata (region_id) VALUES ($1) ON CONFLICT (region_id) DO NOTHING").bind(region_id).execute(&mut *transaction).await?;
         let regional_metadata = sqlx::query(
-            "SELECT baseline_at, last_complete_at FROM regional_collection_metadata WHERE region_id = $1 FOR UPDATE",
+            "SELECT baseline_at, current_recovery_epoch_id, requires_silent_baseline FROM regional_collection_metadata WHERE region_id = $1 FOR UPDATE",
         )
         .bind(region_id)
         .fetch_one(&mut *transaction)
         .await?;
         let baseline_at: Option<DateTime<Utc>> = regional_metadata.get("baseline_at");
-        let last_complete_at: Option<DateTime<Utc>> = regional_metadata.get("last_complete_at");
+        let current_recovery_epoch_id: Option<i64> =
+            regional_metadata.get("current_recovery_epoch_id");
+        let requires_silent_baseline: bool = regional_metadata.get("requires_silent_baseline");
+        let epoch_last_complete_at = if let Some(recovery_epoch_id) = current_recovery_epoch_id {
+            sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+                "SELECT max(completed_at) FROM regional_observation_batches WHERE region_id = $1 AND recovery_epoch_id = $2 AND outcome = 'complete'",
+            )
+            .bind(region_id)
+            .bind(recovery_epoch_id)
+            .fetch_one(&mut *transaction)
+            .await?
+        } else {
+            None
+        };
+        let epoch_initial_complete_at = if let Some(recovery_epoch_id) = current_recovery_epoch_id {
+            sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+                "SELECT initial_complete_at FROM regional_recovery_epochs WHERE id = $1",
+            )
+            .bind(recovery_epoch_id)
+            .fetch_one(&mut *transaction)
+            .await?
+        } else {
+            None
+        };
+        let continuity_complete_at = epoch_last_complete_at.or(epoch_initial_complete_at);
         let recovery_baseline = baseline_at.is_some()
-            && last_complete_at.is_some_and(|last_complete_at| {
-                now.signed_duration_since(last_complete_at) > recovery_gap
-            });
+            && (requires_silent_baseline
+                || current_recovery_epoch_id.is_none()
+                || continuity_complete_at.is_some_and(|complete_at| {
+                    now.signed_duration_since(complete_at) > recovery_gap
+                }));
+        let recovery_epoch_id = match (current_recovery_epoch_id, recovery_baseline) {
+            (Some(recovery_epoch_id), false) => recovery_epoch_id,
+            _ => {
+                let initialization_source = if baseline_at.is_none() {
+                    "initial_baseline"
+                } else if requires_silent_baseline || current_recovery_epoch_id.is_none() {
+                    "migration_silent_baseline"
+                } else {
+                    "recovery_gap"
+                };
+                sqlx::query_scalar::<_, i64>(
+                    "INSERT INTO regional_recovery_epochs (region_id, started_at, initialization_source) VALUES ($1,$2,$3) RETURNING id",
+                )
+                .bind(region_id)
+                .bind(now)
+                .bind(initialization_source)
+                .fetch_one(&mut *transaction)
+                .await?
+            }
+        };
         let resolved_by_id = resolved_contracts
             .iter()
             .map(|observed| (observed.contract.contract_id, observed))
@@ -2850,6 +2942,15 @@ impl ContractCollectionStore {
                 )
             })
             .collect::<HashMap<_, _>>();
+        for summary in summaries {
+            sqlx::query("INSERT INTO regional_epoch_contract_presence (recovery_epoch_id, region_id, contract_id, last_observed_at) VALUES ($1,$2,$3,$4) ON CONFLICT (recovery_epoch_id, region_id, contract_id) DO UPDATE SET last_observed_at = EXCLUDED.last_observed_at")
+                .bind(recovery_epoch_id)
+                .bind(region_id)
+                .bind(summary.contract.contract_id)
+                .bind(now)
+                .execute(&mut *transaction)
+                .await?;
+        }
         let mut newly_observed = Vec::new();
         for summary in summaries {
             let pending = pending_by_id.get(&summary.contract.contract_id);
@@ -2958,6 +3059,15 @@ impl ContractCollectionStore {
                 .execute(&mut *transaction)
                 .await?;
         }
+        let observed_in_current_epoch = sqlx::query_scalar::<_, i64>(
+            "SELECT contract_id FROM regional_epoch_contract_presence WHERE recovery_epoch_id = $1 AND region_id = $2",
+        )
+        .bind(recovery_epoch_id)
+        .bind(region_id)
+        .fetch_all(&mut *transaction)
+        .await?
+        .into_iter()
+        .collect::<HashSet<_>>();
         let last_observed = sqlx::query("SELECT DISTINCT ON (presence_intervals.contract_id) presence_intervals.contract_id, presence_intervals.last_observed_at, public_contract_facts.facts, contract_item_manifests.manifest FROM presence_intervals JOIN public_contract_facts ON public_contract_facts.fact_hash = presence_intervals.fact_hash JOIN contract_item_manifests ON contract_item_manifests.manifest_hash = presence_intervals.manifest_hash WHERE presence_intervals.region_id = $1 ORDER BY presence_intervals.contract_id, presence_intervals.last_observed_at DESC")
             .bind(region_id)
             .fetch_all(&mut *transaction)
@@ -2966,6 +3076,10 @@ impl ContractCollectionStore {
         for row in last_observed {
             let contract_id: i64 = row.get("contract_id");
             if observed_ids.contains(&contract_id) {
+                continue;
+            }
+            let observed_in_epoch = observed_in_current_epoch.contains(&contract_id);
+            if !recovery_baseline && !observed_in_epoch {
                 continue;
             }
             let contract: PublicContract =
@@ -3001,7 +3115,7 @@ impl ContractCollectionStore {
                 .bind(recovery_baseline)
                 .fetch_optional(&mut *transaction)
                 .await?;
-            if inserted.is_some() {
+            if inserted.is_some() && observed_in_epoch {
                 sqlx::query("INSERT INTO contract_lifecycle_evidence (region_id, contract_id, evidence_kind, observed_at, detail) VALUES ($1,$2,'no_longer_public',$3,$4)")
                     .bind(region_id)
                     .bind(contract_id)
@@ -3015,13 +3129,52 @@ impl ContractCollectionStore {
             }
         }
         sqlx::query("INSERT INTO regional_observations (region_id, observed_at, outcome, expected_pages) VALUES ($1,$2,'complete',$3)").bind(region_id).bind(now).bind(expected_pages as i32).execute(&mut *transaction).await?;
+        let retry_after = manifest_failures
+            .iter()
+            .filter_map(|failure| failure.retry_after)
+            .max();
+        let failure_classification =
+            (!manifest_failures.is_empty()).then_some("manifest_collection");
+        let failure_detail = (!manifest_failures.is_empty()).then(|| {
+            let first_detail = manifest_failures
+                .first()
+                .map(|failure| sanitize_contract_failure_detail(&failure.detail))
+                .unwrap_or_default();
+            format!(
+                "{} manifest failures; first: {first_detail}",
+                manifest_failures.len()
+            )
+        });
+        sqlx::query("INSERT INTO regional_observation_batches (region_id, recovery_epoch_id, attempt_started_at, completed_at, outcome, expected_pages, pages_attempted, pages_observed, observed_contract_count, resolved_contract_count, manifest_failure_count, consistency_evidence, failure_classification, failure_detail, retry_after) VALUES ($1,$2,$3,$4,'complete',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)")
+            .bind(region_id)
+            .bind(recovery_epoch_id)
+            .bind(evidence.attempt_started_at)
+            .bind(now)
+            .bind(expected_pages as i32)
+            .bind(evidence.pages_attempted as i32)
+            .bind(evidence.pages_observed as i32)
+            .bind(i64::try_from(evidence.observed_contract_count).unwrap_or(i64::MAX))
+            .bind(i64::try_from(evidence.resolved_contract_count).unwrap_or(i64::MAX))
+            .bind(i64::try_from(evidence.manifest_failure_count).unwrap_or(i64::MAX))
+            .bind(evidence.consistency_evidence())
+            .bind(failure_classification)
+            .bind(failure_detail)
+            .bind(retry_after)
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query("UPDATE contract_collection_failures SET resolved_at = $2 WHERE region_id = $1 AND resource_key = $3 AND failure_kind = 'inconclusive_observation' AND resolved_at IS NULL AND classification IS NULL")
             .bind(region_id)
             .bind(now)
             .bind(regional_snapshot_resource_key(region_id))
             .execute(&mut *transaction)
             .await?;
-        sqlx::query("UPDATE regional_collection_metadata SET baseline_at = COALESCE(baseline_at, $2), complete_observations = complete_observations + 1, last_complete_at = $2, recovery_baseline_at = CASE WHEN $3 THEN $2 ELSE recovery_baseline_at END WHERE region_id = $1").bind(region_id).bind(now).bind(recovery_baseline).execute(&mut *transaction).await?;
+        sqlx::query("UPDATE regional_collection_metadata SET baseline_at = COALESCE(baseline_at, $2), complete_observations = complete_observations + 1, last_complete_at = $2, recovery_baseline_at = CASE WHEN $3 THEN $2 ELSE recovery_baseline_at END, current_recovery_epoch_id = $4, requires_silent_baseline = FALSE WHERE region_id = $1")
+            .bind(region_id)
+            .bind(now)
+            .bind(recovery_baseline)
+            .bind(recovery_epoch_id)
+            .execute(&mut *transaction)
+            .await?;
         transaction.commit().await?;
         Ok(RecordComplete {
             baseline_established: baseline_at.is_none(),
@@ -3029,30 +3182,62 @@ impl ContractCollectionStore {
             observed_contracts: summaries.len(),
             newly_observed,
             observed: resolved_contracts.to_vec(),
-            retry_after: manifest_failures
-                .iter()
-                .filter_map(|failure| failure.retry_after)
-                .max(),
+            retry_after,
         })
     }
 
     async fn record_inconclusive(
         &self,
         region_id: i64,
+        evidence: &RegionalAttemptEvidence,
+        failure_classification: &str,
         detail: &str,
         retry_after: Option<DateTime<Utc>>,
     ) -> Result<(), sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
         let now = Utc::now();
-        sqlx::query("INSERT INTO regional_observations (region_id, observed_at, outcome, detail) VALUES ($1,$2,'inconclusive',$3)").bind(region_id).bind(now).bind(detail).execute(&self.pool).await?;
-        self.record_failure(
-            Some(region_id),
-            None,
-            Some(&regional_snapshot_resource_key(region_id)),
-            "inconclusive_observation",
-            detail,
-            retry_after,
+        let recovery_epoch_id = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT current_recovery_epoch_id FROM regional_collection_metadata WHERE region_id = $1",
         )
-        .await
+        .bind(region_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .flatten();
+        let detail = sanitize_contract_failure_detail(detail);
+        sqlx::query("INSERT INTO regional_observations (region_id, observed_at, outcome, detail) VALUES ($1,$2,'inconclusive',$3)")
+            .bind(region_id)
+            .bind(now)
+            .bind(&detail)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("INSERT INTO regional_observation_batches (region_id, recovery_epoch_id, attempt_started_at, completed_at, outcome, expected_pages, pages_attempted, pages_observed, observed_contract_count, resolved_contract_count, manifest_failure_count, consistency_evidence, failure_classification, failure_detail, retry_after) VALUES ($1,$2,$3,$4,'inconclusive',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)")
+            .bind(region_id)
+            .bind(recovery_epoch_id)
+            .bind(evidence.attempt_started_at)
+            .bind(now)
+            .bind(evidence.expected_pages.map(|pages| pages as i32))
+            .bind(evidence.pages_attempted as i32)
+            .bind(evidence.pages_observed as i32)
+            .bind(i64::try_from(evidence.observed_contract_count).unwrap_or(i64::MAX))
+            .bind(i64::try_from(evidence.resolved_contract_count).unwrap_or(i64::MAX))
+            .bind(i64::try_from(evidence.manifest_failure_count).unwrap_or(i64::MAX))
+            .bind(evidence.consistency_evidence())
+            .bind(failure_classification)
+            .bind(&detail)
+            .bind(retry_after)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("INSERT INTO contract_collection_failures (region_id, contract_id, resource_key, observed_at, failure_kind, detail, retry_after) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+            .bind(Some(region_id))
+            .bind(Option::<i64>::None)
+            .bind(Some(regional_snapshot_resource_key(region_id)))
+            .bind(now)
+            .bind("inconclusive_observation")
+            .bind(&detail)
+            .bind(retry_after)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await
     }
 
     async fn record_failure(
@@ -3174,6 +3359,7 @@ impl ContractCollectionStore {
         resolution: &AwaitingContractResolution,
         evidence_response_at: DateTime<Utc>,
         metadata: &CacheMetadata,
+        response_kind: &str,
         notification_pending: bool,
     ) -> Result<bool, sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
@@ -3194,7 +3380,7 @@ impl ContractCollectionStore {
                     "last_public_observed_at": resolution.last_public_observed_at,
                     "absence_observed_at": resolution.absence_observed_at,
                     "evidence_response_at": evidence_response_at,
-                    "response": "204_no_content",
+                    "response": response_kind,
                 }))
                 .execute(&mut *transaction)
                 .await?;
@@ -3421,6 +3607,108 @@ struct ManifestCollectionFailure {
     retry_after: Option<DateTime<Utc>>,
 }
 
+struct CompleteRegionalObservation<'a> {
+    evidence: &'a RegionalAttemptEvidence,
+    summaries: &'a [SummaryObservedContract],
+    resolved_contracts: &'a [ObservedContract],
+    manifest_failures: &'a [ManifestCollectionFailure],
+}
+
+#[derive(Clone, Debug)]
+struct RegionalAttemptEvidence {
+    attempt_started_at: DateTime<Utc>,
+    expected_pages: Option<u32>,
+    pages_attempted: u32,
+    pages_observed: u32,
+    observed_contract_count: usize,
+    resolved_contract_count: usize,
+    manifest_failure_count: usize,
+    first_page: Option<CacheMetadata>,
+    last_page: Option<CacheMetadata>,
+    expected_pages_matches_first: Option<bool>,
+    last_modified_matches_first: Option<bool>,
+    duplicate_contract_count: usize,
+    failure_response: Option<CacheMetadata>,
+}
+
+impl RegionalAttemptEvidence {
+    fn new(attempt_started_at: DateTime<Utc>) -> Self {
+        Self {
+            attempt_started_at,
+            expected_pages: None,
+            pages_attempted: 0,
+            pages_observed: 0,
+            observed_contract_count: 0,
+            resolved_contract_count: 0,
+            manifest_failure_count: 0,
+            first_page: None,
+            last_page: None,
+            expected_pages_matches_first: None,
+            last_modified_matches_first: None,
+            duplicate_contract_count: 0,
+            failure_response: None,
+        }
+    }
+
+    fn capture_failure(&mut self, error: &ContractCollectionError) {
+        if let ContractCollectionError::Esi(error) = error {
+            self.failure_response = Some(error.metadata.clone());
+        }
+    }
+
+    fn consistency_evidence(&self) -> Value {
+        serde_json::json!({
+            "pages_attempted": self.pages_attempted,
+            "pages_observed": self.pages_observed,
+            "expected_pages": self.expected_pages,
+            "observed_summary_count": self.observed_contract_count,
+            "resolved_contract_count": self.resolved_contract_count,
+            "manifest_failure_count": self.manifest_failure_count,
+            "first_page": self.first_page.as_ref().map(compact_cache_metadata),
+            "last_page": self.last_page.as_ref().map(compact_cache_metadata),
+            "failure_response": self.failure_response.as_ref().map(compact_cache_metadata),
+            "consistency": {
+                "expected_pages_matches_first": self.expected_pages_matches_first,
+                "last_modified_matches_first": self.last_modified_matches_first,
+                "duplicate_contract_count": self.duplicate_contract_count,
+            },
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RegionalCollectionAttemptError {
+    error: ContractCollectionError,
+    evidence: RegionalAttemptEvidence,
+}
+
+fn compact_cache_metadata(metadata: &CacheMetadata) -> Value {
+    serde_json::json!({
+        "etag": metadata.etag,
+        "last_modified": metadata.last_modified,
+        "expires_at": metadata.expires_at,
+        "expected_pages": metadata.expected_pages,
+        "error_limit_remain": metadata.error_limit_remain,
+        "error_limit_reset": metadata.error_limit_reset,
+        "rate_limit_group": metadata.rate_limit_group,
+        "rate_limit_limit": metadata.rate_limit_limit,
+        "rate_limit_remaining": metadata.rate_limit_remaining,
+        "rate_limit_used": metadata.rate_limit_used,
+        "retry_after": metadata.retry_after,
+    })
+}
+
+fn regional_attempt_error(
+    error: ContractCollectionError,
+    evidence: &mut RegionalAttemptEvidence,
+) -> RegionalCollectionAttemptError {
+    evidence.capture_failure(&error);
+    RegionalCollectionAttemptError {
+        error,
+        evidence: evidence.clone(),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AwaitingContractResolution {
     region_id: i64,
@@ -3494,6 +3782,14 @@ impl ContractCollectionError {
             Self::Esi(error) => error.retry_after,
             Self::Database(_) | Self::Cache(_) => None,
         }
+    }
+}
+
+fn collection_failure_classification(error: &ContractCollectionError) -> &'static str {
+    match error {
+        ContractCollectionError::Esi(_) => "esi",
+        ContractCollectionError::Cache(_) => "consistency",
+        ContractCollectionError::Database(_) => "database",
     }
 }
 
@@ -3675,7 +3971,8 @@ impl ContractCollector {
         let mut retry_after = None;
         let mut remaining_embed_context_enrichments = MAX_EMBED_CONTEXT_ENRICHMENTS_PER_CYCLE;
         for region_id in regions {
-            match self.collect_region(region_id).await {
+            let attempt_started_at = Utc::now();
+            match self.collect_region(region_id, attempt_started_at).await {
                 Ok(recorded) => {
                     let observed_contracts = recorded.observed_contracts;
                     retry_after = std::cmp::max(retry_after, recorded.retry_after);
@@ -3715,10 +4012,17 @@ impl ContractCollector {
                     }
                 }
                 Err(error) => {
-                    let detail = error.to_string();
-                    let regional_retry_after = error.retry_after();
+                    let failure_classification = collection_failure_classification(&error.error);
+                    let detail = error.error.to_string();
+                    let regional_retry_after = error.error.retry_after();
                     self.store
-                        .record_inconclusive(region_id, &detail, regional_retry_after)
+                        .record_inconclusive(
+                            region_id,
+                            &error.evidence,
+                            failure_classification,
+                            &detail,
+                            regional_retry_after,
+                        )
                         .await?;
                     retry_after = std::cmp::max(retry_after, regional_retry_after);
                     outcomes.push(CollectionOutcome::Inconclusive {
@@ -3750,47 +4054,92 @@ impl ContractCollector {
     async fn collect_region(
         &self,
         region_id: i64,
-    ) -> Result<RecordComplete, ContractCollectionError> {
-        let first_page = self.contract_page(region_id, 1).await?;
-        let expected_pages = first_page
-            .1
-            .expected_pages
-            .ok_or_else(|| ContractCollectionError::Cache("page 1 omitted X-Pages".to_string()))?;
+        attempt_started_at: DateTime<Utc>,
+    ) -> Result<RecordComplete, RegionalCollectionAttemptError> {
+        let mut evidence = RegionalAttemptEvidence::new(attempt_started_at);
+        evidence.pages_attempted += 1;
+        let (mut contracts, first_page_metadata) = match self.contract_page(region_id, 1).await {
+            Ok(page) => page,
+            Err(error) => return Err(regional_attempt_error(error, &mut evidence)),
+        };
+        evidence.pages_observed += 1;
+        evidence.first_page = Some(first_page_metadata.clone());
+        evidence.last_page = Some(first_page_metadata.clone());
+        evidence.expected_pages = first_page_metadata.expected_pages;
+        evidence.observed_contract_count = contracts
+            .iter()
+            .filter(|contract| contract.is_public_item_exchange())
+            .count();
+        let expected_pages = match first_page_metadata.expected_pages {
+            Some(expected_pages) => expected_pages,
+            None => {
+                return Err(regional_attempt_error(
+                    ContractCollectionError::Cache("page 1 omitted X-Pages".to_string()),
+                    &mut evidence,
+                ));
+            }
+        };
         if expected_pages == 0 {
-            return Err(ContractCollectionError::Cache(
-                "X-Pages must be at least 1".to_string(),
+            return Err(regional_attempt_error(
+                ContractCollectionError::Cache("X-Pages must be at least 1".to_string()),
+                &mut evidence,
             ));
         }
-        let mut contracts = first_page.0;
-        let first_page_last_modified = first_page.1.last_modified;
         for page in 2..=expected_pages {
-            let (mut page_contracts, metadata) = self.contract_page(region_id, page).await?;
+            evidence.pages_attempted += 1;
+            let (mut page_contracts, metadata) = match self.contract_page(region_id, page).await {
+                Ok(page) => page,
+                Err(error) => return Err(regional_attempt_error(error, &mut evidence)),
+            };
+            evidence.pages_observed += 1;
+            evidence.last_page = Some(metadata.clone());
+            evidence.observed_contract_count += page_contracts
+                .iter()
+                .filter(|contract| contract.is_public_item_exchange())
+                .count();
+            evidence.expected_pages_matches_first =
+                Some(metadata.expected_pages == Some(expected_pages));
             if metadata.expected_pages != Some(expected_pages) {
-                return Err(ContractCollectionError::Cache(format!(
-                    "page {page} reported inconsistent X-Pages"
-                )));
+                return Err(regional_attempt_error(
+                    ContractCollectionError::Cache(format!(
+                        "page {page} reported inconsistent X-Pages"
+                    )),
+                    &mut evidence,
+                ));
             }
-            if metadata.last_modified != first_page_last_modified {
-                return Err(ContractCollectionError::Cache(format!(
-                    "page {page} reported inconsistent Last-Modified"
-                )));
+            evidence.last_modified_matches_first =
+                Some(metadata.last_modified == first_page_metadata.last_modified);
+            if metadata.last_modified != first_page_metadata.last_modified {
+                return Err(regional_attempt_error(
+                    ContractCollectionError::Cache(format!(
+                        "page {page} reported inconsistent Last-Modified"
+                    )),
+                    &mut evidence,
+                ));
             }
             contracts.append(&mut page_contracts);
         }
-        let mut contract_ids = HashSet::with_capacity(contracts.len());
-        if contracts
+        evidence.expected_pages_matches_first.get_or_insert(true);
+        evidence.last_modified_matches_first.get_or_insert(true);
+        let contract_ids = contracts
             .iter()
-            .any(|contract| !contract_ids.insert(contract.contract_id))
-        {
-            return Err(ContractCollectionError::Cache(
-                "a contract appeared on more than one page".to_string(),
+            .map(|contract| contract.contract_id)
+            .collect::<HashSet<_>>();
+        evidence.duplicate_contract_count = contracts.len().saturating_sub(contract_ids.len());
+        if evidence.duplicate_contract_count > 0 {
+            return Err(regional_attempt_error(
+                ContractCollectionError::Cache(
+                    "a contract appeared on more than one page".to_string(),
+                ),
+                &mut evidence,
             ));
         }
         let public_contracts: Vec<_> = contracts
             .into_iter()
             .filter(PublicContract::is_public_item_exchange)
             .collect();
-        let summaries = public_contracts
+        evidence.observed_contract_count = public_contracts.len();
+        let summaries = match public_contracts
             .into_iter()
             .map(|contract| {
                 Ok(SummaryObservedContract {
@@ -3798,7 +4147,11 @@ impl ContractCollector {
                     contract,
                 })
             })
-            .collect::<Result<Vec<_>, ContractCollectionError>>()?;
+            .collect::<Result<Vec<_>, ContractCollectionError>>()
+        {
+            Ok(summaries) => summaries,
+            Err(error) => return Err(regional_attempt_error(error, &mut evidence)),
+        };
         let mut observed = Vec::with_capacity(summaries.len());
         let mut manifest_failures = Vec::new();
         let mut limiter_active = false;
@@ -3821,36 +4174,54 @@ impl ContractCollector {
                             .cloned()
                             .collect(),
                     };
-                    let manifest_hash = content_hash(&manifest)?;
+                    let manifest_hash = match content_hash(&manifest) {
+                        Ok(manifest_hash) => manifest_hash,
+                        Err(error) => return Err(regional_attempt_error(error, &mut evidence)),
+                    };
                     observed.push(ObservedContract {
                         contract: summary.contract.clone(),
                         manifest,
                         fact_hash: summary.fact_hash.clone(),
                         manifest_hash,
                     });
+                    evidence.resolved_contract_count = observed.len();
                 }
-                Err(error @ ContractCollectionError::Database(_)) => return Err(error),
+                Err(error @ ContractCollectionError::Database(_)) => {
+                    evidence.manifest_failure_count = manifest_failures.len();
+                    return Err(regional_attempt_error(error, &mut evidence));
+                }
                 Err(error) => {
+                    evidence.capture_failure(&error);
                     manifest_failures.push(ManifestCollectionFailure {
                         contract_id: summary.contract.contract_id,
                         detail: error.to_string(),
                         retry_after: error.retry_after(),
                     });
-                    limiter_active = self.store.active_esi_limiter_deadline().await?.is_some();
+                    evidence.manifest_failure_count = manifest_failures.len();
+                    limiter_active = match self.store.active_esi_limiter_deadline().await {
+                        Ok(deadline) => deadline.is_some(),
+                        Err(error) => {
+                            return Err(regional_attempt_error(error.into(), &mut evidence));
+                        }
+                    };
                 }
             }
         }
-        Ok(self
-            .store
+        evidence.resolved_contract_count = observed.len();
+        evidence.manifest_failure_count = manifest_failures.len();
+        self.store
             .record_complete(
                 region_id,
-                expected_pages,
-                &summaries,
-                &observed,
-                &manifest_failures,
+                CompleteRegionalObservation {
+                    evidence: &evidence,
+                    summaries: &summaries,
+                    resolved_contracts: &observed,
+                    manifest_failures: &manifest_failures,
+                },
                 self.recovery_gap,
             )
-            .await?)
+            .await
+            .map_err(|error| regional_attempt_error(error.into(), &mut evidence))
     }
 
     async fn resolve_awaiting_resolutions(
@@ -4011,7 +4382,7 @@ impl ContractCollector {
                     .await?;
                 Ok(None)
             }
-            ContractItemProbe::NoContent(metadata) => {
+            probe @ (ContractItemProbe::NoContent(_) | ContractItemProbe::AcceptedByPlayer(_)) => {
                 let evidence_response_at = Utc::now();
                 if evidence_response_at >= resolution.contract.date_expired {
                     return self
@@ -4035,7 +4406,10 @@ impl ContractCollector {
                     .confirm_acceptance(
                         resolution,
                         evidence_response_at,
-                        &metadata,
+                        probe.metadata(),
+                        probe
+                            .acceptance_response_kind()
+                            .expect("acceptance probes have a response kind"),
                         event.is_some(),
                     )
                     .await?
@@ -4045,7 +4419,7 @@ impl ContractCollector {
                     Ok(None)
                 }
             }
-            ContractItemProbe::NotFound(_) => {
+            ContractItemProbe::NotPublic(_) | ContractItemProbe::NotFound(_) => {
                 let observed_at = Utc::now();
                 let state = if observed_at >= resolution.contract.date_expired {
                     ContractResolutionState::Expired
