@@ -1,4 +1,4 @@
-use super::{FeedError, KillmailFeed};
+use super::{FeedError, FeedHealthProvider, KillmailFeed};
 use crate::config::AppConfig;
 use crate::models::{R2z2KillmailResponse, R2z2SequenceResponse, ZkDataNoEsi};
 use rand::Rng;
@@ -373,6 +373,10 @@ impl KillmailFeed for R2z2Feed {
                 Ok(None)
             }
         }
+    }
+
+    fn health_provider(&self) -> FeedHealthProvider {
+        FeedHealthProvider::R2z2
     }
 }
 

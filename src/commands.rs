@@ -13,6 +13,7 @@ pub mod contract_subscribe;
 pub mod contract_unsubscribe;
 pub mod diag;
 pub mod find_unsubscribed;
+pub mod health;
 pub mod subscribe;
 pub mod sync_clear;
 pub mod sync_remove;
