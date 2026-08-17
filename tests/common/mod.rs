@@ -36,7 +36,9 @@ pub fn load_fixture(name: &str) -> ZkData {
 }
 
 /// Create an AppState with the given subscriptions
-pub async fn create_app_state_with_subscriptions(subscriptions: Vec<Subscription>) -> Arc<AppState> {
+pub async fn create_app_state_with_subscriptions(
+    subscriptions: Vec<Subscription>,
+) -> Arc<AppState> {
     let app_config =
         load_app_config().expect("Failed to load config - check .env for DISCORD_BOT_TOKEN");
 

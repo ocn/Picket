@@ -31,7 +31,7 @@ impl Command for SyncClearCommand {
         app_state: &Arc<AppState>,
     ) {
         let user_id = command.user.id;
-        
+
         let response_content = {
             let _lock = app_state.user_standings_file_lock.lock().await;
             let mut standings_map = app_state.user_standings.write().unwrap();

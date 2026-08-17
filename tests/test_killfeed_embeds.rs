@@ -26,16 +26,34 @@ use std::sync::Arc;
 
 /// Test fixtures for killfeed mode
 const KILLFEED_FIXTURES: &[(&str, &str)] = &[
-    ("132461133_ceptor_npc_test.json", "Ceptor + NPC attacker - tests unknown ship groups"),
-    ("132235921_supers_involved.json", "Naglfar FI - high value kill"),
+    (
+        "132461133_ceptor_npc_test.json",
+        "Ceptor + NPC attacker - tests unknown ship groups",
+    ),
+    (
+        "132235921_supers_involved.json",
+        "Naglfar FI - high value kill",
+    ),
     ("131501165_drill_kill.json", "Metenox drill - 1B+ ISK"),
     ("132249213_naglfar_loss.json", "Naglfar loss - dread kill"),
     ("132302304_caps_attacking.json", "Revelation - cap fight"),
     ("131126432_keepstar_kill.json", "Keepstar - massive battle"),
-    ("130734446_unknown_group_test.json", "Revelation killed by Infested Carrier - tests ESI group name lookup"),
-    ("132462203_global_feed_test.json", "Astero killed by Astrahus - tests global feed (no entity match)"),
-    ("132467594_dictor_af_tie.json", "Squall killed by 2x Dictors + 2x AFs - tests tie-breaking by GROUP_NAMES priority"),
-    ("132817097_npc_priority_test.json", "NPC-heavy kill - tests known group priority in fleet comp"),
+    (
+        "130734446_unknown_group_test.json",
+        "Revelation killed by Infested Carrier - tests ESI group name lookup",
+    ),
+    (
+        "132462203_global_feed_test.json",
+        "Astero killed by Astrahus - tests global feed (no entity match)",
+    ),
+    (
+        "132467594_dictor_af_tie.json",
+        "Squall killed by 2x Dictors + 2x AFs - tests tie-breaking by GROUP_NAMES priority",
+    ),
+    (
+        "132817097_npc_priority_test.json",
+        "NPC-heavy kill - tests known group priority in fleet comp",
+    ),
 ];
 
 /// Deepwater Hooligans alliance ID
@@ -189,6 +207,9 @@ async fn send_killfeed_embeds() {
     }
 
     println!("{}", "=".repeat(70));
-    println!("=== Test complete: {} killfeed embeds sent ===", total_embeds);
+    println!(
+        "=== Test complete: {} killfeed embeds sent ===",
+        total_embeds
+    );
     println!("{}", "=".repeat(70));
 }

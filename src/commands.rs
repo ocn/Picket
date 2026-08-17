@@ -12,12 +12,12 @@ pub mod contract_command;
 pub mod contract_subscribe;
 pub mod contract_unsubscribe;
 pub mod diag;
-pub mod subscribe;
-pub mod sync_standings;
-pub mod sync_remove;
-pub mod sync_clear;
-pub mod unsubscribe;
 pub mod find_unsubscribed;
+pub mod subscribe;
+pub mod sync_clear;
+pub mod sync_remove;
+pub mod sync_standings;
+pub mod unsubscribe;
 
 #[async_trait]
 pub trait Command: Send + Sync {

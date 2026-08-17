@@ -3,13 +3,13 @@ use crate::config::{AppState, SsoState, StandingSource};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use serenity::async_trait;
+use serenity::builder::CreateApplicationCommand;
 use serenity::builder::{CreateActionRow, CreateButton, CreateSelectMenu};
 use serenity::model::prelude::command::CommandOptionType;
 use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
 use serenity::prelude::Context;
 use std::sync::Arc;
 use tracing::error;
-use serenity::builder::CreateApplicationCommand;
 
 pub struct SyncStandingsCommand;
 
@@ -73,9 +73,21 @@ impl Command for SyncStandingsCommand {
             return;
         }
 
-        let subscription_id = command.data.options[0].value.as_ref().unwrap().as_str().unwrap().to_string();
+        let subscription_id = command.data.options[0]
+            .value
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
 
-        let standing_source = match command.data.options[1].value.as_ref().unwrap().as_str().unwrap() {
+        let standing_source = match command.data.options[1]
+            .value
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .unwrap()
+        {
             "corporation" => StandingSource::Corporation,
             "alliance" => StandingSource::Alliance,
             _ => StandingSource::Character,
@@ -113,7 +125,8 @@ impl Command for SyncStandingsCommand {
             select_menu.options(|f| {
                 for token in existing_tokens {
                     f.create_option(|o| {
-                        o.label(token.character_name).value(token.character_id.to_string())
+                        o.label(token.character_name)
+                            .value(token.character_id.to_string())
                     });
                 }
                 f

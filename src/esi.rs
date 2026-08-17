@@ -45,10 +45,17 @@ impl EsiClient {
         }
     }
 
-    pub async fn load_killmail(&self, url: String) -> Result<KillmailData, Box<dyn Error + Send + Sync>> {
+    pub async fn load_killmail(
+        &self,
+        url: String,
+    ) -> Result<KillmailData, Box<dyn Error + Send + Sync>> {
         let response = self.client.get(url).send().await?;
         if !response.status().is_success() {
-            return Err(format!("ESI API returned status for killmail query: {}", response.status()).into());
+            return Err(format!(
+                "ESI API returned status for killmail query: {}",
+                response.status()
+            )
+            .into());
         }
         let data: KillmailData = response.json().await?;
         Ok(data)
@@ -142,7 +149,9 @@ impl EsiClient {
         struct EsiGroup {
             name: String,
         }
-        let group_info: EsiGroup = self.fetch(&format!("universe/groups/{}/", group_id)).await?;
+        let group_info: EsiGroup = self
+            .fetch(&format!("universe/groups/{}/", group_id))
+            .await?;
         Ok(group_info.name)
     }
 
@@ -338,7 +347,10 @@ mod tests {
         // The request must fail (not hang). Whether it's a timeout or connect
         // error depends on the OS networking stack, but either confirms the
         // client has bounded behavior.
-        assert!(result.is_err(), "Expected error, got Ok — client may be hanging");
+        assert!(
+            result.is_err(),
+            "Expected error, got Ok — client may be hanging"
+        );
     }
 
     #[tokio::test]

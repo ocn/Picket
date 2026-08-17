@@ -1888,7 +1888,10 @@ should have been ignored by the attacker-only filter: {:#?}", results.len(), res
         let zk_data = load_fixture("132249213_naglfar_loss.json");
 
         // Verify fixture data is as expected
-        assert_eq!(zk_data.killmail.victim.ship_type_id, 19722, "Victim should be a Naglfar");
+        assert_eq!(
+            zk_data.killmail.victim.ship_type_id, 19722,
+            "Victim should be a Naglfar"
+        );
 
         let app_state = mock_app_state();
 
@@ -1898,7 +1901,7 @@ should have been ignored by the attacker-only filter: {:#?}", results.len(), res
             // Naglfar (victim) - Dreadnought group 485
             ships.insert(19722, 485);
             // Attacker ships - all subcaps (not group 485)
-            ships.insert(624, 28);    // Badger - Industrial
+            ships.insert(624, 28); // Badger - Industrial
             ships.insert(22428, 906); // Maulus Navy Issue - Combat Recon
             ships.insert(22430, 906); // Exequror Navy Issue - Combat Recon
             ships.insert(22440, 906); // Osprey Navy Issue - Combat Recon
@@ -1948,7 +1951,10 @@ should have been ignored by the attacker-only filter: {:#?}", results.len(), res
         let zk_data = load_fixture("132253134_drill_kill_by_thanatos.json");
 
         // Verify fixture data is as expected
-        assert_eq!(zk_data.killmail.victim.ship_type_id, 81826, "Victim should be a Drill");
+        assert_eq!(
+            zk_data.killmail.victim.ship_type_id, 81826,
+            "Victim should be a Drill"
+        );
 
         let app_state = mock_app_state();
 
@@ -1957,10 +1963,10 @@ should have been ignored by the attacker-only filter: {:#?}", results.len(), res
             let mut ships = app_state.ships.write().unwrap();
             // Victim - Drill (Upwell structure, not a capital)
             ships.insert(81826, 1404); // Upwell structure group
-            // Attacker ships
-            ships.insert(23911, 547);  // Thanatos - Carrier (capital!)
-            ships.insert(23913, 659);  // Nyx - Supercarrier (capital!)
-            ships.insert(22428, 906);  // Maulus Navy Issue - Combat Recon (subcap)
+                                       // Attacker ships
+            ships.insert(23911, 547); // Thanatos - Carrier (capital!)
+            ships.insert(23913, 659); // Nyx - Supercarrier (capital!)
+            ships.insert(22428, 906); // Maulus Navy Issue - Combat Recon (subcap)
         }
 
         // Create a subscription that looks for capital ATTACKERS

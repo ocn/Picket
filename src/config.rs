@@ -441,13 +441,27 @@ impl fmt::Display for FeedProvider {
     }
 }
 
-fn default_4() -> usize { 4 }
-fn default_6() -> u64 { 6 }
-fn default_10() -> u64 { 10 }
-fn default_15() -> u64 { 15 }
-fn default_60() -> u64 { 60 }
-fn default_300() -> u64 { 300 }
-fn default_512() -> usize { 512 }
+fn default_4() -> usize {
+    4
+}
+fn default_6() -> u64 {
+    6
+}
+fn default_10() -> u64 {
+    10
+}
+fn default_15() -> u64 {
+    15
+}
+fn default_60() -> u64 {
+    60
+}
+fn default_300() -> u64 {
+    300
+}
+fn default_512() -> usize {
+    512
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {

@@ -1,7 +1,7 @@
 use crate::commands::{get_option_value, Command};
 use crate::config::{
-    save_subscriptions_for_guild, Action, AppState, Filter, FilterNode, PingType, 
-    SimpleFilter, Subscription, SystemRange, Target, TargetableCondition, TargetedFilter,
+    save_subscriptions_for_guild, Action, AppState, Filter, FilterNode, PingType, SimpleFilter,
+    Subscription, SystemRange, Target, TargetableCondition, TargetedFilter,
 };
 use serenity::async_trait;
 use serenity::builder::CreateApplicationCommand;
