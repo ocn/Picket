@@ -101,7 +101,10 @@ impl Command for HealthCommand {
             let Some(store) = available_contract_store(&store_handle).await else {
                 return "Health storage is unavailable.".to_string();
             };
-            match store.health_snapshot().await {
+            match store
+                .health_snapshot_with_watchdog_publication_failures()
+                .await
+            {
                 Ok(Some(snapshot)) => render_health_response(HEALTH_OPERATOR_ID, &snapshot)
                     .expect("configured operator can render health"),
                 Ok(None) => "No health snapshot has been recorded yet.".to_string(),

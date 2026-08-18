@@ -5,8 +5,8 @@ use crate::config::{
     PingType, SimpleFilter, StandingSource, Subscription, System,
 };
 use crate::contract_intelligence::{
-    ContractDelivery, ContractDeliveryError, ContractNotificationMessage, PreparedContractDelivery,
-    ShipGroupLookup, ShipGroupResolver,
+    ContractDelivery, ContractDeliveryError, ContractNotificationMessage, HealthDiscordPublisher,
+    HealthPublishError, PreparedContractDelivery, ShipGroupLookup, ShipGroupResolver,
 };
 use crate::esi::Celestial;
 use crate::models::{Attacker, ZkData};
@@ -209,6 +209,157 @@ pub struct PreparedDispatch {
 
 pub struct DiscordContractDelivery {
     http: Arc<Http>,
+}
+
+pub struct DiscordHealthPublisher {
+    http: Arc<Http>,
+}
+
+impl DiscordHealthPublisher {
+    pub fn new(http: Arc<Http>) -> Self {
+        Self { http }
+    }
+}
+
+#[async_trait]
+impl HealthDiscordPublisher for DiscordHealthPublisher {
+    async fn create_view(
+        &self,
+        channel_id: u64,
+        content: &str,
+    ) -> Result<String, HealthPublishError> {
+        let message = ChannelId(channel_id)
+            .send_message(&self.http, |builder| {
+                configure_health_view_message(builder, channel_id, content)
+            })
+            .await
+            .map_err(health_publish_error)?;
+        Ok(message.id.to_string())
+    }
+
+    async fn update_view(
+        &self,
+        channel_id: u64,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), HealthPublishError> {
+        ChannelId(channel_id)
+            .edit_message(&self.http, health_message_id(message_id)?, |builder| {
+                builder
+                    .content(content)
+                    .allowed_mentions(|mentions| mentions.empty_parse())
+            })
+            .await
+            .map_err(health_publish_error)?;
+        Ok(())
+    }
+
+    async fn create_incident(
+        &self,
+        channel_id: u64,
+        content: &str,
+        mention_operator_id: Option<u64>,
+    ) -> Result<String, HealthPublishError> {
+        let message = ChannelId(channel_id)
+            .send_message(&self.http, |builder| {
+                configure_health_incident_message(builder, channel_id, content, mention_operator_id)
+            })
+            .await
+            .map_err(health_publish_error)?;
+        Ok(message.id.to_string())
+    }
+
+    async fn update_incident(
+        &self,
+        channel_id: u64,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), HealthPublishError> {
+        ChannelId(channel_id)
+            .edit_message(&self.http, health_message_id(message_id)?, |builder| {
+                builder
+                    .content(content)
+                    .allowed_mentions(|mentions| mentions.empty_parse())
+            })
+            .await
+            .map_err(health_publish_error)?;
+        Ok(())
+    }
+}
+
+fn configure_health_view_message<'a, 'builder>(
+    builder: &'builder mut CreateMessage<'a>,
+    channel_id: u64,
+    content: &str,
+) -> &'builder mut CreateMessage<'a> {
+    builder
+        .content(content)
+        .allowed_mentions(|mentions| mentions.empty_parse());
+    builder
+        .0
+        .insert("nonce", Value::String(format!("hwv-{channel_id}")));
+    builder.0.insert("enforce_nonce", Value::Bool(true));
+    builder
+}
+
+fn configure_health_incident_message<'a, 'builder>(
+    builder: &'builder mut CreateMessage<'a>,
+    channel_id: u64,
+    content: &str,
+    mention_operator_id: Option<u64>,
+) -> &'builder mut CreateMessage<'a> {
+    let content = mention_operator_id
+        .map(|operator_id| format!("<@{operator_id}>\n{content}"))
+        .unwrap_or_else(|| content.to_string());
+    builder.content(content).allowed_mentions(|mentions| {
+        let mentions = mentions.empty_parse();
+        if let Some(operator_id) = mention_operator_id {
+            mentions.users([operator_id])
+        } else {
+            mentions
+        }
+    });
+    builder
+        .0
+        .insert("nonce", Value::String(format!("hwi-{channel_id}")));
+    builder.0.insert("enforce_nonce", Value::Bool(true));
+    builder
+}
+
+fn health_message_id(message_id: &str) -> Result<u64, HealthPublishError> {
+    message_id.parse::<u64>().map_err(|_| {
+        HealthPublishError::Permanent("persisted health Discord message ID is invalid".to_string())
+    })
+}
+
+fn health_publish_error(error: serenity::Error) -> HealthPublishError {
+    let detail = error.to_string();
+    if let serenity::Error::Http(http_error) = &error {
+        if let serenity::http::error::Error::UnsuccessfulRequest(response) = &**http_error {
+            let status = response.status_code.as_u16();
+            return health_publish_error_from_response(
+                status,
+                response.error.code,
+                &response.error.message,
+            );
+        }
+    }
+    HealthPublishError::Transient(detail)
+}
+
+fn health_publish_error_from_response(
+    status: u16,
+    discord_code: isize,
+    message: &str,
+) -> HealthPublishError {
+    let detail = format!("Discord HTTP {status}, JSON code {discord_code}: {message}");
+    if discord_code == 10_008 {
+        HealthPublishError::UnknownMessage(detail)
+    } else if matches!(status, 400 | 401 | 403 | 404) {
+        HealthPublishError::Permanent(detail)
+    } else {
+        HealthPublishError::Transient(detail)
+    }
 }
 
 impl DiscordContractDelivery {
@@ -1964,6 +2115,22 @@ mod tests {
     }
 
     #[test]
+    fn only_discord_unknown_message_code_recreates_a_health_message() {
+        assert!(matches!(
+            health_publish_error_from_response(404, 10_008, "Unknown Message"),
+            HealthPublishError::UnknownMessage(_)
+        ));
+        assert!(matches!(
+            health_publish_error_from_response(404, 10_003, "Unknown Channel"),
+            HealthPublishError::Permanent(_)
+        ));
+        assert!(matches!(
+            health_publish_error_from_response(403, 50_013, "Missing Permissions"),
+            HealthPublishError::Permanent(_)
+        ));
+    }
+
+    #[test]
     fn single_group() {
         let input = vec![(358, 7)];
         let result = select_top_groups(input, 2);
@@ -2113,5 +2280,59 @@ mod tests {
             )),
             ContractDeliveryError::Transient(_)
         ));
+    }
+
+    #[test]
+    fn health_messages_use_channel_scoped_nonces_and_only_the_configured_incident_mention() {
+        let mut view = CreateMessage::default();
+        configure_health_view_message(&mut view, 444, "Health: degraded");
+        assert_eq!(view.0["allowed_mentions"]["parse"], serde_json::json!([]));
+        assert_eq!(view.0["nonce"], "hwv-444");
+        assert_eq!(view.0["enforce_nonce"], true);
+
+        let mut incident = CreateMessage::default();
+        configure_health_incident_message(
+            &mut incident,
+            444,
+            "Health incident: critical",
+            Some(crate::commands::health::HEALTH_OPERATOR_ID),
+        );
+        assert_eq!(
+            incident.0["content"],
+            format!(
+                "<@{}>\nHealth incident: critical",
+                crate::commands::health::HEALTH_OPERATOR_ID
+            )
+        );
+        assert_eq!(
+            incident.0["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            incident.0["allowed_mentions"]["users"],
+            serde_json::json!([crate::commands::health::HEALTH_OPERATOR_ID.to_string()])
+        );
+        assert_eq!(incident.0["nonce"], "hwi-444");
+        assert_eq!(incident.0["enforce_nonce"], true);
+
+        let mut remediated_view = CreateMessage::default();
+        configure_health_view_message(&mut remediated_view, 555, "Health: degraded");
+        let mut remediated_incident = CreateMessage::default();
+        configure_health_incident_message(
+            &mut remediated_incident,
+            555,
+            "Health incident: critical",
+            None,
+        );
+        assert_eq!(remediated_view.0["nonce"], "hwv-555");
+        assert_eq!(remediated_incident.0["nonce"], "hwi-555");
+        assert_ne!(view.0["nonce"], remediated_view.0["nonce"]);
+        assert_ne!(incident.0["nonce"], remediated_incident.0["nonce"]);
+        assert!(view.0["nonce"]
+            .as_str()
+            .is_some_and(|nonce| nonce.len() <= 25));
+        assert!(incident.0["nonce"]
+            .as_str()
+            .is_some_and(|nonce| nonce.len() <= 25));
     }
 }

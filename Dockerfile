@@ -11,8 +11,9 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --release && \
-    cp /app/target/release/killbot-rust /app/killbot-rust
+    cargo build --release --bins && \
+    cp /app/target/release/killbot-rust /app/killbot-rust && \
+    cp /app/target/release/health_watchdog /app/health_watchdog
 
 # Stage 2: Create the final, minimal image
 FROM debian:bullseye
@@ -20,7 +21,7 @@ FROM debian:bullseye
 WORKDIR /app
 
 # Copy the compiled binary from the builder stage
-COPY --from=builder /app/killbot-rust .
+COPY --from=builder /app/killbot-rust /app/health_watchdog ./
 
 # The config directory will be mounted as a volume by docker-compose.
 # No need to copy it here.
