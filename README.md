@@ -215,6 +215,8 @@ This application is written in Rust and containerized using Docker.
 2.  Copy `docs/env.sample` to `.env` and add your Discord bot token and client ID.
 3.  Run `docker-compose up --build -d` to start the application.
 
+For the optional authenticated Contract Intelligence structure resolver, run `ENV_FILE=.env scripts/structure-resolver-provision.sh`. It performs dedicated-character consent, validates the returned authorization, probes known structures, and writes only the required runtime variables; see the [operator runbook](docs/contract-intelligence.md#optional-structure-resolver).
+
 #### Example `.env` file
 
 ```shell

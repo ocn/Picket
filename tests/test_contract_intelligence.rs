@@ -173,6 +173,8 @@ fn structure_resolver_environment_reads_only_named_unicode_settings() {
             "STRUCTURE_RESOLVER_CHARACTER_ID"
             | "STRUCTURE_RESOLVER_CREDENTIAL_REVISION"
             | "STRUCTURE_RESOLVER_REFRESH_TOKEN"
+            | "STRUCTURE_RESOLVER_CLIENT_ID"
+            | "STRUCTURE_RESOLVER_CLIENT_SECRET"
             | "EVE_CLIENT_ID"
             | "EVE_CLIENT_SECRET" => None,
             _ => panic!("unrelated environment setting {name} must not be read"),
