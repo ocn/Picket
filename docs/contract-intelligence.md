@@ -30,6 +30,8 @@ docker compose ps
 
 For a non-Compose process, set `CONTRACT_DATABASE_URL` and optionally `CONTRACT_COLLECTION_INTERVAL_SECS` (default: 300 seconds); use `127.0.0.1:5433` for the local exposed Compose port. `CONTRACT_REGIONAL_CONCURRENCY` defaults to `2` and accepts only `1` through `4`; set it to `1` to roll back collection scheduling to sequential regional attempts without changing schema or retained observations. An absent value uses the default; malformed, out-of-range, or non-Unicode values disable only contract collection at startup and leave the killmail feed running. PostgreSQL URI userinfo reserves characters including `:`, `/`, `?`, `#`, `[`, `]`, and `@`; percent-encode them (and a literal `%`) in the URL, while `CONTRACT_DATABASE_PASSWORD` remains the raw password. Each successful connection runs the SQLx migrations. If `CONTRACT_DATABASE_URL` is absent, contract collection and its commands are unavailable, while the killmail feed continues unchanged.
 
+Compose also starts `health-watchdog`, a separate REST-only process: it has no Discord gateway session and cannot block the bot or collection loops. It intentionally has no PostgreSQL health-gated `depends_on`, so it can report a cold-start database outage. It reads the persisted heartbeat and health snapshot, maintains one non-pinging Health View in `HEALTH_CHANNEL_ID`, and opens one consolidated incident when the current degradation set becomes non-empty. Only the configured operator is mentioned when that incident is created; view updates, incident edits, and recovery never mention anyone. `WATCHDOG_EVALUATION_INTERVAL_SECS` defaults to 60 and must be at least 10 seconds. `WATCHDOG_CONFIG_REVISION` defaults to `1`; bump it after correcting a Discord token or permission issue to retry a permanent publication failure. Changing `HEALTH_CHANNEL_ID` creates the persistent messages in the new channel without editing the old channel. PostgreSQL failures are marked degraded on the first consecutive failure and critical on the third; the interval bounds reconnect attempts. During an outage a warm watchdog cache can keep editing its known message IDs. A cold watchdog can create nonce-stable messages, but cannot persist their IDs until PostgreSQL returns; it then adopts those cached IDs rather than creating replacements. `Http::new` keeps Serenity's HTTP rate limiter enabled: it consumes a valid Discord `429 Retry-After` response before the publisher returns; a returned request failure (including an unparseable rate-limit response) uses the watchdog's transient retry deadline. Discord permanent errors are stored as visible health evidence and are not retried until configuration or persisted state changes.
+
 Keep the PostgreSQL volume when rolling back the bot image. To roll back only the scheduling change, set `CONTRACT_REGIONAL_CONCURRENCY=1` and restart `discordbot`; no data rollback is needed. A prior bot release ignores the contract tables; the JSON-backed killmail subscriptions, caches, standings, and feed checkpoints are separate and unchanged. Re-enable the current image and database URL to resume collection; migrations are re-run safely against an already-current database. Do not remove the PostgreSQL volume as a rollback step.
 
 ## Subscriptions
@@ -56,13 +58,17 @@ The collector records public facts, manifests, presence intervals, lifecycle evi
 
 Each regional attempt has its own committed observation batch. A cycle drains prepared Discord deliveries before starting ESI discovery, then runs at most the configured number of regions. A completed region can prepare and deliver its conclusive events while another region is still in flight; the final cycle report remains in public region-discovery order. When ESI records a persisted limiter or `Retry-After` boundary, no further regional request starts; attempts already in flight retain their own complete or inconclusive batch from actual evidence. A near-exhausted shared rate bucket is persisted and paces every subsequent ESI request in-cycle; it waits between admissions rather than repeatedly restarting an early regional sweep.
 
-Monitor the bot logs for `contract collection cycle finished`, rate-limit pauses, database unavailability, and unresolved delivery failures. Useful local checks are:
+Monitor the bot and watchdog logs for `contract collection cycle finished`, rate-limit pauses, database unavailability, and unresolved delivery failures. Useful local checks are:
 
 ```sh
 docker compose ps
+docker compose config --quiet
 docker compose logs --tail=200 discordbot
+docker compose logs --tail=200 health-watchdog
 docker compose exec postgres psql -U killbot_contracts -d killbot_contracts -c "SELECT status, count(*) FROM contract_outbound_deliveries GROUP BY status"
 docker compose exec postgres psql -U killbot_contracts -d killbot_contracts -c "SELECT failure_kind, count(*) FROM contract_collection_failures WHERE resolved_at IS NULL AND classification IS NULL GROUP BY failure_kind"
+docker compose exec postgres psql -U killbot_contracts -d killbot_contracts -c "SELECT view_key, channel_id, message_id, failure_kind, next_attempt_at FROM health_discord_views"
+docker compose exec postgres psql -U killbot_contracts -d killbot_contracts -c "SELECT incident_key, channel_id, message_id, active, failure_kind, next_attempt_at FROM health_discord_incidents"
 ```
 
 There is no runtime retention job. Contract facts, manifests, presence intervals, deliveries, and unresolved failures are retained. Complete `regional_observations` older than 90 days have a tested library cleanup path but are not automatically pruned. Size the database, back it up, and introduce an explicit retention policy before operating long term.
@@ -98,5 +104,7 @@ This release has no authenticated-contract feed, counterparty tracking, provisio
 - [ESI rate limiting](https://developers.eveonline.com/docs/services/esi/rate-limiting/)
 - [Discord interaction responses](https://docs.discord.com/developers/interactions/receiving-and-responding)
 - [Discord message creation and nonce enforcement](https://docs.discord.com/developers/resources/message)
+- [Discord rate limits](https://docs.discord.com/developers/topics/rate-limits)
+- [Serenity HTTP rate limiter](https://docs.rs/serenity/0.11.7/serenity/http/struct.Ratelimiter.html)
 - [Docker Compose variable interpolation](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/)
 - [PostgreSQL connection strings](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING)

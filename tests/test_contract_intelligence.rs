@@ -13,7 +13,8 @@ use killbot_rust::contract_intelligence::{
     ContractLocationContext, ContractObservationContext, ContractPingLimiter, ContractPingType,
     ContractRequestPacer, ContractResolutionState, ContractSubscription, DeliveryFailureKind,
     DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HealthCheck, HealthClock, HealthCycle,
-    HealthRuntimeConfig, HealthStatus, HttpPublicContractEsi, PreparedContractDelivery,
+    HealthDiscordPublisher, HealthPublishError, HealthRuntimeConfig, HealthStatus, HealthWatchdog,
+    HealthWatchdogConfig, HealthWatchdogRunner, HttpPublicContractEsi, PreparedContractDelivery,
     PublicContract, PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
     SolarSystemPosition,
 };
@@ -3059,6 +3060,316 @@ impl FixedHealthClock {
 impl HealthClock for FixedHealthClock {
     fn now(&self) -> chrono::DateTime<Utc> {
         *self.0.lock().unwrap()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HealthPublishCall {
+    CreateView {
+        channel_id: u64,
+        content: String,
+    },
+    UpdateView {
+        channel_id: u64,
+        message_id: String,
+        content: String,
+    },
+    CreateIncident {
+        channel_id: u64,
+        content: String,
+        mention_operator_id: Option<u64>,
+    },
+    UpdateIncident {
+        channel_id: u64,
+        message_id: String,
+        content: String,
+    },
+}
+
+struct RecordingHealthPublisher {
+    calls: StdMutex<Vec<HealthPublishCall>>,
+    view_updates: StdMutex<Option<Vec<Result<(), HealthPublishError>>>>,
+    incident_updates: StdMutex<Option<Vec<Result<(), HealthPublishError>>>>,
+}
+
+impl Default for RecordingHealthPublisher {
+    fn default() -> Self {
+        Self {
+            calls: StdMutex::new(Vec::new()),
+            view_updates: StdMutex::new(None),
+            incident_updates: StdMutex::new(None),
+        }
+    }
+}
+
+impl RecordingHealthPublisher {
+    fn with_incident_updates(incident_updates: Vec<Result<(), HealthPublishError>>) -> Self {
+        Self {
+            calls: StdMutex::new(Vec::new()),
+            view_updates: StdMutex::new(None),
+            incident_updates: StdMutex::new(Some(incident_updates)),
+        }
+    }
+
+    fn with_view_updates(view_updates: Vec<Result<(), HealthPublishError>>) -> Self {
+        Self {
+            calls: StdMutex::new(Vec::new()),
+            view_updates: StdMutex::new(Some(view_updates)),
+            incident_updates: StdMutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl HealthDiscordPublisher for RecordingHealthPublisher {
+    async fn create_view(
+        &self,
+        channel_id: u64,
+        content: &str,
+    ) -> Result<String, HealthPublishError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HealthPublishCall::CreateView {
+                channel_id,
+                content: content.to_string(),
+            });
+        Ok("health-view-1".to_string())
+    }
+
+    async fn update_view(
+        &self,
+        channel_id: u64,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), HealthPublishError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HealthPublishCall::UpdateView {
+                channel_id,
+                message_id: message_id.to_string(),
+                content: content.to_string(),
+            });
+        let mut view_updates = self.view_updates.lock().unwrap();
+        match view_updates.as_mut() {
+            Some(updates) => updates.remove(0),
+            None => Ok(()),
+        }
+    }
+
+    async fn create_incident(
+        &self,
+        channel_id: u64,
+        content: &str,
+        mention_operator_id: Option<u64>,
+    ) -> Result<String, HealthPublishError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HealthPublishCall::CreateIncident {
+                channel_id,
+                content: content.to_string(),
+                mention_operator_id,
+            });
+        Ok("health-incident-1".to_string())
+    }
+
+    async fn update_incident(
+        &self,
+        channel_id: u64,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), HealthPublishError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HealthPublishCall::UpdateIncident {
+                channel_id,
+                message_id: message_id.to_string(),
+                content: content.to_string(),
+            });
+        let mut incident_updates = self.incident_updates.lock().unwrap();
+        match incident_updates.as_mut() {
+            Some(updates) => updates.remove(0),
+            None => Ok(()),
+        }
+    }
+}
+
+struct ScriptedHealthPublisher {
+    calls: StdMutex<Vec<HealthPublishCall>>,
+    view_creates: StdMutex<Vec<Result<String, HealthPublishError>>>,
+    incident_creates: StdMutex<Option<Vec<Result<String, HealthPublishError>>>>,
+}
+
+impl ScriptedHealthPublisher {
+    fn with_view_creates(view_creates: Vec<Result<String, HealthPublishError>>) -> Self {
+        Self {
+            calls: StdMutex::new(Vec::new()),
+            view_creates: StdMutex::new(view_creates),
+            incident_creates: StdMutex::new(None),
+        }
+    }
+
+    fn with_creates(
+        view_creates: Vec<Result<String, HealthPublishError>>,
+        incident_creates: Vec<Result<String, HealthPublishError>>,
+    ) -> Self {
+        Self {
+            calls: StdMutex::new(Vec::new()),
+            view_creates: StdMutex::new(view_creates),
+            incident_creates: StdMutex::new(Some(incident_creates)),
+        }
+    }
+}
+
+#[async_trait]
+impl HealthDiscordPublisher for ScriptedHealthPublisher {
+    async fn create_view(
+        &self,
+        channel_id: u64,
+        content: &str,
+    ) -> Result<String, HealthPublishError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HealthPublishCall::CreateView {
+                channel_id,
+                content: content.to_string(),
+            });
+        self.view_creates.lock().unwrap().remove(0)
+    }
+
+    async fn update_view(
+        &self,
+        channel_id: u64,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), HealthPublishError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HealthPublishCall::UpdateView {
+                channel_id,
+                message_id: message_id.to_string(),
+                content: content.to_string(),
+            });
+        Ok(())
+    }
+
+    async fn create_incident(
+        &self,
+        channel_id: u64,
+        content: &str,
+        mention_operator_id: Option<u64>,
+    ) -> Result<String, HealthPublishError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HealthPublishCall::CreateIncident {
+                channel_id,
+                content: content.to_string(),
+                mention_operator_id,
+            });
+        let mut incident_creates = self.incident_creates.lock().unwrap();
+        match incident_creates.as_mut() {
+            Some(creates) => creates.remove(0),
+            None => Ok("health-incident-1".to_string()),
+        }
+    }
+
+    async fn update_incident(
+        &self,
+        channel_id: u64,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), HealthPublishError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HealthPublishCall::UpdateIncident {
+                channel_id,
+                message_id: message_id.to_string(),
+                content: content.to_string(),
+            });
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct PermanentIncidentHealthPublisher {
+    calls: StdMutex<Vec<HealthPublishCall>>,
+}
+
+#[async_trait]
+impl HealthDiscordPublisher for PermanentIncidentHealthPublisher {
+    async fn create_view(
+        &self,
+        channel_id: u64,
+        content: &str,
+    ) -> Result<String, HealthPublishError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HealthPublishCall::CreateView {
+                channel_id,
+                content: content.to_string(),
+            });
+        Ok("health-view-1".to_string())
+    }
+
+    async fn update_view(
+        &self,
+        channel_id: u64,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), HealthPublishError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HealthPublishCall::UpdateView {
+                channel_id,
+                message_id: message_id.to_string(),
+                content: content.to_string(),
+            });
+        Ok(())
+    }
+
+    async fn create_incident(
+        &self,
+        channel_id: u64,
+        content: &str,
+        mention_operator_id: Option<u64>,
+    ) -> Result<String, HealthPublishError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HealthPublishCall::CreateIncident {
+                channel_id,
+                content: content.to_string(),
+                mention_operator_id,
+            });
+        Err(HealthPublishError::Permanent(
+            "Discord HTTP 403: Missing Permissions".to_string(),
+        ))
+    }
+
+    async fn update_incident(
+        &self,
+        channel_id: u64,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), HealthPublishError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HealthPublishCall::UpdateIncident {
+                channel_id,
+                message_id: message_id.to_string(),
+                content: content.to_string(),
+            });
+        Ok(())
     }
 }
 
@@ -13134,6 +13445,1313 @@ fn health_command_renders_the_persisted_snapshot_only_for_the_configured_operato
 }
 
 #[tokio::test]
+async fn watchdog_creates_one_non_pinging_view_and_one_consolidated_operator_incident() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to watchdog database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed watchdog time");
+    let snapshot_check = HealthCheck {
+        key: "contract_progress".to_string(),
+        status: HealthStatus::Degraded,
+        observed_at: now - chrono::Duration::minutes(16),
+        evidence: "region 10000002: regional contract progress is 960s old".to_string(),
+        consecutive_failures: 0,
+    };
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now - chrono::Duration::minutes(6))
+    .execute(&pool)
+    .await
+    .expect("seed stale bot heartbeat");
+    sqlx::query("INSERT INTO health_snapshots (singleton, status, observed_at, evidence) VALUES (TRUE, 'degraded', $1, $2)")
+        .bind(snapshot_check.observed_at)
+        .bind(serde_json::to_value(vec![snapshot_check]).expect("serialize snapshot check"))
+        .execute(&pool)
+        .await
+        .expect("seed persisted health snapshot");
+    let publisher = Arc::new(RecordingHealthPublisher::default());
+    HealthWatchdog::new(
+        store.clone(),
+        Arc::new(FixedHealthClock(StdMutex::new(now))),
+        HealthWatchdogConfig::for_channel(444),
+        publisher.clone(),
+    )
+    .run_once()
+    .await
+    .expect("watchdog publishes persisted degradation");
+
+    assert_eq!(
+        publisher.calls.lock().unwrap().as_slice(),
+        [
+            HealthPublishCall::CreateView {
+                channel_id: 444,
+                content: "Health: degraded\ncontract_progress: region 10000002: regional contract progress is 960s old\nheartbeat: bot heartbeat is 360s old".to_string(),
+            },
+            HealthPublishCall::CreateIncident {
+                channel_id: 444,
+                content: "Health incident: degraded\ncontract_progress: region 10000002: regional contract progress is 960s old\nheartbeat: bot heartbeat is 360s old".to_string(),
+                mention_operator_id: Some(HEALTH_OPERATOR_ID),
+            },
+        ]
+    );
+    assert_eq!(
+        store
+            .health_discord_view_identity()
+            .await
+            .expect("read view")
+            .expect("saved view")
+            .message_id,
+        Some("health-view-1".to_string())
+    );
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchdog_restart_updates_the_persistent_view_and_visibly_resolves_the_incident() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to watchdog restart database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed watchdog restart time");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now - chrono::Duration::minutes(11))
+    .execute(&pool)
+    .await
+    .expect("seed critical heartbeat");
+    sqlx::query("INSERT INTO health_snapshots (singleton, status, observed_at, evidence) VALUES (TRUE, 'healthy', $1, '[]'::jsonb)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed otherwise healthy snapshot");
+    let publisher = Arc::new(RecordingHealthPublisher::default());
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    HealthWatchdog::new(
+        store.clone(),
+        clock.clone(),
+        HealthWatchdogConfig::for_channel(444),
+        publisher.clone(),
+    )
+    .run_once()
+    .await
+    .expect("open the stale-heartbeat incident");
+    publisher.calls.lock().unwrap().clear();
+
+    sqlx::query("UPDATE bot_heartbeats SET observed_at = $1 WHERE component = 'bot'")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("restore heartbeat");
+    HealthWatchdog::new(
+        database.store().await,
+        clock,
+        HealthWatchdogConfig::for_channel(444),
+        publisher.clone(),
+    )
+    .run_once()
+    .await
+    .expect("a restarted watchdog reads persisted Discord identities");
+
+    assert_eq!(
+        publisher.calls.lock().unwrap().as_slice(),
+        [
+            HealthPublishCall::UpdateView {
+                channel_id: 444,
+                message_id: "health-view-1".to_string(),
+                content: "Health: healthy\nall checks healthy".to_string(),
+            },
+            HealthPublishCall::UpdateIncident {
+                channel_id: 444,
+                message_id: "health-incident-1".to_string(),
+                content: "Health incident: resolved\nall checks healthy".to_string(),
+            },
+        ]
+    );
+    let active: bool = sqlx::query_scalar(
+        "SELECT active FROM health_discord_incidents WHERE incident_key = 'current'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read resolved incident state");
+    assert!(!active);
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchdog_missing_heartbeat_uses_a_durable_startup_grace_anchor() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 18, 12, 0, 0)
+        .single()
+        .expect("fixed watchdog startup time");
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    let publisher = Arc::new(RecordingHealthPublisher::default());
+    let watchdog = HealthWatchdog::new(
+        store.clone(),
+        clock.clone(),
+        HealthWatchdogConfig::for_channel(444),
+        publisher,
+    );
+
+    assert_eq!(
+        watchdog.run_once().await.expect("initial grace").status,
+        HealthStatus::Healthy
+    );
+    clock.advance(chrono::Duration::minutes(4));
+    assert_eq!(
+        watchdog
+            .run_once()
+            .await
+            .expect("grace before threshold")
+            .status,
+        HealthStatus::Healthy
+    );
+    clock.advance(chrono::Duration::minutes(1));
+    let restarted = HealthWatchdog::new(
+        database.store().await,
+        clock.clone(),
+        HealthWatchdogConfig::for_channel(444),
+        Arc::new(RecordingHealthPublisher::default()),
+    );
+    assert_eq!(
+        restarted
+            .run_once()
+            .await
+            .expect("restart preserves startup anchor")
+            .status,
+        HealthStatus::Degraded
+    );
+    clock.advance(chrono::Duration::minutes(5));
+    assert_eq!(
+        restarted
+            .run_once()
+            .await
+            .expect("critical missing heartbeat")
+            .status,
+        HealthStatus::Critical
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchdog_runner_adopts_its_cold_postgres_startup_anchor_before_the_bot_heartbeat_exists() {
+    let database = TemporaryDatabase::unavailable().await;
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 18, 12, 0, 0)
+        .single()
+        .expect("fixed cold-start time");
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    let runner = HealthWatchdogRunner::new(
+        database.url.clone(),
+        clock.clone(),
+        HealthWatchdogConfig::for_channel(444),
+        Arc::new(RecordingHealthPublisher::default()),
+    );
+    assert_eq!(
+        runner.run_once().await.status,
+        HealthStatus::Degraded,
+        "the database outage is immediately degraded"
+    );
+
+    clock.advance(chrono::Duration::minutes(4));
+    database.create().await;
+    assert_eq!(
+        runner.run_once().await.status,
+        HealthStatus::Healthy,
+        "a bot that remains absent is still inside the watchdog's original grace period"
+    );
+    clock.advance(chrono::Duration::minutes(1));
+    assert_eq!(
+        runner.run_once().await.status,
+        HealthStatus::Degraded,
+        "recovery adopts, rather than refreshes, the cold-start anchor"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchdog_persists_discord_retry_after_and_does_not_retry_before_the_deadline() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to watchdog retry database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed watchdog retry time");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now - chrono::Duration::minutes(6))
+    .execute(&pool)
+    .await
+    .expect("seed stale heartbeat");
+    sqlx::query("INSERT INTO health_snapshots (singleton, status, observed_at, evidence) VALUES (TRUE, 'healthy', $1, '[]'::jsonb)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed healthy snapshot");
+    let publisher = Arc::new(ScriptedHealthPublisher::with_view_creates(vec![
+        Err(HealthPublishError::RetryAfter {
+            detail: "Discord HTTP 429".to_string(),
+            retry_after: chrono::Duration::minutes(5),
+        }),
+        Ok("health-view-1".to_string()),
+    ]));
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    let watchdog = HealthWatchdog::new(
+        store,
+        clock.clone(),
+        HealthWatchdogConfig::for_channel(444),
+        publisher.clone(),
+    );
+
+    watchdog
+        .run_once()
+        .await
+        .expect("Discord publication failure remains observational");
+    let (failure_kind, next_attempt_at): (Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT failure_kind, next_attempt_at FROM health_discord_views WHERE view_key = 'primary'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read persisted Discord retry state");
+    assert_eq!(failure_kind.as_deref(), Some("transient"));
+    assert_eq!(next_attempt_at, Some(now + chrono::Duration::minutes(5)));
+
+    clock.advance(chrono::Duration::minutes(4));
+    watchdog
+        .run_once()
+        .await
+        .expect("watchdog remains observational before the retry deadline");
+    assert_eq!(
+        publisher
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| matches!(call, HealthPublishCall::CreateView { .. }))
+            .count(),
+        1,
+        "the watchdog does not hammer Discord before Retry-After"
+    );
+
+    clock.advance(chrono::Duration::minutes(1));
+    watchdog
+        .run_once()
+        .await
+        .expect("watchdog retries when Discord requested");
+    assert_eq!(
+        publisher
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| matches!(call, HealthPublishCall::CreateView { .. }))
+            .count(),
+        2
+    );
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchdog_runner_reports_first_and_third_postgres_outages_from_a_warm_cache() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to watchdog outage database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed watchdog outage time");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed current bot heartbeat");
+    sqlx::query("INSERT INTO health_snapshots (singleton, status, observed_at, evidence) VALUES (TRUE, 'healthy', $1, '[]'::jsonb)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed healthy snapshot");
+    let publisher = Arc::new(RecordingHealthPublisher::default());
+    let runner = HealthWatchdogRunner::new(
+        database.url.clone(),
+        Arc::new(FixedHealthClock(StdMutex::new(now))),
+        HealthWatchdogConfig::for_channel(444),
+        publisher.clone(),
+    );
+    assert_eq!(
+        runner.run_once().await.status,
+        HealthStatus::Healthy,
+        "warm the watchdog's persisted Discord identity cache"
+    );
+    publisher.calls.lock().unwrap().clear();
+    pool.close().await;
+    drop(store);
+    database.destroy().await;
+
+    assert_eq!(runner.run_once().await.status, HealthStatus::Degraded);
+    assert_eq!(runner.run_once().await.status, HealthStatus::Degraded);
+    assert_eq!(runner.run_once().await.status, HealthStatus::Critical);
+    let calls = publisher.calls.lock().unwrap();
+    assert!(
+        matches!(calls.first(), Some(HealthPublishCall::UpdateView { message_id, .. }) if message_id == "health-view-1")
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| matches!(call, HealthPublishCall::CreateIncident { .. }))
+            .count(),
+        1,
+        "one consolidated outage incident is created from cached state"
+    );
+}
+
+#[tokio::test]
+async fn watchdog_runner_cold_postgres_outage_keeps_one_cached_discord_identity_and_adopts_it_on_recovery(
+) {
+    let database = TemporaryDatabase::unavailable().await;
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed cold-outage time");
+    let publisher = Arc::new(RecordingHealthPublisher::default());
+    let runner = HealthWatchdogRunner::new(
+        database.url.clone(),
+        Arc::new(FixedHealthClock(StdMutex::new(now))),
+        HealthWatchdogConfig::for_channel(444),
+        publisher.clone(),
+    );
+
+    assert_eq!(runner.run_once().await.status, HealthStatus::Degraded);
+    assert_eq!(runner.run_once().await.status, HealthStatus::Degraded);
+    assert_eq!(runner.run_once().await.status, HealthStatus::Critical);
+    assert_eq!(
+        publisher
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| matches!(call, HealthPublishCall::CreateView { .. }))
+            .count(),
+        1,
+        "cold-start PostgreSQL failure keeps one in-memory Health View identity"
+    );
+    assert_eq!(
+        publisher
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| matches!(call, HealthPublishCall::CreateIncident { .. }))
+            .count(),
+        1,
+        "cold-start PostgreSQL failure keeps one in-memory incident identity"
+    );
+
+    database.create().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect after cold outage recovery");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed recovered heartbeat");
+    sqlx::query("INSERT INTO health_snapshots (singleton, status, observed_at, evidence) VALUES (TRUE, 'healthy', $1, '[]'::jsonb)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed recovered health snapshot");
+    publisher.calls.lock().unwrap().clear();
+
+    assert_eq!(runner.run_once().await.status, HealthStatus::Healthy);
+    {
+        let recovery_calls = publisher.calls.lock().unwrap();
+        assert!(recovery_calls.iter().all(|call| !matches!(
+            call,
+            HealthPublishCall::CreateView { .. } | HealthPublishCall::CreateIncident { .. }
+        )));
+        assert!(
+            matches!(recovery_calls.first(), Some(HealthPublishCall::UpdateView { message_id, .. }) if message_id == "health-view-1")
+        );
+        assert!(
+            matches!(recovery_calls.get(1), Some(HealthPublishCall::UpdateIncident { message_id, .. }) if message_id == "health-incident-1")
+        );
+    }
+    assert_eq!(
+        store
+            .health_discord_view_identity()
+            .await
+            .expect("read adopted view")
+            .expect("persisted adopted view")
+            .message_id,
+        Some("health-view-1".to_string())
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT message_id FROM health_discord_incidents WHERE incident_key = 'current'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read adopted incident"),
+        Some("health-incident-1".to_string())
+    );
+
+    pool.close().await;
+    drop(store);
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchdog_runner_caches_discord_retry_after_during_a_postgres_outage() {
+    let database = TemporaryDatabase::unavailable().await;
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed outage retry time");
+    let retry_after = chrono::Duration::minutes(5);
+    let publisher = Arc::new(ScriptedHealthPublisher::with_creates(
+        vec![
+            Err(HealthPublishError::RetryAfter {
+                detail: "Discord HTTP 429".to_string(),
+                retry_after,
+            }),
+            Err(HealthPublishError::RetryAfter {
+                detail: "Discord HTTP 429".to_string(),
+                retry_after,
+            }),
+        ],
+        vec![
+            Err(HealthPublishError::RetryAfter {
+                detail: "Discord HTTP 429".to_string(),
+                retry_after,
+            }),
+            Err(HealthPublishError::RetryAfter {
+                detail: "Discord HTTP 429".to_string(),
+                retry_after,
+            }),
+        ],
+    ));
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    let runner = HealthWatchdogRunner::new(
+        database.url.clone(),
+        clock.clone(),
+        HealthWatchdogConfig::for_channel(444),
+        publisher.clone(),
+    );
+
+    assert_eq!(runner.run_once().await.status, HealthStatus::Degraded);
+    assert_eq!(runner.run_once().await.status, HealthStatus::Degraded);
+    assert_eq!(
+        publisher.calls.lock().unwrap().len(),
+        2,
+        "cached Retry-After prevents both outage publications from hammering Discord"
+    );
+    clock.advance(retry_after);
+    assert_eq!(runner.run_once().await.status, HealthStatus::Critical);
+    let calls = publisher.calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| matches!(call, HealthPublishCall::CreateView { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| matches!(call, HealthPublishCall::CreateIncident { .. }))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn watchdog_runner_adopts_cached_discord_failure_state_before_recovery_can_publish() {
+    for (name, error) in [
+        (
+            "retry-after",
+            HealthPublishError::RetryAfter {
+                detail: "Discord HTTP 429".to_string(),
+                retry_after: chrono::Duration::minutes(5),
+            },
+        ),
+        (
+            "permanent",
+            HealthPublishError::Permanent("Discord HTTP 403: Missing Permissions".to_string()),
+        ),
+    ] {
+        let database = TemporaryDatabase::unavailable().await;
+        let now = Utc
+            .with_ymd_and_hms(2026, 8, 18, 12, 0, 0)
+            .single()
+            .expect("fixed cached-state recovery time");
+        let publisher = Arc::new(ScriptedHealthPublisher::with_creates(
+            vec![Err(error.clone()), Ok("recreated-view".to_string())],
+            vec![Err(error), Ok("recreated-incident".to_string())],
+        ));
+        let runner = HealthWatchdogRunner::new(
+            database.url.clone(),
+            Arc::new(FixedHealthClock(StdMutex::new(now))),
+            HealthWatchdogConfig::for_channel(444),
+            publisher.clone(),
+        );
+        runner.run_once().await;
+        publisher.calls.lock().unwrap().clear();
+
+        database.create().await;
+        runner.run_once().await;
+        assert!(
+            publisher.calls.lock().unwrap().is_empty(),
+            "{name} outage state is adopted before a recovered watchdog can publish"
+        );
+
+        database.destroy().await;
+    }
+}
+
+#[test]
+fn watchdog_rejects_an_interval_that_would_tight_loop_postgres_retries() {
+    assert!(HealthWatchdogConfig::from_settings(&HashMap::from([(
+        "WATCHDOG_EVALUATION_INTERVAL_SECS".to_string(),
+        "9".to_string(),
+    )]))
+    .is_err());
+    assert!(HealthWatchdogConfig::from_settings(&HashMap::from([(
+        "HEALTH_CHANNEL_ID".to_string(),
+        (i64::MAX as u64 + 1).to_string(),
+    )]))
+    .is_err());
+    assert!(HealthWatchdogConfig::from_settings(&HashMap::from([(
+        "WATCHDOG_CONFIG_REVISION".to_string(),
+        " \t ".to_string(),
+    )]))
+    .is_err());
+}
+
+#[tokio::test]
+async fn watchdog_persists_a_permanent_incident_error_without_hammering_discord() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to permanent-incident database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed permanent-incident time");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now - chrono::Duration::minutes(6))
+    .execute(&pool)
+    .await
+    .expect("seed stale heartbeat");
+    sqlx::query("INSERT INTO health_snapshots (singleton, status, observed_at, evidence) VALUES (TRUE, 'healthy', $1, '[]'::jsonb)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed healthy snapshot");
+    let publisher = Arc::new(PermanentIncidentHealthPublisher::default());
+    let watchdog = HealthWatchdog::new(
+        store,
+        Arc::new(FixedHealthClock(StdMutex::new(now))),
+        HealthWatchdogConfig::for_channel(444),
+        publisher.clone(),
+    );
+
+    watchdog
+        .run_once()
+        .await
+        .expect("permanent Discord failure remains observational");
+    let (failure_kind, next_attempt_at): (Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT failure_kind, next_attempt_at FROM health_discord_incidents WHERE incident_key = 'current'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read permanent incident failure state");
+    assert_eq!(failure_kind.as_deref(), Some("permanent"));
+    assert_eq!(next_attempt_at, None);
+
+    watchdog
+        .run_once()
+        .await
+        .expect("permanent incident error does not stop health observation");
+    assert_eq!(
+        publisher
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| matches!(call, HealthPublishCall::CreateIncident { .. }))
+            .count(),
+        1,
+        "a permanent Discord permission error is not hammered"
+    );
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchdog_health_view_keeps_a_persisted_incident_publication_failure_visible_after_recovery(
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to watchdog publication-overlay database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 18, 12, 0, 0)
+        .single()
+        .expect("fixed publication-overlay time");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now - chrono::Duration::minutes(6))
+    .execute(&pool)
+    .await
+    .expect("seed stale heartbeat");
+    sqlx::query("INSERT INTO health_snapshots (singleton, status, observed_at, evidence) VALUES (TRUE, 'healthy', $1, '[]'::jsonb)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed healthy persisted snapshot");
+    let publisher = Arc::new(PermanentIncidentHealthPublisher::default());
+    let watchdog = HealthWatchdog::new(
+        store,
+        Arc::new(FixedHealthClock(StdMutex::new(now))),
+        HealthWatchdogConfig::for_channel(444),
+        publisher.clone(),
+    );
+    watchdog
+        .run_once()
+        .await
+        .expect("record a permanent incident publication failure");
+    publisher.calls.lock().unwrap().clear();
+    sqlx::query("UPDATE bot_heartbeats SET observed_at = $1 WHERE component = 'bot'")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("recover the bot heartbeat");
+
+    watchdog
+        .run_once()
+        .await
+        .expect("render persisted publication failure into the Health View");
+    {
+        let calls = publisher.calls.lock().unwrap();
+        assert!(matches!(
+            calls.first(),
+            Some(HealthPublishCall::UpdateView { content, .. })
+                if content.contains("Health: critical")
+                    && content.contains("discord_health_incident")
+                    && content.contains("Missing Permissions")
+        ));
+    }
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchdog_and_health_command_render_persisted_publication_failures_without_a_base_snapshot()
+{
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to no-snapshot watchdog publication database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 18, 12, 0, 0)
+        .single()
+        .expect("fixed no-snapshot publication time");
+    sqlx::query(
+        "INSERT INTO health_discord_views (view_key, channel_id, config_revision, message_id, last_error, failure_kind, next_attempt_at, attempt_count, updated_at) VALUES ('primary', 444, '1', 'health-view-1', 'Discord HTTP 403: Missing View Permission', 'permanent', NULL, 1, $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("persist a Health View publication failure without a base snapshot");
+    sqlx::query(
+        "INSERT INTO health_discord_incidents (incident_key, channel_id, config_revision, message_id, active, degradation, last_error, failure_kind, next_attempt_at, attempt_count, updated_at) VALUES ('current', 444, '1', 'health-incident-1', TRUE, '[]'::jsonb, 'Discord HTTP 403: Missing Incident Permission', 'permanent', NULL, 1, $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("persist a Health Incident publication failure without a base snapshot");
+    assert!(store
+        .health_snapshot()
+        .await
+        .expect("read absent base snapshot")
+        .is_none());
+
+    let operator_snapshot = store
+        .health_snapshot_with_watchdog_publication_failures()
+        .await
+        .expect("read publication failures without a base snapshot")
+        .expect("publication failures produce a Health Snapshot");
+    assert_eq!(operator_snapshot.status, HealthStatus::Critical);
+    let response = render_health_response(HEALTH_OPERATOR_ID, &operator_snapshot)
+        .expect("operator reads publication failures without a base snapshot");
+    assert!(response.contains("discord_health_view: critical"));
+    assert!(response.contains("Missing View Permission"));
+    assert!(response.contains("discord_health_incident: critical"));
+    assert!(response.contains("Missing Incident Permission"));
+
+    let publisher = Arc::new(RecordingHealthPublisher::default());
+    let mut config = HealthWatchdogConfig::for_channel(444);
+    config.config_revision = "2".to_string();
+    let watchdog = HealthWatchdog::new(
+        store,
+        Arc::new(FixedHealthClock(StdMutex::new(now))),
+        config,
+        publisher.clone(),
+    );
+    assert_eq!(
+        watchdog
+            .run_once()
+            .await
+            .expect("watchdog publishes publication failures without a base snapshot")
+            .status,
+        HealthStatus::Critical
+    );
+    {
+        let calls = publisher.calls.lock().unwrap();
+        assert!(matches!(
+            calls.first(),
+            Some(HealthPublishCall::UpdateView { content, .. })
+                if content.contains("discord_health_view")
+                    && content.contains("Missing View Permission")
+                    && content.contains("discord_health_incident")
+                    && content.contains("Missing Incident Permission")
+        ));
+    }
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchdog_does_not_hammer_a_permanent_incident_recovery_edit() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to recovery publication database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed recovery publication time");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now - chrono::Duration::minutes(6))
+    .execute(&pool)
+    .await
+    .expect("seed stale heartbeat");
+    sqlx::query("INSERT INTO health_snapshots (singleton, status, observed_at, evidence) VALUES (TRUE, 'healthy', $1, '[]'::jsonb)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed healthy snapshot");
+    let publisher = Arc::new(RecordingHealthPublisher::with_incident_updates(vec![Err(
+        HealthPublishError::Permanent("Discord HTTP 403: Missing Permissions".to_string()),
+    )]));
+    let watchdog = HealthWatchdog::new(
+        store,
+        Arc::new(FixedHealthClock(StdMutex::new(now))),
+        HealthWatchdogConfig::for_channel(444),
+        publisher.clone(),
+    );
+    watchdog
+        .run_once()
+        .await
+        .expect("open an incident before its recovery");
+    publisher.calls.lock().unwrap().clear();
+    sqlx::query("UPDATE bot_heartbeats SET observed_at = $1 WHERE component = 'bot'")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("recover the heartbeat");
+
+    watchdog
+        .run_once()
+        .await
+        .expect("record the permanent recovery edit failure");
+    watchdog
+        .run_once()
+        .await
+        .expect("permanent recovery failure remains observational");
+    assert_eq!(
+        publisher
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| matches!(call, HealthPublishCall::UpdateIncident { .. }))
+            .count(),
+        1,
+        "a permanent incident recovery error is not retried each watchdog interval"
+    );
+    let failure_kind: Option<String> = sqlx::query_scalar(
+        "SELECT failure_kind FROM health_discord_incidents WHERE incident_key = 'current'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read permanent recovery failure state");
+    assert_eq!(failure_kind.as_deref(), Some("permanent"));
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchdog_persists_a_permanent_view_error_without_hammering_and_exposes_it_to_health_readers(
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to permanent-view database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed permanent-view time");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now - chrono::Duration::minutes(6))
+    .execute(&pool)
+    .await
+    .expect("seed stale heartbeat");
+    sqlx::query("INSERT INTO health_snapshots (singleton, status, observed_at, evidence) VALUES (TRUE, 'healthy', $1, '[]'::jsonb)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed healthy snapshot");
+    let publisher = Arc::new(ScriptedHealthPublisher::with_view_creates(vec![Err(
+        HealthPublishError::Permanent("Discord HTTP 404: Unknown Channel".to_string()),
+    )]));
+    let watchdog = HealthWatchdog::new(
+        store.clone(),
+        Arc::new(FixedHealthClock(StdMutex::new(now))),
+        HealthWatchdogConfig::for_channel(444),
+        publisher.clone(),
+    );
+
+    watchdog
+        .run_once()
+        .await
+        .expect("permanent Health View failure remains observational");
+    watchdog
+        .run_once()
+        .await
+        .expect("permanent Health View error does not stop health observation");
+    assert_eq!(
+        publisher
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| matches!(call, HealthPublishCall::CreateView { .. }))
+            .count(),
+        1,
+        "a missing health channel is not hammered"
+    );
+    let (failure_kind, next_attempt_at): (Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT failure_kind, next_attempt_at FROM health_discord_views WHERE view_key = 'primary'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read permanent Health View failure state");
+    assert_eq!(failure_kind.as_deref(), Some("permanent"));
+    assert_eq!(next_attempt_at, None);
+    let snapshot = store
+        .health_snapshot_with_watchdog_publication_failures()
+        .await
+        .expect("read persisted watchdog failure evidence")
+        .expect("health snapshot exists");
+    let response = render_health_response(HEALTH_OPERATOR_ID, &snapshot)
+        .expect("operator reads persisted watchdog failure evidence");
+    assert!(response.contains("discord_health_view: critical"));
+    assert!(response.contains("Unknown Channel"));
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchdog_config_revision_retries_permanent_state_but_same_revision_remains_blocked() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to watchdog remediation database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 18, 12, 0, 0)
+        .single()
+        .expect("fixed remediation time");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now - chrono::Duration::minutes(6))
+    .execute(&pool)
+    .await
+    .expect("seed stale heartbeat");
+    sqlx::query("INSERT INTO health_snapshots (singleton, status, observed_at, evidence) VALUES (TRUE, 'healthy', $1, '[]'::jsonb)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed healthy snapshot");
+    let publisher = Arc::new(ScriptedHealthPublisher::with_creates(
+        vec![
+            Err(HealthPublishError::Permanent(
+                "Discord HTTP 403: Missing Permissions".to_string(),
+            )),
+            Ok("remediated-view".to_string()),
+        ],
+        vec![
+            Err(HealthPublishError::Permanent(
+                "Discord HTTP 403: Missing Permissions".to_string(),
+            )),
+            Ok("remediated-incident".to_string()),
+        ],
+    ));
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    let first_config = HealthWatchdogConfig::for_channel(444);
+    let first = HealthWatchdog::new(
+        store.clone(),
+        clock.clone(),
+        first_config.clone(),
+        publisher.clone(),
+    );
+    first
+        .run_once()
+        .await
+        .expect("record permanent publication state");
+    first
+        .run_once()
+        .await
+        .expect("same revision remains blocked");
+    assert_eq!(
+        publisher
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| matches!(call, HealthPublishCall::CreateView { .. }))
+            .count(),
+        1
+    );
+    let mut remediated_config = first_config;
+    remediated_config.config_revision = "2".to_string();
+    HealthWatchdog::new(store, clock, remediated_config, publisher.clone())
+        .run_once()
+        .await
+        .expect("revision bump remediates permanent state");
+    assert_eq!(
+        publisher
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| matches!(call, HealthPublishCall::CreateView { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT config_revision FROM health_discord_views WHERE view_key = 'primary'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("persist remediated revision"),
+        "2"
+    );
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchdog_channel_change_creates_new_messages_without_editing_the_old_channel() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to watchdog channel-remediation database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 18, 12, 0, 0)
+        .single()
+        .expect("fixed channel-remediation time");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now - chrono::Duration::minutes(6))
+    .execute(&pool)
+    .await
+    .expect("seed stale heartbeat");
+    sqlx::query("INSERT INTO health_snapshots (singleton, status, observed_at, evidence) VALUES (TRUE, 'healthy', $1, '[]'::jsonb)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed healthy snapshot");
+    let publisher = Arc::new(RecordingHealthPublisher::default());
+    HealthWatchdog::new(
+        store.clone(),
+        Arc::new(FixedHealthClock(StdMutex::new(now))),
+        HealthWatchdogConfig::for_channel(444),
+        publisher.clone(),
+    )
+    .run_once()
+    .await
+    .expect("create initial channel messages");
+    publisher.calls.lock().unwrap().clear();
+
+    HealthWatchdog::new(
+        store,
+        Arc::new(FixedHealthClock(StdMutex::new(now))),
+        HealthWatchdogConfig::for_channel(555),
+        publisher.clone(),
+    )
+    .run_once()
+    .await
+    .expect("migrate the Health View and incident channel");
+    {
+        let calls = publisher.calls.lock().unwrap();
+        assert!(calls.iter().any(|call| matches!(
+            call,
+            HealthPublishCall::CreateView {
+                channel_id: 555,
+                ..
+            }
+        )));
+        assert!(calls.iter().any(|call| matches!(
+            call,
+            HealthPublishCall::CreateIncident {
+                channel_id: 555,
+                mention_operator_id: None,
+                ..
+            }
+        )));
+        assert!(calls.iter().all(|call| !matches!(
+            call,
+            HealthPublishCall::UpdateView {
+                channel_id: 444,
+                ..
+            } | HealthPublishCall::UpdateIncident {
+                channel_id: 444,
+                ..
+            }
+        )));
+    }
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchdog_recreates_a_deleted_health_view_after_an_unknown_message_error() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to deleted-view database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 18, 12, 0, 0)
+        .single()
+        .expect("fixed deleted-view time");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now - chrono::Duration::minutes(6))
+    .execute(&pool)
+    .await
+    .expect("seed stale heartbeat");
+    sqlx::query("INSERT INTO health_snapshots (singleton, status, observed_at, evidence) VALUES (TRUE, 'healthy', $1, '[]'::jsonb)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed healthy snapshot");
+    let publisher = Arc::new(RecordingHealthPublisher::with_view_updates(vec![
+        Err(HealthPublishError::UnknownMessage(
+            "Discord HTTP 404, JSON code 10008".to_string(),
+        )),
+        Ok(()),
+    ]));
+    let watchdog = HealthWatchdog::new(
+        store,
+        Arc::new(FixedHealthClock(StdMutex::new(now))),
+        HealthWatchdogConfig::for_channel(444),
+        publisher.clone(),
+    );
+    watchdog
+        .run_once()
+        .await
+        .expect("create initial Health View");
+    publisher.calls.lock().unwrap().clear();
+    watchdog
+        .run_once()
+        .await
+        .expect("clear the deleted message identity");
+    watchdog
+        .run_once()
+        .await
+        .expect("recreate the deleted Health View");
+    {
+        let calls = publisher.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, HealthPublishCall::UpdateView { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, HealthPublishCall::CreateView { .. }))
+                .count(),
+            1,
+            "only Discord's Unknown Message code replaces the stale view identity"
+        );
+    }
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchdog_recreates_a_deleted_incident_after_an_unknown_message_error() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to deleted-incident database");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 18, 12, 0, 0)
+        .single()
+        .expect("fixed deleted-incident time");
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now - chrono::Duration::minutes(6))
+    .execute(&pool)
+    .await
+    .expect("seed stale heartbeat");
+    sqlx::query("INSERT INTO health_snapshots (singleton, status, observed_at, evidence) VALUES (TRUE, 'healthy', $1, '[]'::jsonb)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed healthy snapshot");
+    let publisher = Arc::new(RecordingHealthPublisher::with_incident_updates(vec![Err(
+        HealthPublishError::UnknownMessage("Discord HTTP 404, JSON code 10008".to_string()),
+    )]));
+    let watchdog = HealthWatchdog::new(
+        store,
+        Arc::new(FixedHealthClock(StdMutex::new(now))),
+        HealthWatchdogConfig::for_channel(444),
+        publisher.clone(),
+    );
+    watchdog.run_once().await.expect("create initial incident");
+    publisher.calls.lock().unwrap().clear();
+    watchdog
+        .run_once()
+        .await
+        .expect("clear the deleted incident identity");
+    watchdog
+        .run_once()
+        .await
+        .expect("recreate the deleted incident");
+    {
+        let calls = publisher.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, HealthPublishCall::UpdateIncident { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, HealthPublishCall::CreateIncident { .. }))
+                .count(),
+            1,
+            "only Discord's Unknown Message code replaces the stale incident identity"
+        );
+        assert!(calls.iter().any(|call| matches!(
+            call,
+            HealthPublishCall::CreateIncident {
+                mention_operator_id: None,
+                ..
+            }
+        )));
+    }
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn health_schema_failure_isolated_but_core_migration_failure_still_rejects_connect() {
     let health_database = TemporaryDatabase::new().await;
     let _ = health_database.store().await;
@@ -13143,10 +14761,10 @@ async fn health_schema_failure_isolated_but_core_migration_failure_still_rejects
         .await
         .expect("connect to introduce a health-only schema conflict");
     health_pool
-        .execute("DROP TABLE health_backlog_metrics, health_feed_telemetry, health_discord_views, health_transitions, health_check_results, health_snapshots, bot_heartbeats")
+        .execute("DROP TABLE health_discord_incidents, health_backlog_metrics, health_feed_telemetry, health_discord_views, health_transitions, health_check_results, health_snapshots, bot_heartbeats")
         .await
         .expect("remove applied health schema");
-    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 20260817000001")
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version IN (20260817000001, 20260817000004)")
         .execute(&health_pool)
         .await
         .expect("make the health migrations pending again");
@@ -14209,7 +15827,7 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         .fetch_one(&clean_pool)
         .await
         .expect("read clean migration ledger");
-    assert_eq!(clean_migration_count, 16);
+    assert_eq!(clean_migration_count, 17);
     let clean_pacing_column_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'esi_collection_limiter_state' AND column_name = 'next_request_at')",
     )
@@ -14237,12 +15855,29 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
             .expect("read clean location-evidence table");
         assert!(exists, "clean migration creates {table}");
     }
+    for (table, column) in [
+        ("health_discord_views", "config_revision"),
+        ("health_discord_incidents", "config_revision"),
+        ("health_watchdog_runtime", "started_at"),
+    ] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2)",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(&clean_pool)
+        .await
+        .expect("read clean watchdog continuity column");
+        assert!(exists, "clean migration adds {table}.{column}");
+    }
     for table in [
         "bot_heartbeats",
         "health_snapshots",
         "health_check_results",
         "health_transitions",
         "health_discord_views",
+        "health_discord_incidents",
+        "health_watchdog_runtime",
         "health_feed_telemetry",
         "health_backlog_metrics",
     ] {
@@ -14414,12 +16049,29 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
             .expect("read upgraded location-evidence table");
         assert!(exists, "current production migration creates {table}");
     }
+    for (table, column) in [
+        ("health_discord_views", "config_revision"),
+        ("health_discord_incidents", "config_revision"),
+        ("health_watchdog_runtime", "started_at"),
+    ] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2)",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(&upgraded_pool)
+        .await
+        .expect("read upgraded watchdog continuity column");
+        assert!(exists, "current production migration adds {table}.{column}");
+    }
     for table in [
         "bot_heartbeats",
         "health_snapshots",
         "health_check_results",
         "health_transitions",
         "health_discord_views",
+        "health_discord_incidents",
+        "health_watchdog_runtime",
         "health_feed_telemetry",
         "health_backlog_metrics",
     ] {

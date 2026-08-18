@@ -27,7 +27,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
-const HEALTH_MIGRATION_VERSIONS: &[i64] = &[20260817000001];
+const HEALTH_MIGRATION_VERSIONS: &[i64] = &[20260817000001, 20260817000004];
 const CONTRACT_COLLECTOR_USER_AGENT: &str = "killbot-rust Global Public Contract Intelligence";
 const MAX_EMBED_CONTEXT_ENRICHMENTS_PER_CYCLE: usize = 8;
 const MAX_TERMINAL_RESOLUTION_PROBES_PER_COMPLETED_REGION: usize = 8;
@@ -45,6 +45,29 @@ const CONTRACT_NOT_PUBLIC_ERROR: &str = "Contract not public";
 const HEALTH_SNAPSHOT_TRANSITION_LOCK_KEY: i64 = 7_142_300_993_001;
 const MAX_HEALTH_REGIONAL_DETAILS: usize = 12;
 pub const DEFAULT_HEALTH_CHANNEL_ID: u64 = 1_538_030_920_328_810_536;
+pub const DEFAULT_WATCHDOG_CONFIG_REVISION: &str = "1";
+const HEALTH_ENVIRONMENT_VARIABLES: &[&str] = &[
+    "HEALTH_EVALUATION_INTERVAL_SECS",
+    "HEALTH_CHANNEL_ID",
+    "HEALTH_HEARTBEAT_DEGRADED_SECS",
+    "HEALTH_HEARTBEAT_CRITICAL_SECS",
+    "HEALTH_POSTGRES_DEGRADED_FAILURES",
+    "HEALTH_POSTGRES_CRITICAL_FAILURES",
+    "HEALTH_CONTRACT_PROGRESS_DEGRADED_SECS",
+    "HEALTH_CONTRACT_PROGRESS_CRITICAL_SECS",
+    "HEALTH_ESI_PROGRESS_DEGRADED_SECS",
+    "HEALTH_ESI_PROGRESS_CRITICAL_SECS",
+    "HEALTH_PREPARED_DELIVERY_DEGRADED_SECS",
+    "HEALTH_PREPARED_DELIVERY_CRITICAL_SECS",
+    "HEALTH_BACKLOG_DEGRADED_SECS",
+    "HEALTH_BACKLOG_CRITICAL_SECS",
+    "HEALTH_R2Z2_PROGRESS_DEGRADED_SECS",
+    "HEALTH_R2Z2_PROGRESS_CRITICAL_SECS",
+    "HEALTH_FEED_VALIDATION_DEGRADED_FAILURES",
+    "HEALTH_FEED_VALIDATION_CRITICAL_FAILURES",
+    "WATCHDOG_EVALUATION_INTERVAL_SECS",
+    "WATCHDOG_CONFIG_REVISION",
+];
 
 pub fn contract_regional_concurrency_from(value: Option<&str>) -> Result<usize, String> {
     let Some(value) = value else {
@@ -140,6 +163,223 @@ pub struct HealthDiscordViewIdentity {
 }
 
 #[derive(Clone, Debug)]
+pub struct HealthWatchdogConfig {
+    pub channel_id: u64,
+    pub config_revision: String,
+    pub thresholds: HealthThresholds,
+    pub evaluation_interval: Duration,
+}
+
+impl HealthWatchdogConfig {
+    pub fn for_channel(channel_id: u64) -> Self {
+        Self {
+            channel_id,
+            config_revision: DEFAULT_WATCHDOG_CONFIG_REVISION.to_string(),
+            thresholds: HealthThresholds::default(),
+            evaluation_interval: Duration::from_secs(60),
+        }
+    }
+
+    pub fn from_environment() -> Result<Self, HealthConfigError> {
+        Self::from_settings(&health_settings_from_environment()?)
+    }
+
+    pub fn from_settings(settings: &HashMap<String, String>) -> Result<Self, HealthConfigError> {
+        Self::from_lookup(|name| settings.get(name).cloned())
+    }
+
+    fn from_lookup<F>(mut lookup: F) -> Result<Self, HealthConfigError>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let health_config = HealthRuntimeConfig::from_lookup(&mut lookup)?;
+        let interval = match lookup("WATCHDOG_EVALUATION_INTERVAL_SECS") {
+            None => 60,
+            Some(value) => value
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value >= 10)
+                .ok_or_else(|| {
+                    HealthConfigError(
+                    "WATCHDOG_EVALUATION_INTERVAL_SECS must be an integer of at least 10 seconds"
+                        .to_string(),
+                )
+                })?,
+        };
+        let config_revision = lookup("WATCHDOG_CONFIG_REVISION")
+            .unwrap_or_else(|| DEFAULT_WATCHDOG_CONFIG_REVISION.to_string());
+        if config_revision.trim().is_empty() {
+            return Err(HealthConfigError(
+                "WATCHDOG_CONFIG_REVISION must not be empty or whitespace".to_string(),
+            ));
+        }
+        Ok(Self {
+            channel_id: health_config.channel_id,
+            config_revision,
+            thresholds: health_config.thresholds,
+            evaluation_interval: Duration::from_secs(interval),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HealthPublishError {
+    Transient(String),
+    UnknownMessage(String),
+    RetryAfter {
+        detail: String,
+        retry_after: ChronoDuration,
+    },
+    Permanent(String),
+}
+
+impl HealthPublishError {
+    fn failure_kind(&self) -> &'static str {
+        match self {
+            Self::Transient(_) | Self::UnknownMessage(_) | Self::RetryAfter { .. } => "transient",
+            Self::Permanent(_) => "permanent",
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            Self::Transient(detail) | Self::UnknownMessage(detail) | Self::Permanent(detail) => {
+                detail
+            }
+            Self::RetryAfter { detail, .. } => detail,
+        }
+    }
+
+    fn next_attempt_at(&self, observed_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Permanent(_) => None,
+            Self::UnknownMessage(_) => Some(observed_at),
+            Self::Transient(_) => Some(observed_at + ChronoDuration::minutes(1)),
+            Self::RetryAfter { retry_after, .. } => Some(observed_at + *retry_after),
+        }
+    }
+
+    fn clears_message_identity(&self) -> bool {
+        matches!(self, Self::UnknownMessage(_))
+    }
+}
+
+#[async_trait]
+pub trait HealthDiscordPublisher: Send + Sync {
+    async fn create_view(
+        &self,
+        channel_id: u64,
+        content: &str,
+    ) -> Result<String, HealthPublishError>;
+    async fn update_view(
+        &self,
+        channel_id: u64,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), HealthPublishError>;
+    async fn create_incident(
+        &self,
+        channel_id: u64,
+        content: &str,
+        mention_operator_id: Option<u64>,
+    ) -> Result<String, HealthPublishError>;
+    async fn update_incident(
+        &self,
+        channel_id: u64,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), HealthPublishError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HealthDiscordIncidentState {
+    channel_id: u64,
+    config_revision: String,
+    message_id: Option<String>,
+    active: bool,
+    last_error: Option<String>,
+    failure_kind: Option<String>,
+    next_attempt_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HealthDiscordViewState {
+    channel_id: u64,
+    config_revision: String,
+    message_id: Option<String>,
+    last_error: Option<String>,
+    failure_kind: Option<String>,
+    next_attempt_at: Option<DateTime<Utc>>,
+}
+
+pub struct HealthWatchdog {
+    store: ContractCollectionStore,
+    clock: Arc<dyn HealthClock>,
+    config: HealthWatchdogConfig,
+    publisher: Arc<dyn HealthDiscordPublisher>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthWatchdogRun {
+    pub status: HealthStatus,
+    pub consecutive_postgres_failures: i32,
+    pub database_available: bool,
+}
+
+pub struct HealthWatchdogRunner {
+    database_url: String,
+    clock: Arc<dyn HealthClock>,
+    config: HealthWatchdogConfig,
+    publisher: Arc<dyn HealthDiscordPublisher>,
+    last_snapshot: Mutex<Option<HealthSnapshot>>,
+    last_persisted_snapshot_at: Mutex<Option<DateTime<Utc>>>,
+    last_heartbeat_at: Mutex<Option<DateTime<Utc>>>,
+    cached_view: Mutex<Option<HealthDiscordViewState>>,
+    cached_incident: Mutex<Option<HealthDiscordIncidentState>>,
+    watchdog_started_at: Mutex<Option<DateTime<Utc>>>,
+    postgres_failures: Mutex<i32>,
+}
+
+impl HealthWatchdog {
+    pub fn new(
+        store: ContractCollectionStore,
+        clock: Arc<dyn HealthClock>,
+        config: HealthWatchdogConfig,
+        publisher: Arc<dyn HealthDiscordPublisher>,
+    ) -> Self {
+        Self {
+            store,
+            clock,
+            config,
+            publisher,
+        }
+    }
+}
+
+impl HealthWatchdogRunner {
+    pub fn new(
+        database_url: String,
+        clock: Arc<dyn HealthClock>,
+        config: HealthWatchdogConfig,
+        publisher: Arc<dyn HealthDiscordPublisher>,
+    ) -> Self {
+        Self {
+            database_url,
+            clock,
+            config,
+            publisher,
+            last_snapshot: Mutex::new(None),
+            last_persisted_snapshot_at: Mutex::new(None),
+            last_heartbeat_at: Mutex::new(None),
+            cached_view: Mutex::new(None),
+            cached_incident: Mutex::new(None),
+            watchdog_started_at: Mutex::new(None),
+            postgres_failures: Mutex::new(0),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct HealthThresholds {
     pub heartbeat_degraded: ChronoDuration,
     pub heartbeat_critical: ChronoDuration,
@@ -202,7 +442,7 @@ impl std::error::Error for HealthConfigError {}
 
 impl HealthRuntimeConfig {
     pub fn from_environment() -> Result<Self, HealthConfigError> {
-        Self::from_lookup(|name| std::env::var(name).ok())
+        Self::from_settings(&health_settings_from_environment()?)
     }
 
     pub fn from_settings(settings: &HashMap<String, String>) -> Result<Self, HealthConfigError> {
@@ -340,7 +580,7 @@ impl HealthRuntimeConfig {
                 "HEALTH_EVALUATION_INTERVAL_SECS",
                 60,
             )?),
-            channel_id: health_positive_u64_from_settings(
+            channel_id: health_channel_id_from_settings(
                 &mut lookup,
                 "HEALTH_CHANNEL_ID",
                 DEFAULT_HEALTH_CHANNEL_ID,
@@ -396,6 +636,46 @@ fn health_positive_u64_from_settings(
             .filter(|value| *value > 0)
             .ok_or_else(|| HealthConfigError(format!("{name} must be a positive integer"))),
     }
+}
+
+fn health_channel_id_from_settings(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &str,
+    default: u64,
+) -> Result<u64, HealthConfigError> {
+    let value = health_positive_u64_from_settings(lookup, name, default)?;
+    if value <= i64::MAX as u64 {
+        Ok(value)
+    } else {
+        Err(HealthConfigError(format!(
+            "{name} must fit PostgreSQL BIGINT"
+        )))
+    }
+}
+
+fn health_settings_from_environment() -> Result<HashMap<String, String>, HealthConfigError> {
+    health_settings_from_environment_values(|name| std::env::var(name))
+}
+
+fn health_settings_from_environment_values<F>(
+    mut lookup: F,
+) -> Result<HashMap<String, String>, HealthConfigError>
+where
+    F: FnMut(&str) -> Result<String, std::env::VarError>,
+{
+    let mut settings = HashMap::new();
+    for name in HEALTH_ENVIRONMENT_VARIABLES {
+        match lookup(name) {
+            Ok(value) => {
+                settings.insert((*name).to_string(), value);
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(HealthConfigError(format!("{name} must be valid Unicode")));
+            }
+        }
+    }
+    Ok(settings)
 }
 
 fn validate_threshold_order(
@@ -1952,6 +2232,34 @@ fn age_health_check(
     }
 }
 
+fn watchdog_heartbeat_health_check(
+    key: &str,
+    heartbeat_at: Option<DateTime<Utc>>,
+    watchdog_started_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    degraded_after: ChronoDuration,
+    critical_after: ChronoDuration,
+) -> HealthCheck {
+    match heartbeat_at {
+        Some(heartbeat_at) => age_health_check(
+            key,
+            Some(heartbeat_at),
+            now,
+            degraded_after,
+            critical_after,
+            "bot heartbeat",
+        ),
+        None => age_health_check(
+            key,
+            Some(watchdog_started_at),
+            now,
+            degraded_after,
+            critical_after,
+            "bot heartbeat has not been recorded since watchdog start",
+        ),
+    }
+}
+
 fn regional_progress_health_check(
     inputs: &HealthInputs,
     startup_at: DateTime<Utc>,
@@ -2222,6 +2530,612 @@ pub fn render_health_view(snapshot: &HealthSnapshot) -> String {
         snapshot.status.as_str(),
         summary.replace('@', "@\u{200b}")
     )
+}
+
+impl HealthWatchdog {
+    pub async fn run_once(&self) -> Result<HealthSnapshot, sqlx::Error> {
+        let observed_at = self.clock.now();
+        let mut snapshot = self
+            .store
+            .health_snapshot_with_watchdog_publication_failures()
+            .await?
+            .unwrap_or(HealthSnapshot {
+                status: HealthStatus::Healthy,
+                observed_at,
+                checks: Vec::new(),
+            });
+        let watchdog_started_at = self.store.health_watchdog_started_at(observed_at).await?;
+        snapshot.checks.retain(|check| check.key != "heartbeat");
+        snapshot.checks.push(watchdog_heartbeat_health_check(
+            "heartbeat",
+            self.store.bot_heartbeat_at().await?,
+            watchdog_started_at,
+            observed_at,
+            self.config.thresholds.heartbeat_degraded,
+            self.config.thresholds.heartbeat_critical,
+        ));
+        snapshot
+            .checks
+            .sort_by(|left, right| left.key.cmp(&right.key));
+        snapshot.status = snapshot
+            .checks
+            .iter()
+            .map(|check| check.status)
+            .max()
+            .unwrap_or(HealthStatus::Healthy);
+        snapshot.observed_at = observed_at;
+
+        let content = render_watchdog_health_content("Health", &snapshot.checks, snapshot.status);
+        let view_state = self.store.health_discord_view().await?;
+        let mut view_failure = None;
+        if health_discord_publication_is_due(view_state.as_ref(), &self.config, observed_at) {
+            let view_result = match view_state
+                .as_ref()
+                .filter(|state| state.channel_id == self.config.channel_id)
+                .and_then(|state| state.message_id.as_deref())
+            {
+                Some(message_id) => self
+                    .publisher
+                    .update_view(
+                        view_state.as_ref().expect("view state exists").channel_id,
+                        message_id,
+                        &content,
+                    )
+                    .await
+                    .map(|()| message_id.to_string()),
+                None => {
+                    self.publisher
+                        .create_view(self.config.channel_id, &content)
+                        .await
+                }
+            };
+            match view_result {
+                Ok(message_id) => {
+                    self.store
+                        .save_health_discord_view_identity(
+                            self.config.channel_id,
+                            &self.config.config_revision,
+                            &message_id,
+                            observed_at,
+                        )
+                        .await?;
+                    view_failure = None;
+                }
+                Err(error) => {
+                    self.store
+                        .record_health_discord_view_failure(
+                            self.config.channel_id,
+                            &self.config.config_revision,
+                            &error,
+                            observed_at,
+                        )
+                        .await?;
+                    view_failure = Some(health_discord_publication_failure_check_from_error(
+                        "discord_health_view",
+                        &error,
+                        observed_at,
+                    ));
+                    warn!(
+                        "health Discord view publication failed observationally: {}",
+                        error.detail()
+                    );
+                }
+            }
+        }
+
+        let mut degraded = snapshot
+            .checks
+            .iter()
+            .filter(|check| check.status != HealthStatus::Healthy)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(view_failure) = view_failure {
+            degraded.push(view_failure);
+        }
+        let incident_status = degraded
+            .iter()
+            .map(|check| check.status)
+            .max()
+            .unwrap_or(HealthStatus::Healthy);
+        if !degraded.is_empty() {
+            let content =
+                render_watchdog_health_content("Health incident", &degraded, incident_status);
+            let incident_state = self.store.health_discord_incident().await?;
+            if health_discord_incident_is_due(incident_state.as_ref(), &self.config, observed_at) {
+                let incident_result = match incident_state
+                    .as_ref()
+                    .filter(|incident| incident.channel_id == self.config.channel_id)
+                    .and_then(|incident| incident.message_id.as_deref())
+                {
+                    Some(message_id) => self
+                        .publisher
+                        .update_incident(
+                            incident_state
+                                .as_ref()
+                                .expect("incident state exists")
+                                .channel_id,
+                            message_id,
+                            &content,
+                        )
+                        .await
+                        .map(|()| message_id.to_string()),
+                    None => {
+                        self.publisher
+                            .create_incident(
+                                self.config.channel_id,
+                                &content,
+                                incident_state
+                                    .as_ref()
+                                    .filter(|incident| incident.active)
+                                    .map(|_| None)
+                                    .unwrap_or(Some(crate::commands::health::HEALTH_OPERATOR_ID)),
+                            )
+                            .await
+                    }
+                };
+                match incident_result {
+                    Ok(message_id) => {
+                        self.store
+                            .save_health_discord_incident(
+                                self.config.channel_id,
+                                &self.config.config_revision,
+                                &message_id,
+                                true,
+                                &degraded,
+                                observed_at,
+                            )
+                            .await?;
+                    }
+                    Err(error) => {
+                        self.store
+                            .record_health_discord_incident_failure(
+                                self.config.channel_id,
+                                &self.config.config_revision,
+                                &error,
+                                &degraded,
+                                observed_at,
+                            )
+                            .await?;
+                        warn!(
+                            "health Discord incident publication failed observationally: {}",
+                            error.detail()
+                        );
+                    }
+                }
+            }
+        } else if let Some(incident) = self.store.health_discord_incident().await? {
+            if incident.active
+                && incident.channel_id == self.config.channel_id
+                && health_discord_incident_is_due(Some(&incident), &self.config, observed_at)
+            {
+                if let Some(message_id) = incident.message_id.as_deref() {
+                    let result = self
+                        .publisher
+                        .update_incident(
+                            incident.channel_id,
+                            message_id,
+                            "Health incident: resolved\nall checks healthy",
+                        )
+                        .await;
+                    match result {
+                        Ok(()) => {
+                            self.store
+                                .save_health_discord_incident(
+                                    incident.channel_id,
+                                    &self.config.config_revision,
+                                    message_id,
+                                    false,
+                                    &[],
+                                    observed_at,
+                                )
+                                .await?;
+                        }
+                        Err(error) => {
+                            self.store
+                                .record_health_discord_incident_failure(
+                                    incident.channel_id,
+                                    &self.config.config_revision,
+                                    &error,
+                                    &[],
+                                    observed_at,
+                                )
+                                .await?;
+                            warn!(
+                                "health Discord incident recovery publication failed observationally: {}",
+                                error.detail()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(snapshot)
+    }
+}
+
+impl HealthWatchdogRunner {
+    pub async fn run_once(&self) -> HealthWatchdogRun {
+        match ContractCollectionStore::connect(&self.database_url).await {
+            Ok(store) => {
+                if let Err(error) = self.adopt_cached_watchdog_state(&store).await {
+                    warn!("watchdog could not adopt cached Discord identities: {error}");
+                    return self.run_postgres_outage().await;
+                }
+                let persisted_snapshot_at = store
+                    .health_snapshot()
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|snapshot| snapshot.observed_at);
+                let heartbeat_at = store.bot_heartbeat_at().await.ok().flatten();
+                let watchdog = HealthWatchdog::new(
+                    store.clone(),
+                    self.clock.clone(),
+                    self.config.clone(),
+                    self.publisher.clone(),
+                );
+                match watchdog.run_once().await {
+                    Ok(snapshot) => {
+                        *self.last_snapshot.lock().await = Some(snapshot.clone());
+                        *self.last_persisted_snapshot_at.lock().await = persisted_snapshot_at;
+                        *self.last_heartbeat_at.lock().await = heartbeat_at;
+                        *self.cached_view.lock().await =
+                            store.health_discord_view().await.ok().flatten();
+                        *self.cached_incident.lock().await =
+                            store.health_discord_incident().await.ok().flatten();
+                        *self.postgres_failures.lock().await = 0;
+                        HealthWatchdogRun {
+                            status: snapshot.status,
+                            consecutive_postgres_failures: 0,
+                            database_available: true,
+                        }
+                    }
+                    Err(error) => {
+                        warn!("watchdog health database cycle failed observationally: {error}");
+                        self.run_postgres_outage().await
+                    }
+                }
+            }
+            Err(error) => {
+                warn!("watchdog PostgreSQL connection failed observationally: {error}");
+                self.run_postgres_outage().await
+            }
+        }
+    }
+
+    async fn run_postgres_outage(&self) -> HealthWatchdogRun {
+        let observed_at = self.clock.now();
+        let watchdog_started_at = self.watchdog_started_at(observed_at).await;
+        let consecutive_postgres_failures = {
+            let mut failures = self.postgres_failures.lock().await;
+            *failures = failures.saturating_add(1);
+            *failures
+        };
+        let status = health_status_for_failures(
+            consecutive_postgres_failures,
+            self.config.thresholds.postgres_degraded_failures,
+            self.config.thresholds.postgres_critical_failures,
+        );
+        let mut checks = self
+            .last_snapshot
+            .lock()
+            .await
+            .as_ref()
+            .map(|snapshot| snapshot.checks.clone())
+            .unwrap_or_default();
+        checks.retain(|check| {
+            check.key != "watchdog_postgres"
+                && check.key != "heartbeat"
+                && check.key != "watchdog_health_snapshot"
+        });
+        let heartbeat_at = *self.last_heartbeat_at.lock().await;
+        checks.push(watchdog_heartbeat_health_check(
+            "heartbeat",
+            heartbeat_at,
+            watchdog_started_at,
+            observed_at,
+            self.config.thresholds.heartbeat_degraded,
+            self.config.thresholds.heartbeat_critical,
+        ));
+        let snapshot_at = *self.last_persisted_snapshot_at.lock().await;
+        if snapshot_at.is_some() {
+            checks.push(age_health_check(
+                "watchdog_health_snapshot",
+                snapshot_at,
+                observed_at,
+                self.config.thresholds.heartbeat_degraded,
+                self.config.thresholds.heartbeat_critical,
+                "cached persisted health snapshot",
+            ));
+        }
+        checks.push(HealthCheck {
+            key: "watchdog_postgres".to_string(),
+            status,
+            observed_at,
+            evidence: format!(
+                "watchdog PostgreSQL access has failed {consecutive_postgres_failures} consecutive time(s)"
+            ),
+            consecutive_failures: consecutive_postgres_failures,
+        });
+        checks.sort_by(|left, right| left.key.cmp(&right.key));
+        let overall = checks
+            .iter()
+            .map(|check| check.status)
+            .max()
+            .unwrap_or(status);
+        self.publish_postgres_outage(&checks, overall, observed_at)
+            .await;
+        HealthWatchdogRun {
+            status: overall,
+            consecutive_postgres_failures,
+            database_available: false,
+        }
+    }
+
+    async fn publish_postgres_outage(
+        &self,
+        checks: &[HealthCheck],
+        status: HealthStatus,
+        observed_at: DateTime<Utc>,
+    ) {
+        let view_content = render_watchdog_health_content("Health", checks, status);
+        let view = self.cached_view.lock().await.clone();
+        if health_discord_publication_is_due(view.as_ref(), &self.config, observed_at) {
+            let view_result = match view
+                .as_ref()
+                .filter(|view| view.channel_id == self.config.channel_id)
+                .and_then(|view| view.message_id.as_deref())
+            {
+                Some(message_id) => self
+                    .publisher
+                    .update_view(
+                        view.as_ref().expect("cached view exists").channel_id,
+                        message_id,
+                        &view_content,
+                    )
+                    .await
+                    .map(|()| message_id.to_string()),
+                None => {
+                    self.publisher
+                        .create_view(self.config.channel_id, &view_content)
+                        .await
+                }
+            };
+            match view_result {
+                Ok(message_id) => {
+                    *self.cached_view.lock().await = Some(HealthDiscordViewState {
+                        channel_id: self.config.channel_id,
+                        config_revision: self.config.config_revision.clone(),
+                        message_id: Some(message_id),
+                        last_error: None,
+                        failure_kind: None,
+                        next_attempt_at: None,
+                    });
+                }
+                Err(error) => {
+                    *self.cached_view.lock().await = Some(HealthDiscordViewState {
+                        channel_id: self.config.channel_id,
+                        config_revision: self.config.config_revision.clone(),
+                        message_id: view.as_ref().and_then(|view| view.message_id.clone()),
+                        last_error: Some(error.detail().to_string()),
+                        failure_kind: Some(error.failure_kind().to_string()),
+                        next_attempt_at: error.next_attempt_at(observed_at),
+                    });
+                    warn!(
+                        "watchdog outage Health View publication failed: {}",
+                        error.detail()
+                    );
+                }
+            }
+        }
+
+        let incident_content = render_watchdog_health_content("Health incident", checks, status);
+        let incident = self.cached_incident.lock().await.clone();
+        if health_discord_incident_is_due(incident.as_ref(), &self.config, observed_at) {
+            let incident_result = match incident
+                .as_ref()
+                .filter(|incident| incident.channel_id == self.config.channel_id)
+                .and_then(|incident| incident.message_id.as_deref())
+            {
+                Some(message_id) => self
+                    .publisher
+                    .update_incident(
+                        incident
+                            .as_ref()
+                            .expect("cached incident exists")
+                            .channel_id,
+                        message_id,
+                        &incident_content,
+                    )
+                    .await
+                    .map(|()| message_id.to_string()),
+                None => {
+                    self.publisher
+                        .create_incident(
+                            self.config.channel_id,
+                            &incident_content,
+                            incident
+                                .as_ref()
+                                .filter(|incident| incident.active)
+                                .map(|_| None)
+                                .unwrap_or(Some(crate::commands::health::HEALTH_OPERATOR_ID)),
+                        )
+                        .await
+                }
+            };
+            match incident_result {
+                Ok(message_id) => {
+                    *self.cached_incident.lock().await = Some(HealthDiscordIncidentState {
+                        channel_id: self.config.channel_id,
+                        config_revision: self.config.config_revision.clone(),
+                        message_id: Some(message_id),
+                        active: true,
+                        last_error: None,
+                        failure_kind: None,
+                        next_attempt_at: None,
+                    });
+                }
+                Err(error) => {
+                    *self.cached_incident.lock().await = Some(HealthDiscordIncidentState {
+                        channel_id: self.config.channel_id,
+                        config_revision: self.config.config_revision.clone(),
+                        message_id: incident
+                            .as_ref()
+                            .and_then(|incident| incident.message_id.clone()),
+                        active: incident
+                            .as_ref()
+                            .map(|incident| incident.active)
+                            .unwrap_or(true),
+                        last_error: Some(error.detail().to_string()),
+                        failure_kind: Some(error.failure_kind().to_string()),
+                        next_attempt_at: error.next_attempt_at(observed_at),
+                    });
+                    warn!(
+                        "watchdog outage incident publication failed: {}",
+                        error.detail()
+                    );
+                }
+            }
+        }
+    }
+
+    async fn watchdog_started_at(&self, observed_at: DateTime<Utc>) -> DateTime<Utc> {
+        let mut started_at = self.watchdog_started_at.lock().await;
+        *started_at.get_or_insert(observed_at)
+    }
+
+    async fn adopt_cached_watchdog_state(
+        &self,
+        store: &ContractCollectionStore,
+    ) -> Result<(), sqlx::Error> {
+        let observed_at = self.clock.now();
+        let cached_started_at = self.watchdog_started_at(observed_at).await;
+        let persisted_started_at = store.health_watchdog_started_at(cached_started_at).await?;
+        *self.watchdog_started_at.lock().await = Some(persisted_started_at);
+        if let Some(view) = self.cached_view.lock().await.clone() {
+            store
+                .adopt_health_discord_view_state(&view, observed_at)
+                .await?;
+        }
+        if let Some(incident) = self.cached_incident.lock().await.clone() {
+            store
+                .adopt_health_discord_incident_state(&incident, observed_at)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+pub async fn run_health_watchdog_loop(
+    database_url: String,
+    config: HealthWatchdogConfig,
+    publisher: Arc<dyn HealthDiscordPublisher>,
+) {
+    let interval = config.evaluation_interval;
+    let watchdog =
+        HealthWatchdogRunner::new(database_url, Arc::new(SystemHealthClock), config, publisher);
+    loop {
+        watchdog.run_once().await;
+        tokio::time::sleep(interval).await;
+    }
+}
+
+fn health_status_for_failures(
+    failures: i32,
+    degraded_after: i32,
+    critical_after: i32,
+) -> HealthStatus {
+    if failures >= critical_after {
+        HealthStatus::Critical
+    } else if failures >= degraded_after {
+        HealthStatus::Degraded
+    } else {
+        HealthStatus::Healthy
+    }
+}
+
+fn render_watchdog_health_content(
+    title: &str,
+    checks: &[HealthCheck],
+    status: HealthStatus,
+) -> String {
+    let detail = checks
+        .iter()
+        .filter(|check| check.status != HealthStatus::Healthy)
+        .map(|check| format!("{}: {}", check.key, check.evidence))
+        .collect::<Vec<_>>();
+    let summary = if detail.is_empty() {
+        "all checks healthy".to_string()
+    } else {
+        detail.join("\n")
+    };
+    format!(
+        "{title}: {}\n{}",
+        status.as_str(),
+        summary.replace('@', "@\u{200b}")
+    )
+}
+
+fn health_discord_publication_is_due(
+    state: Option<&HealthDiscordViewState>,
+    config: &HealthWatchdogConfig,
+    observed_at: DateTime<Utc>,
+) -> bool {
+    match state {
+        None => true,
+        Some(state)
+            if state.channel_id != config.channel_id
+                || state.config_revision != config.config_revision =>
+        {
+            true
+        }
+        Some(state) if state.failure_kind.as_deref() == Some("permanent") => false,
+        Some(state) => state
+            .next_attempt_at
+            .is_none_or(|next_attempt_at| next_attempt_at <= observed_at),
+    }
+}
+
+fn health_discord_incident_is_due(
+    state: Option<&HealthDiscordIncidentState>,
+    config: &HealthWatchdogConfig,
+    observed_at: DateTime<Utc>,
+) -> bool {
+    match state {
+        None => true,
+        Some(state)
+            if state.channel_id != config.channel_id
+                || state.config_revision != config.config_revision =>
+        {
+            true
+        }
+        Some(state) if state.failure_kind.as_deref() == Some("permanent") => false,
+        Some(state) => state
+            .next_attempt_at
+            .is_none_or(|next_attempt_at| next_attempt_at <= observed_at),
+    }
+}
+
+fn health_discord_publication_failure_check_from_error(
+    key: &str,
+    error: &HealthPublishError,
+    observed_at: DateTime<Utc>,
+) -> HealthCheck {
+    HealthCheck {
+        key: key.to_string(),
+        status: if error.failure_kind() == "permanent" {
+            HealthStatus::Critical
+        } else {
+            HealthStatus::Degraded
+        },
+        observed_at,
+        evidence: format!(
+            "Health View Discord publication {}: {}",
+            error.failure_kind(),
+            error.detail()
+        ),
+        consecutive_failures: 1,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3481,6 +4395,61 @@ impl ContractCollectionStore {
         .transpose()
     }
 
+    pub async fn health_snapshot_with_watchdog_publication_failures(
+        &self,
+    ) -> Result<Option<HealthSnapshot>, sqlx::Error> {
+        let base_snapshot = self.health_snapshot().await?;
+        let publication_failures = sqlx::query(
+            "SELECT 'discord_health_view' AS check_key, last_error, failure_kind, updated_at FROM health_discord_views WHERE view_key = 'primary' AND failure_kind IS NOT NULL UNION ALL SELECT 'discord_health_incident' AS check_key, last_error, failure_kind, updated_at FROM health_discord_incidents WHERE incident_key = 'current' AND failure_kind IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let Some(mut snapshot) = base_snapshot.or_else(|| {
+            publication_failures
+                .iter()
+                .map(|failure| failure.get::<DateTime<Utc>, _>("updated_at"))
+                .max()
+                .map(|observed_at| HealthSnapshot {
+                    status: HealthStatus::Healthy,
+                    observed_at,
+                    checks: Vec::new(),
+                })
+        }) else {
+            return Ok(None);
+        };
+        for failure in publication_failures {
+            let key: String = failure.get("check_key");
+            snapshot.checks.retain(|check| check.key != key);
+            let failure_kind: String = failure.get("failure_kind");
+            let detail: Option<String> = failure.get("last_error");
+            let status = if failure_kind == "permanent" {
+                HealthStatus::Critical
+            } else {
+                HealthStatus::Degraded
+            };
+            snapshot.checks.push(HealthCheck {
+                key,
+                status,
+                observed_at: failure.get("updated_at"),
+                evidence: format!(
+                    "watchdog Discord publication {failure_kind}: {}",
+                    detail.unwrap_or_else(|| "unknown error".to_string())
+                ),
+                consecutive_failures: 1,
+            });
+        }
+        snapshot
+            .checks
+            .sort_by(|left, right| left.key.cmp(&right.key));
+        snapshot.status = snapshot
+            .checks
+            .iter()
+            .map(|check| check.status)
+            .max()
+            .unwrap_or(HealthStatus::Healthy);
+        Ok(Some(snapshot))
+    }
+
     pub async fn health_discord_view_identity(
         &self,
     ) -> Result<Option<HealthDiscordViewIdentity>, sqlx::Error> {
@@ -3502,9 +4471,51 @@ impl ContractCollectionStore {
         .transpose()
     }
 
+    async fn health_discord_view(&self) -> Result<Option<HealthDiscordViewState>, sqlx::Error> {
+        sqlx::query(
+            "SELECT channel_id, config_revision, message_id, last_error, failure_kind, next_attempt_at FROM health_discord_views WHERE view_key = 'primary'",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| {
+            let channel_id: i64 = row.get("channel_id");
+            let channel_id = u64::try_from(channel_id).map_err(|_| {
+                sqlx::Error::Protocol("health view channel ID cannot be negative".to_string())
+            })?;
+            Ok(HealthDiscordViewState {
+                channel_id,
+                config_revision: row.get("config_revision"),
+                message_id: row.get("message_id"),
+                last_error: row.get("last_error"),
+                failure_kind: row.get("failure_kind"),
+                next_attempt_at: row.get("next_attempt_at"),
+            })
+        })
+        .transpose()
+    }
+
+    async fn bot_heartbeat_at(&self) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        sqlx::query_scalar("SELECT observed_at FROM bot_heartbeats WHERE component = 'bot'")
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    async fn health_watchdog_started_at(
+        &self,
+        candidate_started_at: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>, sqlx::Error> {
+        sqlx::query_scalar(
+            "INSERT INTO health_watchdog_runtime (singleton, started_at) VALUES (TRUE, $1) ON CONFLICT (singleton) DO UPDATE SET started_at = health_watchdog_runtime.started_at RETURNING started_at",
+        )
+        .bind(candidate_started_at)
+        .fetch_one(&self.pool)
+        .await
+    }
+
     pub async fn save_health_discord_view_identity(
         &self,
         channel_id: u64,
+        config_revision: &str,
         message_id: &str,
         observed_at: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
@@ -3512,10 +4523,170 @@ impl ContractCollectionStore {
             sqlx::Error::Protocol("health view channel ID exceeds PostgreSQL BIGINT".to_string())
         })?;
         sqlx::query(
-            "INSERT INTO health_discord_views (view_key, channel_id, message_id, updated_at) VALUES ('primary',$1,$2,$3) ON CONFLICT (view_key) DO UPDATE SET channel_id = EXCLUDED.channel_id, message_id = EXCLUDED.message_id, updated_at = EXCLUDED.updated_at",
+            "INSERT INTO health_discord_views (view_key, channel_id, config_revision, message_id, updated_at) VALUES ('primary',$1,$2,$3,$4) ON CONFLICT (view_key) DO UPDATE SET channel_id = EXCLUDED.channel_id, config_revision = EXCLUDED.config_revision, message_id = EXCLUDED.message_id, last_error = NULL, failure_kind = NULL, next_attempt_at = NULL, attempt_count = 0, updated_at = EXCLUDED.updated_at",
         )
         .bind(channel_id)
+        .bind(config_revision)
         .bind(message_id)
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_health_discord_view_failure(
+        &self,
+        channel_id: u64,
+        config_revision: &str,
+        error: &HealthPublishError,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let channel_id = i64::try_from(channel_id).map_err(|_| {
+            sqlx::Error::Protocol("health view channel ID exceeds PostgreSQL BIGINT".to_string())
+        })?;
+        sqlx::query(
+            "INSERT INTO health_discord_views (view_key, channel_id, config_revision, message_id, last_error, failure_kind, next_attempt_at, attempt_count, updated_at) VALUES ('primary',$1,$2,NULL,$3,$4,$5,1,$6) ON CONFLICT (view_key) DO UPDATE SET channel_id = EXCLUDED.channel_id, config_revision = EXCLUDED.config_revision, message_id = CASE WHEN $7 THEN NULL ELSE health_discord_views.message_id END, last_error = EXCLUDED.last_error, failure_kind = EXCLUDED.failure_kind, next_attempt_at = EXCLUDED.next_attempt_at, attempt_count = health_discord_views.attempt_count + 1, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(channel_id)
+        .bind(config_revision)
+        .bind(error.detail())
+        .bind(error.failure_kind())
+        .bind(error.next_attempt_at(observed_at))
+        .bind(observed_at)
+        .bind(error.clears_message_identity())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn adopt_health_discord_view_state(
+        &self,
+        state: &HealthDiscordViewState,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let channel_id = i64::try_from(state.channel_id).map_err(|_| {
+            sqlx::Error::Protocol("health view channel ID exceeds PostgreSQL BIGINT".to_string())
+        })?;
+        sqlx::query(
+            "INSERT INTO health_discord_views (view_key, channel_id, config_revision, message_id, last_error, failure_kind, next_attempt_at, attempt_count, updated_at) VALUES ('primary',$1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (view_key) DO UPDATE SET channel_id = EXCLUDED.channel_id, config_revision = EXCLUDED.config_revision, message_id = EXCLUDED.message_id, last_error = EXCLUDED.last_error, failure_kind = EXCLUDED.failure_kind, next_attempt_at = EXCLUDED.next_attempt_at, attempt_count = EXCLUDED.attempt_count, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(channel_id)
+        .bind(&state.config_revision)
+        .bind(&state.message_id)
+        .bind(&state.last_error)
+        .bind(&state.failure_kind)
+        .bind(state.next_attempt_at)
+        .bind(i32::from(state.failure_kind.is_some()))
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn health_discord_incident(
+        &self,
+    ) -> Result<Option<HealthDiscordIncidentState>, sqlx::Error> {
+        sqlx::query(
+            "SELECT channel_id, config_revision, message_id, active, last_error, failure_kind, next_attempt_at FROM health_discord_incidents WHERE incident_key = 'current'",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| {
+            let channel_id: i64 = row.get("channel_id");
+            let channel_id = u64::try_from(channel_id).map_err(|_| {
+                sqlx::Error::Protocol("health incident channel ID cannot be negative".to_string())
+            })?;
+            Ok(HealthDiscordIncidentState {
+                channel_id,
+                config_revision: row.get("config_revision"),
+                message_id: row.get("message_id"),
+                active: row.get("active"),
+                last_error: row.get("last_error"),
+                failure_kind: row.get("failure_kind"),
+                next_attempt_at: row.get("next_attempt_at"),
+            })
+        })
+        .transpose()
+    }
+
+    async fn save_health_discord_incident(
+        &self,
+        channel_id: u64,
+        config_revision: &str,
+        message_id: &str,
+        active: bool,
+        checks: &[HealthCheck],
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let channel_id = i64::try_from(channel_id).map_err(|_| {
+            sqlx::Error::Protocol(
+                "health incident channel ID exceeds PostgreSQL BIGINT".to_string(),
+            )
+        })?;
+        sqlx::query(
+            "INSERT INTO health_discord_incidents (incident_key, channel_id, config_revision, message_id, active, degradation, updated_at) VALUES ('current',$1,$2,$3,$4,$5,$6) ON CONFLICT (incident_key) DO UPDATE SET channel_id = EXCLUDED.channel_id, config_revision = EXCLUDED.config_revision, message_id = EXCLUDED.message_id, active = EXCLUDED.active, degradation = EXCLUDED.degradation, last_error = NULL, failure_kind = NULL, next_attempt_at = NULL, attempt_count = 0, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(channel_id)
+        .bind(config_revision)
+        .bind(message_id)
+        .bind(active)
+        .bind(serde_json::to_value(checks).map_err(json_to_sqlx)?)
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_health_discord_incident_failure(
+        &self,
+        channel_id: u64,
+        config_revision: &str,
+        error: &HealthPublishError,
+        checks: &[HealthCheck],
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let channel_id = i64::try_from(channel_id).map_err(|_| {
+            sqlx::Error::Protocol(
+                "health incident channel ID exceeds PostgreSQL BIGINT".to_string(),
+            )
+        })?;
+        sqlx::query(
+            "INSERT INTO health_discord_incidents (incident_key, channel_id, config_revision, message_id, active, degradation, last_error, failure_kind, next_attempt_at, attempt_count, updated_at) VALUES ('current',$1,$2,NULL,TRUE,$3,$4,$5,$6,1,$7) ON CONFLICT (incident_key) DO UPDATE SET channel_id = EXCLUDED.channel_id, config_revision = EXCLUDED.config_revision, message_id = CASE WHEN $8 THEN NULL ELSE health_discord_incidents.message_id END, active = TRUE, degradation = EXCLUDED.degradation, last_error = EXCLUDED.last_error, failure_kind = EXCLUDED.failure_kind, next_attempt_at = EXCLUDED.next_attempt_at, attempt_count = health_discord_incidents.attempt_count + 1, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(channel_id)
+        .bind(config_revision)
+        .bind(serde_json::to_value(checks).map_err(json_to_sqlx)?)
+        .bind(error.detail())
+        .bind(error.failure_kind())
+        .bind(error.next_attempt_at(observed_at))
+        .bind(observed_at)
+        .bind(error.clears_message_identity())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn adopt_health_discord_incident_state(
+        &self,
+        state: &HealthDiscordIncidentState,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let channel_id = i64::try_from(state.channel_id).map_err(|_| {
+            sqlx::Error::Protocol(
+                "health incident channel ID exceeds PostgreSQL BIGINT".to_string(),
+            )
+        })?;
+        sqlx::query(
+            "INSERT INTO health_discord_incidents (incident_key, channel_id, config_revision, message_id, active, degradation, last_error, failure_kind, next_attempt_at, attempt_count, updated_at) VALUES ('current',$1,$2,$3,$4,'[]'::jsonb,$5,$6,$7,$8,$9) ON CONFLICT (incident_key) DO UPDATE SET channel_id = EXCLUDED.channel_id, config_revision = EXCLUDED.config_revision, message_id = EXCLUDED.message_id, active = EXCLUDED.active, last_error = EXCLUDED.last_error, failure_kind = EXCLUDED.failure_kind, next_attempt_at = EXCLUDED.next_attempt_at, attempt_count = EXCLUDED.attempt_count, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(channel_id)
+        .bind(&state.config_revision)
+        .bind(&state.message_id)
+        .bind(state.active)
+        .bind(&state.last_error)
+        .bind(&state.failure_kind)
+        .bind(state.next_attempt_at)
+        .bind(i32::from(state.failure_kind.is_some()))
         .bind(observed_at)
         .execute(&self.pool)
         .await?;
@@ -8783,6 +9954,24 @@ mod embed_tests {
         ))
         .expect_err("a configured non-Unicode value must not become the default");
         assert!(error.contains("valid Unicode"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_watchdog_configuration_is_rejected() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let error = health_settings_from_environment_values(|name| {
+            if name == "HEALTH_CHANNEL_ID" {
+                Err(std::env::VarError::NotUnicode(
+                    std::ffi::OsString::from_vec(vec![0x80]),
+                ))
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        })
+        .expect_err("a non-Unicode watchdog setting must not become a default");
+        assert_eq!(error.to_string(), "HEALTH_CHANNEL_ID must be valid Unicode");
     }
 
     fn contract() -> PublicContract {
