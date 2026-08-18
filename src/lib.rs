@@ -239,6 +239,9 @@ pub async fn run() {
         let delivery = Arc::new(discord_bot::DiscordContractDelivery::new(
             http_client.clone(),
         ));
+        let ping_limiter = Arc::new(contract_intelligence::AppStateContractPingLimiter::new(
+            app_state.clone(),
+        ));
         let health_config = match contract_intelligence::HealthRuntimeConfig::from_environment() {
             Ok(config) => Some(config),
             Err(error) => {
@@ -276,16 +279,14 @@ pub async fn run() {
         match contract_intelligence::contract_regional_concurrency_from_environment() {
             Ok(max_concurrent_regions) => {
                 contract_intelligence::spawn_contract_collection_loop_with_notifications_structure_resolver_and_region_concurrency(
-                    database_url,
+                    database_url.clone(),
                     store_handle,
                     Duration::from_secs(interval),
                     timeout,
-                    ship_groups,
-                    delivery,
-                    Arc::new(contract_intelligence::AppStateContractPingLimiter::new(
-                        app_state.clone(),
-                    )),
-                    structure_resolver,
+                    ship_groups.clone(),
+                    delivery.clone(),
+                    ping_limiter.clone(),
+                    structure_resolver.clone(),
                     structure_resolver_runtime,
                     max_concurrent_regions,
                 );
@@ -293,6 +294,22 @@ pub async fn run() {
             Err(error) => {
                 warn!("contract collection disabled by invalid CONTRACT_REGIONAL_CONCURRENCY: {error}");
             }
+        }
+        match contract_intelligence::proximity_reconciliation_interval_from_environment() {
+            Ok(interval) => {
+                contract_intelligence::spawn_proximity_reconciliation_loop(
+                    database_url,
+                    interval,
+                    timeout,
+                    ship_groups,
+                    delivery,
+                    ping_limiter,
+                    structure_resolver,
+                );
+            }
+            Err(error) => warn!(
+                "proximity reconciliation disabled by invalid CONTRACT_PROXIMITY_RECONCILIATION_INTERVAL_SECS: {error}"
+            ),
         }
         if let Some(health_config) = health_config {
             contract_intelligence::spawn_health_monitor_loop(

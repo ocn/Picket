@@ -221,6 +221,25 @@ impl<'a> LocationEvidenceService<'a> {
             .transpose()
     }
 
+    pub(crate) async fn resolve_in_transaction(
+        transaction: &mut Transaction<'_, Postgres>,
+        location_id: i64,
+        now: DateTime<Utc>,
+    ) -> Result<Option<LocationEvidence>, sqlx::Error> {
+        if location_id <= 0 {
+            return Err(sqlx::Error::Protocol(
+                "location ID must be a positive integer".to_string(),
+            ));
+        }
+        sqlx::query("SELECT id, location_id, evidence_class, structure_id, station_id, solar_system_id, region_id, provenance, actor, observed_at, expires_at, expired_at, superseded_at, superseded_by_actor, supersedes_id FROM location_evidence WHERE location_id = $1 AND observed_at <= $2 AND superseded_at IS NULL AND expired_at IS NULL AND (expires_at IS NULL OR expires_at > $2) ORDER BY CASE evidence_class WHEN 'public_npc' THEN 0 WHEN 'access_qualified' THEN 1 WHEN 'operator' THEN 2 ELSE 3 END, observed_at DESC, id DESC LIMIT 1")
+            .bind(location_id)
+            .bind(now)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .map(location_evidence_from_row)
+            .transpose()
+    }
+
     pub async fn record_public_npc(
         &self,
         location_id: i64,
