@@ -9,15 +9,19 @@ use killbot_rust::contract_intelligence::{
     ContractContextRequirements, ContractContextValue, ContractDelivery, ContractDeliveryClock,
     ContractDeliveryError, ContractEmbedContext, ContractEventAction, ContractEventActions,
     ContractEventKind, ContractFilter, ContractFilterCondition, ContractFilterNode,
-    ContractItemDirection, ContractItemProbe, ContractObservationContext, ContractPingLimiter,
-    ContractPingType, ContractResolutionState, ContractSubscription, DeliveryFailureKind,
-    DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HealthCheck, HealthClock, HealthCycle,
-    HealthRuntimeConfig, HealthStatus, HttpPublicContractEsi, PreparedContractDelivery,
-    PublicContract, PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
-    SolarSystemPosition,
+    ContractItemDirection, ContractItemProbe, ContractLocationContext, ContractObservationContext,
+    ContractPingLimiter, ContractPingType, ContractResolutionState, ContractSubscription,
+    DeliveryFailureKind, DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HealthCheck,
+    HealthClock, HealthCycle, HealthRuntimeConfig, HealthStatus, HttpPublicContractEsi,
+    PreparedContractDelivery, PublicContract, PublicContractEsi, PublicContractItem,
+    ShipGroupLookup, ShipGroupResolver, SolarSystemPosition,
 };
 use killbot_rust::esi::EsiClient;
 use killbot_rust::feed::{FeedError, FeedHealthProvider, FeedHealthTelemetry, KillmailFeed};
+use killbot_rust::location_evidence::{
+    execute_operator_location_evidence_cli, LocationEvidenceClass, LocationEvidenceService,
+    OperatorLocationEvidenceCliResult,
+};
 use killbot_rust::models::{ZkData, ZkDataNoEsi};
 use killbot_rust::pipeline::{run_producer, run_producer_with_health, ProcessedResult};
 use moka::future::Cache;
@@ -35,7 +39,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
+use tokio::sync::{mpsc, Barrier, Mutex, Notify, Semaphore};
 use url::Url;
 
 static DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -249,6 +253,1555 @@ impl TemporaryDatabase {
     }
 }
 
+async fn install_public_location_evidence_failure_trigger(pool: &sqlx::PgPool) {
+    sqlx::query(
+        "CREATE FUNCTION fail_public_location_evidence_test_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.evidence_class = 'public_npc' THEN RAISE EXCEPTION 'synthetic public location retention failure'; END IF; RETURN NEW; END; $$",
+    )
+    .execute(pool)
+    .await
+    .expect("create synthetic public-evidence failure function");
+    sqlx::query("CREATE TRIGGER fail_public_location_evidence_test_insert BEFORE INSERT ON location_evidence FOR EACH ROW EXECUTE FUNCTION fail_public_location_evidence_test_insert()")
+        .execute(pool)
+        .await
+        .expect("fail public evidence retention deterministically");
+}
+
+async fn remove_public_location_evidence_failure_trigger(pool: &sqlx::PgPool) {
+    sqlx::query("DROP TRIGGER fail_public_location_evidence_test_insert ON location_evidence")
+        .execute(pool)
+        .await
+        .expect("remove synthetic public-evidence failure trigger");
+    sqlx::query("DROP FUNCTION fail_public_location_evidence_test_insert()")
+        .execute(pool)
+        .await
+        .expect("remove synthetic public-evidence failure function");
+}
+
+#[tokio::test]
+async fn operator_location_evidence_cli_adds_and_inspects_an_auditable_mapping() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
+    let expires_at = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let location_id = 1_035_466_617_946_i64;
+    let add = execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "1035466617946",
+            "--structure-id",
+            "1035466617946",
+            "--system-id",
+            "30002086",
+            "--region-id",
+            "10000003",
+            "--observed-at",
+            "2026-08-17T12:00:00Z",
+            "--expires-at",
+            "2026-08-18T12:00:00Z",
+            "--actor",
+            "operator:146451271497416704",
+            "--provenance",
+            "fleet scout report 2026-08-17T12:00Z",
+        ],
+        observed_at,
+    )
+    .await
+    .expect("add validated operator evidence through the restricted CLI");
+    let evidence_id = match add {
+        OperatorLocationEvidenceCliResult::Added(evidence) => {
+            assert_eq!(evidence.location_id, location_id);
+            assert_eq!(evidence.structure_id, Some(location_id));
+            assert_eq!(evidence.station_id, None);
+            assert_eq!(evidence.solar_system_id, 30_002_086);
+            assert_eq!(evidence.region_id, Some(10_000_003));
+            assert_eq!(evidence.evidence_class, LocationEvidenceClass::Operator);
+            assert_eq!(evidence.actor, "operator:146451271497416704");
+            assert_eq!(evidence.provenance, "fleet scout report 2026-08-17T12:00Z");
+            assert_eq!(evidence.observed_at, observed_at);
+            assert_eq!(evidence.expires_at, Some(expires_at));
+            evidence.id
+        }
+        result => panic!("expected evidence add result, got {result:?}"),
+    };
+    let inspect = execute_operator_location_evidence_cli(
+        &store,
+        &["inspect", "--id", &evidence_id.to_string()],
+        observed_at,
+    )
+    .await
+    .expect("inspect the persisted evidence through the restricted CLI");
+    match inspect {
+        OperatorLocationEvidenceCliResult::Inspected { evidence, audit } => {
+            assert_eq!(evidence.id, evidence_id);
+            assert_eq!(audit.len(), 1);
+            assert_eq!(audit[0].action, "added");
+            assert_eq!(audit[0].actor, "operator:146451271497416704");
+            assert_eq!(audit[0].provenance, "fleet scout report 2026-08-17T12:00Z");
+        }
+        result => panic!("expected evidence inspection result, got {result:?}"),
+    }
+    database.destroy().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_first_public_location_evidence_writes_are_idempotent() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to force overlapping public-evidence writes");
+    sqlx::query(
+        "CREATE FUNCTION pause_location_evidence_test_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.2); RETURN NEW; END; $$",
+    )
+    .execute(&raw_pool)
+    .await
+    .expect("create deterministic first-write pause");
+    sqlx::query("CREATE TRIGGER pause_location_evidence_test_insert BEFORE INSERT ON location_evidence FOR EACH ROW EXECUTE FUNCTION pause_location_evidence_test_insert()")
+        .execute(&raw_pool)
+        .await
+        .expect("pause concurrent first public evidence inserts");
+    raw_pool.close().await;
+
+    let now = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
+    let location_id = 60_003_760_i64;
+    let barrier = Arc::new(Barrier::new(2));
+    let first_store = store.clone();
+    let first_barrier = barrier.clone();
+    let first = tokio::spawn(async move {
+        first_barrier.wait().await;
+        LocationEvidenceService::new(&first_store)
+            .record_public_npc(
+                location_id,
+                Some(location_id),
+                30_002_086,
+                Some(10_000_003),
+                now,
+                now,
+            )
+            .await
+    });
+    let second_store = store.clone();
+    let second_barrier = barrier.clone();
+    let second = tokio::spawn(async move {
+        second_barrier.wait().await;
+        LocationEvidenceService::new(&second_store)
+            .record_public_npc(
+                location_id,
+                Some(location_id),
+                30_002_086,
+                Some(10_000_003),
+                now,
+                now,
+            )
+            .await
+    });
+    let first = first.await.expect("join first public write");
+    let second = second.await.expect("join second public write");
+    let first = first.expect("first public write succeeds");
+    let second = second.expect("second public write succeeds idempotently");
+    assert_eq!(first.id, second.id);
+    let current = LocationEvidenceService::new(&store)
+        .resolve(location_id, now)
+        .await
+        .expect("resolve current evidence")
+        .expect("retain one current public record");
+    assert_eq!(current.id, first.id);
+    assert_eq!(current.evidence_class, LocationEvidenceClass::PublicNpc);
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn older_public_location_observation_cannot_replace_newer_conflicting_system() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let location_id = 60_003_762_i64;
+    let newer_observed_at = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
+    let current = LocationEvidenceService::new(&store)
+        .record_public_npc(
+            location_id,
+            Some(location_id),
+            30_003_089,
+            Some(10_000_002),
+            newer_observed_at,
+            newer_observed_at,
+        )
+        .await
+        .expect("record the newer public station location");
+    let retained = LocationEvidenceService::new(&store)
+        .record_public_npc(
+            location_id,
+            Some(location_id),
+            30_002_086,
+            Some(10_000_003),
+            newer_observed_at - chrono::Duration::minutes(1),
+            newer_observed_at + chrono::Duration::minutes(1),
+        )
+        .await
+        .expect("ignore the older conflicting public observation");
+    assert_eq!(retained.id, current.id);
+    assert_eq!(retained.solar_system_id, 30_003_089);
+    assert_eq!(retained.region_id, Some(10_000_002));
+    let inspection = execute_operator_location_evidence_cli(
+        &store,
+        &["inspect", "--id", &current.id.to_string()],
+        newer_observed_at,
+    )
+    .await
+    .expect("inspect unchanged current public evidence");
+    match inspection {
+        OperatorLocationEvidenceCliResult::Inspected { audit, .. } => {
+            assert_eq!(audit.len(), 1);
+        }
+        result => panic!("expected inspected evidence, got {result:?}"),
+    }
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn newer_conflicting_public_system_does_not_carry_over_the_old_region() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let location_id = 60_003_765_i64;
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
+    let current = LocationEvidenceService::new(&store)
+        .record_public_npc(
+            location_id,
+            Some(location_id),
+            30_003_089,
+            Some(10_000_002),
+            observed_at,
+            observed_at,
+        )
+        .await
+        .expect("record the current public station location");
+    let replacement = LocationEvidenceService::new(&store)
+        .record_public_npc(
+            location_id,
+            Some(location_id),
+            30_002_086,
+            None,
+            observed_at + chrono::Duration::minutes(1),
+            observed_at + chrono::Duration::minutes(1),
+        )
+        .await
+        .expect("record the newer conflicting public station location");
+    assert_ne!(replacement.id, current.id);
+    assert_eq!(replacement.solar_system_id, 30_002_086);
+    assert_eq!(replacement.region_id, None);
+    assert_eq!(replacement.supersedes_id, Some(current.id));
+    let inspection = execute_operator_location_evidence_cli(
+        &store,
+        &["inspect", "--id", &current.id.to_string()],
+        observed_at,
+    )
+    .await
+    .expect("inspect the superseded public evidence");
+    match inspection {
+        OperatorLocationEvidenceCliResult::Inspected { evidence, audit } => {
+            assert!(evidence.superseded_at.is_some());
+            assert_eq!(audit.len(), 2);
+        }
+        result => panic!("expected inspected evidence, got {result:?}"),
+    }
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn public_location_region_facts_are_monotonic_for_same_station_and_system() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
+    let known_region_location_id = 60_003_763_i64;
+    let known_region = LocationEvidenceService::new(&store)
+        .record_public_npc(
+            known_region_location_id,
+            Some(known_region_location_id),
+            30_003_089,
+            Some(10_000_002),
+            observed_at,
+            observed_at,
+        )
+        .await
+        .expect("record the public station with its known region");
+    let retained = LocationEvidenceService::new(&store)
+        .record_public_npc(
+            known_region_location_id,
+            Some(known_region_location_id),
+            30_003_089,
+            None,
+            observed_at + chrono::Duration::minutes(1),
+            observed_at + chrono::Duration::minutes(1),
+        )
+        .await
+        .expect("retain the known region when a later public response omits it");
+    assert_eq!(retained.id, known_region.id);
+    assert_eq!(retained.region_id, Some(10_000_002));
+    let inspection = execute_operator_location_evidence_cli(
+        &store,
+        &["inspect", "--id", &known_region.id.to_string()],
+        observed_at,
+    )
+    .await
+    .expect("inspect the unchanged known-region public row");
+    match inspection {
+        OperatorLocationEvidenceCliResult::Inspected { audit, .. } => {
+            assert_eq!(audit.len(), 1);
+        }
+        result => panic!("expected inspected evidence, got {result:?}"),
+    }
+
+    let missing_region_location_id = 60_003_764_i64;
+    let missing_region = LocationEvidenceService::new(&store)
+        .record_public_npc(
+            missing_region_location_id,
+            Some(missing_region_location_id),
+            30_002_086,
+            None,
+            observed_at,
+            observed_at,
+        )
+        .await
+        .expect("record public station before region is available");
+    let enriched = LocationEvidenceService::new(&store)
+        .record_public_npc(
+            missing_region_location_id,
+            Some(missing_region_location_id),
+            30_002_086,
+            Some(10_000_003),
+            observed_at + chrono::Duration::minutes(1),
+            observed_at + chrono::Duration::minutes(1),
+        )
+        .await
+        .expect("enrich a later public station observation with its region");
+    assert_ne!(enriched.id, missing_region.id);
+    assert_eq!(enriched.region_id, Some(10_000_003));
+    assert_eq!(enriched.supersedes_id, Some(missing_region.id));
+    let inspection = execute_operator_location_evidence_cli(
+        &store,
+        &["inspect", "--id", &missing_region.id.to_string()],
+        observed_at,
+    )
+    .await
+    .expect("inspect the superseded regionless public row");
+    match inspection {
+        OperatorLocationEvidenceCliResult::Inspected { evidence, audit } => {
+            assert!(evidence.superseded_at.is_some());
+            assert_eq!(audit.len(), 2);
+        }
+        result => panic!("expected inspected evidence, got {result:?}"),
+    }
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn public_location_evidence_retention_failure_does_not_abort_listed_delivery() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let contract = item_exchange_contract(44);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(vec![], HashMap::new())),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline before the listed contract");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "public-location-delivery".to_string(),
+            description: "deliver from public location context".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                    config::SystemRange {
+                        system_id: 30_002_086,
+                        range: 1.0,
+                    },
+                ])),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist the public-location subscription");
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to fail optional public retention");
+    install_public_location_evidence_failure_trigger(&raw_pool).await;
+    raw_pool.close().await;
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: regional_esi(
+                vec![contract.clone()],
+                HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![], expiring_cache())),
+                )]),
+            ),
+            contexts: HashMap::from([(
+                contract.contract_id,
+                ContractObservationContext {
+                    solar_system_id: Some(30_002_086),
+                    ..ContractObservationContext::default()
+                },
+            )]),
+            positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .collect_cycle()
+    .await
+    .expect("optional public location retention must not abort listed delivery");
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+    assert!(LocationEvidenceService::new(&store)
+        .resolve(contract.start_location_id, Utc::now())
+        .await
+        .expect("read absent optional evidence")
+        .is_none());
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn snapshot_retries_public_location_retention_without_duplicate_listed_delivery() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let contract = item_exchange_contract(44);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(vec![], HashMap::new())),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline before snapshot retention");
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "snapshot-location-retention",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the listed subscription");
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to fail snapshot public retention");
+    install_public_location_evidence_failure_trigger(&raw_pool).await;
+    raw_pool.close().await;
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let failed_snapshot = Arc::new(SnapshottingEsi {
+        inner: regional_esi(
+            vec![contract.clone()],
+            HashMap::from([(
+                contract.contract_id,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        ),
+        contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+            ContractEmbedContext {
+                observed_at: Some(Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap()),
+                location: ContractLocationContext {
+                    location_kind: Some("Station".to_string()),
+                    solar_system_id: Some(30_002_086),
+                    region_id: Some(10_000_003),
+                    ..ContractLocationContext::default()
+                },
+                ..ContractEmbedContext::default()
+            },
+            CacheMetadata::cached_for_seconds(60),
+        ))]),
+        calls: StdMutex::new(Vec::new()),
+    });
+    let failed = ContractCollector::new(store.clone(), failed_snapshot.clone())
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+        .collect_cycle()
+        .await
+        .expect("optional snapshot retention does not abort the committed listed event");
+    assert_eq!(failed.events.len(), 1);
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+    assert!(store
+        .observed_embed_context(10_000_002, contract.contract_id)
+        .await
+        .expect("read absent snapshot after failed retention")
+        .is_none());
+    assert!(LocationEvidenceService::new(&store)
+        .resolve(contract.start_location_id, Utc::now())
+        .await
+        .expect("read absent failed evidence")
+        .is_none());
+    assert!(store
+        .unresolved_collection_failures()
+        .await
+        .expect("read retryable snapshot retention failure")
+        .iter()
+        .any(|failure| failure.contract_id == Some(contract.contract_id)
+            && failure.failure_kind == "embed_context_enrichment"));
+
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to restore public retention");
+    remove_public_location_evidence_failure_trigger(&raw_pool).await;
+    raw_pool.close().await;
+    let repaired_snapshot = Arc::new(SnapshottingEsi {
+        inner: regional_esi(
+            vec![contract.clone()],
+            HashMap::from([(
+                contract.contract_id,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        ),
+        contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+            ContractEmbedContext {
+                observed_at: Some(Utc.with_ymd_and_hms(2026, 8, 17, 12, 1, 0).unwrap()),
+                location: ContractLocationContext {
+                    location_kind: Some("Station".to_string()),
+                    solar_system_id: Some(30_002_086),
+                    region_id: Some(10_000_003),
+                    ..ContractLocationContext::default()
+                },
+                ..ContractEmbedContext::default()
+            },
+            CacheMetadata::cached_for_seconds(60),
+        ))]),
+        calls: StdMutex::new(Vec::new()),
+    });
+    let repaired = ContractCollector::new(store.clone(), repaired_snapshot.clone())
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+        .collect_cycle()
+        .await
+        .expect("retry the missing snapshot after public retention recovers");
+    assert!(repaired.events.is_empty());
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+    assert!(store
+        .observed_embed_context(10_000_002, contract.contract_id)
+        .await
+        .expect("read repaired snapshot")
+        .is_some());
+    assert_eq!(
+        LocationEvidenceService::new(&store)
+            .resolve(contract.start_location_id, Utc::now())
+            .await
+            .expect("resolve repaired public evidence")
+            .expect("persisted public evidence")
+            .evidence_class,
+        LocationEvidenceClass::PublicNpc
+    );
+    assert!(!store
+        .unresolved_collection_failures()
+        .await
+        .expect("resolve snapshot failure after repair")
+        .iter()
+        .any(|failure| failure.contract_id == Some(contract.contract_id)
+            && failure.failure_kind == "embed_context_enrichment"));
+    assert_eq!(failed_snapshot.calls.lock().unwrap().as_slice(), &[44]);
+    assert_eq!(repaired_snapshot.calls.lock().unwrap().as_slice(), &[44]);
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn deferred_operator_location_rechecks_security_after_evidence_moves_systems() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let contract = item_exchange_contract(44);
+    let now = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(vec![], HashMap::new())),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline before deferred context evaluation");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "moved-operator-security".to_string(),
+            description: "security and proximity require current operator location evidence"
+                .to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::And(vec![
+                    ContractFilterNode::Condition(ContractFilterCondition::SecurityRange {
+                        min: 0.4,
+                        max: 0.6,
+                    }),
+                    ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                        config::SystemRange {
+                            system_id: 30_003_089,
+                            range: 1.0,
+                        },
+                    ])),
+                ]),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist the deferred security subscription");
+    let first = execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "60003760",
+            "--station-id",
+            "60003760",
+            "--system-id",
+            "30002086",
+            "--region-id",
+            "10000003",
+            "--expires-at",
+            "2026-08-19T12:00:00Z",
+            "--actor",
+            "operator:one",
+            "--provenance",
+            "initial station report",
+        ],
+        now,
+    )
+    .await
+    .expect("add initial lower-precedence station evidence");
+    let first_id = match first {
+        OperatorLocationEvidenceCliResult::Added(evidence) => evidence.id.to_string(),
+        result => panic!("expected initial operator evidence, got {result:?}"),
+    };
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let first_esi = Arc::new(SecurityBySystemPositionEsi {
+        inner: regional_esi(
+            vec![contract.clone()],
+            HashMap::from([(
+                contract.contract_id,
+                Ok(EsiResponse::fresh(vec![], expiring_cache())),
+            )]),
+        ),
+        contexts: HashMap::new(),
+        positions: HashMap::from([(30_003_089, position_at_light_years(0.0))]),
+        security_statuses: HashMap::from([(30_002_086, 0.5)]),
+        security_calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), first_esi.clone())
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+        .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+        .collect_cycle()
+        .await
+        .expect("defer while the old operator system position is unavailable");
+    assert!(delivery.sent.lock().unwrap().is_empty());
+    assert_eq!(
+        first_esi.security_calls.lock().unwrap().as_slice(),
+        &[30_002_086]
+    );
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect the deferred context");
+    let deferred_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM contract_deferred_subscription_matches WHERE subscription_id = 'moved-operator-security'",
+    )
+    .fetch_one(&raw_pool)
+    .await
+    .expect("count persisted deferred context");
+    let deferred_event: Value = sqlx::query_scalar(
+        "SELECT event FROM contract_deferred_subscription_matches WHERE subscription_id = 'moved-operator-security'",
+    )
+    .fetch_one(&raw_pool)
+    .await
+    .expect("read persisted deferred event context");
+    raw_pool.close().await;
+    assert_eq!(deferred_count, 1);
+    assert_eq!(
+        deferred_event["context"]["location_evidence_class"],
+        "operator"
+    );
+    assert_eq!(deferred_event["context"]["security_status"], 0.5);
+
+    execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "supersede",
+            "--id",
+            &first_id,
+            "--system-id",
+            "30003089",
+            "--region-id",
+            "10000002",
+            "--expires-at",
+            "2026-08-20T12:01:00Z",
+            "--actor",
+            "operator:two",
+            "--provenance",
+            "moved station report",
+        ],
+        now + chrono::Duration::minutes(1),
+    )
+    .await
+    .expect("supersede the operator evidence with the moved system");
+    let moved_esi = Arc::new(SecurityBySystemPositionEsi {
+        inner: regional_esi(
+            vec![contract.clone()],
+            HashMap::from([(
+                contract.contract_id,
+                Ok(EsiResponse::fresh(vec![], expiring_cache())),
+            )]),
+        ),
+        contexts: HashMap::new(),
+        positions: HashMap::from([(30_003_089, position_at_light_years(0.0))]),
+        security_statuses: HashMap::from([(30_003_089, 0.9)]),
+        security_calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), moved_esi.clone())
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+        .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(
+            now + chrono::Duration::minutes(2),
+        ))))
+        .collect_cycle()
+        .await
+        .expect("re-evaluate the deferred event with moved operator evidence");
+    assert_eq!(
+        moved_esi.security_calls.lock().unwrap().as_slice(),
+        &[30_003_089]
+    );
+    assert!(delivery.sent.lock().unwrap().is_empty());
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn operator_location_evidence_cli_rejects_unknown_options_and_nonfuture_expiry() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
+    let unknown_option = execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "1035466617947",
+            "--structure-id",
+            "1035466617947",
+            "--system-id",
+            "30002086",
+            "--region-id",
+            "10000003",
+            "--expires-at",
+            "2026-08-18T12:00:00Z",
+            "--actor",
+            "operator:146451271497416704",
+            "--provenance",
+            "fleet scout report",
+            "--provenence",
+            "misspelled",
+        ],
+        now,
+    )
+    .await
+    .expect_err("reject a mutation option that would otherwise be silently ignored");
+    assert!(unknown_option.contains("unknown location-evidence option: --provenence"));
+    let negative_evidence_id =
+        execute_operator_location_evidence_cli(&store, &["inspect", "--id", "-1"], now)
+            .await
+            .expect_err("reject non-positive evidence identifiers before querying lifecycle state");
+    assert!(negative_evidence_id.contains("--id must be a positive integer"));
+    let expired = execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "1035466617948",
+            "--structure-id",
+            "1035466617948",
+            "--system-id",
+            "30002086",
+            "--region-id",
+            "10000003",
+            "--expires-at",
+            "2026-08-17T11:59:59Z",
+            "--actor",
+            "operator:146451271497416704",
+            "--provenance",
+            "fleet scout report",
+        ],
+        now,
+    )
+    .await
+    .expect_err("reject operator evidence that is already expired at mutation time");
+    assert!(expired.contains("operator evidence expiry must be in the future"));
+    let future_observation = execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "1035466617949",
+            "--structure-id",
+            "1035466617949",
+            "--system-id",
+            "30002086",
+            "--region-id",
+            "10000003",
+            "--observed-at",
+            "2026-08-17T12:00:01Z",
+            "--expires-at",
+            "2026-08-18T12:00:00Z",
+            "--actor",
+            "operator:146451271497416704",
+            "--provenance",
+            "fleet scout report",
+        ],
+        now,
+    )
+    .await
+    .expect_err("reject a future observation timestamp from the operator CLI");
+    assert!(
+        future_observation.contains("operator evidence observation time cannot be in the future")
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn operator_location_evidence_cli_supersedes_expires_and_lists_only_operator_evidence() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let first_observed_at = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
+    let first = execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "1035466617950",
+            "--structure-id",
+            "1035466617950",
+            "--system-id",
+            "30002086",
+            "--region-id",
+            "10000003",
+            "--expires-at",
+            "2026-08-18T12:00:00Z",
+            "--actor",
+            "operator:one",
+            "--provenance",
+            "first scout report",
+        ],
+        first_observed_at,
+    )
+    .await
+    .expect("add original operator evidence");
+    let first_id = match first {
+        OperatorLocationEvidenceCliResult::Added(evidence) => evidence.id,
+        result => panic!("expected added evidence, got {result:?}"),
+    };
+    let first_id_text = first_id.to_string();
+    let superseded = execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "supersede",
+            "--id",
+            &first_id_text,
+            "--system-id",
+            "30003089",
+            "--region-id",
+            "10000002",
+            "--expires-at",
+            "2026-08-19T12:00:00Z",
+            "--actor",
+            "operator:two",
+            "--provenance",
+            "updated scout report",
+        ],
+        first_observed_at + chrono::Duration::minutes(1),
+    )
+    .await
+    .expect("supersede only the current operator evidence");
+    let replacement_id = match superseded {
+        OperatorLocationEvidenceCliResult::Superseded(evidence) => {
+            assert_eq!(evidence.location_id, 1_035_466_617_950);
+            assert_eq!(evidence.solar_system_id, 30_003_089);
+            assert_eq!(evidence.region_id, Some(10_000_002));
+            assert_eq!(evidence.supersedes_id, Some(first_id));
+            evidence.id
+        }
+        result => panic!("expected superseded evidence, got {result:?}"),
+    };
+    let inspected_first = execute_operator_location_evidence_cli(
+        &store,
+        &["inspect", "--id", &first_id_text],
+        first_observed_at,
+    )
+    .await
+    .expect("inspect superseded evidence");
+    match inspected_first {
+        OperatorLocationEvidenceCliResult::Inspected { evidence, audit } => {
+            assert!(evidence.superseded_at.is_some());
+            assert_eq!(
+                evidence.superseded_by_actor.as_deref(),
+                Some("operator:two")
+            );
+            assert_eq!(
+                audit
+                    .iter()
+                    .map(|entry| entry.action.as_str())
+                    .collect::<Vec<_>>(),
+                ["added", "superseded"]
+            );
+        }
+        result => panic!("expected inspection result, got {result:?}"),
+    }
+    let replacement_id_text = replacement_id.to_string();
+    let expired = execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "expire",
+            "--id",
+            &replacement_id_text,
+            "--actor",
+            "operator:three",
+            "--provenance",
+            "structure removed from watch list",
+        ],
+        first_observed_at + chrono::Duration::minutes(2),
+    )
+    .await
+    .expect("expire only the replacement operator evidence");
+    assert!(matches!(
+        expired,
+        OperatorLocationEvidenceCliResult::Expired(_)
+    ));
+    let listed = execute_operator_location_evidence_cli(
+        &store,
+        &["list", "--location-id", "1035466617950"],
+        first_observed_at,
+    )
+    .await
+    .expect("list the evidence history without mutating it");
+    match listed {
+        OperatorLocationEvidenceCliResult::Listed(evidence) => {
+            assert_eq!(evidence.len(), 2);
+            assert_eq!(evidence[0].id, first_id);
+            assert_eq!(evidence[1].id, replacement_id);
+            assert!(evidence[1].expired_at.is_some());
+        }
+        result => panic!("expected evidence list, got {result:?}"),
+    }
+    let inspected_replacement = execute_operator_location_evidence_cli(
+        &store,
+        &["inspect", "--id", &replacement_id_text],
+        first_observed_at,
+    )
+    .await
+    .expect("inspect explicitly expired operator evidence");
+    match inspected_replacement {
+        OperatorLocationEvidenceCliResult::Inspected { evidence, audit } => {
+            assert!(evidence.expired_at.is_some());
+            assert_eq!(
+                audit
+                    .iter()
+                    .map(|entry| entry.action.as_str())
+                    .collect::<Vec<_>>(),
+                ["added", "expired"]
+            );
+            assert_eq!(audit[1].actor, "operator:three");
+        }
+        result => panic!("expected evidence inspection result, got {result:?}"),
+    }
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn location_evidence_audit_and_supersession_use_mutation_time_not_observed_time() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let added_at = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
+    let backdated_observed_at = added_at - chrono::Duration::hours(1);
+    let added = execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "1035466617953",
+            "--structure-id",
+            "1035466617953",
+            "--system-id",
+            "30002086",
+            "--observed-at",
+            "2026-08-17T11:00:00Z",
+            "--expires-at",
+            "2026-08-19T12:00:00Z",
+            "--actor",
+            "operator:one",
+            "--provenance",
+            "backdated scout report",
+        ],
+        added_at,
+    )
+    .await
+    .expect("retain the supplied backdated observation time");
+    let original_id = match added {
+        OperatorLocationEvidenceCliResult::Added(evidence) => {
+            assert_eq!(evidence.observed_at, backdated_observed_at);
+            evidence.id.to_string()
+        }
+        result => panic!("expected added evidence, got {result:?}"),
+    };
+    let original = execute_operator_location_evidence_cli(
+        &store,
+        &["inspect", "--id", &original_id],
+        added_at,
+    )
+    .await
+    .expect("inspect backdated evidence audit");
+    match original {
+        OperatorLocationEvidenceCliResult::Inspected { audit, .. } => {
+            assert_eq!(audit[0].occurred_at, added_at);
+        }
+        result => panic!("expected inspected evidence, got {result:?}"),
+    }
+    let superseded_at = added_at + chrono::Duration::minutes(10);
+    let replacement_observed_at = added_at - chrono::Duration::minutes(30);
+    let replacement = execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "supersede",
+            "--id",
+            &original_id,
+            "--system-id",
+            "30003089",
+            "--observed-at",
+            "2026-08-17T11:30:00Z",
+            "--expires-at",
+            "2026-08-20T12:00:00Z",
+            "--actor",
+            "operator:two",
+            "--provenance",
+            "backdated replacement scout report",
+        ],
+        superseded_at,
+    )
+    .await
+    .expect("supersede while preserving supplied observation time");
+    let replacement_id = match replacement {
+        OperatorLocationEvidenceCliResult::Superseded(evidence) => {
+            assert_eq!(evidence.observed_at, replacement_observed_at);
+            evidence.id.to_string()
+        }
+        result => panic!("expected superseded evidence, got {result:?}"),
+    };
+    let original = execute_operator_location_evidence_cli(
+        &store,
+        &["inspect", "--id", &original_id],
+        superseded_at,
+    )
+    .await
+    .expect("inspect superseded source evidence");
+    match original {
+        OperatorLocationEvidenceCliResult::Inspected { evidence, audit } => {
+            assert_eq!(evidence.superseded_at, Some(superseded_at));
+            assert_eq!(audit[1].occurred_at, superseded_at);
+        }
+        result => panic!("expected inspected source evidence, got {result:?}"),
+    }
+    let replacement = execute_operator_location_evidence_cli(
+        &store,
+        &["inspect", "--id", &replacement_id],
+        superseded_at,
+    )
+    .await
+    .expect("inspect replacement evidence audit");
+    match replacement {
+        OperatorLocationEvidenceCliResult::Inspected { audit, .. } => {
+            assert_eq!(audit[0].occurred_at, superseded_at);
+        }
+        result => panic!("expected inspected replacement evidence, got {result:?}"),
+    }
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn future_dated_location_evidence_is_not_selected_before_its_observation_time() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = Utc::now();
+    let expires_at = (now + chrono::Duration::days(2)).to_rfc3339();
+    execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "60003761",
+            "--station-id",
+            "60003761",
+            "--system-id",
+            "30002086",
+            "--expires-at",
+            &expires_at,
+            "--actor",
+            "operator:one",
+            "--provenance",
+            "current operator report",
+        ],
+        now,
+    )
+    .await
+    .expect("add current operator evidence");
+    let future_observed_at = now + chrono::Duration::days(1);
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed future access-qualified evidence");
+    sqlx::query("INSERT INTO location_evidence (location_id, evidence_class, station_id, solar_system_id, provenance, actor, observed_at) VALUES ($1, 'access_qualified', $1, $2, 'future scoped lookup', 'system:ticket06-seam', $3)")
+        .bind(60_003_761_i64)
+        .bind(30_003_089_i64)
+        .bind(future_observed_at)
+        .execute(&raw_pool)
+        .await
+        .expect("seed future-dated access-qualified evidence through its future writer seam");
+    raw_pool.close().await;
+    drop(store);
+    let restarted_store = database.store().await;
+    let selected_now = LocationEvidenceService::new(&restarted_store)
+        .resolve(60_003_761, now)
+        .await
+        .expect("resolve current evidence")
+        .expect("operator evidence remains current before future observation");
+    assert_eq!(selected_now.evidence_class, LocationEvidenceClass::Operator);
+    assert_eq!(selected_now.solar_system_id, 30_002_086);
+    let selected_later = LocationEvidenceService::new(&restarted_store)
+        .resolve(
+            60_003_761,
+            future_observed_at + chrono::Duration::seconds(1),
+        )
+        .await
+        .expect("resolve evidence after the future observation time")
+        .expect("access-qualified evidence becomes selectable when observed");
+    assert_eq!(
+        selected_later.evidence_class,
+        LocationEvidenceClass::AccessQualified
+    );
+    assert_eq!(selected_later.solar_system_id, 30_003_089);
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn adding_after_time_expiry_audits_the_automatic_operator_expiration() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let first_now = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
+    let first = execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "1035466617952",
+            "--structure-id",
+            "1035466617952",
+            "--system-id",
+            "30002086",
+            "--region-id",
+            "10000003",
+            "--expires-at",
+            "2026-08-17T12:01:00Z",
+            "--actor",
+            "operator:one",
+            "--provenance",
+            "short-lived scout report",
+        ],
+        first_now,
+    )
+    .await
+    .expect("add short-lived operator evidence");
+    let first_id = match first {
+        OperatorLocationEvidenceCliResult::Added(evidence) => evidence.id.to_string(),
+        result => panic!("expected added evidence, got {result:?}"),
+    };
+    execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "1035466617952",
+            "--structure-id",
+            "1035466617952",
+            "--system-id",
+            "30003089",
+            "--region-id",
+            "10000002",
+            "--expires-at",
+            "2026-08-19T12:00:00Z",
+            "--actor",
+            "operator:two",
+            "--provenance",
+            "replacement scout report",
+        ],
+        first_now + chrono::Duration::minutes(2),
+    )
+    .await
+    .expect("replace operator evidence only after its prior expiry");
+    let inspected =
+        execute_operator_location_evidence_cli(&store, &["inspect", "--id", &first_id], first_now)
+            .await
+            .expect("inspect automatically expired evidence");
+    match inspected {
+        OperatorLocationEvidenceCliResult::Inspected { evidence, audit } => {
+            assert!(evidence.expired_at.is_some());
+            assert_eq!(evidence.superseded_at, None);
+            assert_eq!(
+                audit
+                    .iter()
+                    .map(|entry| entry.action.as_str())
+                    .collect::<Vec<_>>(),
+                ["added", "expired"]
+            );
+            assert_eq!(audit[1].actor, "system:expiry");
+        }
+        result => panic!("expected evidence inspection, got {result:?}"),
+    }
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn operator_evidence_resolves_deferred_player_structure_proximity_after_store_recreation() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let location_id = 1_035_466_617_951_i64;
+    let mut player_structure_contract = item_exchange_contract(44);
+    player_structure_contract.start_location_id = location_id;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish a silent public-contract baseline");
+    for (id, center) in [("near-turnur", 30_002_086), ("near-kurniainen", 30_003_089)] {
+        store
+            .upsert_contract_subscription(&ContractSubscription {
+                guild_id: 42,
+                channel_id: 77,
+                id: id.to_string(),
+                description: id.to_string(),
+                filter: ContractFilter {
+                    root: ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(
+                        vec![config::SystemRange {
+                            system_id: center,
+                            range: 1.0,
+                        }],
+                    )),
+                },
+                event_actions: ContractEventActions {
+                    listed: ContractEventAction::Post,
+                    ..ContractEventActions::default()
+                },
+            })
+            .await
+            .expect("persist a proximity subscription");
+    }
+    let positions = HashMap::from([
+        (30_002_086, position_at_light_years(0.0)),
+        (30_003_089, position_at_light_years(20.0)),
+    ]);
+    let unknown_delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(
+                        vec![player_structure_contract.clone()],
+                        expiring_page(1),
+                    )),
+                )]),
+                items: HashMap::from([(44, Ok(EsiResponse::fresh(vec![], expiring_cache())))]),
+            },
+            contexts: HashMap::new(),
+            positions: positions.clone(),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::new())),
+        unknown_delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("defer the player-structure proximity match without evidence");
+    assert!(unknown_delivery.sent.lock().unwrap().is_empty());
+    let now = Utc::now();
+    execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "1035466617951",
+            "--structure-id",
+            "1035466617951",
+            "--system-id",
+            "30002086",
+            "--region-id",
+            "10000003",
+            "--expires-at",
+            &(now + chrono::Duration::days(1)).to_rfc3339(),
+            "--actor",
+            "operator:146451271497416704",
+            "--provenance",
+            "scout report for retained structure location",
+        ],
+        now,
+    )
+    .await
+    .expect("add evidence without any subscription identity");
+    drop(store);
+    let restarted_store = database.store().await;
+    let selected = LocationEvidenceService::new(&restarted_store)
+        .resolve(location_id, now)
+        .await
+        .expect("read retained evidence after reconstructing the store")
+        .expect("operator evidence remains selected before expiry");
+    assert_eq!(selected.evidence_class, LocationEvidenceClass::Operator);
+    assert_eq!(selected.solar_system_id, 30_002_086);
+    let resolved_delivery = Arc::new(RecordingDelivery {
+        store: restarted_store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        restarted_store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(
+                        vec![player_structure_contract],
+                        expiring_page(1),
+                    )),
+                )]),
+                items: HashMap::from([(44, Ok(EsiResponse::fresh(vec![], expiring_cache())))]),
+            },
+            contexts: HashMap::new(),
+            positions,
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::new())),
+        resolved_delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("re-evaluate deferred proximity from retained operator evidence");
+    let sent = resolved_delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].subscription_id, "near-turnur");
+    assert_eq!(sent[0].contract_id, 44);
+    drop(sent);
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn fresh_public_npc_location_evidence_outranks_retained_operator_evidence_after_restart() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let contract = item_exchange_contract(44);
+    let now = Utc::now();
+    let public_observed_at = now + chrono::Duration::seconds(1);
+    execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "60003760",
+            "--station-id",
+            "60003760",
+            "--system-id",
+            "30002086",
+            "--region-id",
+            "10000003",
+            "--expires-at",
+            &(now + chrono::Duration::days(1)).to_rfc3339(),
+            "--actor",
+            "operator:146451271497416704",
+            "--provenance",
+            "outdated station report",
+        ],
+        now,
+    )
+    .await
+    .expect("retain lower-precedence operator station evidence");
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline before the public station contract");
+    for (id, center) in [
+        ("operator-system", 30_002_086),
+        ("public-system", 30_003_089),
+    ] {
+        store
+            .upsert_contract_subscription(&ContractSubscription {
+                guild_id: 42,
+                channel_id: 77,
+                id: id.to_string(),
+                description: id.to_string(),
+                filter: ContractFilter {
+                    root: ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(
+                        vec![config::SystemRange {
+                            system_id: center,
+                            range: 1.0,
+                        }],
+                    )),
+                },
+                event_actions: ContractEventActions {
+                    listed: ContractEventAction::Post,
+                    ..ContractEventActions::default()
+                },
+            })
+            .await
+            .expect("persist a public-precedence proximity subscription");
+    }
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![], expiring_cache())),
+                )]),
+            },
+            contexts: HashMap::from([(
+                contract.contract_id,
+                ContractObservationContext {
+                    solar_system_id: Some(30_003_089),
+                    ..ContractObservationContext::default()
+                },
+            )]),
+            positions: HashMap::from([
+                (30_002_086, position_at_light_years(0.0)),
+                (30_003_089, position_at_light_years(20.0)),
+            ]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(
+        public_observed_at,
+    ))))
+    .collect_cycle()
+    .await
+    .expect("prefer the fresh public station location during proximity evaluation");
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].subscription_id, "public-system");
+    drop(sent);
+    let evidence = LocationEvidenceService::new(&store)
+        .resolve(contract.start_location_id, public_observed_at)
+        .await
+        .expect("resolve precedence from retained evidence")
+        .expect("public ESI result is retained");
+    assert_eq!(evidence.evidence_class, LocationEvidenceClass::PublicNpc);
+    assert_eq!(evidence.solar_system_id, 30_003_089);
+    let public_id = evidence.id.to_string();
+    let public_expire = execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "expire",
+            "--id",
+            &public_id,
+            "--actor",
+            "operator:146451271497416704",
+            "--provenance",
+            "must not expire system-owned evidence",
+        ],
+        now,
+    )
+    .await
+    .expect_err("operator CLI cannot mutate authoritative public evidence");
+    assert!(public_expire.contains("not current operator evidence"));
+    drop(store);
+    let restarted_store = database.store().await;
+    let selected_after_restart = LocationEvidenceService::new(&restarted_store)
+        .resolve(contract.start_location_id, public_observed_at)
+        .await
+        .expect("resolve retained precedence after store recreation")
+        .expect("public evidence remains selected after restart");
+    assert_eq!(
+        selected_after_restart.evidence_class,
+        LocationEvidenceClass::PublicNpc
+    );
+    assert_eq!(selected_after_restart.solar_system_id, 30_003_089);
+    let retained = execute_operator_location_evidence_cli(
+        &restarted_store,
+        &["list", "--location-id", "60003760"],
+        now,
+    )
+    .await
+    .expect("list separately retained evidence classes");
+    match retained {
+        OperatorLocationEvidenceCliResult::Listed(evidence) => {
+            assert_eq!(evidence.len(), 2);
+            assert!(evidence.iter().any(|entry| entry.evidence_class
+                == LocationEvidenceClass::Operator
+                && entry.superseded_at.is_none()));
+            assert!(evidence
+                .iter()
+                .any(|entry| entry.evidence_class == LocationEvidenceClass::PublicNpc));
+        }
+        result => panic!("expected retained evidence list, got {result:?}"),
+    }
+    database.destroy().await;
+}
+
 #[derive(Default)]
 struct FakeEsi {
     regions: Vec<i64>,
@@ -266,6 +1819,14 @@ struct PositionEsi {
     contexts: HashMap<i64, ContractObservationContext>,
     positions: HashMap<u32, SolarSystemPosition>,
     position_calls: StdMutex<Vec<u32>>,
+}
+
+struct SecurityBySystemPositionEsi {
+    inner: FakeEsi,
+    contexts: HashMap<i64, ContractObservationContext>,
+    positions: HashMap<u32, SolarSystemPosition>,
+    security_statuses: HashMap<i64, f64>,
+    security_calls: StdMutex<Vec<i64>>,
 }
 
 struct PositionedResolutionEsi {
@@ -694,6 +2255,76 @@ impl PublicContractEsi for PositionEsi {
         _etag: Option<&str>,
     ) -> Result<EsiResponse<SolarSystemPosition>, EsiError> {
         self.position_calls.lock().unwrap().push(solar_system_id);
+        self.positions
+            .get(&solar_system_id)
+            .copied()
+            .map(|position| EsiResponse::fresh(position, CacheMetadata::cached_for_seconds(60)))
+            .ok_or_else(|| EsiError::retryable("position unavailable", None))
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for SecurityBySystemPositionEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+
+    async fn observed_contract_context(
+        &self,
+        contract: &PublicContract,
+        _requirements: ContractContextRequirements,
+    ) -> Result<EsiResponse<ContractObservationContext>, EsiError> {
+        Ok(EsiResponse::fresh(
+            self.contexts
+                .get(&contract.contract_id)
+                .cloned()
+                .unwrap_or_default(),
+            CacheMetadata::cached_for_seconds(60),
+        ))
+    }
+
+    async fn observed_solar_system_security(
+        &self,
+        _contract: &PublicContract,
+        solar_system_id: i64,
+    ) -> Result<EsiResponse<ContractContextValue<f64>>, EsiError> {
+        self.security_calls.lock().unwrap().push(solar_system_id);
+        self.security_statuses
+            .get(&solar_system_id)
+            .copied()
+            .map(|security_status| {
+                EsiResponse::fresh(
+                    ContractContextValue::Resolved(security_status),
+                    CacheMetadata::cached_for_seconds(60),
+                )
+            })
+            .ok_or_else(|| EsiError::retryable("security unavailable", None))
+    }
+
+    async fn solar_system_position(
+        &self,
+        solar_system_id: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<SolarSystemPosition>, EsiError> {
         self.positions
             .get(&solar_system_id)
             .copied()
@@ -10736,7 +12367,7 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         .fetch_one(&clean_pool)
         .await
         .expect("read clean migration ledger");
-    assert_eq!(clean_migration_count, 14);
+    assert_eq!(clean_migration_count, 15);
     let batch_table_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
         .bind("regional_observation_batches")
         .fetch_one(&clean_pool)
@@ -10746,6 +12377,14 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         batch_table_exists,
         "clean migration creates regional batch ledger"
     );
+    for table in ["location_evidence", "location_evidence_audit"] {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(table)
+            .fetch_one(&clean_pool)
+            .await
+            .expect("read clean location-evidence table");
+        assert!(exists, "clean migration creates {table}");
+    }
     for table in [
         "bot_heartbeats",
         "health_snapshots",
@@ -10905,6 +12544,14 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         upgraded_batch_table_exists,
         "current production migration creates regional batch ledger"
     );
+    for table in ["location_evidence", "location_evidence_audit"] {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(table)
+            .fetch_one(&upgraded_pool)
+            .await
+            .expect("read upgraded location-evidence table");
+        assert!(exists, "current production migration creates {table}");
+    }
     for table in [
         "bot_heartbeats",
         "health_snapshots",

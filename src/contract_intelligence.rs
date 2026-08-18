@@ -1,6 +1,7 @@
 use crate::config::SystemRange;
 use crate::discord_bot::SHIP_GROUP_PRIORITY;
 use crate::feed::{FeedHealthSnapshot, FeedHealthTelemetry};
+use crate::location_evidence::{LocationEvidenceClass, LocationEvidenceService};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::header::{HeaderMap, ETAG, EXPIRES, IF_NONE_MATCH, LAST_MODIFIED, RETRY_AFTER};
@@ -2748,6 +2749,10 @@ pub struct ContractObservationContext {
     #[serde(default)]
     pub solar_system_position_resolution: ContractContextResolution,
     #[serde(default)]
+    pub location_evidence_id: Option<i64>,
+    #[serde(default)]
+    pub location_evidence_class: Option<LocationEvidenceClass>,
+    #[serde(default)]
     pub range_center_positions: BTreeMap<u32, SolarSystemPosition>,
     pub security_status: Option<f64>,
     #[serde(default)]
@@ -3136,6 +3141,10 @@ async fn run_migrator_releasing_lock_on_error(
 }
 
 impl ContractCollectionStore {
+    pub(crate) fn location_evidence_pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
         Self::connect_with_migrator(database_url, &MIGRATOR, HEALTH_MIGRATION_VERSIONS).await
     }
@@ -5719,7 +5728,23 @@ impl ContractCollector {
         subscriptions: &[ContractSubscription],
         ship_groups: &dyn ShipGroupResolver,
     ) -> Result<ContractEvent, ContractCollectionError> {
+        let evidence_now = self.delivery_clock.now();
         let mut event = self.event_with_persisted_observation_context(event).await?;
+        let location_is_retainable_evidence = matches!(
+            event.context.location_evidence_class,
+            Some(LocationEvidenceClass::AccessQualified | LocationEvidenceClass::Operator)
+        );
+        if matches!(event.kind, ContractEventKind::Listed) && location_is_retainable_evidence {
+            event.context.solar_system_id = None;
+            event.context.solar_system_position = None;
+            event.context.security_status = None;
+            event.context.solar_system_resolution = ContractContextResolution::Indeterminate;
+            event.context.solar_system_position_resolution =
+                ContractContextResolution::Indeterminate;
+            event.context.security_status_resolution = ContractContextResolution::Indeterminate;
+            event.context.location_evidence_id = None;
+            event.context.location_evidence_class = None;
+        }
         let mut requirements = ContractContextRequirements::default();
         for subscription in subscriptions {
             if matches!(
@@ -5747,10 +5772,6 @@ impl ContractCollector {
 
         if (requirements.solar_system || requirements.security_status)
             && event.context.solar_system_id.is_none()
-            && !matches!(
-                event.context.solar_system_resolution,
-                ContractContextResolution::DefinitivelyAbsent
-            )
         {
             if self
                 .context_request_allowed(event.contract.contract_id)
@@ -5764,10 +5785,57 @@ impl ContractCollector {
                             .await,
                     )
                     .await?;
+                let public_system_id =
+                    response.as_ref().and_then(|response| match response.value {
+                        Some(ContractContextValue::Resolved(system_id)) => Some(system_id),
+                        Some(ContractContextValue::DefinitivelyAbsent)
+                        | Some(ContractContextValue::Indeterminate)
+                        | None => None,
+                    });
                 apply_solar_system_context(&mut event.context, response);
+                if let Some(solar_system_id) = public_system_id {
+                    let station_id = (event.contract.start_location_id != solar_system_id)
+                        .then_some(event.contract.start_location_id);
+                    match LocationEvidenceService::new(&self.store)
+                        .record_public_npc(
+                            event.contract.start_location_id,
+                            station_id,
+                            solar_system_id,
+                            None,
+                            evidence_now,
+                            evidence_now,
+                        )
+                        .await
+                    {
+                        Ok(evidence) => {
+                            event.context.location_evidence_id = Some(evidence.id);
+                            event.context.location_evidence_class =
+                                Some(LocationEvidenceClass::PublicNpc);
+                        }
+                        Err(error) => warn!(
+                            contract_id = event.contract.contract_id,
+                            location_id = event.contract.start_location_id,
+                            "could not retain optional public location evidence: {error}"
+                        ),
+                    }
+                }
             } else {
                 event.context.solar_system_resolution =
                     ContractContextResolution::TemporarilyUnavailable;
+            }
+        }
+
+        if (requirements.solar_system || requirements.security_status)
+            && event.context.solar_system_id.is_none()
+        {
+            if let Some(evidence) = LocationEvidenceService::new(&self.store)
+                .resolve(event.contract.start_location_id, evidence_now)
+                .await?
+            {
+                event.context.solar_system_id = Some(evidence.solar_system_id);
+                event.context.solar_system_resolution = ContractContextResolution::Resolved;
+                event.context.location_evidence_id = Some(evidence.id);
+                event.context.location_evidence_class = Some(evidence.evidence_class);
             }
         }
 
@@ -6183,6 +6251,7 @@ impl ContractCollector {
         observed: &[ObservedContract],
         remaining: usize,
     ) -> Result<usize, ContractCollectionError> {
+        let evidence_now = self.delivery_clock.now();
         let mut consumed = 0;
         for observed in observed {
             if self
@@ -6235,13 +6304,88 @@ impl ContractCollector {
                 .await?
             {
                 Some(response) => {
-                    self.store
-                        .save_observed_embed_context(
-                            region_id,
-                            observed.contract.contract_id,
-                            &response.value.unwrap_or_default(),
-                        )
-                        .await?;
+                    let context = response.value.unwrap_or_default();
+                    let mut retain_snapshot = true;
+                    if let Some(solar_system_id) = context.location.solar_system_id {
+                        let station_id = (context.location.location_kind.as_deref()
+                            == Some("Station"))
+                        .then_some(observed.contract.start_location_id)
+                        .or_else(|| {
+                            (observed.contract.start_location_id == solar_system_id)
+                                .then_some(observed.contract.start_location_id)
+                        });
+                        if station_id.is_some()
+                            || observed.contract.start_location_id == solar_system_id
+                        {
+                            let observed_at = context
+                                .observed_at
+                                .unwrap_or(evidence_now)
+                                .min(evidence_now);
+                            if let Err(error) = LocationEvidenceService::new(&self.store)
+                                .record_public_npc(
+                                    observed.contract.start_location_id,
+                                    station_id,
+                                    solar_system_id,
+                                    context.location.region_id,
+                                    observed_at,
+                                    evidence_now,
+                                )
+                                .await
+                            {
+                                retain_snapshot = false;
+                                warn!(
+                                    region_id,
+                                    contract_id = observed.contract.contract_id,
+                                    location_id = observed.contract.start_location_id,
+                                    "could not retain public location evidence before saving the embed snapshot: {error}"
+                                );
+                                let retry_after = match self
+                                    .store
+                                    .active_esi_limiter_deadline()
+                                    .await
+                                {
+                                    Ok(retry_after) => retry_after,
+                                    Err(limiter_error) => {
+                                        warn!(
+                                            region_id,
+                                            contract_id = observed.contract.contract_id,
+                                            "could not read the ESI limiter while recording public location retention failure: {limiter_error}"
+                                        );
+                                        None
+                                    }
+                                };
+                                if let Err(record_error) = self
+                                    .store
+                                    .record_failure(
+                                        Some(region_id),
+                                        Some(observed.contract.contract_id),
+                                        Some(&embed_context_resource_key(
+                                            observed.contract.contract_id,
+                                        )),
+                                        "embed_context_enrichment",
+                                        "public location evidence retention will be retried",
+                                        retry_after,
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        region_id,
+                                        contract_id = observed.contract.contract_id,
+                                        "could not record public location retention failure: {record_error}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if retain_snapshot {
+                        self.store
+                            .save_observed_embed_context(
+                                region_id,
+                                observed.contract.contract_id,
+                                &context,
+                            )
+                            .await?;
+                    }
                 }
                 None => {
                     self.store
