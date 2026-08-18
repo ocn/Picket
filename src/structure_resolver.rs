@@ -13,6 +13,7 @@ use url::Url;
 use crate::contract_intelligence::{cache_metadata_at, esi_limiter_deadline_at, CacheMetadata};
 
 pub const STRUCTURE_RESOLVER_SCOPE: &str = "esi-universe.read_structures.v1";
+const EVE_SSO_AUTHORIZATION_URL: &str = "https://login.eveonline.com/v2/oauth/authorize/";
 const EVE_SSO_ISSUERS: &[&str] = &["https://login.eveonline.com/", "login.eveonline.com"];
 const EVE_SSO_METADATA_URL: &str =
     "https://login.eveonline.com/.well-known/oauth-authorization-server";
@@ -23,9 +24,132 @@ const STRUCTURE_RESOLVER_ENVIRONMENT_VARIABLES: &[&str] = &[
     "STRUCTURE_RESOLVER_CHARACTER_ID",
     "STRUCTURE_RESOLVER_CREDENTIAL_REVISION",
     "STRUCTURE_RESOLVER_REFRESH_TOKEN",
+    "STRUCTURE_RESOLVER_CLIENT_ID",
+    "STRUCTURE_RESOLVER_CLIENT_SECRET",
     "EVE_CLIENT_ID",
     "EVE_CLIENT_SECRET",
 ];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StructureResolverProvisioningError {
+    message: &'static str,
+}
+
+impl StructureResolverProvisioningError {
+    fn new(message: &'static str) -> Self {
+        Self { message }
+    }
+}
+
+impl Display for StructureResolverProvisioningError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for StructureResolverProvisioningError {}
+
+pub fn build_structure_resolver_authorization_url(
+    client_id: &str,
+    redirect_uri: &str,
+    state: &str,
+) -> Result<String, StructureResolverProvisioningError> {
+    if client_id.trim().is_empty() || state.trim().is_empty() {
+        return Err(StructureResolverProvisioningError::new(
+            "structure resolver authorization request is incomplete",
+        ));
+    }
+    validate_structure_resolver_redirect_uri(redirect_uri)?;
+    let mut authorization_url = Url::parse(EVE_SSO_AUTHORIZATION_URL).map_err(|_| {
+        StructureResolverProvisioningError::new(
+            "structure resolver authorization endpoint is invalid",
+        )
+    })?;
+    authorization_url
+        .query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", STRUCTURE_RESOLVER_SCOPE)
+        .append_pair("state", state);
+    Ok(authorization_url.into())
+}
+
+pub fn parse_structure_resolver_callback(
+    callback_uri: &str,
+    redirect_uri: &str,
+    expected_state: &str,
+) -> Result<String, StructureResolverProvisioningError> {
+    validate_structure_resolver_redirect_uri(redirect_uri)?;
+    if expected_state.trim().is_empty() {
+        return Err(StructureResolverProvisioningError::new(
+            "structure resolver authorization state is missing",
+        ));
+    }
+    let mut callback = Url::parse(callback_uri).map_err(|_| {
+        StructureResolverProvisioningError::new("structure resolver callback is invalid")
+    })?;
+    let callback_query = callback.query_pairs().into_owned().collect::<Vec<_>>();
+    callback.set_query(None);
+    callback.set_fragment(None);
+    if callback.as_str() != redirect_uri {
+        return Err(StructureResolverProvisioningError::new(
+            "structure resolver callback does not match the registered redirect URI",
+        ));
+    }
+    let states = callback_query
+        .iter()
+        .filter_map(|(key, value)| (key == "state").then_some(value.as_str()))
+        .collect::<Vec<_>>();
+    let [state] = states.as_slice() else {
+        return Err(StructureResolverProvisioningError::new(
+            "structure resolver callback state is invalid",
+        ));
+    };
+    if state.is_empty() {
+        return Err(StructureResolverProvisioningError::new(
+            "structure resolver callback state is missing",
+        ));
+    }
+    if *state != expected_state {
+        return Err(StructureResolverProvisioningError::new(
+            "structure resolver callback state does not match",
+        ));
+    }
+    let codes = callback_query
+        .iter()
+        .filter_map(|(key, value)| (key == "code").then_some(value.as_str()))
+        .collect::<Vec<_>>();
+    let [code] = codes.as_slice() else {
+        return Err(StructureResolverProvisioningError::new(
+            "structure resolver callback authorization code is invalid",
+        ));
+    };
+    if code.trim().is_empty() {
+        return Err(StructureResolverProvisioningError::new(
+            "structure resolver callback authorization code is missing",
+        ));
+    }
+    Ok((*code).to_string())
+}
+
+fn validate_structure_resolver_redirect_uri(
+    redirect_uri: &str,
+) -> Result<(), StructureResolverProvisioningError> {
+    let redirect = Url::parse(redirect_uri).map_err(|_| {
+        StructureResolverProvisioningError::new("structure resolver redirect URI is invalid")
+    })?;
+    if !matches!(redirect.scheme(), "http" | "https")
+        || redirect.host_str().is_none()
+        || redirect.query().is_some()
+        || redirect.fragment().is_some()
+    {
+        return Err(StructureResolverProvisioningError::new(
+            "structure resolver redirect URI is invalid",
+        ));
+    }
+    Ok(())
+}
 
 pub trait StructureResolverClock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
@@ -99,8 +223,7 @@ impl StructureResolverConfig {
             });
         }
         let character_id = required_positive_i64(&settings, "STRUCTURE_RESOLVER_CHARACTER_ID")?;
-        let client_id = required_setting(&settings, "EVE_CLIENT_ID")?;
-        let client_secret = required_setting(&settings, "EVE_CLIENT_SECRET")?;
+        let (client_id, client_secret) = resolver_client_credentials(&settings)?;
         let refresh_token = required_setting(&settings, "STRUCTURE_RESOLVER_REFRESH_TOKEN")?;
         let credential_revision = settings
             .get("STRUCTURE_RESOLVER_CREDENTIAL_REVISION")
@@ -152,6 +275,278 @@ impl StructureResolverConfig {
     pub(crate) fn refresh_token(&self) -> Option<&str> {
         self.refresh_token.as_deref()
     }
+}
+
+pub struct StructureResolverProvisioningClient {
+    client_id: String,
+    client_secret: String,
+}
+
+impl StructureResolverProvisioningClient {
+    pub fn new(
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+    ) -> Result<Self, StructureResolverProvisioningError> {
+        let client_id = client_id.into();
+        let client_secret = client_secret.into();
+        if client_id.trim().is_empty() || client_secret.trim().is_empty() {
+            return Err(StructureResolverProvisioningError::new(
+                "structure resolver client credentials are incomplete",
+            ));
+        }
+        Ok(Self {
+            client_id,
+            client_secret,
+        })
+    }
+}
+
+pub struct StructureResolverProvisioningAuthorization {
+    access_token: String,
+    refresh_token: String,
+    character_id: i64,
+}
+
+impl StructureResolverProvisioningAuthorization {
+    #[doc(hidden)]
+    pub fn from_parts(access_token: String, refresh_token: String, character_id: i64) -> Self {
+        Self {
+            access_token,
+            refresh_token,
+            character_id,
+        }
+    }
+
+    pub fn character_id(&self) -> i64 {
+        self.character_id
+    }
+
+    pub fn access_token(&self) -> &str {
+        &self.access_token
+    }
+
+    pub fn refresh_token(&self) -> &str {
+        &self.refresh_token
+    }
+}
+
+pub struct StructureResolverProvisioningEndpoints {
+    esi_base_url: String,
+    token_url: String,
+    metadata_url: String,
+    require_eve_sso_binding: bool,
+}
+
+impl StructureResolverProvisioningEndpoints {
+    pub fn official() -> Self {
+        Self {
+            esi_base_url: EVE_ESI_BASE_URL.to_string(),
+            token_url: EVE_SSO_TOKEN_URL.to_string(),
+            metadata_url: EVE_SSO_METADATA_URL.to_string(),
+            require_eve_sso_binding: true,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn for_test(
+        esi_base_url: impl Into<String>,
+        token_url: impl Into<String>,
+        metadata_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            esi_base_url: esi_base_url.into(),
+            token_url: token_url.into(),
+            metadata_url: metadata_url.into(),
+            require_eve_sso_binding: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StructureProbeCoverage {
+    Full,
+    Partial,
+    Denied,
+    Indeterminate,
+}
+
+pub struct StructureProbeReport {
+    coverage: StructureProbeCoverage,
+    successful: usize,
+    denied: usize,
+    indeterminate: usize,
+}
+
+impl StructureProbeReport {
+    pub fn coverage(&self) -> StructureProbeCoverage {
+        self.coverage
+    }
+
+    pub fn successful(&self) -> usize {
+        self.successful
+    }
+
+    pub fn denied(&self) -> usize {
+        self.denied
+    }
+
+    pub fn indeterminate(&self) -> usize {
+        self.indeterminate
+    }
+}
+
+pub async fn exchange_structure_resolver_authorization(
+    client: StructureResolverProvisioningClient,
+    authorization_code: &str,
+    timeout: Duration,
+) -> Result<StructureResolverProvisioningAuthorization, StructureResolverProvisioningError> {
+    exchange_structure_resolver_authorization_with_endpoints(
+        client,
+        authorization_code,
+        StructureResolverProvisioningEndpoints::official(),
+        timeout,
+    )
+    .await
+}
+
+#[doc(hidden)]
+pub async fn exchange_structure_resolver_authorization_with_endpoints(
+    client: StructureResolverProvisioningClient,
+    authorization_code: &str,
+    endpoints: StructureResolverProvisioningEndpoints,
+    timeout: Duration,
+) -> Result<StructureResolverProvisioningAuthorization, StructureResolverProvisioningError> {
+    if authorization_code.trim().is_empty() {
+        return Err(StructureResolverProvisioningError::new(
+            "structure resolver authorization code is missing",
+        ));
+    }
+    let http_client = Client::builder().timeout(timeout).build().map_err(|_| {
+        StructureResolverProvisioningError::new("structure resolver provisioning HTTP setup failed")
+    })?;
+    let response = http_client
+        .post(&endpoints.token_url)
+        .basic_auth(&client.client_id, Some(&client.client_secret))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", authorization_code),
+        ])
+        .send()
+        .await
+        .map_err(|_| {
+            StructureResolverProvisioningError::new(
+                "structure resolver authorization exchange failed",
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(StructureResolverProvisioningError::new(
+            "structure resolver authorization exchange was rejected",
+        ));
+    }
+    let response = response.json::<TokenRefreshResponse>().await.map_err(|_| {
+        StructureResolverProvisioningError::new(
+            "structure resolver authorization exchange returned an invalid response",
+        )
+    })?;
+    if response.access_token.trim().is_empty() {
+        return Err(StructureResolverProvisioningError::new(
+            "structure resolver authorization exchange returned an invalid response",
+        ));
+    }
+    let refresh_token = response
+        .refresh_token
+        .filter(|refresh_token| !refresh_token.trim().is_empty())
+        .ok_or_else(|| {
+            StructureResolverProvisioningError::new(
+                "structure resolver authorization exchange did not return a refresh token",
+            )
+        })?;
+    let validation_config = StructureResolverConfig {
+        enabled: true,
+        character_id: Some(1),
+        credential_revision: "provisioning".to_string(),
+        client_id: Some(client.client_id.clone()),
+        client_secret: Some(client.client_secret.clone()),
+        refresh_token: Some(refresh_token.clone()),
+    };
+    let validator = AuthenticatedStructureResolver::with_endpoints_and_sso_binding(
+        validation_config,
+        &endpoints.esi_base_url,
+        &endpoints.token_url,
+        &endpoints.metadata_url,
+        timeout,
+        endpoints.require_eve_sso_binding,
+    )
+    .map_err(|_| {
+        StructureResolverProvisioningError::new("structure resolver provisioning HTTP setup failed")
+    })?;
+    let validated = validator
+        .validate_eve_access_token_for_client(&response.access_token, &client.client_id)
+        .await
+        .map_err(|_| {
+            StructureResolverProvisioningError::new(
+                "structure resolver authorization token validation failed",
+            )
+        })?;
+    Ok(StructureResolverProvisioningAuthorization {
+        access_token: response.access_token,
+        refresh_token,
+        character_id: validated.character_id,
+    })
+}
+
+pub async fn probe_structure_resolver_coverage(
+    authorization: &StructureResolverProvisioningAuthorization,
+    structure_ids: &[i64],
+    endpoints: &StructureResolverProvisioningEndpoints,
+    timeout: Duration,
+) -> Result<StructureProbeReport, StructureResolverProvisioningError> {
+    if structure_ids.is_empty() || structure_ids.iter().any(|structure_id| *structure_id <= 0) {
+        return Err(StructureResolverProvisioningError::new(
+            "structure resolver probes must contain positive structure identifiers",
+        ));
+    }
+    let http_client = Client::builder().timeout(timeout).build().map_err(|_| {
+        StructureResolverProvisioningError::new("structure resolver provisioning HTTP setup failed")
+    })?;
+    let mut successful = 0;
+    let mut denied = 0;
+    let mut indeterminate = 0;
+    for structure_id in structure_ids {
+        let response = http_client
+            .get(format!(
+                "{}universe/structures/{structure_id}/",
+                endpoints.esi_base_url
+            ))
+            .bearer_auth(authorization.access_token())
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => successful += 1,
+            Ok(response)
+                if response.status() == StatusCode::FORBIDDEN
+                    || response.status() == StatusCode::NOT_FOUND =>
+            {
+                denied += 1
+            }
+            Ok(_) | Err(_) => indeterminate += 1,
+        }
+    }
+    let coverage = if indeterminate > 0 {
+        StructureProbeCoverage::Indeterminate
+    } else if successful == structure_ids.len() {
+        StructureProbeCoverage::Full
+    } else if successful > 0 {
+        StructureProbeCoverage::Partial
+    } else {
+        StructureProbeCoverage::Denied
+    };
+    Ok(StructureProbeReport {
+        coverage,
+        successful,
+        denied,
+        indeterminate,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -445,6 +840,12 @@ pub trait StructureResolver: Send + Sync {
 #[derive(Clone)]
 struct ValidatedAccessToken {
     value: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct ValidatedEveAccessToken {
+    character_id: i64,
     expires_at: DateTime<Utc>,
 }
 
@@ -1106,6 +1507,28 @@ impl AuthenticatedStructureResolver {
         &self,
         access_token: &str,
     ) -> Result<ValidatedAccessToken, StructureResolverError> {
+        let client_id = self.config.client_id().ok_or_else(invalid_access_token)?;
+        let validated = self
+            .validate_eve_access_token_for_client(access_token, client_id)
+            .await?;
+        let expected_character = self
+            .config
+            .character_id()
+            .ok_or_else(invalid_access_token)?;
+        if validated.character_id != expected_character {
+            return Err(invalid_access_token());
+        }
+        Ok(ValidatedAccessToken {
+            value: access_token.to_string(),
+            expires_at: validated.expires_at,
+        })
+    }
+
+    async fn validate_eve_access_token_for_client(
+        &self,
+        access_token: &str,
+        client_id: &str,
+    ) -> Result<ValidatedEveAccessToken, StructureResolverError> {
         let metadata = self
             .sso_metadata()
             .await
@@ -1114,14 +1537,14 @@ impl AuthenticatedStructureResolver {
             .sso_jwks(&metadata.jwks_uri, false)
             .await
             .map_err(StructureResolverError::global_auth_failure)?;
-        match validate_eve_access_token(access_token, &jwks, &self.config) {
+        match validate_eve_access_token_for_client(access_token, &jwks, client_id) {
             Ok(token) => Ok(token),
             Err(_) if jwt_kid_is_missing_from(access_token, &jwks) => {
                 let refreshed = self
                     .sso_jwks(&metadata.jwks_uri, true)
                     .await
                     .map_err(StructureResolverError::global_auth_failure)?;
-                validate_eve_access_token(access_token, &refreshed, &self.config)
+                validate_eve_access_token_for_client(access_token, &refreshed, client_id)
             }
             Err(error) => Err(error),
         }
@@ -1303,11 +1726,11 @@ fn trusted_eve_sso_metadata(metadata: &OpenIdMetadata) -> bool {
         && jwks_uri.port().is_none()
 }
 
-fn validate_eve_access_token(
+fn validate_eve_access_token_for_client(
     access_token: &str,
     jwks: &JsonWebKeySet,
-    config: &StructureResolverConfig,
-) -> Result<ValidatedAccessToken, StructureResolverError> {
+    client_id: &str,
+) -> Result<ValidatedEveAccessToken, StructureResolverError> {
     let header = decode_header(access_token).map_err(|_| invalid_access_token())?;
     if header.alg != Algorithm::RS256 {
         return Err(invalid_access_token());
@@ -1323,7 +1746,6 @@ fn validate_eve_access_token(
         .ok_or_else(invalid_access_token)?;
     let decoding_key =
         DecodingKey::from_rsa_components(&key.n, &key.e).map_err(|_| invalid_access_token())?;
-    let client_id = config.client_id().ok_or_else(invalid_access_token)?;
     let mut validation = Validation::new(Algorithm::RS256);
     validation.leeway = 0;
     validation.set_issuer(EVE_SSO_ISSUERS);
@@ -1335,18 +1757,22 @@ fn validate_eve_access_token(
     let claims = decode::<EveAccessTokenClaims>(access_token, &decoding_key, &validation)
         .map_err(|_| invalid_access_token())?
         .claims;
-    let expected_character = config.character_id().ok_or_else(invalid_access_token)?;
+    let character_id = claims
+        .sub
+        .strip_prefix("CHARACTER:EVE:")
+        .and_then(|character_id| character_id.parse::<i64>().ok())
+        .filter(|character_id| *character_id > 0);
     if claims.iss.is_empty()
         || !claims.aud.iter().any(|audience| audience == "EVE Online")
-        || claims.sub != format!("CHARACTER:EVE:{expected_character}")
+        || character_id.is_none()
         || claims.scp.values() != BTreeSet::from([STRUCTURE_RESOLVER_SCOPE.to_string()])
     {
         return Err(invalid_access_token());
     }
     let expires_at =
         DateTime::from_timestamp(claims.exp as i64, 0).ok_or_else(invalid_access_token)?;
-    Ok(ValidatedAccessToken {
-        value: access_token.to_string(),
+    Ok(ValidatedEveAccessToken {
+        character_id: character_id.expect("checked above"),
         expires_at,
     })
 }
@@ -1431,6 +1857,31 @@ fn required_setting(
                 "{name} is required when STRUCTURE_RESOLVER_ENABLED is true"
             ))
         })
+}
+
+fn resolver_client_credentials(
+    settings: &BTreeMap<String, String>,
+) -> Result<(String, String), StructureResolverConfigError> {
+    let resolver_override_is_configured = [
+        "STRUCTURE_RESOLVER_CLIENT_ID",
+        "STRUCTURE_RESOLVER_CLIENT_SECRET",
+    ]
+    .into_iter()
+    .any(|name| {
+        settings
+            .get(name)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    if resolver_override_is_configured {
+        return Ok((
+            required_setting(settings, "STRUCTURE_RESOLVER_CLIENT_ID")?,
+            required_setting(settings, "STRUCTURE_RESOLVER_CLIENT_SECRET")?,
+        ));
+    }
+    Ok((
+        required_setting(settings, "EVE_CLIENT_ID")?,
+        required_setting(settings, "EVE_CLIENT_SECRET")?,
+    ))
 }
 
 fn required_positive_i64(
