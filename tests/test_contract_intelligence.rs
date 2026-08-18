@@ -3,18 +3,19 @@ use chrono::{DateTime, TimeZone, Utc};
 use killbot_rust::commands::health::{render_health_response, HEALTH_OPERATOR_ID};
 use killbot_rust::config::{self, AppConfig, AppState};
 use killbot_rust::contract_intelligence::{
-    available_contract_store, collection_retry_delay, new_contract_store_handle,
-    spawn_contract_collection_loop_with_notifications, AppStateContractPingLimiter, CacheMetadata,
-    CollectionOutcome, ContractCollectionStore, ContractCollector, ContractContextLimiter,
-    ContractContextRequirements, ContractContextValue, ContractDelivery, ContractDeliveryClock,
-    ContractDeliveryError, ContractEmbedContext, ContractEventAction, ContractEventActions,
-    ContractEventKind, ContractFilter, ContractFilterCondition, ContractFilterNode,
-    ContractItemDirection, ContractItemProbe, ContractLocationContext, ContractObservationContext,
-    ContractPingLimiter, ContractPingType, ContractResolutionState, ContractSubscription,
-    DeliveryFailureKind, DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HealthCheck,
-    HealthClock, HealthCycle, HealthRuntimeConfig, HealthStatus, HttpPublicContractEsi,
-    PreparedContractDelivery, PublicContract, PublicContractEsi, PublicContractItem,
-    ShipGroupLookup, ShipGroupResolver, SolarSystemPosition,
+    available_contract_store, collection_retry_delay, contract_regional_concurrency_from,
+    new_contract_store_handle, spawn_contract_collection_loop_with_notifications,
+    AppStateContractPingLimiter, CacheMetadata, CollectionOutcome, ContractCollectionStore,
+    ContractCollector, ContractContextLimiter, ContractContextRequirements, ContractContextValue,
+    ContractDelivery, ContractDeliveryClock, ContractDeliveryError, ContractEmbedContext,
+    ContractEventAction, ContractEventActions, ContractEventKind, ContractFilter,
+    ContractFilterCondition, ContractFilterNode, ContractItemDirection, ContractItemProbe,
+    ContractLocationContext, ContractObservationContext, ContractPingLimiter, ContractPingType,
+    ContractRequestPacer, ContractResolutionState, ContractSubscription, DeliveryFailureKind,
+    DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HealthCheck, HealthClock, HealthCycle,
+    HealthRuntimeConfig, HealthStatus, HttpPublicContractEsi, PreparedContractDelivery,
+    PublicContract, PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
+    SolarSystemPosition,
 };
 use killbot_rust::esi::EsiClient;
 use killbot_rust::feed::{FeedError, FeedHealthProvider, FeedHealthTelemetry, KillmailFeed};
@@ -34,7 +35,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::thread::JoinHandle;
@@ -104,15 +105,29 @@ struct WireReply {
 struct SequenceHttpServer {
     base_url: String,
     requests: Arc<StdMutex<Vec<String>>>,
+    request_times: Arc<StdMutex<Vec<DateTime<Utc>>>>,
     handle: JoinHandle<()>,
 }
 
 impl SequenceHttpServer {
     fn start(replies: Vec<WireReply>) -> Self {
+        Self::start_with_request_pacer(replies, None)
+    }
+
+    fn start_with_pacer(replies: Vec<WireReply>, pacer: Arc<AdvancingRequestPacer>) -> Self {
+        Self::start_with_request_pacer(replies, Some(pacer))
+    }
+
+    fn start_with_request_pacer(
+        replies: Vec<WireReply>,
+        pacer: Option<Arc<AdvancingRequestPacer>>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ESI HTTP listener");
         let address = listener.local_addr().expect("fake ESI listener address");
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let recorded_requests = requests.clone();
+        let request_times = Arc::new(StdMutex::new(Vec::new()));
+        let recorded_request_times = request_times.clone();
         let handle = std::thread::spawn(move || {
             for reply in replies {
                 let (mut stream, _) = listener.accept().expect("accept fake ESI HTTP request");
@@ -124,6 +139,9 @@ impl SequenceHttpServer {
                     .lock()
                     .unwrap()
                     .push(String::from_utf8_lossy(&request[..length]).into_owned());
+                if let Some(pacer) = &pacer {
+                    recorded_request_times.lock().unwrap().push(pacer.now());
+                }
                 let response = format!(
                     "HTTP/1.1 {} test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
                     reply.status,
@@ -143,6 +161,7 @@ impl SequenceHttpServer {
         Self {
             base_url: format!("http://{address}/"),
             requests,
+            request_times,
             handle,
         }
     }
@@ -1809,6 +1828,63 @@ struct FakeEsi {
     items: HashMap<i64, Result<EsiResponse<Vec<PublicContractItem>>, EsiError>>,
 }
 
+struct GatedRegionalEsi {
+    slow_region: i64,
+    slow_started: Arc<Notify>,
+    slow_release: Arc<Notify>,
+    pages: HashMap<i64, Vec<PublicContract>>,
+    items: HashMap<i64, Vec<PublicContractItem>>,
+    probes: StdMutex<Vec<Result<ContractItemProbe, EsiError>>>,
+}
+
+struct InFlightLimiterEsi {
+    first_region: i64,
+    second_region: i64,
+    third_region: i64,
+    first_started: Arc<Notify>,
+    second_started: Arc<Notify>,
+    first_release: Arc<Notify>,
+    second_release: Arc<Notify>,
+    calls: StdMutex<Vec<i64>>,
+}
+
+struct AdvancingRequestPacer {
+    now: StdMutex<DateTime<Utc>>,
+    waits: StdMutex<Vec<DateTime<Utc>>>,
+}
+
+struct GatedAdvancingRequestPacer {
+    now: StdMutex<DateTime<Utc>>,
+    waits: StdMutex<Vec<DateTime<Utc>>>,
+    wait_entered: Arc<Notify>,
+    wait_release: Arc<Notify>,
+}
+
+struct TimestampedRateBucketEsi {
+    pacer: Arc<AdvancingRequestPacer>,
+    calls: StdMutex<Vec<(String, DateTime<Utc>)>>,
+    regions: Vec<i64>,
+    discovery_metadata: CacheMetadata,
+    page_metadata: StdMutex<Vec<CacheMetadata>>,
+}
+
+struct DelayedSameGroupPacingEsi {
+    pacer: Arc<GatedAdvancingRequestPacer>,
+    second_started: Arc<Notify>,
+    second_release: Arc<Notify>,
+    calls: StdMutex<Vec<(i64, DateTime<Utc>)>>,
+}
+
+struct GatedProbeBatchEsi {
+    inner: FakeEsi,
+    probes: StdMutex<Vec<Result<ContractItemProbe, EsiError>>>,
+    probe_count: AtomicU64,
+    first_probe_started: Arc<Notify>,
+    first_probe_release: Arc<Notify>,
+    second_probe_started: Arc<Notify>,
+    second_probe_release: Arc<Notify>,
+}
+
 struct ContextualFakeEsi {
     inner: FakeEsi,
     context: ContractObservationContext,
@@ -1849,6 +1925,10 @@ struct ExhaustedWireManifestEsi {
     contracts: Vec<PublicContract>,
     manifests: HashMap<i64, EsiResponse<Vec<PublicContractItem>>>,
     unavailable_contract_id: i64,
+}
+
+struct HttpRegionsAndTerminalProbeEsi {
+    http: Arc<HttpPublicContractEsi>,
 }
 
 #[derive(Default)]
@@ -1977,6 +2057,297 @@ impl PublicContractEsi for FakeEsi {
 }
 
 #[async_trait]
+impl PublicContractEsi for GatedRegionalEsi {
+    async fn regions(&self, _etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        let mut regions = self.pages.keys().copied().collect::<Vec<_>>();
+        regions.sort_unstable();
+        Ok(EsiResponse::fresh(
+            regions,
+            CacheMetadata::cached_for_seconds(0),
+        ))
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        assert_eq!(page, 1, "the controlled regional fixture has one page");
+        if region_id == self.slow_region {
+            self.slow_started.notify_one();
+            self.slow_release.notified().await;
+        }
+        Ok(EsiResponse::fresh(
+            self.pages
+                .get(&region_id)
+                .expect("configured regional page")
+                .clone(),
+            expiring_page(1),
+        ))
+    }
+
+    async fn public_contract_items_probe(
+        &self,
+        _contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<ContractItemProbe, EsiError> {
+        self.probes.lock().unwrap().remove(0)
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        Ok(EsiResponse::fresh(
+            self.items
+                .get(&contract_id)
+                .expect("configured contract manifest")
+                .clone(),
+            expiring_cache(),
+        ))
+    }
+
+    async fn observed_contract_embed_context(
+        &self,
+        _contract: &PublicContract,
+        _items: &[PublicContractItem],
+    ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
+        Ok(EsiResponse::fresh(
+            ContractEmbedContext {
+                item_names: std::collections::BTreeMap::from([(587, "Rifter".to_string())]),
+                ..ContractEmbedContext::default()
+            },
+            CacheMetadata::cached_for_seconds(60),
+        ))
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for InFlightLimiterEsi {
+    async fn regions(&self, _etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        Ok(EsiResponse::fresh(
+            vec![self.first_region, self.second_region, self.third_region],
+            CacheMetadata::cached_for_seconds(0),
+        ))
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        assert_eq!(page, 1, "the controlled limiter fixture has one page");
+        self.calls.lock().unwrap().push(region_id);
+        if region_id == self.first_region {
+            self.first_started.notify_one();
+            self.first_release.notified().await;
+            return Ok(EsiResponse::fresh(
+                vec![],
+                CacheMetadata {
+                    rate_limit_group: Some("public-contracts".to_string()),
+                    rate_limit_limit: Some("1/1m".to_string()),
+                    rate_limit_remaining: Some(0),
+                    ..expiring_page(1)
+                },
+            ));
+        }
+        assert_eq!(
+            region_id, self.second_region,
+            "the persisted limiter must prevent a third regional ESI request"
+        );
+        self.second_started.notify_one();
+        self.second_release.notified().await;
+        Ok(EsiResponse::fresh(vec![], expiring_page(1)))
+    }
+
+    async fn public_contract_items(
+        &self,
+        _contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        panic!("the limiter fixture has no contract manifests")
+    }
+}
+
+#[async_trait]
+impl ContractRequestPacer for AdvancingRequestPacer {
+    fn now(&self) -> DateTime<Utc> {
+        *self.now.lock().unwrap()
+    }
+
+    async fn wait_until(&self, deadline: DateTime<Utc>) {
+        self.waits.lock().unwrap().push(deadline);
+        let mut now = self.now.lock().unwrap();
+        *now = std::cmp::max(*now, deadline);
+    }
+}
+
+impl GatedAdvancingRequestPacer {
+    fn advance_to(&self, now: DateTime<Utc>) {
+        *self.now.lock().unwrap() = now;
+    }
+}
+
+#[async_trait]
+impl ContractRequestPacer for GatedAdvancingRequestPacer {
+    fn now(&self) -> DateTime<Utc> {
+        *self.now.lock().unwrap()
+    }
+
+    async fn wait_until(&self, deadline: DateTime<Utc>) {
+        self.waits.lock().unwrap().push(deadline);
+        self.wait_entered.notify_one();
+        self.wait_release.notified().await;
+        let mut now = self.now.lock().unwrap();
+        *now = std::cmp::max(*now, deadline);
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for TimestampedRateBucketEsi {
+    async fn regions(&self, _etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("regions".to_string(), self.pacer.now()));
+        Ok(EsiResponse::fresh(
+            self.regions.clone(),
+            self.discovery_metadata.clone(),
+        ))
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        assert_eq!(page, 1, "the rate-bucket fixture has one page per region");
+        self.calls
+            .lock()
+            .unwrap()
+            .push((format!("page:{region_id}"), self.pacer.now()));
+        Ok(EsiResponse::fresh(
+            vec![],
+            self.page_metadata.lock().unwrap().remove(0),
+        ))
+    }
+
+    async fn public_contract_items(
+        &self,
+        _contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        panic!("the rate-bucket fixture has no contract manifests")
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for DelayedSameGroupPacingEsi {
+    async fn regions(&self, _etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        Ok(EsiResponse::fresh(
+            vec![10_000_002, 10_000_003, 10_000_004],
+            CacheMetadata::cached_for_seconds(0),
+        ))
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        assert_eq!(page, 1, "the delayed-rate fixture has one page per region");
+        self.calls
+            .lock()
+            .unwrap()
+            .push((region_id, self.pacer.now()));
+        match region_id {
+            10_000_002 => Ok(EsiResponse::fresh(
+                vec![],
+                CacheMetadata {
+                    rate_limit_group: Some("public-contracts".to_string()),
+                    rate_limit_limit: Some("20/60s".to_string()),
+                    rate_limit_remaining: Some(2),
+                    ..expiring_page(1)
+                },
+            )),
+            10_000_003 => {
+                self.second_started.notify_one();
+                self.second_release.notified().await;
+                Ok(EsiResponse::fresh(
+                    vec![],
+                    CacheMetadata {
+                        rate_limit_group: Some("public-contracts".to_string()),
+                        rate_limit_limit: Some("20/60s".to_string()),
+                        rate_limit_remaining: Some(18),
+                        ..expiring_page(1)
+                    },
+                ))
+            }
+            10_000_004 => Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            region_id => panic!("unexpected delayed-rate fixture region {region_id}"),
+        }
+    }
+
+    async fn public_contract_items(
+        &self,
+        _contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        panic!("the delayed-rate fixture has no contract manifests")
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for GatedProbeBatchEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+
+    async fn public_contract_items_probe(
+        &self,
+        _contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<ContractItemProbe, EsiError> {
+        match self.probe_count.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                self.first_probe_started.notify_one();
+                self.first_probe_release.notified().await;
+            }
+            1 => {
+                self.second_probe_started.notify_one();
+                self.second_probe_release.notified().await;
+            }
+            _ => panic!("the controlled terminal-probe fixture permits exactly two probes"),
+        }
+        self.probes.lock().unwrap().remove(0)
+    }
+}
+
+#[async_trait]
 impl PublicContractEsi for ExhaustedWireManifestEsi {
     async fn regions(&self, _etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
         Ok(EsiResponse::fresh(
@@ -2011,6 +2382,44 @@ impl PublicContractEsi for ExhaustedWireManifestEsi {
                 .expect("successful manifest configured")
                 .clone())
         }
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for HttpRegionsAndTerminalProbeEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.http.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        _region_id: i64,
+        page: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        assert_eq!(
+            page, 1,
+            "the terminal-probe wire fixture has one summary page"
+        );
+        Ok(EsiResponse::fresh(vec![], expiring_page(1)))
+    }
+
+    async fn public_contract_items(
+        &self,
+        _contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        panic!("the terminal-probe wire fixture has no summary manifests")
+    }
+
+    async fn public_contract_items_probe(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<ContractItemProbe, EsiError> {
+        self.http
+            .public_contract_items_probe(contract_id, etag)
+            .await
     }
 }
 
@@ -2574,10 +2983,23 @@ impl PublicContractEsi for StopsBetweenContextCallsEsi {
 
 struct StaticShipGroups(HashMap<i64, i64>);
 
+struct CountingShipGroups {
+    groups: HashMap<i64, i64>,
+    calls: AtomicU64,
+}
+
 #[async_trait]
 impl ShipGroupResolver for StaticShipGroups {
     async fn group_for_type(&self, type_id: i64) -> ShipGroupLookup {
         ShipGroupLookup::Resolved(self.0.get(&type_id).copied())
+    }
+}
+
+#[async_trait]
+impl ShipGroupResolver for CountingShipGroups {
+    async fn group_for_type(&self, type_id: i64) -> ShipGroupLookup {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        ShipGroupLookup::Resolved(self.groups.get(&type_id).copied())
     }
 }
 
@@ -2595,6 +3017,20 @@ impl ShipGroupResolver for EventuallyResolvedShipGroup {
 struct RecordingDelivery {
     store: ContractCollectionStore,
     sent: StdMutex<Vec<PreparedContractDelivery>>,
+}
+
+struct NotifyingDelivery {
+    store: ContractCollectionStore,
+    sent: StdMutex<Vec<PreparedContractDelivery>>,
+    delivered: Arc<Notify>,
+}
+
+struct FirstDeliveryGate {
+    store: ContractCollectionStore,
+    sent: StdMutex<Vec<PreparedContractDelivery>>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    gate_open: AtomicBool,
 }
 
 struct NoopDelivery;
@@ -2708,6 +3144,47 @@ impl ContractDelivery for RecordingDelivery {
             .expect("read the persisted delivery before Discord is called")
             .expect("delivery exists before Discord is called");
         assert_eq!(record.status, DeliveryStatus::Prepared);
+        self.sent.lock().unwrap().push(delivery);
+        Ok("discord-message-id".to_string())
+    }
+}
+
+#[async_trait]
+impl ContractDelivery for NotifyingDelivery {
+    async fn send(
+        &self,
+        delivery: PreparedContractDelivery,
+    ) -> Result<String, ContractDeliveryError> {
+        let record = self
+            .store
+            .delivery_record(delivery.delivery_id)
+            .await
+            .expect("read the persisted delivery before Discord is called")
+            .expect("delivery exists before Discord is called");
+        assert_eq!(record.status, DeliveryStatus::Prepared);
+        self.sent.lock().unwrap().push(delivery);
+        self.delivered.notify_one();
+        Ok("discord-message-id".to_string())
+    }
+}
+
+#[async_trait]
+impl ContractDelivery for FirstDeliveryGate {
+    async fn send(
+        &self,
+        delivery: PreparedContractDelivery,
+    ) -> Result<String, ContractDeliveryError> {
+        let record = self
+            .store
+            .delivery_record(delivery.delivery_id)
+            .await
+            .expect("read the persisted delivery before Discord is called")
+            .expect("delivery exists before Discord is called");
+        assert_eq!(record.status, DeliveryStatus::Prepared);
+        if self.gate_open.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
         self.sent.lock().unwrap().push(delivery);
         Ok("discord-message-id".to_string())
     }
@@ -2948,6 +3425,19 @@ fn collection_failures_use_bounded_exponential_backoff_without_violating_retry_a
     );
     let retry_after = Utc::now() + chrono::Duration::seconds(30);
     assert!(collection_retry_delay(interval, Some(retry_after), 1) >= Duration::from_secs(29));
+}
+
+#[test]
+fn contract_regional_concurrency_is_conservative_and_strict() {
+    assert_eq!(contract_regional_concurrency_from(None).unwrap(), 2);
+    assert_eq!(contract_regional_concurrency_from(Some("1")).unwrap(), 1);
+    assert_eq!(contract_regional_concurrency_from(Some("4")).unwrap(), 4);
+    for value in ["0", "5", "two", " 2", "2 "] {
+        assert!(
+            contract_regional_concurrency_from(Some(value)).is_err(),
+            "{value:?} must not silently change the collection rate"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3586,6 +4076,10 @@ async fn a_resolution_probe_failure_does_not_discard_prior_listings_or_confirmat
         .execute(&raw_pool)
         .await
         .expect("seed unrelated resolution failure");
+    sqlx::query("UPDATE contract_resolution_cases SET next_probe_at = now() - interval '1 second' WHERE region_id = 10000002 AND contract_id = 45")
+        .execute(&raw_pool)
+        .await
+        .expect("advance the controlled retry boundary before testing restart recovery");
     raw_pool.close().await;
 
     let restarted_resolver = Arc::new(ResolutionEsi {
@@ -5026,111 +5520,100 @@ async fn wire_304_responses_preserve_last_modified_for_paginated_snapshot_valida
 }
 
 #[tokio::test]
-async fn wire_empty_success_body_is_retried_without_invalidating_the_region() {
+async fn wire_eof_retry_reenters_durable_pacing_after_restart() {
     let database = TemporaryDatabase::new().await;
-    let store = database.store().await;
-    let server = SequenceHttpServer::start(vec![
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: "[10000002]",
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60"), ("X-Pages", "1")],
-            body: ESI_PUBLIC_CONTRACT_SUMMARY_FIXTURE,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![
-                ("Cache-Control", "max-age=60"),
-                ("ETag", "\"items-empty\""),
-                ("X-ESI-Error-Limit-Remain", "100"),
-                ("X-ESI-Error-Limit-Reset", "60"),
-            ],
-            body: "",
-        },
-        WireReply {
-            status: 200,
-            headers: vec![
-                ("Cache-Control", "max-age=60"),
-                ("ETag", "\"items-v1\""),
-                ("X-ESI-Error-Limit-Remain", "99"),
-                ("X-ESI-Error-Limit-Reset", "60"),
-            ],
-            body: ESI_PUBLIC_CONTRACT_ITEMS_FIXTURE,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"{"name":"Jita IV - Moon 4","system_id":30000142}"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"{"name":"Jita","security_status":0.9,"constellation_id":20000020}"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"{"region_id":10000002}"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"{"name":"The Forge"}"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"[{"alliance_id":99000111}]"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"[{"id":90000001,"name":"Issuer"},{"id":98000001,"name":"Issuer Corp"},{"id":99000111,"name":"Issuer Alliance"},{"id":48473,"name":"Blueprint"}]"#,
-        },
-    ]);
-    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
-        .expect("construct HTTP ESI client");
-    let collector = ContractCollector::new(store.clone(), Arc::new(esi));
+    let started_at = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed durable pacing test time");
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(started_at),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let server = SequenceHttpServer::start_with_pacer(
+        vec![
+            WireReply {
+                status: 200,
+                headers: vec![
+                    ("X-Ratelimit-Group", "public-contracts"),
+                    ("X-Ratelimit-Limit", "20/60s"),
+                    ("X-Ratelimit-Remaining", "2"),
+                ],
+                body: "",
+            },
+            WireReply {
+                status: 200,
+                headers: vec![],
+                body: "[]",
+            },
+        ],
+        pacer.clone(),
+    );
+    let esi = Arc::new(
+        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+            .expect("construct HTTP ESI client"),
+    );
+    let collector = ContractCollector::new(database.store().await, esi.clone())
+        .with_request_pacer(pacer.clone());
 
-    let first = collector
+    let error = collector
         .collect_cycle()
         .await
-        .expect("transient empty body is retried within the collection cycle");
+        .expect_err("an EOF returns to the admitted collector seam");
     assert_eq!(
-        first.regions,
-        vec![CollectionOutcome::BaselineEstablished {
-            region_id: 10_000_002,
-        }]
+        server.requests.lock().unwrap().len(),
+        1,
+        "the HTTP client must not retry a successful malformed body behind the collector"
     );
-    let request_count = server.requests.lock().unwrap().len();
-    assert_eq!(request_count, 10);
-    assert!(server.requests.lock().unwrap()[2].contains("/contracts/public/items/234057619/"));
-    assert!(server.requests.lock().unwrap()[3].contains("/contracts/public/items/234057619/"));
+    assert!(error.to_string().contains("EOF while parsing a value"));
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect first response pacing");
+    let first_deadline = sqlx::query_scalar::<_, DateTime<Utc>>(
+        "SELECT next_request_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("persist malformed response rate metadata");
+    assert_eq!(first_deadline, started_at + chrono::Duration::seconds(30));
+    pool.close().await;
 
-    let second = collector
+    let restarted = ContractCollector::new(database.store().await, esi)
+        .with_request_pacer(pacer.clone())
         .collect_cycle()
         .await
-        .expect("successful retry representation remains cached");
+        .expect("restart re-enters durable admission before retrying the wire request");
     assert_eq!(
-        second.regions,
-        vec![CollectionOutcome::Complete {
-            region_id: 10_000_002,
-            observed_contracts: 1,
-        }]
+        restarted.regions,
+        Vec::<CollectionOutcome>::new(),
+        "the headerless retry has no regions to scan"
     );
-    assert_eq!(server.requests.lock().unwrap().len(), request_count);
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
     assert_eq!(
-        store
-            .region_state(10_000_002)
-            .await
-            .expect("region state")
-            .expect("stored region")
-            .complete_observations,
-        2
+        pacer.waits.lock().unwrap().as_slice(),
+        &[started_at + chrono::Duration::seconds(30)],
+        "the retry waits on the first response's persisted low-water deadline"
     );
+    assert_eq!(
+        server.request_times.lock().unwrap().as_slice(),
+        &[started_at, started_at + chrono::Duration::seconds(30)],
+        "the second wire request happens only after durable pacing advances the injected clock"
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect restart pacing");
+    let next_deadline = sqlx::query_scalar::<_, DateTime<Utc>>(
+        "SELECT next_request_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("headerless retry retains the reserved low-water state");
+    assert_eq!(next_deadline, started_at + chrono::Duration::seconds(90));
+    pool.close().await;
 
     server.finish();
     database.destroy().await;
@@ -5173,6 +5656,77 @@ async fn wire_empty_success_body_does_not_retry_across_an_esi_error_limit_bounda
 }
 
 #[tokio::test]
+async fn malformed_terminal_probe_persists_limiter_metadata_and_blocks_restart() {
+    const REGION: i64 = 10_000_002;
+    const CONTRACT: i64 = 44;
+
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed a due terminal probe");
+    sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,now(),now(),now() - interval '1 second','awaiting_resolution')")
+        .bind(REGION)
+        .bind(CONTRACT)
+        .bind(serde_json::to_value(item_exchange_contract(CONTRACT)).expect("serialize terminal contract"))
+        .bind(serde_json::json!({"offered_items": [], "requested_items": []}))
+        .execute(&pool)
+        .await
+        .expect("seed due terminal probe");
+    pool.close().await;
+    let server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=0")],
+            body: "[10000002]",
+        },
+        WireReply {
+            status: 200,
+            headers: vec![
+                ("X-ESI-Error-Limit-Remain", "0"),
+                ("X-ESI-Error-Limit-Reset", "60"),
+            ],
+            body: "{",
+        },
+    ]);
+    let http = Arc::new(
+        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+            .expect("construct HTTP ESI client"),
+    );
+    let esi = Arc::new(HttpRegionsAndTerminalProbeEsi { http });
+
+    let report = ContractCollector::new(store, esi.clone())
+        .collect_cycle()
+        .await
+        .expect("a malformed terminal probe remains an isolated regional failure");
+    assert_eq!(
+        report.regions,
+        vec![CollectionOutcome::BaselineEstablished { region_id: REGION }]
+    );
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        2,
+        "the first cycle sends discovery and one malformed terminal probe"
+    );
+
+    let error = ContractCollector::new(database.store().await, esi)
+        .collect_cycle()
+        .await
+        .expect_err("the malformed probe's persisted limiter boundary blocks restart discovery");
+    assert!(error.to_string().contains("persisted global ESI limiter"));
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        2,
+        "restart must make no wire request after the malformed 2xx limiter boundary"
+    );
+
+    server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn wire_rate_limit_headers_stop_the_collector_before_the_next_request() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
@@ -5194,42 +5748,26 @@ async fn wire_rate_limit_headers_stop_the_collector_before_the_next_request() {
     let report = collector
         .collect_cycle()
         .await
-        .expect("rate boundary creates an inconclusive regional observation");
+        .expect("rate boundary stops before a regional attempt starts");
 
     assert!(report.retry_after.is_some());
-    assert!(matches!(
-        report.regions.as_slice(),
-        [CollectionOutcome::Inconclusive {
-            region_id: 10_000_002,
-            ..
-        }]
-    ));
+    assert!(report.regions.is_empty());
     assert_eq!(server.requests.lock().unwrap().len(), 1);
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&database.url)
         .await
-        .expect("connect to inspect the limiter-boundary batch");
-    let batch = sqlx::query("SELECT pages_attempted, pages_observed, observed_contract_count, resolved_contract_count, manifest_failure_count, consistency_evidence, failure_classification, failure_detail, retry_after FROM regional_observation_batches WHERE region_id = 10000002")
+        .expect("connect to confirm no fabricated limiter-boundary batch");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM regional_observation_batches WHERE region_id = 10000002",
+        )
         .fetch_one(&pool)
         .await
-        .expect("retain the limiter-boundary attempt");
-    assert_eq!(batch.get::<i32, _>("pages_attempted"), 1);
-    assert_eq!(batch.get::<i32, _>("pages_observed"), 0);
-    assert_eq!(batch.get::<i64, _>("observed_contract_count"), 0);
-    assert_eq!(batch.get::<i64, _>("resolved_contract_count"), 0);
-    assert_eq!(batch.get::<i64, _>("manifest_failure_count"), 0);
-    assert_eq!(batch.get::<String, _>("failure_classification"), "esi");
-    assert!(batch
-        .get::<String, _>("failure_detail")
-        .contains("persisted global ESI limiter"));
-    assert!(batch
-        .get::<Option<DateTime<Utc>>, _>("retry_after")
-        .is_some());
-    let evidence: Value = batch.get("consistency_evidence");
-    assert!(evidence["failure_response"]["retry_after"]
-        .as_str()
-        .is_some());
+        .expect("count unstarted regional batches"),
+        0,
+        "a shared limiter after discovery must not fabricate a regional attempt"
+    );
     pool.close().await;
     server.finish();
     database.destroy().await;
@@ -5321,15 +5859,10 @@ async fn exhausted_manifest_retries_defer_only_that_contract_and_preserve_the_ba
         WireReply {
             status: 200,
             headers: vec![("X-ESI-Error-Limit-Remain", "100")],
-            body: "",
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("X-ESI-Error-Limit-Remain", "100")],
-            body: "",
+            body: ESI_PUBLIC_CONTRACT_ITEMS_FIXTURE,
         },
     ]);
-    let esi = ExhaustedWireManifestEsi {
+    let esi = Arc::new(ExhaustedWireManifestEsi {
         http: HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
             .expect("construct HTTP ESI client"),
         contracts: vec![first_contract.clone(), pending_contract.clone()],
@@ -5338,9 +5871,9 @@ async fn exhausted_manifest_retries_defer_only_that_contract_and_preserve_the_ba
             EsiResponse::fresh(vec![offered_ship(1)], expiring_cache()),
         )]),
         unavailable_contract_id: 45,
-    };
+    });
 
-    let baseline = ContractCollector::new(store.clone(), Arc::new(esi))
+    let baseline = ContractCollector::new(store.clone(), esi.clone())
         .collect_cycle()
         .await
         .expect("one unavailable manifest does not invalidate a conclusive summary");
@@ -5351,8 +5884,11 @@ async fn exhausted_manifest_retries_defer_only_that_contract_and_preserve_the_ba
         }]
     );
     assert!(baseline.events.is_empty());
-    assert_eq!(server.requests.lock().unwrap().len(), 3);
-    server.finish();
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        1,
+        "the malformed manifest is one admitted failed attempt, not hidden HTTP retries"
+    );
     assert_eq!(
         store
             .region_contracts(10_000_002)
@@ -5412,25 +5948,12 @@ async fn exhausted_manifest_retries_defer_only_that_contract_and_preserve_the_ba
     assert_eq!(evidence["manifest_failure_count"], serde_json::json!(1));
     assert!(evidence.get("manifest_failure_contract_ids").is_none());
 
-    let recovered = ContractCollector::new(
-        store.clone(),
-        Arc::new(regional_esi(
-            vec![first_contract, pending_contract],
-            HashMap::from([
-                (
-                    44,
-                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
-                ),
-                (
-                    45,
-                    Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
-                ),
-            ]),
-        )),
-    )
-    .collect_cycle()
-    .await
-    .expect("a restarted collector backfills the pending baseline manifest");
+    let recovered = ContractCollector::new(store.clone(), esi)
+        .collect_cycle()
+        .await
+        .expect(
+            "a restarted collector re-enters admission and backfills the pending baseline manifest",
+        );
     assert!(recovered.events.is_empty());
     assert_eq!(
         store
@@ -5454,8 +5977,14 @@ async fn exhausted_manifest_retries_defer_only_that_contract_and_preserve_the_ba
             .expect("count recovered pending manifests"),
         0
     );
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        2,
+        "the later valid manifest is a new admitted wire request after restart"
+    );
     validation_pool.close().await;
 
+    server.finish();
     database.destroy().await;
 }
 
@@ -8558,6 +9087,1319 @@ async fn prepared_delivery_replays_before_region_discovery_outage() {
             .status,
         DeliveryStatus::Sent
     );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn bounded_regional_collection_dispatches_a_fast_enriched_listing_before_a_slow_region() {
+    const FAST_REGION: i64 = 10_000_002;
+    const SLOW_REGION: i64 = 10_000_003;
+
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![FAST_REGION, SLOW_REGION],
+            pages: HashMap::from([
+                (
+                    (FAST_REGION, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                ),
+                (
+                    (SLOW_REGION, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                ),
+            ]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish independent silent regional baselines");
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "fast-listed-ship",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the fast-region listing subscription");
+
+    let listed_contract = item_exchange_contract(44);
+    let slow_listed_contract = item_exchange_contract(45);
+    let esi = Arc::new(GatedRegionalEsi {
+        slow_region: SLOW_REGION,
+        slow_started: Arc::new(Notify::new()),
+        slow_release: Arc::new(Notify::new()),
+        pages: HashMap::from([
+            (FAST_REGION, vec![listed_contract.clone()]),
+            (SLOW_REGION, vec![slow_listed_contract.clone()]),
+        ]),
+        items: HashMap::from([(44, vec![offered_ship(1)]), (45, vec![offered_ship(2)])]),
+        probes: StdMutex::new(Vec::new()),
+    });
+    let delivery = Arc::new(NotifyingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+        delivered: Arc::new(Notify::new()),
+    });
+    let slow_started = esi.slow_started.notified();
+    let delivered = delivery.delivered.notified();
+    let ship_groups = Arc::new(CountingShipGroups {
+        groups: HashMap::from([(587, 25)]),
+        calls: AtomicU64::new(0),
+    });
+    let collector = ContractCollector::new(store.clone(), esi.clone())
+        .with_notifications(ship_groups.clone(), delivery.clone())
+        .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(
+            Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap(),
+        ))))
+        .with_max_concurrent_regions(2);
+    let cycle = tokio::spawn(async move { collector.collect_cycle().await });
+
+    tokio::time::timeout(Duration::from_secs(2), slow_started)
+        .await
+        .expect("the slow regional attempt starts concurrently");
+    tokio::time::timeout(Duration::from_secs(2), delivered)
+        .await
+        .expect("the fast region reaches delivery without waiting for the slow region");
+    assert!(
+        !cycle.is_finished(),
+        "the slow attempt remains in flight when the fast listing is delivered"
+    );
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].contract_id, listed_contract.contract_id);
+    assert!(
+        sent[0].message.title.contains("Rifter"),
+        "snapshot enrichment completes before the fast listing is dispatched: {}",
+        sent[0].message.title
+    );
+    drop(sent);
+
+    esi.slow_release.notify_one();
+    let report = cycle
+        .await
+        .expect("join bounded regional cycle")
+        .expect("complete the released slow regional attempt");
+    assert_eq!(
+        report
+            .regions
+            .iter()
+            .map(|outcome| match outcome {
+                CollectionOutcome::BaselineEstablished { region_id }
+                | CollectionOutcome::RecoveryBaselineEstablished { region_id }
+                | CollectionOutcome::Complete { region_id, .. }
+                | CollectionOutcome::Inconclusive { region_id, .. } => *region_id,
+            })
+            .collect::<Vec<_>>(),
+        vec![FAST_REGION, SLOW_REGION],
+        "the final report preserves discovery order despite completion-order dispatch"
+    );
+    assert_eq!(
+        report
+            .events
+            .iter()
+            .map(|event| event.contract.contract_id)
+            .collect::<Vec<_>>(),
+        vec![
+            listed_contract.contract_id,
+            slow_listed_contract.contract_id
+        ],
+        "the final report preserves discovery order even when fast delivery happened first"
+    );
+    assert_eq!(
+        ship_groups.calls.load(Ordering::Relaxed),
+        2,
+        "the immediate dispatch evaluates each listed event once and does not re-evaluate it at cycle end"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn started_regional_attempts_commit_while_parent_delivery_is_gated() {
+    const FAST_REGION: i64 = 10_000_002;
+    const SLOW_REGION: i64 = 10_000_003;
+
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![FAST_REGION, SLOW_REGION],
+            pages: HashMap::from([
+                (
+                    (FAST_REGION, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                ),
+                (
+                    (SLOW_REGION, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                ),
+            ]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish independent silent regional baselines");
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "started-attempts-progress",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the listing subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to mark the regional baseline boundary");
+    let baseline_batch_id: i64 =
+        sqlx::query_scalar("SELECT max(id) FROM regional_observation_batches")
+            .fetch_one(&pool)
+            .await
+            .expect("read the regional baseline boundary");
+
+    let esi = Arc::new(GatedRegionalEsi {
+        slow_region: SLOW_REGION,
+        slow_started: Arc::new(Notify::new()),
+        slow_release: Arc::new(Notify::new()),
+        pages: HashMap::from([
+            (FAST_REGION, vec![item_exchange_contract(44)]),
+            (SLOW_REGION, vec![item_exchange_contract(45)]),
+        ]),
+        items: HashMap::from([(44, vec![offered_ship(1)]), (45, vec![offered_ship(2)])]),
+        probes: StdMutex::new(Vec::new()),
+    });
+    let delivery = Arc::new(FirstDeliveryGate {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        gate_open: AtomicBool::new(true),
+    });
+    let slow_started = esi.slow_started.notified();
+    let delivery_entered = delivery.entered.notified();
+    let collector = ContractCollector::new(store, esi.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+            delivery.clone(),
+        )
+        .with_max_concurrent_regions(2);
+    let cycle = tokio::spawn(async move { collector.collect_cycle().await });
+
+    tokio::time::timeout(Duration::from_secs(2), slow_started)
+        .await
+        .expect("the second regional attempt starts before parent postprocessing");
+    tokio::time::timeout(Duration::from_secs(2), delivery_entered)
+        .await
+        .expect("the first regional delivery reaches its controlled parent gate");
+    esi.slow_release.notify_one();
+    let committed_before_delivery_release = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let committed: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM regional_observation_batches WHERE id > $1 AND region_id = $2 AND outcome = 'complete'",
+            )
+            .bind(baseline_batch_id)
+            .bind(SLOW_REGION)
+            .fetch_one(&pool)
+            .await
+            .expect("read the independently committed second regional batch");
+            if committed == 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if committed_before_delivery_release.is_err() {
+        delivery.release.notify_one();
+        cycle
+            .await
+            .expect("join failed current scheduler after releasing delivery")
+            .expect("finish current scheduler after releasing delivery");
+        panic!(
+            "the second regional attempt did not commit while first-region parent delivery was gated"
+        );
+    }
+    delivery.release.notify_one();
+    let report = cycle
+        .await
+        .expect("join bounded regional collection")
+        .expect("finish bounded regional collection");
+    assert_eq!(
+        report
+            .regions
+            .iter()
+            .map(|outcome| match outcome {
+                CollectionOutcome::BaselineEstablished { region_id }
+                | CollectionOutcome::RecoveryBaselineEstablished { region_id }
+                | CollectionOutcome::Complete { region_id, .. }
+                | CollectionOutcome::Inconclusive { region_id, .. } => *region_id,
+            })
+            .collect::<Vec<_>>(),
+        vec![FAST_REGION, SLOW_REGION],
+        "completed reports remain in region discovery order"
+    );
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn parent_postprocess_error_drains_started_successes_into_restartable_delivery() {
+    const FIRST_REGION: i64 = 10_000_002;
+    const SECOND_REGION: i64 = 10_000_003;
+    const FIRST_CONTRACT: i64 = 44;
+    const SECOND_CONTRACT: i64 = 45;
+
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![FIRST_REGION, SECOND_REGION],
+            pages: HashMap::from([
+                (
+                    (FIRST_REGION, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                ),
+                (
+                    (SECOND_REGION, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                ),
+            ]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish independent silent regional baselines");
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "postprocess-drain",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the listing subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to install the isolated parent postprocess failure");
+    sqlx::query("CREATE FUNCTION fail_first_embed_snapshot_test_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.contract_id = 44 THEN RAISE EXCEPTION 'synthetic first parent postprocess failure'; END IF; RETURN NEW; END; $$")
+        .execute(&pool)
+        .await
+        .expect("create first-snapshot failure function");
+    sqlx::query("CREATE TRIGGER fail_first_embed_snapshot_test_insert BEFORE INSERT ON contract_observed_embed_contexts FOR EACH ROW EXECUTE FUNCTION fail_first_embed_snapshot_test_insert()")
+        .execute(&pool)
+        .await
+        .expect("fail only the first completed regional postprocess");
+
+    let esi = Arc::new(GatedRegionalEsi {
+        slow_region: SECOND_REGION,
+        slow_started: Arc::new(Notify::new()),
+        slow_release: Arc::new(Notify::new()),
+        pages: HashMap::from([
+            (FIRST_REGION, vec![item_exchange_contract(FIRST_CONTRACT)]),
+            (SECOND_REGION, vec![item_exchange_contract(SECOND_CONTRACT)]),
+        ]),
+        items: HashMap::from([
+            (FIRST_CONTRACT, vec![offered_ship(1)]),
+            (SECOND_CONTRACT, vec![offered_ship(2)]),
+        ]),
+        probes: StdMutex::new(Vec::new()),
+    });
+    let initial_delivery = Arc::new(ScriptedDelivery {
+        store: store.clone(),
+        attempts: StdMutex::new(Vec::new()),
+        outcomes: StdMutex::new(vec![
+            Err(ContractDeliveryError::transient(
+                "first replayable send failure",
+            )),
+            Err(ContractDeliveryError::transient(
+                "second replayable send failure",
+            )),
+        ]),
+    });
+    let slow_started = esi.slow_started.notified();
+    let collector = ContractCollector::new(store.clone(), esi.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+            initial_delivery.clone(),
+        )
+        .with_max_concurrent_regions(2);
+    let cycle = tokio::spawn(async move { collector.collect_cycle().await });
+
+    tokio::time::timeout(Duration::from_secs(2), slow_started)
+        .await
+        .expect("both regional attempts start before the parent failure");
+    esi.slow_release.notify_one();
+    let error = cycle
+        .await
+        .expect("join the collector that retains started work")
+        .expect_err("the first parent snapshot failure remains observable after draining");
+    assert!(
+        error
+            .to_string()
+            .contains("synthetic first parent postprocess failure"),
+        "the original parent error is returned after the started attempt drain: {error}"
+    );
+    assert_eq!(
+        initial_delivery.attempts.lock().unwrap().len(),
+        2,
+        "the independently completed second region prepares and attempts its replayable listing before returning the parent error"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM contract_outbound_deliveries WHERE contract_id = $1 AND status = 'prepared'",
+        )
+        .bind(SECOND_CONTRACT)
+        .fetch_one(&pool)
+        .await
+        .expect("read the replayable second-region listing"),
+        1,
+        "the second region retains exactly one prepared listing for restart"
+    );
+    sqlx::query(
+        "DROP TRIGGER fail_first_embed_snapshot_test_insert ON contract_observed_embed_contexts",
+    )
+    .execute(&pool)
+    .await
+    .expect("remove the first-snapshot failure trigger before restart");
+    sqlx::query("DROP FUNCTION fail_first_embed_snapshot_test_insert()")
+        .execute(&pool)
+        .await
+        .expect("remove the first-snapshot failure function before restart");
+
+    let restarted_delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![FIRST_REGION, SECOND_REGION],
+            pages: HashMap::from([
+                (
+                    (FIRST_REGION, 1),
+                    Ok(EsiResponse::fresh(
+                        vec![item_exchange_contract(FIRST_CONTRACT)],
+                        expiring_page(1),
+                    )),
+                ),
+                (
+                    (SECOND_REGION, 1),
+                    Ok(EsiResponse::fresh(
+                        vec![item_exchange_contract(SECOND_CONTRACT)],
+                        expiring_page(1),
+                    )),
+                ),
+            ]),
+            items: HashMap::from([
+                (
+                    FIRST_CONTRACT,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    SECOND_CONTRACT,
+                    Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                ),
+            ]),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+        restarted_delivery.clone(),
+    )
+    .with_max_concurrent_regions(2)
+    .collect_cycle()
+    .await
+    .expect("restart replays the prepared second-region listing once");
+    let sent = restarted_delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1, "restart sends only the retained listing");
+    assert_eq!(sent[0].contract_id, SECOND_CONTRACT);
+    drop(sent);
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn listings_and_each_terminal_delivery_precede_gated_later_resolution_probes() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_TERMINAL: i64 = 44;
+    const SECOND_TERMINAL: i64 = 45;
+    const LISTED: i64 = 46;
+
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut first_terminal = item_exchange_contract(FIRST_TERMINAL);
+    first_terminal.date_expired = Utc::now() + chrono::Duration::hours(1);
+    let mut second_terminal = item_exchange_contract(SECOND_TERMINAL);
+    second_terminal.date_expired = Utc::now() + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![REGION],
+            pages: HashMap::from([(
+                (REGION, 1),
+                Ok(EsiResponse::fresh(
+                    vec![first_terminal.clone(), second_terminal.clone()],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    FIRST_TERMINAL,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    SECOND_TERMINAL,
+                    Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                ),
+            ]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish disappearing contracts as a silent baseline");
+    for subscription in [
+        contract_subscription(
+            "listed-before-probes",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ),
+        confirmed_ship_subscription(
+            "terminal-before-next-probe",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ),
+    ] {
+        store
+            .upsert_contract_subscription(&subscription)
+            .await
+            .expect("persist immediate lifecycle delivery subscription");
+    }
+
+    let esi = Arc::new(GatedProbeBatchEsi {
+        inner: FakeEsi {
+            regions: vec![REGION],
+            pages: HashMap::from([(
+                (REGION, 1),
+                Ok(EsiResponse::fresh(
+                    vec![item_exchange_contract(LISTED)],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([(
+                LISTED,
+                Ok(EsiResponse::fresh(vec![offered_ship(3)], expiring_cache())),
+            )]),
+        },
+        probes: StdMutex::new(vec![
+            Ok(ContractItemProbe::NoContent(expiring_cache())),
+            Ok(ContractItemProbe::NoContent(expiring_cache())),
+        ]),
+        probe_count: AtomicU64::new(0),
+        first_probe_started: Arc::new(Notify::new()),
+        first_probe_release: Arc::new(Notify::new()),
+        second_probe_started: Arc::new(Notify::new()),
+        second_probe_release: Arc::new(Notify::new()),
+    });
+    let delivery = Arc::new(NotifyingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+        delivered: Arc::new(Notify::new()),
+    });
+    let first_delivery = delivery.delivered.notified();
+    let first_probe_started = esi.first_probe_started.notified();
+    let collector = ContractCollector::new(store, esi.clone()).with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+        delivery.clone(),
+    );
+    let cycle = tokio::spawn(async move { collector.collect_cycle().await });
+
+    if tokio::time::timeout(Duration::from_secs(2), first_delivery)
+        .await
+        .is_err()
+    {
+        esi.first_probe_release.notify_one();
+        esi.second_probe_release.notify_one();
+        cycle
+            .await
+            .expect("join the released listing-before-probe regression")
+            .expect("finish the released listing-before-probe regression");
+        panic!("the ready listing waited behind the first terminal probe");
+    }
+    assert_eq!(delivery.sent.lock().unwrap()[0].contract_id, LISTED);
+    let first_terminal_delivery = delivery.delivered.notified();
+    tokio::time::timeout(Duration::from_secs(2), first_probe_started)
+        .await
+        .expect("the first terminal probe begins after the listing delivery");
+    esi.first_probe_release.notify_one();
+    if tokio::time::timeout(Duration::from_secs(2), first_terminal_delivery)
+        .await
+        .is_err()
+    {
+        esi.second_probe_release.notify_one();
+        cycle
+            .await
+            .expect("join the released first-terminal regression")
+            .expect("finish the released first-terminal regression");
+        panic!("the first terminal result waited behind the later gated probe");
+    }
+    assert_eq!(delivery.sent.lock().unwrap()[1].contract_id, FIRST_TERMINAL);
+    let second_probe_started = esi.second_probe_started.notified();
+    tokio::time::timeout(Duration::from_secs(2), second_probe_started)
+        .await
+        .expect("the second terminal probe begins only after first terminal dispatch");
+    esi.second_probe_release.notify_one();
+    cycle
+        .await
+        .expect("join the released lifecycle collection")
+        .expect("finish the released lifecycle collection");
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn transient_terminal_probe_failures_back_off_so_the_ninth_due_case_advances() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 44;
+    const NINTH_CONTRACT: i64 = 52;
+
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![REGION],
+            pages: HashMap::from([(
+                (REGION, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the regional baseline before seeding due cases");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed more than one regional terminal-probe batch");
+    for contract_id in FIRST_CONTRACT..=NINTH_CONTRACT {
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,now(),now(),now() - interval '1 second','awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize the due resolution contract"))
+            .bind(serde_json::json!({"offered_items": [], "requested_items": []}))
+            .execute(&pool)
+            .await
+            .expect("seed a due regional terminal probe");
+    }
+
+    let first_pass = Arc::new(ResolutionEsi {
+        inner: FakeEsi {
+            regions: vec![REGION],
+            pages: HashMap::from([(
+                (REGION, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        },
+        probes: StdMutex::new(
+            (FIRST_CONTRACT..NINTH_CONTRACT)
+                .map(|_| {
+                    Err(EsiError::retryable(
+                        "transient terminal probe failure",
+                        None,
+                    ))
+                })
+                .collect(),
+        ),
+        probe_calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), first_pass.clone())
+        .collect_cycle()
+        .await
+        .expect("isolated transient probe failures do not abort the regional cycle");
+    assert_eq!(
+        first_pass
+            .probe_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(contract_id, _)| *contract_id)
+            .collect::<Vec<_>>(),
+        (FIRST_CONTRACT..NINTH_CONTRACT).collect::<Vec<_>>(),
+        "the first bounded regional pass attempts the first eight due cases"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM contract_resolution_cases WHERE region_id = $1 AND contract_id < $2 AND next_probe_at > now()",
+        )
+        .bind(REGION)
+        .bind(NINTH_CONTRACT)
+        .fetch_one(&pool)
+        .await
+        .expect("read durable retry scheduling for transient probe failures"),
+        8,
+        "each transient failure advances its persisted next-probe boundary before the next fair pass"
+    );
+
+    let second_pass = Arc::new(ResolutionEsi {
+        inner: FakeEsi {
+            regions: vec![REGION],
+            pages: HashMap::from([(
+                (REGION, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        },
+        probes: StdMutex::new(vec![Ok(ContractItemProbe::Available(EsiResponse::fresh(
+            vec![],
+            CacheMetadata::cached_for_seconds(60),
+        )))]),
+        probe_calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store, second_pass.clone())
+        .collect_cycle()
+        .await
+        .expect("the fair follow-up pass resolves the still-due ninth case");
+    assert_eq!(
+        second_pass.probe_calls.lock().unwrap().as_slice(),
+        [(NINTH_CONTRACT, None)],
+        "the ninth case advances instead of the first eight being selected again"
+    );
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn shared_rate_bucket_paces_concurrent_regional_requests_with_controlled_time() {
+    const FIRST_REGION: i64 = 10_000_002;
+    const SECOND_REGION: i64 = 10_000_003;
+
+    let database = TemporaryDatabase::new().await;
+    let started_at = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed rate-bucket test time");
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(started_at),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let metadata = CacheMetadata {
+        rate_limit_group: Some("public-contracts".to_string()),
+        rate_limit_limit: Some("20/60s".to_string()),
+        rate_limit_remaining: Some(2),
+        ..expiring_page(1)
+    };
+    let esi = Arc::new(TimestampedRateBucketEsi {
+        pacer: pacer.clone(),
+        calls: StdMutex::new(Vec::new()),
+        regions: vec![FIRST_REGION, SECOND_REGION],
+        discovery_metadata: metadata,
+        page_metadata: StdMutex::new(vec![
+            CacheMetadata {
+                rate_limit_group: Some("healthy-other-group".to_string()),
+                rate_limit_limit: Some("100/60s".to_string()),
+                rate_limit_remaining: Some(99),
+                ..expiring_page(1)
+            },
+            expiring_page(1),
+        ]),
+    });
+    let report = ContractCollector::new(database.store().await, esi.clone())
+        .with_request_pacer(pacer.clone())
+        .with_max_concurrent_regions(2)
+        .collect_cycle()
+        .await
+        .expect("low but positive bucket capacity waits rather than rejects regional work");
+    assert_eq!(
+        report
+            .regions
+            .iter()
+            .map(|outcome| match outcome {
+                CollectionOutcome::BaselineEstablished { region_id }
+                | CollectionOutcome::RecoveryBaselineEstablished { region_id }
+                | CollectionOutcome::Complete { region_id, .. }
+                | CollectionOutcome::Inconclusive { region_id, .. } => *region_id,
+            })
+            .collect::<Vec<_>>(),
+        vec![FIRST_REGION, SECOND_REGION],
+        "soft pacing retains both started regional attempts"
+    );
+    let waits = pacer.waits.lock().unwrap();
+    assert!(
+        waits.iter().all(
+            |deadline| *deadline == started_at + chrono::Duration::seconds(30)
+                || *deadline == started_at + chrono::Duration::seconds(90)
+        ),
+        "only the persisted low-bucket boundaries are waited"
+    );
+    assert_eq!(
+        waits.last(),
+        Some(&(started_at + chrono::Duration::seconds(90))),
+        "the headerless and different-group responses retain the later staggered admission"
+    );
+    drop(waits);
+    let page_times = esi
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(call, at)| call.starts_with("page:").then_some(*at))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        page_times,
+        vec![
+            started_at + chrono::Duration::seconds(30),
+            started_at + chrono::Duration::seconds(90),
+        ],
+        "no concurrent page request bursts through the near-exhausted shared bucket"
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn delayed_same_group_response_retains_active_pacing_for_later_and_restarted_requests() {
+    let database = TemporaryDatabase::new().await;
+    let started_at = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed delayed-response pacing test time");
+    let pacer = Arc::new(GatedAdvancingRequestPacer {
+        now: StdMutex::new(started_at),
+        waits: StdMutex::new(Vec::new()),
+        wait_entered: Arc::new(Notify::new()),
+        wait_release: Arc::new(Notify::new()),
+    });
+    let esi = Arc::new(DelayedSameGroupPacingEsi {
+        pacer: pacer.clone(),
+        second_started: Arc::new(Notify::new()),
+        second_release: Arc::new(Notify::new()),
+        calls: StdMutex::new(Vec::new()),
+    });
+    let first_collector = ContractCollector::new(database.store().await, esi.clone())
+        .with_request_pacer(pacer.clone())
+        .with_max_concurrent_regions(2);
+    let first_cycle = tokio::spawn(async move { first_collector.collect_cycle().await });
+
+    tokio::time::timeout(Duration::from_secs(1), esi.second_started.notified())
+        .await
+        .expect("two regional pages start before either response is postprocessed");
+    tokio::time::timeout(Duration::from_secs(1), pacer.wait_entered.notified())
+        .await
+        .expect("the third region waits on the first low-water response");
+    let delayed_response_at = started_at + chrono::Duration::seconds(1);
+    pacer.advance_to(delayed_response_at);
+    esi.second_release.notify_one();
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to observe the delayed same-group response");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let updated_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+                "SELECT updated_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+            )
+            .fetch_optional(&pool)
+            .await
+            .expect("read delayed-response limiter state")
+            .flatten();
+            if updated_at.is_some_and(|updated_at| updated_at >= delayed_response_at) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the delayed same-group response is persisted before releasing the third request");
+    let limiter = sqlx::query(
+        "SELECT pacing_active, next_request_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read pacing state after delayed same-group response");
+    assert!(
+        limiter.get::<bool, _>("pacing_active"),
+        "a delayed healthy response in the same group cannot clear the newer active low-water pacing"
+    );
+    assert_eq!(
+        limiter.get::<Option<DateTime<Utc>>, _>("next_request_at"),
+        Some(started_at + chrono::Duration::seconds(30)),
+        "the delayed healthy response retains the low-water deadline until reservation consumes it"
+    );
+    pool.close().await;
+
+    pacer.wait_release.notify_one();
+    let first_report = tokio::time::timeout(Duration::from_secs(1), first_cycle)
+        .await
+        .expect("release the third regional request")
+        .expect("join first collection cycle")
+        .expect("complete all three regional attempts");
+    assert_eq!(first_report.regions.len(), 3);
+    assert_eq!(
+        esi.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|(region_id, at)| (*region_id == 10_000_004).then_some(*at)),
+        Some(started_at + chrono::Duration::seconds(30)),
+        "the third request reaches the wire only after its active low-water admission wait"
+    );
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to expire regional discovery before restart");
+    sqlx::query("DELETE FROM esi_cache_metadata WHERE resource_key = 'regions'")
+        .execute(&pool)
+        .await
+        .expect("force restart to re-enter the shared admission seam");
+    pool.close().await;
+    let restarted = ContractCollector::new(
+        database.store().await,
+        Arc::new(FakeEsi {
+            regions: vec![],
+            pages: HashMap::new(),
+            items: HashMap::new(),
+        }),
+    )
+    .with_request_pacer(pacer.clone());
+    let restarted_cycle = tokio::spawn(async move { restarted.collect_cycle().await });
+    tokio::time::timeout(Duration::from_secs(1), pacer.wait_entered.notified())
+        .await
+        .expect("restart retains the reservation made by the third request");
+    assert_eq!(
+        pacer.waits.lock().unwrap().as_slice(),
+        &[
+            started_at + chrono::Duration::seconds(30),
+            started_at + chrono::Duration::seconds(90),
+        ],
+        "the restarted collector still waits after the delayed same-group response"
+    );
+    pacer.wait_release.notify_one();
+    restarted_cycle
+        .await
+        .expect("join restarted collector")
+        .expect("restart completes after its retained pacing boundary");
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn bounded_regional_collection_dispatches_fast_terminal_evidence_before_a_slow_region() {
+    const FAST_REGION: i64 = 10_000_002;
+    const SLOW_REGION: i64 = 10_000_003;
+
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut sale = item_exchange_contract(44);
+    sale.date_expired = Utc::now() + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![FAST_REGION, SLOW_REGION],
+            pages: HashMap::from([
+                (
+                    (FAST_REGION, 1),
+                    Ok(EsiResponse::fresh(vec![sale.clone()], expiring_page(1))),
+                ),
+                (
+                    (SLOW_REGION, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                ),
+            ]),
+            items: HashMap::from([(
+                sale.contract_id,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        }),
+    )
+    .with_max_concurrent_regions(2)
+    .collect_cycle()
+    .await
+    .expect("establish independent regional baselines before disappearance evidence");
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "fast-sale-confirmed",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the terminal evidence subscription");
+
+    let esi = Arc::new(GatedRegionalEsi {
+        slow_region: SLOW_REGION,
+        slow_started: Arc::new(Notify::new()),
+        slow_release: Arc::new(Notify::new()),
+        pages: HashMap::from([(FAST_REGION, vec![]), (SLOW_REGION, vec![])]),
+        items: HashMap::new(),
+        probes: StdMutex::new(vec![Ok(ContractItemProbe::NoContent(expiring_cache()))]),
+    });
+    let delivery = Arc::new(NotifyingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+        delivered: Arc::new(Notify::new()),
+    });
+    let slow_started = esi.slow_started.notified();
+    let delivered = delivery.delivered.notified();
+    let collector = ContractCollector::new(store.clone(), esi.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+            delivery.clone(),
+        )
+        .with_max_concurrent_regions(2);
+    let cycle = tokio::spawn(async move { collector.collect_cycle().await });
+
+    tokio::time::timeout(Duration::from_secs(2), slow_started)
+        .await
+        .expect("the unrelated slow regional attempt starts");
+    if tokio::time::timeout(Duration::from_secs(2), delivered)
+        .await
+        .is_err()
+    {
+        esi.slow_release.notify_one();
+        cycle
+            .await
+            .expect("join the released cycle after the failing assertion")
+            .expect("complete the released slow region");
+        panic!("conclusive fast terminal evidence waited for an unrelated slow region");
+    }
+    assert!(
+        !cycle.is_finished(),
+        "the fast terminal notification is sent while the slow region remains in flight"
+    );
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].contract_id, sale.contract_id);
+    drop(sent);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect immediate terminal notification state");
+    assert!(!sqlx::query_scalar::<_, bool>(
+        "SELECT notification_pending FROM contract_resolution_cases WHERE region_id = $1 AND contract_id = $2",
+    )
+    .bind(FAST_REGION)
+    .bind(sale.contract_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read the fast terminal notification state"));
+    pool.close().await;
+
+    esi.slow_release.notify_one();
+    let report = cycle
+        .await
+        .expect("join bounded terminal-evidence cycle")
+        .expect("finish the released slow region");
+    assert!(report.events.iter().any(|event| {
+        event.region_id == FAST_REGION && event.kind == ContractEventKind::SaleConfirmed
+    }));
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn shared_limiter_stops_unstarted_regions_and_preserves_a_completed_batch_after_restart() {
+    const FIRST_REGION: i64 = 10_000_002;
+    const SECOND_REGION: i64 = 10_000_003;
+    const THIRD_REGION: i64 = 10_000_004;
+
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![FIRST_REGION, SECOND_REGION, THIRD_REGION],
+            pages: HashMap::from([
+                (
+                    (FIRST_REGION, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                ),
+                (
+                    (SECOND_REGION, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                ),
+                (
+                    (THIRD_REGION, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                ),
+            ]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish three independent regional baselines");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to mark the baseline boundary");
+    let baseline_batch_id: i64 =
+        sqlx::query_scalar("SELECT max(id) FROM regional_observation_batches")
+            .fetch_one(&pool)
+            .await
+            .expect("read the baseline batch boundary");
+    pool.close().await;
+
+    let boundary_metadata = CacheMetadata {
+        rate_limit_group: Some("public-contracts".to_string()),
+        rate_limit_limit: Some("1/1m".to_string()),
+        rate_limit_remaining: Some(0),
+        ..expiring_page(1)
+    };
+    let report = ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![FIRST_REGION, SECOND_REGION, THIRD_REGION],
+            pages: HashMap::from([(
+                (FIRST_REGION, 1),
+                Ok(EsiResponse::fresh(
+                    vec![item_exchange_contract(44)],
+                    boundary_metadata,
+                )),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .with_max_concurrent_regions(1)
+    .collect_cycle()
+    .await
+    .expect("the completed first region survives the shared limiter boundary");
+
+    assert!(report.retry_after.is_some());
+    assert_eq!(
+        report.regions,
+        vec![CollectionOutcome::Complete {
+            region_id: FIRST_REGION,
+            observed_contracts: 1,
+        }],
+        "unstarted regions have no fabricated complete or inconclusive outcomes"
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect post-boundary batches");
+    let batches = sqlx::query(
+        "SELECT region_id, outcome FROM regional_observation_batches WHERE id > $1 ORDER BY id",
+    )
+    .bind(baseline_batch_id)
+    .fetch_all(&pool)
+    .await
+    .expect("read only newly attempted regional batches");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].get::<i64, _>("region_id"), FIRST_REGION);
+    assert_eq!(batches[0].get::<String, _>("outcome"), "complete");
+    pool.close().await;
+
+    let restart_error =
+        ContractCollector::new(database.store().await, Arc::new(FakeEsi::default()))
+            .with_max_concurrent_regions(1)
+            .collect_cycle()
+            .await
+            .expect_err("the persisted limiter blocks discovery after restart");
+    assert!(restart_error
+        .to_string()
+        .contains("persisted global ESI limiter"));
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to confirm restart did not write a batch");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM regional_observation_batches WHERE id > $1",
+        )
+        .bind(baseline_batch_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count post-boundary batches after restart"),
+        1
+    );
+    pool.close().await;
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn shared_limiter_does_not_cancel_an_already_started_region_or_start_a_third_region() {
+    const FIRST_REGION: i64 = 10_000_002;
+    const SECOND_REGION: i64 = 10_000_003;
+    const THIRD_REGION: i64 = 10_000_004;
+
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![FIRST_REGION, SECOND_REGION, THIRD_REGION],
+            pages: HashMap::from([
+                (
+                    (FIRST_REGION, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                ),
+                (
+                    (SECOND_REGION, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                ),
+                (
+                    (THIRD_REGION, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                ),
+            ]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish three independent regional baselines");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to mark the cap-two baseline boundary");
+    let baseline_batch_id: i64 =
+        sqlx::query_scalar("SELECT max(id) FROM regional_observation_batches")
+            .fetch_one(&pool)
+            .await
+            .expect("read the cap-two baseline batch boundary");
+    sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,now(),now(),now() - interval '1 second','awaiting_resolution')")
+        .bind(FIRST_REGION)
+        .bind(99_i64)
+        .bind(serde_json::to_value(item_exchange_contract(99)).expect("serialize the dormant resolution contract"))
+        .bind(serde_json::json!({"offered_items": [], "requested_items": []}))
+        .execute(&pool)
+        .await
+        .expect("seed an otherwise due resolution probe before the shared limiter boundary");
+    pool.close().await;
+
+    let esi = Arc::new(InFlightLimiterEsi {
+        first_region: FIRST_REGION,
+        second_region: SECOND_REGION,
+        third_region: THIRD_REGION,
+        first_started: Arc::new(Notify::new()),
+        second_started: Arc::new(Notify::new()),
+        first_release: Arc::new(Notify::new()),
+        second_release: Arc::new(Notify::new()),
+        calls: StdMutex::new(Vec::new()),
+    });
+    let first_started = esi.first_started.notified();
+    let second_started = esi.second_started.notified();
+    let collector =
+        ContractCollector::new(store.clone(), esi.clone()).with_max_concurrent_regions(2);
+    let cycle = tokio::spawn(async move { collector.collect_cycle().await });
+
+    tokio::time::timeout(Duration::from_secs(2), first_started)
+        .await
+        .expect("the first regional attempt starts");
+    tokio::time::timeout(Duration::from_secs(2), second_started)
+        .await
+        .expect("the second regional attempt was already in flight before the limiter boundary");
+    esi.first_release.notify_one();
+    tokio::task::yield_now().await;
+    assert!(
+        !esi.calls.lock().unwrap().contains(&THIRD_REGION),
+        "the limiter-hitting completed region must not open a third ESI attempt"
+    );
+    assert!(
+        !cycle.is_finished(),
+        "the already-started second region remains allowed to finish its own attempt"
+    );
+    esi.second_release.notify_one();
+    let report = cycle
+        .await
+        .expect("join the cap-two limiter cycle")
+        .expect("both already-started regions finish cleanly");
+    assert!(report.retry_after.is_some());
+    assert_eq!(
+        report
+            .regions
+            .iter()
+            .map(|outcome| match outcome {
+                CollectionOutcome::BaselineEstablished { region_id }
+                | CollectionOutcome::RecoveryBaselineEstablished { region_id }
+                | CollectionOutcome::Complete { region_id, .. }
+                | CollectionOutcome::Inconclusive { region_id, .. } => *region_id,
+            })
+            .collect::<Vec<_>>(),
+        vec![FIRST_REGION, SECOND_REGION],
+        "the report retains the two actual attempts and omits the unstarted third region"
+    );
+    assert!(
+        !esi.calls.lock().unwrap().contains(&THIRD_REGION),
+        "the persisted limiter also prevents a delayed third attempt"
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect retained cap-two batches");
+    let batches = sqlx::query(
+        "SELECT region_id, outcome FROM regional_observation_batches WHERE id > $1 ORDER BY id",
+    )
+    .bind(baseline_batch_id)
+    .fetch_all(&pool)
+    .await
+    .expect("read the two actually started batches");
+    assert_eq!(batches.len(), 2);
+    let batch_outcomes = batches
+        .iter()
+        .map(|batch| {
+            (
+                batch.get::<i64, _>("region_id"),
+                batch.get::<String, _>("outcome"),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    assert_eq!(batch_outcomes[&FIRST_REGION], "complete");
+    assert_eq!(batch_outcomes[&SECOND_REGION], "complete");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM contract_collection_failures WHERE region_id = $1 AND contract_id = $2 AND failure_kind = 'resolution_probe'",
+        )
+        .bind(FIRST_REGION)
+        .bind(99_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("ensure the limiter did not manufacture a resolution failure"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM contract_resolution_cases WHERE region_id = $1 AND contract_id = $2",
+        )
+        .bind(FIRST_REGION)
+        .bind(99_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("keep the unprobed regional case awaiting a future allowed cycle"),
+        "awaiting_resolution"
+    );
+    pool.close().await;
 
     database.destroy().await;
 }
@@ -12367,7 +14209,17 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         .fetch_one(&clean_pool)
         .await
         .expect("read clean migration ledger");
-    assert_eq!(clean_migration_count, 15);
+    assert_eq!(clean_migration_count, 16);
+    let clean_pacing_column_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'esi_collection_limiter_state' AND column_name = 'next_request_at')",
+    )
+    .fetch_one(&clean_pool)
+    .await
+    .expect("read clean limiter pacing column");
+    assert!(
+        clean_pacing_column_exists,
+        "clean migration adds ESI pacing state"
+    );
     let batch_table_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
         .bind("regional_observation_batches")
         .fetch_one(&clean_pool)
@@ -12543,6 +14395,16 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
     assert!(
         upgraded_batch_table_exists,
         "current production migration creates regional batch ledger"
+    );
+    let upgraded_pacing_column_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'esi_collection_limiter_state' AND column_name = 'next_request_at')",
+    )
+    .fetch_one(&upgraded_pool)
+    .await
+    .expect("read upgraded limiter pacing column");
+    assert!(
+        upgraded_pacing_column_exists,
+        "current production migration adds ESI pacing state"
     );
     for table in ["location_evidence", "location_evidence_audit"] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")

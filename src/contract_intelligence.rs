@@ -23,14 +23,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 const HEALTH_MIGRATION_VERSIONS: &[i64] = &[20260817000001];
 const CONTRACT_COLLECTOR_USER_AGENT: &str = "killbot-rust Global Public Contract Intelligence";
-const ESI_BODY_MAX_ATTEMPTS: usize = 3;
-const ESI_BODY_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 const MAX_EMBED_CONTEXT_ENRICHMENTS_PER_CYCLE: usize = 8;
+const MAX_TERMINAL_RESOLUTION_PROBES_PER_COMPLETED_REGION: usize = 8;
+const RESOLUTION_PROBE_RETRY_BASE_SECONDS: i64 = 30;
+const RESOLUTION_PROBE_RETRY_MAX_SECONDS: i64 = 15 * 60;
+pub const DEFAULT_CONTRACT_REGIONAL_CONCURRENCY: usize = 2;
+pub const MAX_CONTRACT_REGIONAL_CONCURRENCY: usize = 4;
 const DISCORD_NONCE_ENFORCEMENT_WINDOW: ChronoDuration = ChronoDuration::minutes(5);
 const DEFAULT_COLLECTION_RECOVERY_GAP: ChronoDuration = ChronoDuration::minutes(15);
 const REGION_DISCOVERY_RESOURCE_KEY: &str = "esi:regions";
@@ -41,6 +45,41 @@ const CONTRACT_NOT_PUBLIC_ERROR: &str = "Contract not public";
 const HEALTH_SNAPSHOT_TRANSITION_LOCK_KEY: i64 = 7_142_300_993_001;
 const MAX_HEALTH_REGIONAL_DETAILS: usize = 12;
 pub const DEFAULT_HEALTH_CHANNEL_ID: u64 = 1_538_030_920_328_810_536;
+
+pub fn contract_regional_concurrency_from(value: Option<&str>) -> Result<usize, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_CONTRACT_REGIONAL_CONCURRENCY);
+    };
+    let concurrency = value.parse::<usize>().map_err(|_| {
+        format!(
+            "CONTRACT_REGIONAL_CONCURRENCY must be an integer from 1 to {MAX_CONTRACT_REGIONAL_CONCURRENCY}"
+        )
+    })?;
+    if !(1..=MAX_CONTRACT_REGIONAL_CONCURRENCY).contains(&concurrency) {
+        return Err(format!(
+            "CONTRACT_REGIONAL_CONCURRENCY must be from 1 to {MAX_CONTRACT_REGIONAL_CONCURRENCY}"
+        ));
+    }
+    Ok(concurrency)
+}
+
+pub fn contract_regional_concurrency_from_environment() -> Result<usize, String> {
+    contract_regional_concurrency_from_environment_value(std::env::var(
+        "CONTRACT_REGIONAL_CONCURRENCY",
+    ))
+}
+
+fn contract_regional_concurrency_from_environment_value(
+    value: Result<String, std::env::VarError>,
+) -> Result<usize, String> {
+    match value {
+        Ok(value) => contract_regional_concurrency_from(Some(&value)),
+        Err(std::env::VarError::NotPresent) => contract_regional_concurrency_from(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "CONTRACT_REGIONAL_CONCURRENCY must be valid Unicode and an integer from 1 to {MAX_CONTRACT_REGIONAL_CONCURRENCY}"
+        )),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -554,7 +593,7 @@ impl CacheMetadata {
             .unwrap_or(false)
     }
 
-    fn collection_pause_until(&self) -> Option<DateTime<Utc>> {
+    fn collection_pause_until_at(&self, observed_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.retry_after.or_else(|| {
             let reset_seconds = if self.error_limit_remain.unwrap_or(1) <= 0 {
                 self.error_limit_reset
@@ -565,8 +604,16 @@ impl CacheMetadata {
             } else {
                 None
             };
-            reset_seconds.map(|seconds| Utc::now() + ChronoDuration::seconds(seconds))
+            reset_seconds.map(|seconds| observed_at + ChronoDuration::seconds(seconds))
         })
+    }
+
+    fn collection_pacing_until(&self, observed_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        rate_limit_pacing_deadline(
+            self.rate_limit_limit.as_deref()?,
+            self.rate_limit_remaining?,
+            observed_at,
+        )
     }
 }
 
@@ -881,6 +928,16 @@ pub trait PublicContractEsi: Send + Sync {
 #[async_trait]
 pub trait ContractContextLimiter: Send + Sync {
     async fn request_allowed(&self) -> Result<bool, EsiError>;
+    async fn wait_for_request_admission(&self) -> Result<(), EsiError> {
+        if self.request_allowed().await? {
+            Ok(())
+        } else {
+            Err(EsiError::retryable(
+                "persisted global ESI limiter boundary remains active",
+                None,
+            ))
+        }
+    }
     async fn record_response(&self, metadata: &CacheMetadata) -> Result<(), EsiError>;
 }
 
@@ -928,64 +985,50 @@ impl HttpPublicContractEsi {
         etag: Option<&str>,
     ) -> Result<EsiResponse<T>, EsiError> {
         let url = format!("{}{}", self.base_url, path);
-        for attempt in 0..ESI_BODY_MAX_ATTEMPTS {
-            let mut request = self.client.get(&url);
-            if let Some(etag) = etag {
-                request = request.header(IF_NONE_MATCH, etag);
-            }
-            let response = request
-                .send()
-                .await
-                .map_err(|error| EsiError::retryable(error.to_string(), None))?;
-            let metadata = cache_metadata(response.headers());
-            if response.status() == StatusCode::NOT_MODIFIED {
-                return Ok(EsiResponse::not_modified(metadata));
-            }
-            if !response.status().is_success() {
-                let retry_after = metadata.retry_after.or_else(|| {
-                    if matches!(response.status(), StatusCode::TOO_MANY_REQUESTS)
-                        || response.status().as_u16() == 420
-                    {
-                        metadata
-                            .error_limit_reset
-                            .map(|seconds| Utc::now() + ChronoDuration::seconds(seconds))
-                    } else {
-                        None
-                    }
-                });
-                let mut metadata = metadata;
-                metadata.retry_after = retry_after;
-                return Err(EsiError::from_metadata(
-                    format!("ESI returned {}", response.status()),
-                    Some(response.status()),
-                    metadata,
-                ));
-            }
-            let body = match response.bytes().await {
-                Ok(body) => body,
-                Err(error) => {
-                    if body_retry_allowed(attempt, &metadata) {
-                        tokio::time::sleep(body_retry_delay(attempt)).await;
-                        continue;
-                    }
-                    return Err(EsiError::from_metadata(error.to_string(), None, metadata));
-                }
-            };
-            match serde_json::from_slice(&body) {
-                Ok(value) => return Ok(EsiResponse::fresh(value, metadata)),
-                Err(error) if error.is_eof() && body_retry_allowed(attempt, &metadata) => {
-                    tokio::time::sleep(body_retry_delay(attempt)).await;
-                }
-                Err(error) => {
-                    return Err(EsiError::from_metadata(
-                        format!("error decoding response body: {error}"),
-                        None,
-                        metadata,
-                    ));
-                }
-            }
+        let mut request = self.client.get(&url);
+        if let Some(etag) = etag {
+            request = request.header(IF_NONE_MATCH, etag);
         }
-        unreachable!("ESI body attempt loop always returns on its final attempt")
+        let response = request
+            .send()
+            .await
+            .map_err(|error| EsiError::retryable(error.to_string(), None))?;
+        let metadata = cache_metadata(response.headers());
+        if response.status() == StatusCode::NOT_MODIFIED {
+            return Ok(EsiResponse::not_modified(metadata));
+        }
+        if !response.status().is_success() {
+            let retry_after = metadata.retry_after.or_else(|| {
+                if matches!(response.status(), StatusCode::TOO_MANY_REQUESTS)
+                    || response.status().as_u16() == 420
+                {
+                    metadata
+                        .error_limit_reset
+                        .map(|seconds| Utc::now() + ChronoDuration::seconds(seconds))
+                } else {
+                    None
+                }
+            });
+            let mut metadata = metadata;
+            metadata.retry_after = retry_after;
+            return Err(EsiError::from_metadata(
+                format!("ESI returned {}", response.status()),
+                Some(response.status()),
+                metadata,
+            ));
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| EsiError::from_metadata(error.to_string(), None, metadata.clone()))?;
+        let value = serde_json::from_slice(&body).map_err(|error| {
+            EsiError::from_metadata(
+                format!("error decoding response body: {error}"),
+                None,
+                metadata.clone(),
+            )
+        })?;
+        Ok(EsiResponse::fresh(value, metadata))
     }
 
     async fn post_json<T: DeserializeOwned, B: Serialize>(
@@ -1021,7 +1064,7 @@ impl HttpPublicContractEsi {
         let value = response
             .json()
             .await
-            .map_err(|error| EsiError::retryable(error.to_string(), None))?;
+            .map_err(|error| EsiError::from_metadata(error.to_string(), None, metadata.clone()))?;
         Ok(EsiResponse::fresh(value, metadata))
     }
 
@@ -1031,12 +1074,7 @@ impl HttpPublicContractEsi {
         etag: Option<&str>,
         limiter: &dyn ContractContextLimiter,
     ) -> Result<EsiResponse<T>, EsiError> {
-        if !limiter.request_allowed().await? {
-            return Err(EsiError::retryable(
-                "persisted global ESI limiter boundary remains active",
-                None,
-            ));
-        }
+        limiter.wait_for_request_admission().await?;
         let response = self.get(path, etag).await;
         match &response {
             Ok(response) => limiter.record_response(&response.metadata).await?,
@@ -1051,12 +1089,7 @@ impl HttpPublicContractEsi {
         body: &B,
         limiter: &dyn ContractContextLimiter,
     ) -> Result<EsiResponse<T>, EsiError> {
-        if !limiter.request_allowed().await? {
-            return Err(EsiError::retryable(
-                "persisted global ESI limiter boundary remains active",
-                None,
-            ));
-        }
+        limiter.wait_for_request_admission().await?;
         let response = self.post_json(path, body).await;
         match &response {
             Ok(response) => limiter.record_response(&response.metadata).await?,
@@ -1196,10 +1229,9 @@ impl HttpPublicContractEsi {
                 EsiResponse::not_modified(metadata),
             )),
             status if status.is_success() => {
-                let value = response
-                    .json()
-                    .await
-                    .map_err(|error| EsiError::retryable(error.to_string(), None))?;
+                let value = response.json().await.map_err(|error| {
+                    EsiError::from_metadata(error.to_string(), None, metadata.clone())
+                })?;
                 Ok(ContractItemProbe::Available(EsiResponse::fresh(
                     value, metadata,
                 )))
@@ -1400,7 +1432,7 @@ impl PublicContractEsi for HttpPublicContractEsi {
         let affiliations = response
             .json::<Vec<Affiliation>>()
             .await
-            .map_err(|error| EsiError::retryable(error.to_string(), None))?;
+            .map_err(|error| EsiError::from_metadata(error.to_string(), None, metadata.clone()))?;
         let value = affiliations.into_iter().next().map_or(
             ContractContextValue::Indeterminate,
             |affiliation| match affiliation.alliance_id {
@@ -1585,20 +1617,6 @@ impl PublicContractEsi for HttpPublicContractEsi {
     }
 }
 
-fn body_retry_allowed(attempt: usize, metadata: &CacheMetadata) -> bool {
-    attempt + 1 < ESI_BODY_MAX_ATTEMPTS
-        && metadata.error_limit_remain.unwrap_or(1) > 0
-        && metadata.rate_limit_remaining.unwrap_or(1) > 0
-        && metadata
-            .collection_pause_until()
-            .map(|pause_until| pause_until <= Utc::now())
-            .unwrap_or(true)
-}
-
-fn body_retry_delay(attempt: usize) -> Duration {
-    ESI_BODY_RETRY_BASE_DELAY * (1_u32 << attempt)
-}
-
 fn cache_metadata(headers: &HeaderMap) -> CacheMetadata {
     let mut metadata = CacheMetadata {
         etag: headers
@@ -1676,21 +1694,46 @@ fn cache_max_age(value: &str) -> Option<i64> {
 }
 
 fn rate_limit_window_seconds(value: &str) -> Option<i64> {
-    let (_, window) = value.split_once('/')?;
+    rate_limit_capacity_and_window_seconds(value).map(|(_, window)| window)
+}
+
+fn rate_limit_capacity_and_window_seconds(value: &str) -> Option<(i64, i64)> {
+    let (limit, window) = value.split_once('/')?;
+    let limit = limit.parse::<i64>().ok()?;
     let (number, unit) = window.split_at(window.len().checked_sub(1)?);
     let count = number.parse::<i64>().ok()?;
-    match unit {
+    let window_seconds = match unit {
         "s" => Some(count),
         "m" => count.checked_mul(60),
         "h" => count.checked_mul(60 * 60),
         "d" => count.checked_mul(60 * 60 * 24),
         _ => None,
+    }?;
+    (limit > 0 && window_seconds > 0).then_some((limit, window_seconds))
+}
+
+fn rate_limit_pacing_deadline(
+    rate_limit: &str,
+    remaining: i64,
+    observed_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let (limit, window_seconds) = rate_limit_capacity_and_window_seconds(rate_limit)?;
+    if remaining < 0 || remaining.saturating_mul(10) > limit {
+        return None;
     }
+    let spacing_seconds = (window_seconds + remaining.max(1) - 1) / remaining.max(1);
+    Some(observed_at + ChronoDuration::seconds(spacing_seconds.max(1)))
 }
 
 #[derive(Clone)]
 pub struct ContractCollectionStore {
     pool: PgPool,
+}
+
+enum EsiRequestAdmission {
+    Granted,
+    WaitUntil(DateTime<Utc>),
+    PausedUntil(DateTime<Utc>),
 }
 
 pub type ContractStoreHandle = Arc<RwLock<Option<Arc<ContractCollectionStore>>>>;
@@ -3024,6 +3067,28 @@ impl ContractDeliveryClock for SystemContractDeliveryClock {
 }
 
 #[async_trait]
+pub trait ContractRequestPacer: Send + Sync {
+    fn now(&self) -> DateTime<Utc>;
+    async fn wait_until(&self, deadline: DateTime<Utc>);
+}
+
+struct SystemContractRequestPacer;
+
+#[async_trait]
+impl ContractRequestPacer for SystemContractRequestPacer {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    async fn wait_until(&self, deadline: DateTime<Utc>) {
+        let delay = (deadline - Utc::now()).to_std().unwrap_or_default();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
+#[async_trait]
 pub trait ContractPingLimiter: Send + Sync {
     async fn try_acquire(&self, channel_id: u64) -> bool;
 }
@@ -4048,9 +4113,71 @@ impl ContractCollectionStore {
         .await
     }
 
-    async fn record_esi_limiter(&self, metadata: &CacheMetadata) -> Result<(), sqlx::Error> {
-        let pause_until = metadata.collection_pause_until();
-        sqlx::query("INSERT INTO esi_collection_limiter_state (limiter_scope, pause_until, error_limit_remain, error_limit_reset, rate_limit_group, rate_limit_limit, rate_limit_remaining, rate_limit_used, updated_at) VALUES (TRUE,$1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT (limiter_scope) DO UPDATE SET pause_until = CASE WHEN EXCLUDED.pause_until IS NULL THEN esi_collection_limiter_state.pause_until WHEN esi_collection_limiter_state.pause_until IS NULL OR esi_collection_limiter_state.pause_until < EXCLUDED.pause_until THEN EXCLUDED.pause_until ELSE esi_collection_limiter_state.pause_until END, error_limit_remain = EXCLUDED.error_limit_remain, error_limit_reset = EXCLUDED.error_limit_reset, rate_limit_group = EXCLUDED.rate_limit_group, rate_limit_limit = EXCLUDED.rate_limit_limit, rate_limit_remaining = EXCLUDED.rate_limit_remaining, rate_limit_used = EXCLUDED.rate_limit_used, updated_at = now()")
+    async fn record_esi_limiter_at(
+        &self,
+        metadata: &CacheMetadata,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let pause_until = metadata.collection_pause_until_at(observed_at);
+        let next_request_at = metadata.collection_pacing_until(observed_at);
+        let pacing_active = next_request_at.is_some();
+        sqlx::query(
+            r#"
+INSERT INTO esi_collection_limiter_state (
+    limiter_scope, pause_until, error_limit_remain, error_limit_reset,
+    rate_limit_group, rate_limit_limit, rate_limit_remaining, rate_limit_used,
+    next_request_at, pacing_active, updated_at
+) VALUES (TRUE,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+ON CONFLICT (limiter_scope) DO UPDATE SET
+    pause_until = CASE
+        WHEN EXCLUDED.pause_until IS NULL THEN esi_collection_limiter_state.pause_until
+        WHEN esi_collection_limiter_state.pause_until IS NULL
+          OR esi_collection_limiter_state.pause_until < EXCLUDED.pause_until
+            THEN EXCLUDED.pause_until
+        ELSE esi_collection_limiter_state.pause_until
+    END,
+    error_limit_remain = EXCLUDED.error_limit_remain,
+    error_limit_reset = EXCLUDED.error_limit_reset,
+    rate_limit_group = CASE WHEN esi_collection_limiter_state.pacing_active AND (
+        EXCLUDED.next_request_at IS NULL
+        OR EXCLUDED.rate_limit_group IS NULL
+        OR EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+    ) THEN esi_collection_limiter_state.rate_limit_group ELSE EXCLUDED.rate_limit_group END,
+    rate_limit_limit = CASE WHEN esi_collection_limiter_state.pacing_active AND (
+        EXCLUDED.next_request_at IS NULL
+        OR EXCLUDED.rate_limit_group IS NULL
+        OR EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+    ) THEN esi_collection_limiter_state.rate_limit_limit ELSE COALESCE(EXCLUDED.rate_limit_limit, esi_collection_limiter_state.rate_limit_limit) END,
+    rate_limit_remaining = CASE WHEN esi_collection_limiter_state.pacing_active AND (
+        EXCLUDED.next_request_at IS NULL
+        OR EXCLUDED.rate_limit_group IS NULL
+        OR EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+    ) THEN esi_collection_limiter_state.rate_limit_remaining ELSE COALESCE(EXCLUDED.rate_limit_remaining, esi_collection_limiter_state.rate_limit_remaining) END,
+    rate_limit_used = CASE WHEN esi_collection_limiter_state.pacing_active AND (
+        EXCLUDED.next_request_at IS NULL
+        OR EXCLUDED.rate_limit_group IS NULL
+        OR EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+    ) THEN esi_collection_limiter_state.rate_limit_used ELSE COALESCE(EXCLUDED.rate_limit_used, esi_collection_limiter_state.rate_limit_used) END,
+    next_request_at = CASE
+        WHEN esi_collection_limiter_state.pacing_active AND (
+            EXCLUDED.next_request_at IS NULL
+            OR EXCLUDED.rate_limit_group IS NULL
+            OR EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+        ) THEN esi_collection_limiter_state.next_request_at
+        WHEN EXCLUDED.next_request_at IS NULL THEN NULL
+        WHEN esi_collection_limiter_state.next_request_at IS NULL
+          OR esi_collection_limiter_state.next_request_at < EXCLUDED.next_request_at
+            THEN EXCLUDED.next_request_at
+        ELSE esi_collection_limiter_state.next_request_at
+    END,
+    pacing_active = CASE WHEN esi_collection_limiter_state.pacing_active AND (
+        EXCLUDED.next_request_at IS NULL
+        OR EXCLUDED.rate_limit_group IS NULL
+        OR EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+    ) THEN TRUE ELSE EXCLUDED.pacing_active END,
+    updated_at = GREATEST(esi_collection_limiter_state.updated_at, EXCLUDED.updated_at)
+"#,
+        )
             .bind(pause_until)
             .bind(metadata.error_limit_remain)
             .bind(metadata.error_limit_reset)
@@ -4058,9 +4185,59 @@ impl ContractCollectionStore {
             .bind(&metadata.rate_limit_limit)
             .bind(metadata.rate_limit_remaining)
             .bind(metadata.rate_limit_used)
+            .bind(next_request_at)
+            .bind(pacing_active)
+            .bind(observed_at)
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn reserve_esi_request(
+        &self,
+        requested_at: DateTime<Utc>,
+    ) -> Result<EsiRequestAdmission, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let limiter = sqlx::query("SELECT pause_until, next_request_at, rate_limit_limit, rate_limit_remaining, pacing_active FROM esi_collection_limiter_state WHERE limiter_scope = TRUE FOR UPDATE")
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let Some(limiter) = limiter else {
+            transaction.commit().await?;
+            return Ok(EsiRequestAdmission::Granted);
+        };
+        let pause_until: Option<DateTime<Utc>> = limiter.get("pause_until");
+        if let Some(pause_until) = pause_until.filter(|deadline| *deadline > requested_at) {
+            transaction.commit().await?;
+            return Ok(EsiRequestAdmission::PausedUntil(pause_until));
+        }
+        let next_request_at: Option<DateTime<Utc>> = limiter.get("next_request_at");
+        if let Some(next_request_at) = next_request_at.filter(|deadline| *deadline > requested_at) {
+            transaction.commit().await?;
+            return Ok(EsiRequestAdmission::WaitUntil(next_request_at));
+        }
+        let rate_limit: Option<String> = limiter.get("rate_limit_limit");
+        let remaining: Option<i64> = limiter.get("rate_limit_remaining");
+        let pacing_active: bool = limiter.get("pacing_active");
+        if pacing_active && remaining.is_some_and(|remaining| remaining <= 0) {
+            sqlx::query("UPDATE esi_collection_limiter_state SET rate_limit_group = NULL, rate_limit_limit = NULL, rate_limit_remaining = NULL, rate_limit_used = NULL, next_request_at = NULL, pacing_active = FALSE, updated_at = $1 WHERE limiter_scope = TRUE")
+                .bind(requested_at)
+                .execute(&mut *transaction)
+                .await?;
+        } else if let (Some(rate_limit), Some(remaining)) = (rate_limit, remaining) {
+            let reserved_remaining = remaining.saturating_sub(1);
+            if let Some(next_request_at) =
+                rate_limit_pacing_deadline(&rate_limit, reserved_remaining, requested_at)
+            {
+                sqlx::query("UPDATE esi_collection_limiter_state SET rate_limit_remaining = $1, next_request_at = $2, pacing_active = TRUE, updated_at = $3 WHERE limiter_scope = TRUE")
+                    .bind(reserved_remaining)
+                    .bind(next_request_at)
+                    .bind(requested_at)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+        }
+        transaction.commit().await?;
+        Ok(EsiRequestAdmission::Granted)
     }
 
     async fn record_complete(
@@ -4489,6 +4666,46 @@ impl ContractCollectionStore {
         Ok(())
     }
 
+    async fn record_resolution_probe_failure(
+        &self,
+        resolution: &AwaitingContractResolution,
+        detail: &str,
+        retry_after: Option<DateTime<Utc>>,
+    ) -> Result<(), sqlx::Error> {
+        let resource_key = format!("contracts/public/items/{}", resolution.contract_id);
+        let mut transaction = self.pool.begin().await?;
+        let previous_failures: i64 = sqlx::query_scalar("SELECT count(*) FROM contract_collection_failures WHERE region_id = $1 AND contract_id = $2 AND resource_key = $3 AND failure_kind = 'resolution_probe' AND resolved_at IS NULL AND classification IS NULL")
+            .bind(resolution.region_id)
+            .bind(resolution.contract_id)
+            .bind(&resource_key)
+            .fetch_one(&mut *transaction)
+            .await?;
+        let shift = u32::try_from(previous_failures.clamp(0, 5)).unwrap_or(5);
+        let delay_seconds = RESOLUTION_PROBE_RETRY_BASE_SECONDS
+            .saturating_mul(1_i64 << shift)
+            .min(RESOLUTION_PROBE_RETRY_MAX_SECONDS);
+        let fallback_retry_at = Utc::now() + ChronoDuration::seconds(delay_seconds);
+        let next_probe_at = retry_after
+            .map(|deadline| std::cmp::max(deadline, fallback_retry_at))
+            .unwrap_or(fallback_retry_at);
+        sqlx::query("INSERT INTO contract_collection_failures (region_id, contract_id, resource_key, observed_at, failure_kind, detail, retry_after) VALUES ($1,$2,$3,$4,'resolution_probe',$5,$6)")
+            .bind(resolution.region_id)
+            .bind(resolution.contract_id)
+            .bind(&resource_key)
+            .bind(Utc::now())
+            .bind(sanitize_contract_failure_detail(detail))
+            .bind(retry_after)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE contract_resolution_cases SET next_probe_at = GREATEST(next_probe_at, $3), updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution'")
+            .bind(resolution.region_id)
+            .bind(resolution.contract_id)
+            .bind(next_probe_at)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await
+    }
+
     async fn resolve_collection_failures(
         &self,
         region_id: Option<i64>,
@@ -4528,10 +4745,108 @@ impl ContractCollectionStore {
             .collect()
     }
 
+    async fn awaiting_resolution_cases_for_region(
+        &self,
+        region_id: i64,
+        limit: usize,
+    ) -> Result<Vec<AwaitingContractResolution>, sqlx::Error> {
+        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, suppresses_nonfinancial_notification FROM contract_resolution_cases WHERE state = 'awaiting_resolution' AND next_probe_at <= now() AND region_id = $1 ORDER BY contract_id LIMIT $2")
+            .bind(region_id)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(AwaitingContractResolution {
+                    region_id: row.get("region_id"),
+                    contract_id: row.get("contract_id"),
+                    contract: serde_json::from_value(row.get("contract")).map_err(json_to_sqlx)?,
+                    manifest: serde_json::from_value(row.get("manifest")).map_err(json_to_sqlx)?,
+                    last_public_observed_at: row.get("last_public_observed_at"),
+                    absence_observed_at: row.get("absence_observed_at"),
+                    suppresses_nonfinancial_notification: row
+                        .get("suppresses_nonfinancial_notification"),
+                })
+            })
+            .collect()
+    }
+
+    async fn awaiting_resolution_cases_excluding_regions(
+        &self,
+        excluded_region_ids: &[i64],
+    ) -> Result<Vec<AwaitingContractResolution>, sqlx::Error> {
+        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, suppresses_nonfinancial_notification FROM contract_resolution_cases WHERE state = 'awaiting_resolution' AND next_probe_at <= now() AND NOT (region_id = ANY($1)) ORDER BY region_id, contract_id")
+            .bind(excluded_region_ids)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(AwaitingContractResolution {
+                    region_id: row.get("region_id"),
+                    contract_id: row.get("contract_id"),
+                    contract: serde_json::from_value(row.get("contract")).map_err(json_to_sqlx)?,
+                    manifest: serde_json::from_value(row.get("manifest")).map_err(json_to_sqlx)?,
+                    last_public_observed_at: row.get("last_public_observed_at"),
+                    absence_observed_at: row.get("absence_observed_at"),
+                    suppresses_nonfinancial_notification: row
+                        .get("suppresses_nonfinancial_notification"),
+                })
+            })
+            .collect()
+    }
+
     async fn pending_terminal_notifications(
         &self,
     ) -> Result<Vec<TerminalContractResolution>, sqlx::Error> {
         sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at, state FROM contract_resolution_cases WHERE state <> 'awaiting_resolution' AND notification_pending = TRUE ORDER BY region_id, contract_id")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(TerminalContractResolution {
+                    region_id: row.get("region_id"),
+                    contract_id: row.get("contract_id"),
+                    contract: serde_json::from_value(row.get("contract")).map_err(json_to_sqlx)?,
+                    manifest: serde_json::from_value(row.get("manifest")).map_err(json_to_sqlx)?,
+                    last_public_observed_at: row.get("last_public_observed_at"),
+                    absence_observed_at: row.get("absence_observed_at"),
+                    acceptance_evidence_at: row.get("acceptance_evidence_at"),
+                    state: contract_resolution_state_from_str(&row.get::<String, _>("state"))?,
+                })
+            })
+            .collect()
+    }
+
+    async fn pending_terminal_notifications_for_region(
+        &self,
+        region_id: i64,
+    ) -> Result<Vec<TerminalContractResolution>, sqlx::Error> {
+        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at, state FROM contract_resolution_cases WHERE state <> 'awaiting_resolution' AND notification_pending = TRUE AND region_id = $1 ORDER BY contract_id")
+            .bind(region_id)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(TerminalContractResolution {
+                    region_id: row.get("region_id"),
+                    contract_id: row.get("contract_id"),
+                    contract: serde_json::from_value(row.get("contract")).map_err(json_to_sqlx)?,
+                    manifest: serde_json::from_value(row.get("manifest")).map_err(json_to_sqlx)?,
+                    last_public_observed_at: row.get("last_public_observed_at"),
+                    absence_observed_at: row.get("absence_observed_at"),
+                    acceptance_evidence_at: row.get("acceptance_evidence_at"),
+                    state: contract_resolution_state_from_str(&row.get::<String, _>("state"))?,
+                })
+            })
+            .collect()
+    }
+
+    async fn pending_terminal_notifications_excluding_regions(
+        &self,
+        excluded_region_ids: &[i64],
+    ) -> Result<Vec<TerminalContractResolution>, sqlx::Error> {
+        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at, state FROM contract_resolution_cases WHERE state <> 'awaiting_resolution' AND notification_pending = TRUE AND NOT (region_id = ANY($1)) ORDER BY region_id, contract_id")
+            .bind(excluded_region_ids)
             .fetch_all(&self.pool)
             .await?
             .into_iter()
@@ -4573,8 +4888,23 @@ impl ContractCollectionStore {
         Ok(())
     }
 
-    async fn resolve_terminal_resolution_failures(&self) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE contract_collection_failures AS failure SET resolved_at = now() FROM contract_resolution_cases AS resolution WHERE resolution.state <> 'awaiting_resolution' AND failure.region_id = resolution.region_id AND failure.contract_id = resolution.contract_id AND failure.resource_key = 'contracts/public/items/' || resolution.contract_id::text AND failure.failure_kind = 'resolution_probe' AND failure.resolved_at IS NULL AND failure.classification IS NULL")
+    async fn resolve_terminal_resolution_failures(
+        &self,
+        region_id: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE contract_collection_failures AS failure SET resolved_at = now() FROM contract_resolution_cases AS resolution WHERE resolution.state <> 'awaiting_resolution' AND failure.region_id = resolution.region_id AND failure.contract_id = resolution.contract_id AND failure.resource_key = 'contracts/public/items/' || resolution.contract_id::text AND failure.failure_kind = 'resolution_probe' AND failure.resolved_at IS NULL AND failure.classification IS NULL AND ($1::bigint IS NULL OR resolution.region_id = $1)")
+            .bind(region_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn resolve_terminal_resolution_failures_excluding_regions(
+        &self,
+        excluded_region_ids: &[i64],
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE contract_collection_failures AS failure SET resolved_at = now() FROM contract_resolution_cases AS resolution WHERE resolution.state <> 'awaiting_resolution' AND failure.region_id = resolution.region_id AND failure.contract_id = resolution.contract_id AND failure.resource_key = 'contracts/public/items/' || resolution.contract_id::text AND failure.failure_kind = 'resolution_probe' AND failure.resolved_at IS NULL AND failure.classification IS NULL AND NOT (resolution.region_id = ANY($1))")
+            .bind(excluded_region_ids)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -4974,6 +5304,12 @@ struct RecordComplete {
     retry_after: Option<DateTime<Utc>>,
 }
 
+type RegionalAttemptTaskResult = (
+    usize,
+    i64,
+    Result<RecordComplete, RegionalCollectionAttemptError>,
+);
+
 #[derive(Debug)]
 pub enum ContractCollectionError {
     Database(sqlx::Error),
@@ -5066,14 +5402,18 @@ pub struct CollectionReport {
     pub retry_after: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone)]
 pub struct ContractCollector {
     store: ContractCollectionStore,
     esi: Arc<dyn PublicContractEsi>,
     notifications: Option<ContractNotifications>,
     delivery_clock: Arc<dyn ContractDeliveryClock>,
+    request_pacer: Arc<dyn ContractRequestPacer>,
     recovery_gap: ChronoDuration,
+    max_concurrent_regions: usize,
 }
 
+#[derive(Clone)]
 struct ContractNotifications {
     ship_groups: Arc<dyn ShipGroupResolver>,
     delivery: Arc<dyn ContractDelivery>,
@@ -5088,12 +5428,41 @@ enum NotificationResolution {
 #[derive(Default)]
 struct ResolutionBatch {
     events: Vec<ContractEvent>,
-    notification_cases: Vec<ResolutionCaseKey>,
+    retry_after: Option<DateTime<Utc>>,
+}
+
+struct CompletedRegionalPostprocessing {
+    outcome: CollectionOutcome,
+    events: Vec<ContractEvent>,
+    consumed_embed_context_enrichments: usize,
     retry_after: Option<DateTime<Utc>>,
 }
 
 struct PersistedContractContextLimiter {
     store: ContractCollectionStore,
+    request_pacer: Arc<dyn ContractRequestPacer>,
+}
+
+async fn wait_for_esi_request_admission(
+    store: &ContractCollectionStore,
+    request_pacer: &dyn ContractRequestPacer,
+) -> Result<(), EsiError> {
+    loop {
+        match store
+            .reserve_esi_request(request_pacer.now())
+            .await
+            .map_err(|error| EsiError::retryable(error.to_string(), None))?
+        {
+            EsiRequestAdmission::Granted => return Ok(()),
+            EsiRequestAdmission::WaitUntil(deadline) => request_pacer.wait_until(deadline).await,
+            EsiRequestAdmission::PausedUntil(deadline) => {
+                return Err(EsiError::retryable(
+                    "persisted global ESI limiter boundary remains active",
+                    Some(deadline),
+                ));
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -5106,9 +5475,13 @@ impl ContractContextLimiter for PersistedContractContextLimiter {
             .map_err(|error| EsiError::retryable(error.to_string(), None))
     }
 
+    async fn wait_for_request_admission(&self) -> Result<(), EsiError> {
+        wait_for_esi_request_admission(&self.store, &*self.request_pacer).await
+    }
+
     async fn record_response(&self, metadata: &CacheMetadata) -> Result<(), EsiError> {
         self.store
-            .record_esi_limiter(metadata)
+            .record_esi_limiter_at(metadata, self.request_pacer.now())
             .await
             .map_err(|error| EsiError::retryable(error.to_string(), None))
     }
@@ -5121,7 +5494,9 @@ impl ContractCollector {
             esi,
             notifications: None,
             delivery_clock: Arc::new(SystemContractDeliveryClock),
+            request_pacer: Arc::new(SystemContractRequestPacer),
             recovery_gap: DEFAULT_COLLECTION_RECOVERY_GAP,
+            max_concurrent_regions: 1,
         }
     }
 
@@ -5156,16 +5531,103 @@ impl ContractCollector {
         self
     }
 
+    pub fn with_request_pacer(mut self, request_pacer: Arc<dyn ContractRequestPacer>) -> Self {
+        self.request_pacer = request_pacer;
+        self
+    }
+
     pub fn with_recovery_gap(mut self, recovery_gap: ChronoDuration) -> Self {
         self.recovery_gap = recovery_gap.max(ChronoDuration::zero());
         self
+    }
+
+    pub fn with_max_concurrent_regions(mut self, max_concurrent_regions: usize) -> Self {
+        self.max_concurrent_regions =
+            max_concurrent_regions.clamp(1, MAX_CONTRACT_REGIONAL_CONCURRENCY);
+        self
+    }
+
+    fn start_regional_attempt(
+        &self,
+        attempts: &mut JoinSet<RegionalAttemptTaskResult>,
+        region_index: usize,
+        region_id: i64,
+    ) {
+        let collector = self.clone();
+        attempts.spawn(async move {
+            (
+                region_index,
+                region_id,
+                collector.collect_region(region_id, Utc::now()).await,
+            )
+        });
+    }
+
+    async fn postprocess_completed_region(
+        &self,
+        region_id: i64,
+        recorded: RecordComplete,
+        remaining_embed_context_enrichments: usize,
+    ) -> Result<CompletedRegionalPostprocessing, ContractCollectionError> {
+        let observed_contracts = recorded.observed_contracts;
+        let consumed = self
+            .snapshot_observed_contracts(
+                region_id,
+                &recorded.observed,
+                remaining_embed_context_enrichments,
+            )
+            .await?;
+        let mut events = recorded
+            .newly_observed
+            .into_iter()
+            .map(|observed| ContractEvent {
+                region_id,
+                kind: ContractEventKind::Listed,
+                contract: observed.contract,
+                offered_items: observed.manifest.offered_items,
+                requested_items: observed.manifest.requested_items,
+                context: ContractObservationContext::default(),
+                acceptance_evidence: None,
+                embed_context: ContractEmbedContext::default(),
+            })
+            .collect::<Vec<_>>();
+        if !events.is_empty() {
+            self.notify_fresh_events(&events).await?;
+        }
+        let resolution_batch = self
+            .resolve_awaiting_resolutions_for_region(region_id)
+            .await?;
+        events.extend(resolution_batch.events);
+        let outcome = if recorded.baseline_established {
+            CollectionOutcome::BaselineEstablished { region_id }
+        } else if recorded.recovery_baseline {
+            CollectionOutcome::RecoveryBaselineEstablished { region_id }
+        } else {
+            CollectionOutcome::Complete {
+                region_id,
+                observed_contracts,
+            }
+        };
+        Ok(CompletedRegionalPostprocessing {
+            outcome,
+            events,
+            consumed_embed_context_enrichments: consumed,
+            retry_after: std::cmp::max(recorded.retry_after, resolution_batch.retry_after),
+        })
     }
 
     pub async fn collect_cycle(&self) -> Result<CollectionReport, ContractCollectionError> {
         if let Some(notifications) = &self.notifications {
             self.deliver_prepared_notifications(notifications).await?;
         }
-        self.ensure_esi_limiter_allows_requests().await?;
+        self.notify(&[]).await?;
+        if let Some(deadline) = self.store.active_esi_limiter_deadline().await? {
+            return Err(EsiError::retryable(
+                "persisted global ESI limiter boundary remains active",
+                Some(deadline),
+            )
+            .into());
+        }
         let regions = match self.regions().await {
             Ok(regions) => {
                 self.store
@@ -5192,56 +5654,91 @@ impl ContractCollector {
                 return Err(error);
             }
         };
-        let mut outcomes = Vec::with_capacity(regions.len());
-        let mut events = Vec::new();
-        let mut retry_after = None;
+        let region_order = regions
+            .iter()
+            .enumerate()
+            .map(|(index, region_id)| (*region_id, index))
+            .collect::<HashMap<_, _>>();
+        let mut outcomes = (0..regions.len()).map(|_| None).collect::<Vec<_>>();
+        let mut events = (0..regions.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+        let mut retry_after = self.store.active_esi_limiter_deadline().await?;
         let mut remaining_embed_context_enrichments = MAX_EMBED_CONTEXT_ENRICHMENTS_PER_CYCLE;
-        for region_id in regions {
-            let attempt_started_at = Utc::now();
-            match self.collect_region(region_id, attempt_started_at).await {
+        let mut next_region = 0;
+        let mut accepting_regions = true;
+        let mut parent_error = None;
+        let mut attempts = JoinSet::new();
+
+        loop {
+            while accepting_regions
+                && next_region < regions.len()
+                && attempts.len() < self.max_concurrent_regions
+            {
+                match self.store.active_esi_limiter_deadline().await {
+                    Ok(Some(deadline)) => {
+                        retry_after = std::cmp::max(retry_after, Some(deadline));
+                        accepting_regions = false;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        parent_error.get_or_insert_with(|| error.into());
+                        accepting_regions = false;
+                        break;
+                    }
+                }
+                let region_index = next_region;
+                let region_id = regions[region_index];
+                next_region += 1;
+                self.start_regional_attempt(&mut attempts, region_index, region_id);
+            }
+
+            let Some(joined) = attempts.join_next().await else {
+                break;
+            };
+            let (region_index, region_id, result) = match joined {
+                Ok(result) => result,
+                Err(error) => {
+                    parent_error.get_or_insert_with(|| {
+                        ContractCollectionError::Cache(format!(
+                            "started regional attempt task failed before a batch could be retained: {error}"
+                        ))
+                    });
+                    accepting_regions = false;
+                    continue;
+                }
+            };
+            match result {
                 Ok(recorded) => {
-                    let observed_contracts = recorded.observed_contracts;
                     retry_after = std::cmp::max(retry_after, recorded.retry_after);
-                    let consumed = self
-                        .snapshot_observed_contracts(
+                    match self
+                        .postprocess_completed_region(
                             region_id,
-                            &recorded.observed,
+                            recorded,
                             remaining_embed_context_enrichments,
                         )
-                        .await?;
-                    remaining_embed_context_enrichments =
-                        remaining_embed_context_enrichments.saturating_sub(consumed);
-                    events.extend(recorded.newly_observed.into_iter().map(|observed| {
-                        ContractEvent {
-                            region_id,
-                            kind: ContractEventKind::Listed,
-                            contract: observed.contract,
-                            offered_items: observed.manifest.offered_items,
-                            requested_items: observed.manifest.requested_items,
-                            context: ContractObservationContext::default(),
-                            acceptance_evidence: None,
-                            embed_context: ContractEmbedContext::default(),
+                        .await
+                    {
+                        Ok(postprocessed) => {
+                            remaining_embed_context_enrichments =
+                                remaining_embed_context_enrichments.saturating_sub(
+                                    postprocessed.consumed_embed_context_enrichments,
+                                );
+                            retry_after = std::cmp::max(retry_after, postprocessed.retry_after);
+                            outcomes[region_index] = Some(postprocessed.outcome);
+                            events[region_index].extend(postprocessed.events);
                         }
-                    }));
-                    outcomes.push(if recorded.baseline_established {
-                        CollectionOutcome::BaselineEstablished { region_id }
-                    } else if recorded.recovery_baseline {
-                        CollectionOutcome::RecoveryBaselineEstablished { region_id }
-                    } else {
-                        CollectionOutcome::Complete {
-                            region_id,
-                            observed_contracts,
+                        Err(error) => {
+                            parent_error.get_or_insert(error);
+                            accepting_regions = false;
                         }
-                    });
-                    if self.store.active_esi_limiter_deadline().await?.is_some() {
-                        break;
                     }
                 }
                 Err(error) => {
                     let failure_classification = collection_failure_classification(&error.error);
                     let detail = error.error.to_string();
                     let regional_retry_after = error.error.retry_after();
-                    self.store
+                    match self
+                        .store
                         .record_inconclusive(
                             region_id,
                             &error.evidence,
@@ -5249,29 +5746,54 @@ impl ContractCollector {
                             &detail,
                             regional_retry_after,
                         )
-                        .await?;
-                    retry_after = std::cmp::max(retry_after, regional_retry_after);
-                    outcomes.push(CollectionOutcome::Inconclusive {
-                        region_id,
-                        reason: detail,
-                    });
-                    if self.store.active_esi_limiter_deadline().await?.is_some() {
-                        break;
+                        .await
+                    {
+                        Ok(()) => {
+                            retry_after = std::cmp::max(retry_after, regional_retry_after);
+                            outcomes[region_index] = Some(CollectionOutcome::Inconclusive {
+                                region_id,
+                                reason: detail,
+                            });
+                        }
+                        Err(record_error) => {
+                            parent_error.get_or_insert(record_error.into());
+                            accepting_regions = false;
+                        }
                     }
                 }
             }
         }
-        let resolution_batch = self.resolve_awaiting_resolutions().await?;
+        if let Some(error) = parent_error {
+            return Err(error);
+        }
+        let completed_region_ids = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                Some(CollectionOutcome::BaselineEstablished { region_id })
+                | Some(CollectionOutcome::RecoveryBaselineEstablished { region_id })
+                | Some(CollectionOutcome::Complete { region_id, .. }) => Some(*region_id),
+                Some(CollectionOutcome::Inconclusive { .. }) | None => None,
+            })
+            .collect::<Vec<_>>();
+        let mut events = events.into_iter().flatten().collect::<Vec<_>>();
+        let resolution_batch = if self.store.active_esi_limiter_deadline().await?.is_some() {
+            ResolutionBatch::default()
+        } else if completed_region_ids.is_empty() {
+            self.resolve_awaiting_resolutions().await?
+        } else {
+            self.resolve_awaiting_resolutions_excluding_regions(&completed_region_ids)
+                .await?
+        };
         retry_after = std::cmp::max(retry_after, resolution_batch.retry_after);
         events.extend(resolution_batch.events);
-        self.notify(&events).await?;
-        if self.notifications.is_some() {
-            self.store
-                .mark_terminal_notifications_reported(&resolution_batch.notification_cases)
-                .await?;
-        }
+        events.sort_by_key(|event| {
+            region_order
+                .get(&event.region_id)
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
         Ok(CollectionReport {
-            regions: outcomes,
+            regions: outcomes.into_iter().flatten().collect(),
             events,
             retry_after,
         })
@@ -5453,15 +5975,74 @@ impl ContractCollector {
     async fn resolve_awaiting_resolutions(
         &self,
     ) -> Result<ResolutionBatch, ContractCollectionError> {
+        self.store
+            .resolve_terminal_resolution_failures(None)
+            .await?;
+        self.resolve_resolution_batch(
+            self.store.pending_terminal_notifications().await?,
+            self.store.awaiting_resolution_cases().await?,
+        )
+        .await
+    }
+
+    async fn resolve_awaiting_resolutions_excluding_regions(
+        &self,
+        excluded_region_ids: &[i64],
+    ) -> Result<ResolutionBatch, ContractCollectionError> {
+        self.store
+            .resolve_terminal_resolution_failures_excluding_regions(excluded_region_ids)
+            .await?;
+        self.resolve_resolution_batch(
+            self.store
+                .pending_terminal_notifications_excluding_regions(excluded_region_ids)
+                .await?,
+            self.store
+                .awaiting_resolution_cases_excluding_regions(excluded_region_ids)
+                .await?,
+        )
+        .await
+    }
+
+    async fn resolve_awaiting_resolutions_for_region(
+        &self,
+        region_id: i64,
+    ) -> Result<ResolutionBatch, ContractCollectionError> {
+        self.store
+            .resolve_terminal_resolution_failures(Some(region_id))
+            .await?;
+        let awaiting_resolutions = if self.store.active_esi_limiter_deadline().await?.is_some() {
+            Vec::new()
+        } else {
+            self.store
+                .awaiting_resolution_cases_for_region(
+                    region_id,
+                    MAX_TERMINAL_RESOLUTION_PROBES_PER_COMPLETED_REGION,
+                )
+                .await?
+        };
+        self.resolve_resolution_batch(
+            self.store
+                .pending_terminal_notifications_for_region(region_id)
+                .await?,
+            awaiting_resolutions,
+        )
+        .await
+    }
+
+    async fn resolve_resolution_batch(
+        &self,
+        pending_notifications: Vec<TerminalContractResolution>,
+        awaiting_resolutions: Vec<AwaitingContractResolution>,
+    ) -> Result<ResolutionBatch, ContractCollectionError> {
         let mut batch = ResolutionBatch::default();
-        self.store.resolve_terminal_resolution_failures().await?;
-        for resolution in self.store.pending_terminal_notifications().await? {
+        for resolution in pending_notifications {
             if let Some(event) = terminal_resolution_event(&resolution) {
-                batch.events.push(event);
-                batch.notification_cases.push(ResolutionCaseKey {
+                let resolution_key = ResolutionCaseKey {
                     region_id: resolution.region_id,
                     contract_id: resolution.contract_id,
-                });
+                };
+                self.notify_terminal_event(&event, &resolution_key).await?;
+                batch.events.push(event);
             } else {
                 warn!(
                     region_id = resolution.region_id,
@@ -5470,15 +6051,15 @@ impl ContractCollector {
                 );
             }
         }
-        for resolution in self.store.awaiting_resolution_cases().await? {
+        for resolution in awaiting_resolutions {
             let resolution_key = ResolutionCaseKey {
                 region_id: resolution.region_id,
                 contract_id: resolution.contract_id,
             };
             match self.resolve_awaiting_resolution(&resolution).await {
                 Ok(Some(event)) => {
+                    self.notify_terminal_event(&event, &resolution_key).await?;
                     batch.events.push(event);
-                    batch.notification_cases.push(resolution_key);
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -5490,14 +6071,8 @@ impl ContractCollector {
                     );
                     if let Err(record_error) = self
                         .store
-                        .record_failure(
-                            Some(resolution.region_id),
-                            Some(resolution.contract_id),
-                            Some(&format!(
-                                "contracts/public/items/{}",
-                                resolution.contract_id
-                            )),
-                            "resolution_probe",
+                        .record_resolution_probe_failure(
+                            &resolution,
                             &error.to_string(),
                             retry_after,
                         )
@@ -5523,6 +6098,21 @@ impl ContractCollector {
             }
         }
         Ok(batch)
+    }
+
+    async fn notify_terminal_event(
+        &self,
+        event: &ContractEvent,
+        resolution_key: &ResolutionCaseKey,
+    ) -> Result<(), ContractCollectionError> {
+        self.notify_fresh_events(std::slice::from_ref(event))
+            .await?;
+        if self.notifications.is_some() {
+            self.store
+                .mark_terminal_notifications_reported(std::slice::from_ref(resolution_key))
+                .await?;
+        }
+        Ok(())
     }
 
     async fn resolve_awaiting_resolution(
@@ -5681,7 +6271,6 @@ impl ContractCollector {
         };
         let ship_groups = CycleShipGroupResolver::new(&*notifications.ship_groups);
         let deferred_matches = self.store.deferred_contract_matches().await?;
-        let subscriptions = self.store.all_contract_subscriptions().await?;
         for deferred in deferred_matches {
             let event = self
                 .event_with_observed_context(
@@ -5702,13 +6291,36 @@ impl ContractCollector {
                 NotificationResolution::Deferred => {}
             }
         }
+        self.notify_events(events, notifications, &ship_groups)
+            .await
+    }
+
+    async fn notify_fresh_events(
+        &self,
+        events: &[ContractEvent],
+    ) -> Result<(), ContractCollectionError> {
+        let Some(notifications) = &self.notifications else {
+            return Ok(());
+        };
+        let ship_groups = CycleShipGroupResolver::new(&*notifications.ship_groups);
+        self.notify_events(events, notifications, &ship_groups)
+            .await
+    }
+
+    async fn notify_events(
+        &self,
+        events: &[ContractEvent],
+        notifications: &ContractNotifications,
+        ship_groups: &dyn ShipGroupResolver,
+    ) -> Result<(), ContractCollectionError> {
+        let subscriptions = self.store.all_contract_subscriptions().await?;
         for event in events {
             let event = self
-                .event_with_observed_context(event, &subscriptions, &ship_groups)
+                .event_with_observed_context(event, &subscriptions, ship_groups)
                 .await?;
             for subscription in &subscriptions {
                 if matches!(
-                    self.notify_subscription(subscription, &event, &ship_groups)
+                    self.notify_subscription(subscription, &event, ship_groups)
                         .await?,
                     NotificationResolution::Deferred
                 ) {
@@ -6047,11 +6659,15 @@ impl ContractCollector {
     ) -> Result<Option<EsiResponse<T>>, ContractCollectionError> {
         match result {
             Ok(response) => {
-                self.store.record_esi_limiter(&response.metadata).await?;
+                self.store
+                    .record_esi_limiter_at(&response.metadata, self.request_pacer.now())
+                    .await?;
                 Ok(Some(response))
             }
             Err(error) => {
-                self.store.record_esi_limiter(&error.metadata).await?;
+                self.store
+                    .record_esi_limiter_at(&error.metadata, self.request_pacer.now())
+                    .await?;
                 warn!(
                     contract_id,
                     "contract context will be retried during a later complete observation: {error}"
@@ -6273,10 +6889,7 @@ impl ContractCollector {
             if consumed >= remaining {
                 break;
             }
-            if !self
-                .context_request_allowed(observed.contract.contract_id)
-                .await?
-            {
+            if self.store.active_esi_limiter_deadline().await?.is_some() {
                 break;
             }
             consumed += 1;
@@ -6289,6 +6902,7 @@ impl ContractCollector {
                 .collect::<Vec<_>>();
             let limiter = PersistedContractContextLimiter {
                 store: self.store.clone(),
+                request_pacer: self.request_pacer.clone(),
             };
             match self
                 .record_context_esi_result(
@@ -6470,14 +7084,9 @@ impl ContractCollector {
     }
 
     async fn ensure_esi_limiter_allows_requests(&self) -> Result<(), ContractCollectionError> {
-        if let Some(retry_after) = self.store.active_esi_limiter_deadline().await? {
-            return Err(EsiError::retryable(
-                "persisted global ESI limiter boundary remains active",
-                Some(retry_after),
-            )
-            .into());
-        }
-        Ok(())
+        wait_for_esi_request_admission(&self.store, &*self.request_pacer)
+            .await
+            .map_err(Into::into)
     }
 
     async fn record_esi_result<T>(
@@ -6486,11 +7095,15 @@ impl ContractCollector {
     ) -> Result<EsiResponse<T>, ContractCollectionError> {
         match result {
             Ok(response) => {
-                self.store.record_esi_limiter(&response.metadata).await?;
+                self.store
+                    .record_esi_limiter_at(&response.metadata, self.request_pacer.now())
+                    .await?;
                 Ok(response)
             }
             Err(error) => {
-                self.store.record_esi_limiter(&error.metadata).await?;
+                self.store
+                    .record_esi_limiter_at(&error.metadata, self.request_pacer.now())
+                    .await?;
                 Err(error.into())
             }
         }
@@ -6502,11 +7115,15 @@ impl ContractCollector {
     ) -> Result<ContractItemProbe, ContractCollectionError> {
         match result {
             Ok(probe) => {
-                self.store.record_esi_limiter(probe.metadata()).await?;
+                self.store
+                    .record_esi_limiter_at(probe.metadata(), self.request_pacer.now())
+                    .await?;
                 Ok(probe)
             }
             Err(error) => {
-                self.store.record_esi_limiter(&error.metadata).await?;
+                self.store
+                    .record_esi_limiter_at(&error.metadata, self.request_pacer.now())
+                    .await?;
                 Err(error.into())
             }
         }
@@ -7909,7 +8526,7 @@ pub fn spawn_contract_collection_loop_with_notifications(
     delivery: Arc<dyn ContractDelivery>,
     ping_limiter: Arc<dyn ContractPingLimiter>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_contract_collection_loop_with_notifications(
+    spawn_contract_collection_loop_with_notifications_and_region_concurrency(
         database_url,
         store_handle,
         interval,
@@ -7917,7 +8534,33 @@ pub fn spawn_contract_collection_loop_with_notifications(
         ship_groups,
         delivery,
         ping_limiter,
-    ))
+        DEFAULT_CONTRACT_REGIONAL_CONCURRENCY,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_contract_collection_loop_with_notifications_and_region_concurrency(
+    database_url: String,
+    store_handle: ContractStoreHandle,
+    interval: Duration,
+    esi_timeout: Duration,
+    ship_groups: Arc<dyn ShipGroupResolver>,
+    delivery: Arc<dyn ContractDelivery>,
+    ping_limiter: Arc<dyn ContractPingLimiter>,
+    max_concurrent_regions: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(
+        run_contract_collection_loop_with_notifications_and_region_concurrency(
+            database_url,
+            store_handle,
+            interval,
+            esi_timeout,
+            ship_groups,
+            delivery,
+            ping_limiter,
+            max_concurrent_regions,
+        ),
+    )
 }
 
 pub async fn run_contract_collection_loop_with_notifications(
@@ -7928,6 +8571,30 @@ pub async fn run_contract_collection_loop_with_notifications(
     ship_groups: Arc<dyn ShipGroupResolver>,
     delivery: Arc<dyn ContractDelivery>,
     ping_limiter: Arc<dyn ContractPingLimiter>,
+) {
+    run_contract_collection_loop_with_notifications_and_region_concurrency(
+        database_url,
+        store_handle,
+        interval,
+        esi_timeout,
+        ship_groups,
+        delivery,
+        ping_limiter,
+        DEFAULT_CONTRACT_REGIONAL_CONCURRENCY,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_contract_collection_loop_with_notifications_and_region_concurrency(
+    database_url: String,
+    store_handle: ContractStoreHandle,
+    interval: Duration,
+    esi_timeout: Duration,
+    ship_groups: Arc<dyn ShipGroupResolver>,
+    delivery: Arc<dyn ContractDelivery>,
+    ping_limiter: Arc<dyn ContractPingLimiter>,
+    max_concurrent_regions: usize,
 ) {
     let notifications = ContractNotifications {
         ship_groups,
@@ -7956,7 +8623,8 @@ pub async fn run_contract_collection_loop_with_notifications(
                         notifications.delivery.clone(),
                         notifications.ping_limiter.clone(),
                     )
-                    .with_recovery_gap(collection_recovery_gap(interval));
+                    .with_recovery_gap(collection_recovery_gap(interval))
+                    .with_max_concurrent_regions(max_concurrent_regions);
                 match collector.collect_cycle().await {
                     Ok(report) => {
                         if report.retry_after.is_some()
@@ -8020,7 +8688,8 @@ async fn run_contract_collection_loop_inner(
         let mut delay = interval;
         match ContractCollectionStore::connect(&database_url).await {
             Ok(store) => {
-                let mut collector = ContractCollector::new(store, esi.clone());
+                let mut collector = ContractCollector::new(store, esi.clone())
+                    .with_max_concurrent_regions(DEFAULT_CONTRACT_REGIONAL_CONCURRENCY);
                 if let Some(notifications) = &notifications {
                     collector = collector.with_notifications(
                         notifications.ship_groups.clone(),
@@ -8103,6 +8772,18 @@ mod embed_tests {
     use super::*;
 
     const MANUAL_CONTRACT_EMBED_NONCE: &str = "ci-manual-contract-check";
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_regional_concurrency_is_rejected() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let error = contract_regional_concurrency_from_environment_value(Err(
+            std::env::VarError::NotUnicode(std::ffi::OsString::from_vec(vec![0x80])),
+        ))
+        .expect_err("a configured non-Unicode value must not become the default");
+        assert!(error.contains("valid Unicode"));
+    }
 
     fn contract() -> PublicContract {
         PublicContract {

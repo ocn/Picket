@@ -242,17 +242,25 @@ pub async fn run() {
             }
         };
         let health_database_url = database_url.clone();
-        contract_intelligence::spawn_contract_collection_loop_with_notifications(
-            database_url,
-            store_handle,
-            Duration::from_secs(interval),
-            timeout,
-            ship_groups,
-            delivery,
-            Arc::new(contract_intelligence::AppStateContractPingLimiter::new(
-                app_state.clone(),
-            )),
-        );
+        match contract_intelligence::contract_regional_concurrency_from_environment() {
+            Ok(max_concurrent_regions) => {
+                contract_intelligence::spawn_contract_collection_loop_with_notifications_and_region_concurrency(
+                    database_url,
+                    store_handle,
+                    Duration::from_secs(interval),
+                    timeout,
+                    ship_groups,
+                    delivery,
+                    Arc::new(contract_intelligence::AppStateContractPingLimiter::new(
+                        app_state.clone(),
+                    )),
+                    max_concurrent_regions,
+                );
+            }
+            Err(error) => {
+                warn!("contract collection disabled by invalid CONTRACT_REGIONAL_CONCURRENCY: {error}");
+            }
+        }
         if let Some(health_config) = health_config {
             contract_intelligence::spawn_health_monitor_loop(
                 health_database_url,
