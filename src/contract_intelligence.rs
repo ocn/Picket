@@ -10,6 +10,7 @@ use crate::structure_resolver::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use rand::Rng;
 use reqwest::header::{HeaderMap, ETAG, EXPIRES, IF_NONE_MATCH, LAST_MODIFIED, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
 use serde::de::{DeserializeOwned, Error as DeError};
@@ -25,9 +26,11 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::future::Future;
+use std::io::Read;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
@@ -42,6 +45,10 @@ const RESOLUTION_PROBE_RETRY_MAX_SECONDS: i64 = 15 * 60;
 pub const DEFAULT_CONTRACT_REGIONAL_CONCURRENCY: usize = 2;
 pub const MAX_CONTRACT_REGIONAL_CONCURRENCY: usize = 4;
 const DISCORD_NONCE_ENFORCEMENT_WINDOW: ChronoDuration = ChronoDuration::minutes(5);
+const CONTRACT_REPAIR_LEASE: ChronoDuration = ChronoDuration::minutes(2);
+const CONTRACT_REPAIR_STALE_COMPLETION_DELAY: ChronoDuration = ChronoDuration::seconds(5);
+const CONTRACT_REPAIR_RETRY_BASE_SECONDS: i64 = 5;
+const CONTRACT_REPAIR_RETRY_MAX_SECONDS: i64 = 5 * 60;
 const DEFAULT_COLLECTION_RECOVERY_GAP: ChronoDuration = ChronoDuration::minutes(15);
 const REGION_DISCOVERY_RESOURCE_KEY: &str = "esi:regions";
 const METERS_PER_LIGHT_YEAR: f64 = 9_460_730_472_580_800.0;
@@ -3952,13 +3959,36 @@ pub struct PreparedContractDelivery {
     pub message: ContractNotificationMessage,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContractMessageEdit {
+    pub delivery_id: i64,
+    pub channel_id: u64,
+    pub discord_message_id: String,
+    pub contract_id: i64,
+    pub event_kind: ContractEventKind,
+    repair_revision: i64,
+    repair_claim_token: Option<String>,
+    repair_attempt_count: i32,
+    pub message: ContractNotificationMessage,
+}
+
 struct DeliveryOrdering {
     strategic_priority: usize,
     relevant_isk: f64,
     confirmed_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+enum PrepareDeliveryOutcome {
+    Prepared,
+    Existing,
+    ExistingSent {
+        delivery_id: i64,
+        message: ContractNotificationMessage,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeliveryStatus {
     Prepared,
     Sent,
@@ -3972,7 +4002,7 @@ pub struct DeliveryRecord {
     pub discord_message_id: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DeliveryFailureKind {
     Transient,
     Ambiguous,
@@ -3991,6 +4021,96 @@ pub struct ContractDeliveryFailure {
     pub last_attempt_at: Option<DateTime<Utc>>,
 }
 
+pub const CONTRACT_DELIVERY_OPERATOR_ACTOR: &str = "discord:146451271497416704";
+pub const CONTRACT_DELIVERY_OPERATOR_TOKEN_MAX_BYTES: usize = 128;
+
+pub struct ContractDeliveryOperatorCapability {
+    actor: String,
+    digest: [u8; 32],
+}
+impl ContractDeliveryOperatorCapability {
+    pub fn from_config(actor: String, digest_hex: &str) -> Result<Self, String> {
+        if digest_hex.len() != 64 || !digest_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("operator digest must be 64 hex characters".to_string());
+        }
+        let bytes = (0..64)
+            .step_by(2)
+            .map(|index| {
+                u8::from_str_radix(
+                    digest_hex
+                        .get(index..index + 2)
+                        .ok_or("operator digest must be 64 hex characters")?,
+                    16,
+                )
+                .map_err(|_| "operator digest must be 64 hex characters".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let digest: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| "operator digest must be 64 hex characters".to_string())?;
+        if actor != CONTRACT_DELIVERY_OPERATOR_ACTOR {
+            return Err(format!(
+                "operator identity must be {CONTRACT_DELIVERY_OPERATOR_ACTOR}"
+            ));
+        }
+        Ok(Self { actor, digest })
+    }
+    pub fn verify(&self, token: &[u8]) -> bool {
+        self.digest.ct_eq(&Sha256::digest(token)).into()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractRepairStatus {
+    None,
+    Pending,
+    Permanent,
+}
+
+fn contract_repair_status_from_str(value: &str) -> Result<ContractRepairStatus, sqlx::Error> {
+    match value {
+        "none" => Ok(ContractRepairStatus::None),
+        "pending" => Ok(ContractRepairStatus::Pending),
+        "permanent" => Ok(ContractRepairStatus::Permanent),
+        _ => Err(sqlx::Error::Protocol(format!(
+            "unknown contract repair status: {value}"
+        ))),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContractDeliveryAudit {
+    pub action: String,
+    pub actor: String,
+    pub occurred_at: DateTime<Utc>,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ContractDeliveryInspection {
+    pub delivery_id: i64,
+    pub status: DeliveryStatus,
+    pub discord_message_id: Option<String>,
+    pub ping: bool,
+    pub ping_type: ContractPingType,
+    pub desired_message: Option<ContractNotificationMessage>,
+    pub repair_status: ContractRepairStatus,
+    pub repair_attempt_count: i32,
+    pub last_repair_attempt_at: Option<DateTime<Utc>>,
+    pub next_repair_attempt_at: Option<DateTime<Utc>>,
+    pub repair_failure_kind: Option<DeliveryFailureKind>,
+    pub repair_last_error: Option<String>,
+    pub audit: Vec<ContractDeliveryAudit>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum OperatorDeliveryCliResult {
+    Inspected(ContractDeliveryInspection),
+    Requeued(ContractDeliveryInspection),
+}
+
 #[derive(Clone, Debug)]
 struct DeferredContractMatch {
     subscription: ContractSubscription,
@@ -3999,31 +4119,77 @@ struct DeferredContractMatch {
 }
 
 #[derive(Clone, Debug)]
+pub struct ContractDeliveryErrorDetail {
+    message: String,
+    retry_at: Option<DateTime<Utc>>,
+    delivery_scoped: bool,
+}
+
+#[derive(Clone, Debug)]
 pub enum ContractDeliveryError {
-    Transient(String),
-    Ambiguous(String),
-    Permanent(String),
+    Transient(ContractDeliveryErrorDetail),
+    Ambiguous(ContractDeliveryErrorDetail),
+    Permanent(ContractDeliveryErrorDetail),
 }
 
 impl ContractDeliveryError {
     pub fn transient(message: impl Into<String>) -> Self {
-        Self::Transient(message.into())
+        Self::Transient(ContractDeliveryErrorDetail {
+            message: message.into(),
+            retry_at: None,
+            delivery_scoped: false,
+        })
+    }
+
+    pub fn transient_after(message: impl Into<String>, retry_at: DateTime<Utc>) -> Self {
+        Self::Transient(ContractDeliveryErrorDetail {
+            message: message.into(),
+            retry_at: Some(retry_at),
+            delivery_scoped: false,
+        })
     }
 
     pub fn ambiguous(message: impl Into<String>) -> Self {
-        Self::Ambiguous(message.into())
+        Self::Ambiguous(ContractDeliveryErrorDetail {
+            message: message.into(),
+            retry_at: None,
+            delivery_scoped: false,
+        })
     }
 
     pub fn permanent(message: impl Into<String>) -> Self {
-        Self::Permanent(message.into())
+        Self::Permanent(ContractDeliveryErrorDetail {
+            message: message.into(),
+            retry_at: None,
+            delivery_scoped: false,
+        })
+    }
+
+    pub fn permanent_delivery(message: impl Into<String>) -> Self {
+        Self::Permanent(ContractDeliveryErrorDetail {
+            message: message.into(),
+            retry_at: None,
+            delivery_scoped: true,
+        })
     }
 
     fn message(&self) -> &str {
         match self {
-            Self::Transient(message) | Self::Ambiguous(message) | Self::Permanent(message) => {
-                message
+            Self::Transient(detail) | Self::Ambiguous(detail) | Self::Permanent(detail) => {
+                &detail.message
             }
         }
+    }
+
+    fn retry_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Transient(detail) | Self::Ambiguous(detail) => detail.retry_at,
+            Self::Permanent(_) => None,
+        }
+    }
+
+    fn is_delivery_scoped_permanent(&self) -> bool {
+        matches!(self, Self::Permanent(detail) if detail.delivery_scoped)
     }
 }
 
@@ -4041,6 +4207,12 @@ pub trait ContractDelivery: Send + Sync {
         &self,
         delivery: PreparedContractDelivery,
     ) -> Result<String, ContractDeliveryError>;
+
+    async fn edit(&self, _edit: ContractMessageEdit) -> Result<(), ContractDeliveryError> {
+        Err(ContractDeliveryError::permanent(
+            "contract message editing is unsupported",
+        ))
+    }
 }
 
 pub trait ContractDeliveryClock: Send + Sync {
@@ -4708,7 +4880,7 @@ impl ContractCollectionStore {
         .fetch_one(&self.pool)
         .await?;
         let permanent_delivery_failures = sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM contract_outbound_deliveries WHERE status = 'failed' AND failure_kind = 'permanent' AND failure_resolved_at IS NULL",
+            "SELECT count(*) FROM contract_outbound_deliveries WHERE (status = 'failed' AND failure_kind = 'permanent' AND failure_resolved_at IS NULL) OR (repair_status = 'permanent' AND repair_failure_kind = 'permanent' AND repair_failure_resolved_at IS NULL)",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -5575,6 +5747,133 @@ impl ContractCollectionStore {
             .transpose()
     }
 
+    pub async fn prepare_delivery_repair(
+        &self,
+        delivery_id: i64,
+        desired_message: ContractNotificationMessage,
+    ) -> Result<bool, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let result = sqlx::query("UPDATE contract_outbound_deliveries SET desired_message = $2, repair_status = 'pending', repair_revision = CASE WHEN repair_status <> 'pending' OR desired_message IS DISTINCT FROM $2 THEN repair_revision + 1 ELSE repair_revision END, repair_prepared_at = CASE WHEN repair_status = 'pending' THEN repair_prepared_at ELSE now() END, repair_next_attempt_at = CASE WHEN repair_status = 'pending' THEN repair_next_attempt_at ELSE NULL END, repair_failure_kind = CASE WHEN repair_status = 'pending' THEN repair_failure_kind ELSE NULL END, repair_last_error = CASE WHEN repair_status = 'pending' THEN repair_last_error ELSE NULL END, repair_failed_at = CASE WHEN repair_status = 'pending' THEN repair_failed_at ELSE NULL END, repair_failure_resolved_at = CASE WHEN repair_status = 'pending' THEN repair_failure_resolved_at ELSE NULL END WHERE id = $1 AND status = 'sent' AND discord_message_id IS NOT NULL")
+            .bind(delivery_id)
+            .bind(serde_json::to_value(desired_message).map_err(json_to_sqlx)?)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn inspect_contract_delivery(
+        &self,
+        delivery_id: i64,
+    ) -> Result<Option<ContractDeliveryInspection>, sqlx::Error> {
+        let row = sqlx::query("SELECT id, status, discord_message_id, ping, ping_type, desired_message, repair_status, repair_attempt_count, last_repair_attempt_at, repair_next_attempt_at, repair_failure_kind, repair_last_error FROM contract_outbound_deliveries WHERE id = $1")
+            .bind(delivery_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let audit = sqlx::query("SELECT action, actor, occurred_at, detail FROM contract_delivery_audit WHERE delivery_id = $1 ORDER BY id")
+            .bind(delivery_id)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| ContractDeliveryAudit {
+                action: row.get("action"),
+                actor: row.get("actor"),
+                occurred_at: row.get("occurred_at"),
+                detail: row.get("detail"),
+            })
+            .collect();
+        Ok(Some(ContractDeliveryInspection {
+            delivery_id: row.get("id"),
+            status: delivery_status_from_str(&row.get::<String, _>("status"))?,
+            discord_message_id: row.get("discord_message_id"),
+            ping: row.get("ping"),
+            ping_type: contract_ping_type_from_str(&row.get::<String, _>("ping_type"))?,
+            desired_message: row
+                .get::<Option<Value>, _>("desired_message")
+                .map(|message| serde_json::from_value(message).map_err(json_to_sqlx))
+                .transpose()?,
+            repair_status: contract_repair_status_from_str(&row.get::<String, _>("repair_status"))?,
+            repair_attempt_count: row.get("repair_attempt_count"),
+            last_repair_attempt_at: row.get("last_repair_attempt_at"),
+            next_repair_attempt_at: row.get("repair_next_attempt_at"),
+            repair_failure_kind: row
+                .get::<Option<String>, _>("repair_failure_kind")
+                .map(|kind| delivery_failure_kind_from_str(&kind))
+                .transpose()?,
+            repair_last_error: row.get("repair_last_error"),
+            audit,
+        }))
+    }
+
+    async fn requeue_permanent_contract_delivery(
+        &self,
+        delivery_id: i64,
+        actor: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<ContractDeliveryInspection, sqlx::Error> {
+        if actor != CONTRACT_DELIVERY_OPERATOR_ACTOR {
+            return Err(sqlx::Error::Protocol(
+                "delivery requeue actor is not authorized".to_string(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query("SELECT status, failure_kind, failure_resolved_at, repair_status, desired_message FROM contract_outbound_deliveries WHERE id = $1 FOR UPDATE")
+            .bind(delivery_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| sqlx::Error::Protocol(format!("contract delivery {delivery_id} does not exist")))?;
+        if row.get::<String, _>("status") != "failed"
+            || row.get::<Option<String>, _>("failure_kind").as_deref() != Some("permanent")
+            || row
+                .get::<Option<DateTime<Utc>>, _>("failure_resolved_at")
+                .is_some()
+        {
+            return Err(sqlx::Error::Protocol(format!(
+                "contract delivery {delivery_id} is not an unresolved permanent failure"
+            )));
+        }
+        let requeue_repair = row.get::<String, _>("repair_status") == "permanent"
+            && row.get::<Option<Value>, _>("desired_message").is_some();
+        let (status, repair_status, detail) = if requeue_repair {
+            (
+                "sent",
+                "pending",
+                "operator requeued permanent Discord repair",
+            )
+        } else {
+            (
+                "prepared",
+                "none",
+                "operator requeued permanent Discord delivery",
+            )
+        };
+        sqlx::query("UPDATE contract_outbound_deliveries SET status = $2, repair_status = $3, repair_next_attempt_at = NULL, failure_resolved_at = $4, repair_failure_resolved_at = CASE WHEN $3 = 'pending' THEN $4 ELSE repair_failure_resolved_at END WHERE id = $1")
+            .bind(delivery_id)
+            .bind(status)
+            .bind(repair_status)
+            .bind(occurred_at)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("INSERT INTO contract_delivery_audit (delivery_id, action, actor, occurred_at, detail) VALUES ($1, 'requeued', $2, $3, $4)")
+            .bind(delivery_id)
+            .bind(actor)
+            .bind(occurred_at)
+            .bind(detail)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        self.inspect_contract_delivery(delivery_id)
+            .await?
+            .ok_or_else(|| {
+                sqlx::Error::Protocol(format!(
+                    "contract delivery {delivery_id} disappeared after requeue"
+                ))
+            })
+    }
+
     async fn deferred_contract_matches(&self) -> Result<Vec<DeferredContractMatch>, sqlx::Error> {
         sqlx::query("SELECT contract_subscriptions.guild_id, contract_subscriptions.channel_id, contract_subscriptions.subscription_id, contract_subscriptions.description, contract_subscriptions.filter, contract_subscriptions.event_actions, contract_deferred_subscription_matches.event, contract_deferred_subscription_matches.proximity_unverified FROM contract_deferred_subscription_matches JOIN contract_subscriptions USING (guild_id, channel_id, subscription_id) WHERE contract_subscriptions.deleted_at IS NULL ORDER BY contract_deferred_subscription_matches.created_at, contract_subscriptions.guild_id, contract_subscriptions.channel_id, contract_subscriptions.subscription_id")
             .fetch_all(&self.pool)
@@ -5653,19 +5952,21 @@ impl ContractCollectionStore {
         ping: bool,
         ping_type: ContractPingType,
         ordering: DeliveryOrdering,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<PrepareDeliveryOutcome, sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
-        self.prepare_delivery_in_transaction(
-            &mut transaction,
-            subscription,
-            event,
-            message,
-            ping,
-            ping_type,
-            ordering,
-        )
-        .await?;
-        transaction.commit().await
+        let outcome = self
+            .prepare_delivery_in_transaction(
+                &mut transaction,
+                subscription,
+                event,
+                message,
+                ping,
+                ping_type,
+                ordering,
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(outcome)
     }
 
     async fn prepare_proximity_unverified_delivery(
@@ -5675,21 +5976,23 @@ impl ContractCollectionStore {
         message: &ContractNotificationMessage,
         ping_type: ContractPingType,
         ordering: DeliveryOrdering,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<PrepareDeliveryOutcome, sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
-        self.prepare_delivery_in_transaction(
-            &mut transaction,
-            subscription,
-            event,
-            message,
-            false,
-            ping_type,
-            ordering,
-        )
-        .await?;
+        let outcome = self
+            .prepare_delivery_in_transaction(
+                &mut transaction,
+                subscription,
+                event,
+                message,
+                false,
+                ping_type,
+                ordering,
+            )
+            .await?;
         self.defer_contract_match_in_transaction(&mut transaction, subscription, event, true)
             .await?;
-        transaction.commit().await
+        transaction.commit().await?;
+        Ok(outcome)
     }
 
     async fn prepare_delivery_in_transaction(
@@ -5701,7 +6004,7 @@ impl ContractCollectionStore {
         ping: bool,
         ping_type: ContractPingType,
         ordering: DeliveryOrdering,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<PrepareDeliveryOutcome, sqlx::Error> {
         let delivery_id = sqlx::query_scalar::<_, i64>("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, strategic_priority, relevant_isk, confirmed_at) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,'prepared',$10,$11,$12,$13 WHERE EXISTS (SELECT 1 FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND deleted_at IS NULL) ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind) DO NOTHING RETURNING id")
             .bind(subscription.guild_id as i64)
             .bind(subscription.channel_id as i64)
@@ -5726,8 +6029,24 @@ impl ContractCollectionStore {
             .bind(format!("ci-{delivery_id}"))
             .execute(&mut **transaction)
             .await?;
+            return Ok(PrepareDeliveryOutcome::Prepared);
         }
-        Ok(())
+        let existing = sqlx::query("SELECT id, status, message FROM contract_outbound_deliveries WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND contract_id = $4 AND event_kind = $5")
+            .bind(subscription.guild_id as i64)
+            .bind(subscription.channel_id as i64)
+            .bind(&subscription.id)
+            .bind(event.contract.contract_id)
+            .bind(event.kind.as_str())
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or_else(|| sqlx::Error::Protocol("contract delivery disappeared after its identity conflict".to_string()))?;
+        if existing.get::<String, _>("status") == "sent" {
+            return Ok(PrepareDeliveryOutcome::ExistingSent {
+                delivery_id: existing.get("id"),
+                message: serde_json::from_value(existing.get("message")).map_err(json_to_sqlx)?,
+            });
+        }
+        Ok(PrepareDeliveryOutcome::Existing)
     }
 
     async fn prepared_deliveries(&self) -> Result<Vec<PreparedContractDelivery>, sqlx::Error> {
@@ -5736,6 +6055,19 @@ impl ContractCollectionStore {
             .await?
             .into_iter()
             .map(prepared_contract_delivery_from_row)
+            .collect()
+    }
+
+    async fn pending_repairs(
+        &self,
+        attempted_at: DateTime<Utc>,
+    ) -> Result<Vec<ContractMessageEdit>, sqlx::Error> {
+        sqlx::query("SELECT id, channel_id, discord_message_id, contract_id, event_kind, desired_message, repair_revision, repair_claim_token, repair_attempt_count FROM contract_outbound_deliveries WHERE status = 'sent' AND repair_status = 'pending' AND desired_message IS NOT NULL AND (repair_next_attempt_at IS NULL OR repair_next_attempt_at <= $1) AND (repair_lease_until IS NULL OR repair_lease_until <= $1) ORDER BY repair_prepared_at, id")
+            .bind(attempted_at)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(contract_message_edit_from_row)
             .collect()
     }
 
@@ -5760,6 +6092,23 @@ impl ContractCollectionStore {
         .transpose()
     }
 
+    async fn begin_repair_attempt(
+        &self,
+        delivery_id: i64,
+        attempted_at: DateTime<Utc>,
+    ) -> Result<Option<ContractMessageEdit>, sqlx::Error> {
+        let claim_token = format!("repair-{:032x}", rand::thread_rng().gen::<u128>());
+        let lease_until = attempted_at + CONTRACT_REPAIR_LEASE;
+        let row = sqlx::query("UPDATE contract_outbound_deliveries SET repair_attempt_count = repair_attempt_count + 1, first_repair_attempt_at = COALESCE(first_repair_attempt_at, $2), last_repair_attempt_at = $2, repair_claim_token = $3, repair_claimed_revision = repair_revision, repair_claimed_at = $2, repair_lease_until = $4 WHERE id = $1 AND status = 'sent' AND repair_status = 'pending' AND desired_message IS NOT NULL AND (repair_next_attempt_at IS NULL OR repair_next_attempt_at <= $2) AND (repair_lease_until IS NULL OR repair_lease_until <= $2) RETURNING id, channel_id, discord_message_id, contract_id, event_kind, desired_message, repair_revision, repair_claim_token, repair_attempt_count")
+            .bind(delivery_id)
+            .bind(attempted_at)
+            .bind(&claim_token)
+            .bind(lease_until)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(contract_message_edit_from_row).transpose()
+    }
+
     async fn mark_delivery_sent(
         &self,
         delivery_id: i64,
@@ -5773,6 +6122,102 @@ impl ContractCollectionStore {
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol(format!(
                 "contract delivery {delivery_id} was not prepared when Discord returned success"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn mark_repair_succeeded(
+        &self,
+        edit: &ContractMessageEdit,
+        completed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let claim_token = edit.repair_claim_token.as_deref().ok_or_else(|| {
+            sqlx::Error::Protocol("repair completion is missing its claim token".to_string())
+        })?;
+        let result = sqlx::query("UPDATE contract_outbound_deliveries SET message = desired_message, desired_message = NULL, repair_status = 'none', repair_next_attempt_at = NULL, repair_failure_resolved_at = CASE WHEN repair_failure_kind IS NOT NULL THEN $5 ELSE repair_failure_resolved_at END, repair_claim_token = NULL, repair_claimed_revision = NULL, repair_claimed_at = NULL, repair_lease_until = NULL WHERE id = $1 AND repair_claim_token = $3 AND repair_revision = $2")
+            .bind(edit.delivery_id)
+            .bind(edit.repair_revision)
+            .bind(claim_token)
+            .bind(completed_at + CONTRACT_REPAIR_STALE_COMPLETION_DELAY)
+            .bind(completed_at)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() != 1 {
+            let recovery = sqlx::query("UPDATE contract_outbound_deliveries SET desired_message = COALESCE(desired_message, message), repair_status = 'pending', repair_revision = CASE WHEN desired_message IS NULL THEN repair_revision + 1 ELSE repair_revision END, repair_prepared_at = CASE WHEN desired_message IS NULL THEN $2 ELSE repair_prepared_at END, repair_next_attempt_at = GREATEST(COALESCE(repair_next_attempt_at, $3), $3), repair_failure_kind = CASE WHEN desired_message IS NULL THEN NULL ELSE repair_failure_kind END, repair_last_error = CASE WHEN desired_message IS NULL THEN NULL ELSE repair_last_error END, repair_failed_at = CASE WHEN desired_message IS NULL THEN NULL ELSE repair_failed_at END, repair_failure_resolved_at = CASE WHEN desired_message IS NULL THEN NULL ELSE repair_failure_resolved_at END WHERE id = $1 AND status = 'sent' AND discord_message_id IS NOT NULL AND repair_status <> 'permanent'")
+                .bind(edit.delivery_id)
+                .bind(completed_at)
+                .bind(completed_at + CONTRACT_REPAIR_STALE_COMPLETION_DELAY)
+                .execute(&self.pool)
+                .await?;
+            if recovery.rows_affected() != 1 {
+                return Err(sqlx::Error::Protocol(format!(
+                    "contract delivery {} was not claimed when Discord acknowledged its repair",
+                    edit.delivery_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn mark_repair_failed(
+        &self,
+        edit: &ContractMessageEdit,
+        error: &ContractDeliveryError,
+        failed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let claim_token = edit.repair_claim_token.as_deref().ok_or_else(|| {
+            sqlx::Error::Protocol("repair failure is missing its claim token".to_string())
+        })?;
+        let result = sqlx::query("UPDATE contract_outbound_deliveries SET status = CASE WHEN repair_revision = $2 OR $6 THEN 'failed' ELSE status END, failure_kind = CASE WHEN repair_revision = $2 OR $6 THEN 'permanent' ELSE failure_kind END, last_error = CASE WHEN repair_revision = $2 OR $6 THEN $4 ELSE last_error END, failed_at = CASE WHEN repair_revision = $2 OR $6 THEN $3 ELSE failed_at END, failure_resolved_at = CASE WHEN repair_revision = $2 OR $6 THEN NULL ELSE failure_resolved_at END, repair_status = CASE WHEN repair_revision = $2 OR $6 THEN 'permanent' ELSE repair_status END, repair_next_attempt_at = CASE WHEN repair_revision = $2 OR $6 THEN NULL ELSE repair_next_attempt_at END, repair_failure_kind = CASE WHEN repair_revision = $2 OR $6 THEN 'permanent' ELSE repair_failure_kind END, repair_last_error = CASE WHEN repair_revision = $2 OR $6 THEN $4 ELSE repair_last_error END, repair_failed_at = CASE WHEN repair_revision = $2 OR $6 THEN $3 ELSE repair_failed_at END, repair_failure_resolved_at = CASE WHEN repair_revision = $2 OR $6 THEN NULL ELSE repair_failure_resolved_at END, repair_claim_token = NULL, repair_claimed_revision = NULL, repair_claimed_at = NULL, repair_lease_until = NULL WHERE id = $1 AND repair_claim_token = $5")
+            .bind(edit.delivery_id)
+            .bind(edit.repair_revision)
+            .bind(failed_at)
+            .bind(sanitize_contract_failure_detail(error.message()))
+            .bind(claim_token)
+            .bind(error.is_delivery_scoped_permanent())
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol(format!(
+                "contract delivery {} was not claimed when Discord returned a permanent repair failure",
+                edit.delivery_id
+            )));
+        }
+        Ok(())
+    }
+
+    async fn mark_repair_retryable(
+        &self,
+        edit: &ContractMessageEdit,
+        error: &ContractDeliveryError,
+        retry_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let claim_token = edit.repair_claim_token.as_deref().ok_or_else(|| {
+            sqlx::Error::Protocol("repair retry is missing its claim token".to_string())
+        })?;
+        let failure_kind = match error {
+            ContractDeliveryError::Transient(_) => "transient",
+            ContractDeliveryError::Ambiguous(_) => "ambiguous",
+            ContractDeliveryError::Permanent(_) => {
+                return Err(sqlx::Error::Protocol(
+                    "permanent contract repair failure cannot remain pending".to_string(),
+                ))
+            }
+        };
+        let result = sqlx::query("UPDATE contract_outbound_deliveries SET repair_failure_kind = CASE WHEN repair_revision = $2 THEN $4 ELSE repair_failure_kind END, repair_last_error = CASE WHEN repair_revision = $2 THEN $5 ELSE repair_last_error END, repair_failure_resolved_at = CASE WHEN repair_revision = $2 THEN NULL ELSE repair_failure_resolved_at END, repair_next_attempt_at = GREATEST(COALESCE(repair_next_attempt_at, $3), $3), repair_claim_token = NULL, repair_claimed_revision = NULL, repair_claimed_at = NULL, repair_lease_until = NULL WHERE id = $1 AND repair_claim_token = $6")
+            .bind(edit.delivery_id)
+            .bind(edit.repair_revision)
+            .bind(retry_at)
+            .bind(failure_kind)
+            .bind(sanitize_contract_failure_detail(error.message()))
+            .bind(claim_token)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol(format!(
+                "contract delivery {} was not claimed when Discord returned a retryable repair failure",
+                edit.delivery_id
             )));
         }
         Ok(())
@@ -6835,6 +7280,159 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
     }
 }
 
+pub async fn run_operator_delivery_cli_from_process_args(arguments: &[String]) -> Option<i32> {
+    let (command, values) = arguments.split_first()?;
+    if command != "contract-delivery" {
+        return None;
+    }
+    let database_url = match std::env::var("CONTRACT_DATABASE_URL") {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("contract-delivery requires CONTRACT_DATABASE_URL");
+            return Some(2);
+        }
+    };
+    let store = match ContractCollectionStore::connect(&database_url).await {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("cannot open contract-delivery store: {error}");
+            return Some(2);
+        }
+    };
+    let values = values.iter().map(String::as_str).collect::<Vec<_>>();
+    let actor = match std::env::var("CONTRACT_DELIVERY_OPERATOR_ID")
+        .ok()
+        .zip(std::env::var("CONTRACT_DELIVERY_OPERATOR_TOKEN_SHA256").ok())
+        .map(|(actor, digest)| ContractDeliveryOperatorCapability::from_config(actor, &digest))
+    {
+        Some(Ok(capability)) => capability,
+        _ => {
+            eprintln!("contract-delivery requires configured operator capability");
+            return Some(2);
+        }
+    };
+    let mut token = Vec::with_capacity(CONTRACT_DELIVERY_OPERATOR_TOKEN_MAX_BYTES + 1);
+    let mut stdin = std::io::stdin();
+    if std::io::Read::take(
+        std::io::Read::by_ref(&mut stdin),
+        (CONTRACT_DELIVERY_OPERATOR_TOKEN_MAX_BYTES + 1) as u64,
+    )
+    .read_to_end(&mut token)
+    .is_err()
+        || token.len() > CONTRACT_DELIVERY_OPERATOR_TOKEN_MAX_BYTES
+        || !actor.verify(token.strip_suffix(b"\n").unwrap_or(&token))
+    {
+        eprintln!("contract-delivery capability rejected");
+        return Some(2);
+    }
+    if values.contains(&"--actor") {
+        eprintln!("contract-delivery does not accept --actor");
+        return Some(2);
+    }
+    let values = [values, vec!["--actor", actor.actor.as_str()]].concat();
+    match execute_operator_delivery_cli(&store, &values, Utc::now()).await {
+        Ok(result) => match serde_json::to_string(&result) {
+            Ok(output) => {
+                println!("{output}");
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("cannot render contract-delivery result: {error}");
+                Some(2)
+            }
+        },
+        Err(error) => {
+            eprintln!("contract-delivery command failed: {error}");
+            Some(2)
+        }
+    }
+}
+
+pub async fn execute_operator_delivery_cli(
+    store: &ContractCollectionStore,
+    arguments: &[&str],
+    now: DateTime<Utc>,
+) -> Result<OperatorDeliveryCliResult, String> {
+    let (command, flags) = parse_operator_delivery_command(arguments)?;
+    reject_unknown_operator_delivery_options(&flags, &["--id", "--actor"])?;
+    let actor = required_operator_delivery_option(&flags, "--actor")?;
+    if actor != CONTRACT_DELIVERY_OPERATOR_ACTOR {
+        return Err("delivery requeue actor is not authorized".to_string());
+    }
+    let delivery_id = required_positive_operator_delivery_id(&flags, "--id")?;
+    match command {
+        "inspect" => store
+            .inspect_contract_delivery(delivery_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .map(OperatorDeliveryCliResult::Inspected)
+            .ok_or_else(|| format!("contract delivery {delivery_id} does not exist")),
+        "requeue" => store
+            .requeue_permanent_contract_delivery(delivery_id, actor, now)
+            .await
+            .map(OperatorDeliveryCliResult::Requeued)
+            .map_err(|error| error.to_string()),
+        _ => Err("contract-delivery command must be inspect or requeue".to_string()),
+    }
+}
+
+fn parse_operator_delivery_command<'a>(
+    arguments: &'a [&'a str],
+) -> Result<(&'a str, BTreeMap<&'a str, &'a str>), String> {
+    let Some((command, values)) = arguments.split_first() else {
+        return Err("contract-delivery command is required".to_string());
+    };
+    let mut flags = BTreeMap::new();
+    let mut values = values.iter();
+    while let Some(flag) = values.next() {
+        if !flag.starts_with("--") || flags.contains_key(flag) {
+            return Err(format!(
+                "invalid or duplicate contract-delivery option: {flag}"
+            ));
+        }
+        let value = values
+            .next()
+            .ok_or_else(|| format!("missing value for contract-delivery option: {flag}"))?;
+        flags.insert(*flag, *value);
+    }
+    Ok((command, flags))
+}
+
+fn reject_unknown_operator_delivery_options(
+    flags: &BTreeMap<&str, &str>,
+    allowed: &[&str],
+) -> Result<(), String> {
+    flags
+        .keys()
+        .find(|flag| !allowed.contains(flag))
+        .map(|flag| Err(format!("unknown contract-delivery option: {flag}")))
+        .unwrap_or(Ok(()))
+}
+
+fn required_operator_delivery_option<'a>(
+    flags: &BTreeMap<&str, &'a str>,
+    name: &str,
+) -> Result<&'a str, String> {
+    flags
+        .get(name)
+        .copied()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{name} is required"))
+}
+
+fn required_positive_operator_delivery_id(
+    flags: &BTreeMap<&str, &str>,
+    name: &str,
+) -> Result<i64, String> {
+    let value = required_operator_delivery_option(flags, name)?
+        .parse::<i64>()
+        .map_err(|_| format!("{name} must be an integer"))?;
+    if value <= 0 {
+        return Err(format!("{name} must be a positive integer"));
+    }
+    Ok(value)
+}
+
 fn contract_subscription_from_row(
     row: sqlx::postgres::PgRow,
 ) -> Result<ContractSubscription, sqlx::Error> {
@@ -6881,18 +7479,7 @@ fn delivery_failure_kind_from_str(value: &str) -> Result<DeliveryFailureKind, sq
 fn prepared_contract_delivery_from_row(
     row: sqlx::postgres::PgRow,
 ) -> Result<PreparedContractDelivery, sqlx::Error> {
-    let event_kind = match row.get::<String, _>("event_kind").as_str() {
-        "listed" => ContractEventKind::Listed,
-        "sale_confirmed" => ContractEventKind::SaleConfirmed,
-        "purchase_confirmed" => ContractEventKind::PurchaseConfirmed,
-        "expired" => ContractEventKind::Expired,
-        "closed_outcome_unknown" => ContractEventKind::ClosedOutcomeUnknown,
-        value => {
-            return Err(sqlx::Error::Protocol(format!(
-                "unknown contract delivery event kind: {value}"
-            )))
-        }
-    };
+    let event_kind = contract_delivery_event_kind_from_str(&row.get::<String, _>("event_kind"))?;
     Ok(PreparedContractDelivery {
         delivery_id: row.get("id"),
         guild_id: row.get::<i64, _>("guild_id") as u64,
@@ -6905,6 +7492,58 @@ fn prepared_contract_delivery_from_row(
         nonce: row.get("delivery_nonce"),
         enforce_nonce: false,
         message: serde_json::from_value(row.get("message")).map_err(json_to_sqlx)?,
+    })
+}
+
+fn contract_message_edit_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<ContractMessageEdit, sqlx::Error> {
+    Ok(ContractMessageEdit {
+        delivery_id: row.get("id"),
+        channel_id: row.get::<i64, _>("channel_id") as u64,
+        discord_message_id: row
+            .get::<Option<String>, _>("discord_message_id")
+            .ok_or_else(|| {
+                sqlx::Error::Protocol(
+                    "pending repair lacks an original Discord message ID".to_string(),
+                )
+            })?,
+        contract_id: row.get("contract_id"),
+        event_kind: contract_delivery_event_kind_from_str(&row.get::<String, _>("event_kind"))?,
+        repair_revision: row.get("repair_revision"),
+        repair_claim_token: row.get("repair_claim_token"),
+        repair_attempt_count: row.get("repair_attempt_count"),
+        message: serde_json::from_value(row.get("desired_message")).map_err(json_to_sqlx)?,
+    })
+}
+
+fn contract_repair_retry_at(
+    error: &ContractDeliveryError,
+    attempted_at: DateTime<Utc>,
+    attempt_count: i32,
+) -> DateTime<Utc> {
+    let exponent = (attempt_count.saturating_sub(1) as u32).min(16);
+    let delay = CONTRACT_REPAIR_RETRY_BASE_SECONDS
+        .saturating_mul(1_i64 << exponent)
+        .min(CONTRACT_REPAIR_RETRY_MAX_SECONDS);
+    let backoff = attempted_at + ChronoDuration::seconds(delay);
+    error
+        .retry_at()
+        .map_or(backoff, |deadline| deadline.max(backoff))
+}
+
+fn contract_delivery_event_kind_from_str(value: &str) -> Result<ContractEventKind, sqlx::Error> {
+    Ok(match value {
+        "listed" => ContractEventKind::Listed,
+        "sale_confirmed" => ContractEventKind::SaleConfirmed,
+        "purchase_confirmed" => ContractEventKind::PurchaseConfirmed,
+        "expired" => ContractEventKind::Expired,
+        "closed_outcome_unknown" => ContractEventKind::ClosedOutcomeUnknown,
+        value => {
+            return Err(sqlx::Error::Protocol(format!(
+                "unknown contract delivery event kind: {value}"
+            )))
+        }
     })
 }
 
@@ -9021,7 +9660,7 @@ impl ContractCollector {
             relevant_isk,
             confirmed_at,
         };
-        if proximity_unverified {
+        let preparation = if proximity_unverified {
             self.store
                 .prepare_proximity_unverified_delivery(
                     subscription,
@@ -9030,7 +9669,7 @@ impl ContractCollector {
                     ping_type.unwrap_or_default(),
                     ordering,
                 )
-                .await?;
+                .await?
         } else {
             self.store
                 .prepare_delivery(
@@ -9041,7 +9680,19 @@ impl ContractCollector {
                     ping_type.unwrap_or_default(),
                     ordering,
                 )
-                .await?;
+                .await?
+        };
+        if let PrepareDeliveryOutcome::ExistingSent {
+            delivery_id,
+            message: stored_message,
+        } = preparation
+        {
+            let desired_message = repaired_contract_message(&stored_message, &message);
+            if desired_message != stored_message {
+                self.store
+                    .prepare_delivery_repair(delivery_id, desired_message)
+                    .await?;
+            }
         }
         Ok(if proximity_unverified {
             NotificationResolution::ProximityUnverified
@@ -9063,7 +9714,70 @@ impl ContractCollector {
                     .await?;
             }
         }
+        for pending in self
+            .store
+            .pending_repairs(self.delivery_clock.now())
+            .await?
+        {
+            let retry = self.deliver_pending_repair(&pending, notifications).await?;
+            if retry {
+                self.deliver_pending_repair(&pending, notifications).await?;
+            }
+        }
         Ok(())
+    }
+
+    async fn deliver_pending_repair(
+        &self,
+        pending: &ContractMessageEdit,
+        notifications: &ContractNotifications,
+    ) -> Result<bool, ContractCollectionError> {
+        let attempted_at = self.delivery_clock.now();
+        let Some(edit) = self
+            .store
+            .begin_repair_attempt(pending.delivery_id, attempted_at)
+            .await?
+        else {
+            return Ok(false);
+        };
+        match notifications.delivery.edit(edit.clone()).await {
+            Ok(()) => {
+                let completed_at = self.delivery_clock.now();
+                self.store
+                    .mark_repair_succeeded(&edit, completed_at)
+                    .await?;
+                Ok(false)
+            }
+            Err(ContractDeliveryError::Permanent(error)) => {
+                let completed_at = self.delivery_clock.now();
+                let error = ContractDeliveryError::Permanent(error);
+                self.store
+                    .mark_repair_failed(&edit, &error, completed_at)
+                    .await?;
+                warn!(
+                    delivery_id = edit.delivery_id,
+                    contract_id = edit.contract_id,
+                    "contract message repair failed permanently: {error}"
+                );
+                Ok(false)
+            }
+            Err(
+                error @ (ContractDeliveryError::Transient(_) | ContractDeliveryError::Ambiguous(_)),
+            ) => {
+                let completed_at = self.delivery_clock.now();
+                let retry_at =
+                    contract_repair_retry_at(&error, completed_at, edit.repair_attempt_count);
+                self.store
+                    .mark_repair_retryable(&edit, &error, retry_at)
+                    .await?;
+                warn!(
+                    delivery_id = edit.delivery_id,
+                    contract_id = edit.contract_id,
+                    "contract message repair remains pending after retryable Discord failure: {error}"
+                );
+                Ok(false)
+            }
+        }
     }
 
     async fn deliver_prepared_notification(
@@ -10552,6 +11266,19 @@ fn contract_notification_message(
     message
 }
 
+fn repaired_contract_message(
+    stored: &ContractNotificationMessage,
+    regenerated: &ContractNotificationMessage,
+) -> ContractNotificationMessage {
+    ContractNotificationMessage {
+        title: regenerated.title.clone(),
+        description: regenerated.description.clone(),
+        thumbnail_url: regenerated.thumbnail_url.clone(),
+        fields: stored.fields.clone(),
+        footer: stored.footer.clone(),
+    }
+}
+
 const MAX_EMBED_TITLE_CHARACTERS: usize = 256;
 const MAX_EMBED_DESCRIPTION_CHARACTERS: usize = 4096;
 const MAX_EMBED_FIELD_NAME_CHARACTERS: usize = 256;
@@ -11235,6 +11962,12 @@ fn collection_recovery_gap(interval: Duration) -> ChronoDuration {
 mod embed_tests {
     use crate::discord_bot::{contract_notification_embed, DiscordContractDelivery};
     use serenity::http::Http;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::thread::JoinHandle;
+    use std::time::Duration;
 
     use super::*;
 
@@ -11350,6 +12083,347 @@ mod embed_tests {
             .iter()
             .find(|field| field.name == name)
             .map(|field| field.value.as_str())
+    }
+
+    #[derive(Clone)]
+    struct DiscordWireReply {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    struct DiscordEditWireServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+        handle: JoinHandle<()>,
+    }
+
+    impl DiscordEditWireServer {
+        fn start(replies: Vec<DiscordWireReply>) -> Self {
+            let listener =
+                TcpListener::bind("127.0.0.1:0").expect("bind controlled Discord HTTP listener");
+            listener
+                .set_nonblocking(true)
+                .expect("make controlled Discord listener nonblocking");
+            let address = listener
+                .local_addr()
+                .expect("controlled Discord listener address");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorded_requests = requests.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = stop.clone();
+            let handle = std::thread::spawn(move || {
+                let mut replies = replies.into_iter();
+                while !stopped.load(Ordering::Relaxed) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("accept controlled Discord request: {error}"),
+                    };
+                    stream
+                        .set_nonblocking(false)
+                        .expect("make controlled Discord connection blocking");
+                    let request = read_discord_edit_request(&mut stream);
+                    recorded_requests.lock().unwrap().push(request);
+                    let reply = replies.next().unwrap_or(DiscordWireReply {
+                        status: 500,
+                        headers: vec![],
+                        body: r#"{"code":0,"message":"unexpected retry"}"#.to_string(),
+                    });
+                    let headers = reply
+                        .headers
+                        .iter()
+                        .map(|(name, value)| format!("{name}: {value}\r\n"))
+                        .collect::<String>();
+                    let response = format!(
+                        "HTTP/1.1 {} controlled\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
+                        reply.status,
+                        reply.body.len(),
+                        headers,
+                        reply.body,
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("write controlled Discord response");
+                }
+            });
+            Self {
+                base_url: format!("http://{address}"),
+                requests,
+                stop,
+                handle,
+            }
+        }
+
+        fn finish(self) -> Vec<String> {
+            self.stop.store(true, Ordering::Relaxed);
+            self.handle
+                .join()
+                .expect("join controlled Discord listener");
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn read_discord_edit_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set controlled Discord request timeout");
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream
+                .read(&mut chunk)
+                .expect("read controlled Discord request");
+            assert!(read > 0, "controlled Discord request ended before headers");
+            bytes.extend_from_slice(&chunk[..read]);
+            let Some(headers_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&bytes[..headers_end])
+                .expect("controlled Discord request headers are UTF-8");
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("content length"))
+                    })
+                })
+                .unwrap_or(0);
+            if bytes.len() >= headers_end + 4 + content_length {
+                return String::from_utf8(bytes).expect("controlled Discord request is UTF-8");
+            }
+        }
+    }
+
+    fn contract_edit_for_wire(message: ContractNotificationMessage) -> ContractMessageEdit {
+        ContractMessageEdit {
+            delivery_id: 13,
+            channel_id: 77,
+            discord_message_id: "9001".to_string(),
+            contract_id: 45,
+            event_kind: ContractEventKind::Listed,
+            repair_revision: 1,
+            repair_claim_token: Some("controlled-claim".to_string()),
+            repair_attempt_count: 1,
+            message,
+        }
+    }
+
+    #[test]
+    fn contract_delivery_operator_capability_requires_the_configured_operator_id() {
+        let digest = "00".repeat(32);
+        assert!(ContractDeliveryOperatorCapability::from_config(
+            CONTRACT_DELIVERY_OPERATOR_ACTOR.to_string(),
+            &digest,
+        )
+        .is_ok());
+        assert!(ContractDeliveryOperatorCapability::from_config(
+            "discord:000000000000000001".to_string(),
+            &digest,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn contract_delivery_operator_capability_requires_exactly_64_ascii_hex_digest_characters() {
+        let actor = CONTRACT_DELIVERY_OPERATOR_ACTOR.to_string();
+        assert!(
+            ContractDeliveryOperatorCapability::from_config(actor.clone(), &"aB".repeat(32))
+                .is_ok()
+        );
+        for digest in [
+            "0".repeat(63),
+            "0".repeat(65),
+            format!("{}g", "0".repeat(63)),
+            format!("{}é", "0".repeat(62)),
+        ] {
+            assert!(
+                ContractDeliveryOperatorCapability::from_config(actor.clone(), &digest).is_err(),
+                "digest must be exactly 64 ASCII hexadecimal characters: {digest:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discord_contract_edit_patches_the_exact_message_with_embed_and_mentions_suppressed() {
+        let server = DiscordEditWireServer::start(vec![DiscordWireReply {
+            status: 200,
+            headers: vec![],
+            body: "{}".to_string(),
+        }]);
+        let token = "controlled-auth-token";
+        let message = ContractNotificationMessage {
+            title: "Corrected public contract".to_string(),
+            description: Some("@everyone remains inert".to_string()),
+            fields: vec![ContractEmbedField {
+                name: "Contract Address".to_string(),
+                value: "contract:0//45".to_string(),
+                inline: false,
+            }],
+            thumbnail_url: Some("https://images.example.test/rifter.png".to_string()),
+            footer: Some("corrected".to_string()),
+        };
+        let expected_embed = contract_notification_embed(&message).0;
+        let delivery = DiscordContractDelivery::new_with_edit_api_base(
+            Arc::new(Http::new(token)),
+            server.base_url.clone(),
+        );
+
+        delivery
+            .edit(contract_edit_for_wire(message))
+            .await
+            .expect("Discord accepts the contract repair PATCH");
+        let requests = server.finish();
+
+        assert_eq!(requests.len(), 1, "an edit never issues a replacement POST");
+        let request = &requests[0];
+        assert!(request.starts_with("PATCH /channels/77/messages/9001 HTTP/1.1\r\n"));
+        assert!(request
+            .lines()
+            .any(|line| { line.eq_ignore_ascii_case(&format!("authorization: Bot {token}")) }));
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| serde_json::from_str::<Value>(body).expect("edit JSON body"))
+            .expect("edit HTTP body");
+        assert_eq!(body["embeds"], serde_json::json!([expected_embed]));
+        assert_eq!(body["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn discord_contract_edit_uses_platform_retry_after_without_retrying_internally() {
+        for (headers, body, expected_delay) in [
+            (
+                vec![("Retry-After".to_string(), "1.5".to_string())],
+                r#"{"retry_after":9.0}"#.to_string(),
+                ChronoDuration::milliseconds(1500),
+            ),
+            (
+                vec![],
+                r#"{"retry_after":2.25}"#.to_string(),
+                ChronoDuration::milliseconds(2250),
+            ),
+        ] {
+            let server = DiscordEditWireServer::start(vec![DiscordWireReply {
+                status: 429,
+                headers,
+                body,
+            }]);
+            let delivery = DiscordContractDelivery::new_with_edit_api_base(
+                Arc::new(Http::new("controlled-auth-token")),
+                server.base_url.clone(),
+            );
+            let before = Utc::now();
+            let error = delivery
+                .edit(contract_edit_for_wire(ContractNotificationMessage {
+                    title: "Rate limited correction".to_string(),
+                    description: None,
+                    fields: vec![],
+                    thumbnail_url: None,
+                    footer: None,
+                }))
+                .await
+                .expect_err("the retry deadline is returned to the durable dispatcher");
+            let after = Utc::now();
+            let requests = server.finish();
+
+            let retry_at = error.retry_at().expect("platform retry deadline");
+            assert!(matches!(error, ContractDeliveryError::Transient(_)));
+            assert!(retry_at >= before + expected_delay);
+            assert!(retry_at <= after + expected_delay);
+            assert_eq!(
+                requests.len(),
+                1,
+                "the delivery adapter never retries 429 itself"
+            );
+            assert!(requests.iter().all(|request| request.starts_with("PATCH ")));
+        }
+    }
+
+    #[tokio::test]
+    async fn discord_code_10008_edit_is_permanent_without_replacement_or_token_leakage() {
+        let server = DiscordEditWireServer::start(vec![DiscordWireReply {
+            status: 500,
+            headers: vec![],
+            body: r#"{"code":10008,"message":"Unknown Message"}"#.to_string(),
+        }]);
+        let token = "controlled-auth-token";
+        let delivery = DiscordContractDelivery::new_with_edit_api_base(
+            Arc::new(Http::new(token)),
+            server.base_url.clone(),
+        );
+        let error = delivery
+            .edit(contract_edit_for_wire(ContractNotificationMessage {
+                title: "Missing message correction".to_string(),
+                description: None,
+                fields: vec![],
+                thumbnail_url: None,
+                footer: None,
+            }))
+            .await
+            .expect_err("an unknown Discord message is a permanent repair failure");
+        let requests = server.finish();
+
+        assert!(error.to_string().contains("JSON code 10008"));
+        assert!(!error.to_string().contains(token));
+        assert!(!format!("{error:?}").contains(token));
+        assert!(matches!(error, ContractDeliveryError::Permanent(_)));
+        assert_eq!(
+            requests.len(),
+            1,
+            "unknown messages never create replacement posts"
+        );
+        assert!(requests[0].starts_with("PATCH /channels/77/messages/9001 HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn discord_contract_edit_classifies_temporary_codes_before_delivery_scoped_405() {
+        for (status, code, expected_temporary, expected_delivery_scoped) in [
+            (400, 40_004, true, false),
+            (400, 0, false, false),
+            (405, 0, false, true),
+            (500, 10_008, false, true),
+        ] {
+            let server = DiscordEditWireServer::start(vec![DiscordWireReply {
+                status,
+                headers: vec![],
+                body: format!(r#"{{"code":{code},"message":"controlled"}}"#),
+            }]);
+            let delivery = DiscordContractDelivery::new_with_edit_api_base(
+                Arc::new(Http::new("controlled-auth-token")),
+                server.base_url.clone(),
+            );
+            let error = delivery
+                .edit(contract_edit_for_wire(ContractNotificationMessage {
+                    title: "classification".to_string(),
+                    description: None,
+                    fields: vec![],
+                    thumbnail_url: None,
+                    footer: None,
+                }))
+                .await
+                .expect_err("controlled Discord error");
+            let requests = server.finish();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                matches!(error, ContractDeliveryError::Transient(_)),
+                expected_temporary,
+                "Discord HTTP {status}, code {code}"
+            );
+            if !expected_temporary {
+                assert!(matches!(error, ContractDeliveryError::Permanent(_)));
+                assert_eq!(
+                    error.is_delivery_scoped_permanent(),
+                    expected_delivery_scoped,
+                    "Discord HTTP {status}, code {code}"
+                );
+            }
+        }
     }
 
     #[test]
