@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use killbot_rust::commands::health::{render_health_response, HEALTH_OPERATOR_ID};
 use killbot_rust::config::{self, AppConfig, AppState};
 use killbot_rust::contract_intelligence::{
@@ -16,7 +17,7 @@ use killbot_rust::contract_intelligence::{
     HealthDiscordPublisher, HealthPublishError, HealthRuntimeConfig, HealthStatus, HealthWatchdog,
     HealthWatchdogConfig, HealthWatchdogRunner, HttpPublicContractEsi, PreparedContractDelivery,
     PublicContract, PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
-    SolarSystemPosition,
+    SolarSystemPosition, StructureResolutionAdmission,
 };
 use killbot_rust::esi::EsiClient;
 use killbot_rust::feed::{FeedError, FeedHealthProvider, FeedHealthTelemetry, KillmailFeed};
@@ -26,7 +27,12 @@ use killbot_rust::location_evidence::{
 };
 use killbot_rust::models::{ZkData, ZkDataNoEsi};
 use killbot_rust::pipeline::{run_producer, run_producer_with_health, ProcessedResult};
+use killbot_rust::structure_resolver::{
+    AuthenticatedStructureResolver, StructureResolver, StructureResolverClock,
+    StructureResolverConfig, StructureResolverError, StructureResolverRuntimeStatus,
+};
 use moka::future::Cache;
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha384};
 use sqlx::migrate::{Migration, MigrationType, Migrator};
@@ -34,6 +40,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, Row};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,7 +48,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tokio::sync::{mpsc, Barrier, Mutex, Notify, Semaphore};
+use tokio::sync::{mpsc, oneshot, Barrier, Mutex, Notify, Semaphore};
 use url::Url;
 
 static DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -49,6 +56,34 @@ const ESI_PUBLIC_CONTRACT_SUMMARY_FIXTURE: &str =
     include_str!("../resources/contracts/public-contract-summary.json");
 const ESI_PUBLIC_CONTRACT_ITEMS_FIXTURE: &str =
     include_str!("../resources/contracts/public-contract-items.json");
+type PersistedStructureRepresentation = (
+    Option<String>,
+    Option<i64>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+);
+type PersistedEsiLimiter = (
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+type PersistedRatePacing = (
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<DateTime<Utc>>,
+);
+type PersistedStructureCompletion = (
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    Option<String>,
+);
 
 fn app_state_for_ping_limiter() -> Arc<AppState> {
     Arc::new(AppState {
@@ -92,6 +127,4386 @@ fn app_state_for_ping_limiter() -> Arc<AppState> {
     })
 }
 
+#[test]
+fn structure_resolver_configuration_is_feature_gated_and_requires_one_dedicated_character() {
+    let disabled = StructureResolverConfig::from_settings([
+        ("STRUCTURE_RESOLVER_ENABLED", "false"),
+        ("EVE_CLIENT_ID", "existing-eve-application"),
+        ("EVE_CLIENT_SECRET", "application-secret"),
+    ])
+    .expect("disabled resolver needs no authorization material");
+    assert!(!disabled.is_enabled());
+
+    let enabled = StructureResolverConfig::from_settings([
+        ("STRUCTURE_RESOLVER_ENABLED", "true"),
+        ("STRUCTURE_RESOLVER_CHARACTER_ID", "90000001"),
+        ("STRUCTURE_RESOLVER_REFRESH_TOKEN", "refresh-secret"),
+        ("STRUCTURE_RESOLVER_CREDENTIAL_REVISION", "2026-08-18"),
+        ("EVE_CLIENT_ID", "existing-eve-application"),
+        ("EVE_CLIENT_SECRET", "application-secret"),
+    ])
+    .expect("dedicated resolver authorization is valid");
+    assert!(enabled.is_enabled());
+    assert_eq!(enabled.character_id(), Some(90_000_001));
+    assert_eq!(enabled.required_scope(), "esi-universe.read_structures.v1");
+
+    let missing_dedicated_character = StructureResolverConfig::from_settings([
+        ("STRUCTURE_RESOLVER_ENABLED", "true"),
+        ("STRUCTURE_RESOLVER_REFRESH_TOKEN", "refresh-secret"),
+        ("EVE_CLIENT_ID", "existing-eve-application"),
+        ("EVE_CLIENT_SECRET", "application-secret"),
+    ]);
+    assert!(missing_dedicated_character.is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn structure_resolver_environment_reads_only_named_unicode_settings() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let unrelated = OsString::from_vec(vec![0xff]);
+    let config = StructureResolverConfig::from_environment_values(|name| {
+        let _unrelated = &unrelated;
+        match name {
+            "STRUCTURE_RESOLVER_ENABLED" => Some(OsString::from("false")),
+            "STRUCTURE_RESOLVER_CHARACTER_ID"
+            | "STRUCTURE_RESOLVER_CREDENTIAL_REVISION"
+            | "STRUCTURE_RESOLVER_REFRESH_TOKEN"
+            | "EVE_CLIENT_ID"
+            | "EVE_CLIENT_SECRET" => None,
+            _ => panic!("unrelated environment setting {name} must not be read"),
+        }
+    })
+    .expect("an unrelated non-Unicode environment value cannot panic disabled resolver setup");
+    assert!(!config.is_enabled());
+
+    let invalid = StructureResolverConfig::from_environment_values(|name| match name {
+        "STRUCTURE_RESOLVER_ENABLED" => Some(OsString::from_vec(vec![0xff])),
+        _ => None,
+    });
+    let Err(invalid) = invalid else {
+        panic!("non-Unicode resolver configuration must degrade safely")
+    };
+    assert!(invalid.to_string().contains("STRUCTURE_RESOLVER_ENABLED"));
+}
+
+const RESOLVER_TEST_PRIVATE_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAzAIQj8deXaYHITcomlORNlShy3YHpHSqWoTnQlugf+/8VAtZ\nOHHusoi6asRXDT0icmwMM6GeCBTusp3nEMZwli/NNYMImSO9s15ZkwPRtMXDA6E2\nJNMmeYeojf7QHM5OdO3MOFa/LgxHLDkI9aghAlblGkSxzNXQ+Ii8WERbO3sbCYCl\n1bS91rdBUKEAXkzSSU9VdmuJbcFwAxTL/Sf5wbAl6urFf2r9woJMdysJCA3euTdu\njGOdEAZxSg+S1e5OU+KmX2sVtaY0+pqKwRku+Awcslu/EEcgQLfccTaekuqySTTY\nteU8UI6V+N1D5jNhFLJ9j20l5udz9bzO7FfHSQIDAQABAoIBAA7+PdpbRCesyoxZ\n4e2Jo7vy91sdJw2il1yEtPxPAJo2eHxywxFfajQL0WuEV4N9ETmIkFMBFzyv0SUm\nbrNwahjXlYTPxwN+OXRjxECGQNTAzgbHw9NsA0FeQ3iAGCptzR1R1rbzRSSsuVRa\nMrrfKuHhof/OuaR8uFlzryfriiryTR/h/psHsNUIR0xQrLMMwlIOw+/MTqPqGK0g\nfXrofUhxf2+vGAaTHZRZ+uD6USDkrBml64wyqz5f5NHVmA3VnBaIk6R2uDHQ9YAQ\nuIgS0dlL99Ddz5LqvuWriolHJ7J0mgWpz/DfgC5DFY/URjqrYxnuyk6BTZRBFPvz\na+G1/ssCgYEA52I4tpS/yMfaUNhBHXjxwF04af1RnXlOSCxMLzvJUtuBYxVfMCu3\njR6owuKwNSHADXz7bDLUztbLqekvCIuhrBwz0FFRwXk/yQDRfnKPrD9Q1JuzOMk8\nzurd5rrd3iz58C93tdmf4aYIK9V2+F/ozFDnGmvvwrCb9mfg1pcDSC8CgYEA4bZD\nXT9mVbopYQL+Kwk1Qp4xVgKWxprTRhHg1+QNWRBKI9nZThHQL7EUwvVWHx+H/bSQ\n/JOj1GnNTgX+fxsXx4xX2IZA1o8zWpFOWD5OuuwVth59xJxvtmERyJjWgdxRTrkX\n29diWFBC3piNYlsS3WecSHfH5nbq4GLP8LnKkgcCgYAS17vYmop3tlbACKxc0xGU\n4cKLVxbDZTKLzBe0LQE7HycNQ5tJ1/WNp3aE0GMbIJF8R7ZN3GHaKkHRp2yuHHjh\nBDbv+v9WayJXoxpsWrX6h/l0Ju3UbQbnrta9SHBy/GSqO6NbCsrrXFMEBtE2btEN\nenUngKy4xRseWN1FfGzG/wKBgQCy1AlDU/vsZ/Zo2kouJrl/8n38O0jiScCif3+5\nDQJWUkWraep1pD9hydc9L8vwFLdWFz3YH9FpdfonmzAr3HdWrqba8mNkm0iAtSdx\nWsxd5La++CGFKLyJrxa76/voH3p7+MIid99/QPf6DLvX9XhY2sJD2EMVIZqt9Rvz\nCgCo+QKBgFM5TePSNXyV9KBglRzv3TGdDyPwxoGfMD484aKCStHuIRp+MwD5r2el\nbtZijAlHlB6S7RwpGYdKcEsBzuD1pcNaP4c/PIX3Kejr8jdVSJyUmo7NqJfh4aH+\n4sUl7JBUSVNiCUPq06FgvtQrDhERkzcoxNF2pIptWf1fkY8kbl3x\n-----END RSA PRIVATE KEY-----\n";
+const RESOLVER_TEST_JWK_N: &str = "zAIQj8deXaYHITcomlORNlShy3YHpHSqWoTnQlugf-_8VAtZOHHusoi6asRXDT0icmwMM6GeCBTusp3nEMZwli_NNYMImSO9s15ZkwPRtMXDA6E2JNMmeYeojf7QHM5OdO3MOFa_LgxHLDkI9aghAlblGkSxzNXQ-Ii8WERbO3sbCYCl1bS91rdBUKEAXkzSSU9VdmuJbcFwAxTL_Sf5wbAl6urFf2r9woJMdysJCA3euTdujGOdEAZxSg-S1e5OU-KmX2sVtaY0-pqKwRku-Awcslu_EEcgQLfccTaekuqySTTYteU8UI6V-N1D5jNhFLJ9j20l5udz9bzO7FfHSQ";
+
+#[derive(Serialize)]
+struct ResolverTestClaims {
+    aud: Vec<String>,
+    exp: usize,
+    iss: String,
+    scp: Vec<String>,
+    sub: String,
+}
+
+fn signed_resolver_access_token() -> String {
+    signed_resolver_access_token_with(
+        vec!["existing-eve-application", "EVE Online"],
+        4_102_444_800,
+        "https://login.eveonline.com/",
+        vec!["esi-universe.read_structures.v1"],
+        "CHARACTER:EVE:90000001",
+        "resolver-test-key",
+    )
+}
+
+fn signed_resolver_access_token_with(
+    aud: Vec<&str>,
+    exp: usize,
+    iss: &str,
+    scp: Vec<&str>,
+    sub: &str,
+    kid: &str,
+) -> String {
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(kid.to_string());
+    encode(
+        &header,
+        &ResolverTestClaims {
+            aud: aud.into_iter().map(ToOwned::to_owned).collect(),
+            exp,
+            iss: iss.to_string(),
+            scp: scp.into_iter().map(ToOwned::to_owned).collect(),
+            sub: sub.to_string(),
+        },
+        &EncodingKey::from_rsa_pem(RESOLVER_TEST_PRIVATE_KEY.as_bytes())
+            .expect("parse resolver test signing key"),
+    )
+    .expect("sign resolver access token")
+}
+
+#[tokio::test]
+async fn structure_resolver_refreshes_a_signed_token_and_authorizes_only_the_structure_request() {
+    let access_token = signed_resolver_access_token();
+    let jwks_server = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+        ),
+    );
+    let metadata_server = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks_server.base_url),
+    );
+    let token_server =
+        OneShotHttpServer::start(200, &[], &format!(r#"{{"access_token":"{access_token}"}}"#));
+    let structure_server = SequenceHttpServer::start(vec![WireReply {
+        status: 200,
+        headers: vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        body: r#"{"name":"Test Citadel","solar_system_id":30002086}"#,
+    }]);
+    let config = StructureResolverConfig::from_settings([
+        ("STRUCTURE_RESOLVER_ENABLED", "true"),
+        ("STRUCTURE_RESOLVER_CHARACTER_ID", "90000001"),
+        ("STRUCTURE_RESOLVER_REFRESH_TOKEN", "refresh-secret"),
+        ("EVE_CLIENT_ID", "existing-eve-application"),
+        ("EVE_CLIENT_SECRET", "application-secret"),
+    ])
+    .expect("resolver configuration");
+    let resolver = AuthenticatedStructureResolver::with_endpoints(
+        config,
+        &structure_server.base_url,
+        &format!("{}token", token_server.base_url),
+        &format!("{}metadata", metadata_server.base_url),
+        Duration::from_secs(1),
+    )
+    .expect("resolver HTTP client");
+
+    let result = resolver
+        .resolve_structure(1_024_000_001)
+        .await
+        .expect("signed resolver token authorizes the structure request");
+    assert_eq!(result.solar_system_id, 30_002_086);
+    let requests = structure_server.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("GET /universe/structures/1024000001/ HTTP/1.1"));
+    assert!(requests[0]
+        .to_ascii_lowercase()
+        .contains(&format!("authorization: bearer {access_token}").to_ascii_lowercase()));
+
+    structure_server.finish();
+    token_server.finish();
+    metadata_server.finish();
+    jwks_server.finish();
+}
+
+#[tokio::test]
+async fn structure_resolver_caches_sso_discovery_and_jwks_until_their_response_expiry() {
+    let access_token = signed_resolver_access_token_with(
+        vec!["existing-eve-application", "EVE Online"],
+        (Utc::now() + chrono::Duration::seconds(10)).timestamp() as usize,
+        "https://login.eveonline.com/",
+        vec!["esi-universe.read_structures.v1"],
+        "CHARACTER:EVE:90000001",
+        "resolver-test-key",
+    );
+    let jwks_server = SequenceHttpServer::start(vec![WireReply {
+        status: 200,
+        headers: vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        body: Box::leak(
+            format!(
+                r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+            )
+            .into_boxed_str(),
+        ),
+    }]);
+    let metadata_server = SequenceHttpServer::start(vec![WireReply {
+        status: 200,
+        headers: vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        body: Box::leak(
+            format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks_server.base_url).into_boxed_str(),
+        ),
+    }]);
+    let token_body = Box::leak(format!(r#"{{"access_token":"{access_token}"}}"#).into_boxed_str());
+    let token_server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: token_body,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: token_body,
+        },
+    ]);
+    let structure_server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+            body: r#"{"solar_system_id":30002086}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+            body: r#"{"solar_system_id":30002086}"#,
+        },
+    ]);
+    let config = resolver_test_config();
+    let resolver = AuthenticatedStructureResolver::with_endpoints(
+        config,
+        &structure_server.base_url,
+        format!("{}token", token_server.base_url),
+        format!("{}metadata", metadata_server.base_url),
+        Duration::from_secs(1),
+    )
+    .expect("resolver HTTP client");
+
+    resolver
+        .resolve_structure(1_024_000_001)
+        .await
+        .expect("first resolution");
+    resolver
+        .resolve_structure(1_024_000_002)
+        .await
+        .expect("second resolution");
+    assert_eq!(token_server.requests.lock().unwrap().len(), 2);
+    assert_eq!(metadata_server.requests.lock().unwrap().len(), 1);
+    assert_eq!(jwks_server.requests.lock().unwrap().len(), 1);
+
+    structure_server.finish();
+    token_server.finish();
+    metadata_server.finish();
+    jwks_server.finish();
+}
+
+#[tokio::test]
+async fn concurrent_structure_resolutions_singleflight_a_rotating_refresh_token() {
+    let access_token = signed_resolver_access_token();
+    let jwks_server = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+        ),
+    );
+    let metadata_server = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks_server.base_url),
+    );
+    let token_server = SequenceHttpServer::start(vec![WireReply {
+        status: 200,
+        headers: vec![],
+        body: Box::leak(
+            format!(
+                r#"{{"access_token":"{access_token}","refresh_token":"rotated-refresh-secret"}}"#
+            )
+            .into_boxed_str(),
+        ),
+    }]);
+    let structure_server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+            body: r#"{"solar_system_id":30002086}"#,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+            body: r#"{"solar_system_id":30002086}"#,
+        },
+    ]);
+    let resolver = AuthenticatedStructureResolver::with_endpoints(
+        resolver_test_config(),
+        &structure_server.base_url,
+        format!("{}token", token_server.base_url),
+        format!("{}metadata", metadata_server.base_url),
+        Duration::from_secs(1),
+    )
+    .expect("resolver HTTP client");
+    let (first, second) = tokio::join!(
+        resolver.resolve_structure(1_024_000_001),
+        resolver.resolve_structure(1_024_000_002),
+    );
+    first.expect("first resolution succeeds after the shared refresh");
+    second.expect("second resolution reuses the shared refreshed token");
+    assert_eq!(token_server.requests.lock().unwrap().len(), 1);
+    assert_eq!(structure_server.requests.lock().unwrap().len(), 2);
+    structure_server.finish();
+    token_server.finish();
+    metadata_server.finish();
+    jwks_server.finish();
+}
+
+#[tokio::test]
+async fn concurrent_structure_refresh_rate_limit_is_singleflight_and_shared() {
+    let token_server = SequenceHttpServer::start(vec![WireReply {
+        status: 429,
+        headers: vec![("Retry-After", "60")],
+        body: "",
+    }]);
+    let structure_server = SequenceHttpServer::start(vec![]);
+    let resolver = AuthenticatedStructureResolver::with_endpoints(
+        resolver_test_config(),
+        &structure_server.base_url,
+        format!("{}token", token_server.base_url),
+        "http://127.0.0.1:9/metadata".to_string(),
+        Duration::from_secs(1),
+    )
+    .expect("resolver HTTP client");
+    let (first, second) = tokio::join!(
+        resolver.resolve_structure(1_024_000_031),
+        resolver.resolve_structure(1_024_000_032),
+    );
+    for error in [first, second] {
+        let error = error.expect_err("shared 429 blocks both structure resolutions");
+        assert!(error.is_global_auth_failure());
+        assert!(error.retry_after().is_some());
+    }
+    assert_eq!(token_server.requests.lock().unwrap().len(), 1);
+    assert!(structure_server.requests.lock().unwrap().is_empty());
+    structure_server.finish();
+    token_server.finish();
+}
+
+#[tokio::test]
+async fn concurrent_headerless_refresh_failures_share_a_bounded_default_deadline() {
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    for (name, status, body) in [
+        ("token-401", 401, ""),
+        ("token-5xx", 500, ""),
+        ("invalid-token-response", 200, "{}"),
+    ] {
+        let clock = Arc::new(FixedStructureResolverClock::new(now));
+        let token_server = SequenceHttpServer::start(vec![WireReply {
+            status,
+            headers: vec![],
+            body,
+        }]);
+        let structure_server = SequenceHttpServer::start(vec![]);
+        let resolver = AuthenticatedStructureResolver::with_endpoints_and_clock(
+            resolver_test_config(),
+            &structure_server.base_url,
+            format!("{}token", token_server.base_url),
+            "http://127.0.0.1:9/metadata".to_string(),
+            Duration::from_secs(1),
+            clock,
+        )
+        .expect("resolver HTTP client");
+        let (first, second) = tokio::join!(
+            resolver.resolve_structure(1_024_000_041),
+            resolver.resolve_structure(1_024_000_042),
+        );
+        for failure in [first, second] {
+            let failure = failure.expect_err("{name} blocks both concurrent resolutions");
+            assert!(failure.is_global_auth_failure(), "{name}");
+            assert_eq!(
+                failure.retry_after(),
+                Some(now + chrono::Duration::seconds(30))
+            );
+        }
+        assert_eq!(token_server.requests.lock().unwrap().len(), 1, "{name}");
+        assert!(
+            structure_server.requests.lock().unwrap().is_empty(),
+            "{name}"
+        );
+        structure_server.finish();
+        token_server.finish();
+    }
+}
+
+fn resolver_test_config() -> StructureResolverConfig {
+    StructureResolverConfig::from_settings([
+        ("STRUCTURE_RESOLVER_ENABLED", "true"),
+        ("STRUCTURE_RESOLVER_CHARACTER_ID", "90000001"),
+        ("STRUCTURE_RESOLVER_REFRESH_TOKEN", "refresh-secret"),
+        ("EVE_CLIENT_ID", "existing-eve-application"),
+        ("EVE_CLIENT_SECRET", "application-secret"),
+    ])
+    .expect("resolver configuration")
+}
+
+async fn initialize_resolver_runtime(
+    store: &ContractCollectionStore,
+    credential_revision: &str,
+    now: DateTime<Utc>,
+) {
+    let runtime = StructureResolverConfig::from_settings([
+        ("STRUCTURE_RESOLVER_ENABLED", "true"),
+        ("STRUCTURE_RESOLVER_CHARACTER_ID", "90000001"),
+        ("STRUCTURE_RESOLVER_REFRESH_TOKEN", "refresh-secret"),
+        ("EVE_CLIENT_ID", "existing-eve-application"),
+        ("EVE_CLIENT_SECRET", "application-secret"),
+        (
+            "STRUCTURE_RESOLVER_CREDENTIAL_REVISION",
+            credential_revision,
+        ),
+    ])
+    .expect("resolver runtime configuration")
+    .runtime_status();
+    store
+        .initialize_structure_resolver_runtime(&runtime, now)
+        .await
+        .expect("initialize active resolver runtime");
+}
+
+fn signed_hs256_resolver_access_token() -> String {
+    let mut header = Header::new(Algorithm::HS256);
+    header.kid = Some("resolver-test-key".to_string());
+    encode(
+        &header,
+        &ResolverTestClaims {
+            aud: vec![
+                "existing-eve-application".to_string(),
+                "EVE Online".to_string(),
+            ],
+            exp: 4_102_444_800,
+            iss: "https://login.eveonline.com/".to_string(),
+            scp: vec!["esi-universe.read_structures.v1".to_string()],
+            sub: "CHARACTER:EVE:90000001".to_string(),
+        },
+        &EncodingKey::from_secret(b"not-an-rsa-key"),
+    )
+    .expect("sign mismatched algorithm token")
+}
+
+async fn assert_wire_rejects_resolver_access_token(name: &str, access_token: String) {
+    let jwks_server = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+        ),
+    );
+    let metadata_server = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks_server.base_url),
+    );
+    let token_server =
+        OneShotHttpServer::start(200, &[], &format!(r#"{{"access_token":"{access_token}"}}"#));
+    let structure_server = SequenceHttpServer::start(Vec::new());
+    let resolver = AuthenticatedStructureResolver::with_endpoints(
+        resolver_test_config(),
+        &structure_server.base_url,
+        format!("{}token", token_server.base_url),
+        format!("{}metadata", metadata_server.base_url),
+        Duration::from_secs(1),
+    )
+    .expect("resolver HTTP client");
+    let error = resolver
+        .resolve_structure(1_024_000_001)
+        .await
+        .expect_err("invalid signed claim must not authorize a structure request");
+    assert_eq!(
+        error.kind(),
+        killbot_rust::structure_resolver::StructureResolverFailureKind::Degraded,
+        "{name}"
+    );
+    assert!(!error.to_string().contains(&access_token));
+    assert!(structure_server.requests.lock().unwrap().is_empty());
+    structure_server.finish();
+    token_server.finish();
+    metadata_server.finish();
+    jwks_server.finish();
+}
+
+#[tokio::test]
+async fn structure_resolver_rejects_signed_algorithm_key_and_claim_mismatches_before_esi() {
+    let now = Utc::now().timestamp() as usize;
+    for (name, token) in [
+        ("algorithm", signed_hs256_resolver_access_token()),
+        (
+            "kid",
+            signed_resolver_access_token_with(
+                vec!["existing-eve-application", "EVE Online"],
+                4_102_444_800,
+                "https://login.eveonline.com/",
+                vec!["esi-universe.read_structures.v1"],
+                "CHARACTER:EVE:90000001",
+                "unknown-rotated-key",
+            ),
+        ),
+        (
+            "missing-client-audience",
+            signed_resolver_access_token_with(
+                vec!["EVE Online"],
+                4_102_444_800,
+                "https://login.eveonline.com/",
+                vec!["esi-universe.read_structures.v1"],
+                "CHARACTER:EVE:90000001",
+                "resolver-test-key",
+            ),
+        ),
+        (
+            "missing-eve-audience",
+            signed_resolver_access_token_with(
+                vec!["existing-eve-application"],
+                4_102_444_800,
+                "https://login.eveonline.com/",
+                vec!["esi-universe.read_structures.v1"],
+                "CHARACTER:EVE:90000001",
+                "resolver-test-key",
+            ),
+        ),
+        (
+            "issuer",
+            signed_resolver_access_token_with(
+                vec!["existing-eve-application", "EVE Online"],
+                4_102_444_800,
+                "https://invalid.example/",
+                vec!["esi-universe.read_structures.v1"],
+                "CHARACTER:EVE:90000001",
+                "resolver-test-key",
+            ),
+        ),
+        (
+            "expiry",
+            signed_resolver_access_token_with(
+                vec!["existing-eve-application", "EVE Online"],
+                now.saturating_sub(1),
+                "https://login.eveonline.com/",
+                vec!["esi-universe.read_structures.v1"],
+                "CHARACTER:EVE:90000001",
+                "resolver-test-key",
+            ),
+        ),
+        (
+            "subject",
+            signed_resolver_access_token_with(
+                vec!["existing-eve-application", "EVE Online"],
+                4_102_444_800,
+                "https://login.eveonline.com/",
+                vec!["esi-universe.read_structures.v1"],
+                "CHARACTER:EVE:90000002",
+                "resolver-test-key",
+            ),
+        ),
+        (
+            "missing-scope",
+            signed_resolver_access_token_with(
+                vec!["existing-eve-application", "EVE Online"],
+                4_102_444_800,
+                "https://login.eveonline.com/",
+                vec![],
+                "CHARACTER:EVE:90000001",
+                "resolver-test-key",
+            ),
+        ),
+        (
+            "extra-scope",
+            signed_resolver_access_token_with(
+                vec!["existing-eve-application", "EVE Online"],
+                4_102_444_800,
+                "https://login.eveonline.com/",
+                vec![
+                    "esi-universe.read_structures.v1",
+                    "esi-location.read_location.v1",
+                ],
+                "CHARACTER:EVE:90000001",
+                "resolver-test-key",
+            ),
+        ),
+    ] {
+        assert_wire_rejects_resolver_access_token(name, token).await;
+    }
+}
+
+#[tokio::test]
+async fn trusted_sso_discovery_rejects_an_untrusted_jwks_origin_before_contacting_it() {
+    let token = signed_resolver_access_token();
+    let trap = SequenceHttpServer::start(vec![]);
+    let metadata = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(
+            r#"{{"issuer":"https://login.eveonline.com/","jwks_uri":"{}jwks"}}"#,
+            trap.base_url
+        ),
+    );
+    let token_server =
+        OneShotHttpServer::start(200, &[], &format!(r#"{{"access_token":"{token}"}}"#));
+    let structure_server = SequenceHttpServer::start(vec![]);
+    let resolver = AuthenticatedStructureResolver::with_endpoints_and_sso_binding(
+        resolver_test_config(),
+        &structure_server.base_url,
+        format!("{}token", token_server.base_url),
+        format!("{}metadata", metadata.base_url),
+        Duration::from_secs(1),
+        true,
+    )
+    .expect("resolver");
+    let error = resolver
+        .resolve_structure(1_024_000_001)
+        .await
+        .expect_err("untrusted discovery must be rejected");
+    assert_eq!(
+        error.kind(),
+        killbot_rust::structure_resolver::StructureResolverFailureKind::Degraded
+    );
+    assert!(trap.requests.lock().unwrap().is_empty());
+    assert!(structure_server.requests.lock().unwrap().is_empty());
+    token_server.finish();
+    metadata.finish();
+}
+
+#[tokio::test]
+async fn unknown_jwt_kid_forces_one_jwks_refresh_and_accepts_the_rotated_key() {
+    let token = signed_resolver_access_token_with(
+        vec!["existing-eve-application", "EVE Online"],
+        4_102_444_800,
+        "https://login.eveonline.com/",
+        vec!["esi-universe.read_structures.v1"],
+        "CHARACTER:EVE:90000001",
+        "rotated-kid",
+    );
+    let jwks_server = SequenceHttpServer::start(vec![
+        WireReply { status: 200, headers: vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")], body: Box::leak(format!(r#"{{"keys":[{{"kty":"RSA","kid":"old-kid","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#).into_boxed_str()) },
+        WireReply { status: 200, headers: vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")], body: Box::leak(format!(r#"{{"keys":[{{"kty":"RSA","kid":"rotated-kid","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#).into_boxed_str()) },
+    ]);
+    let metadata_server = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks_server.base_url),
+    );
+    let token_server =
+        OneShotHttpServer::start(200, &[], &format!(r#"{{"access_token":"{token}"}}"#));
+    let structure_server = SequenceHttpServer::start(vec![WireReply {
+        status: 200,
+        headers: vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        body: r#"{"solar_system_id":30002086}"#,
+    }]);
+    let resolver = AuthenticatedStructureResolver::with_endpoints(
+        resolver_test_config(),
+        &structure_server.base_url,
+        format!("{}token", token_server.base_url),
+        format!("{}metadata", metadata_server.base_url),
+        Duration::from_secs(1),
+    )
+    .expect("resolver");
+    resolver
+        .resolve_structure(1_024_000_001)
+        .await
+        .expect("rotated JWKS key validates token");
+    assert_eq!(jwks_server.requests.lock().unwrap().len(), 2);
+    structure_server.finish();
+    token_server.finish();
+    metadata_server.finish();
+    jwks_server.finish();
+}
+
+#[tokio::test]
+async fn structure_resolver_preserves_retry_after_and_keeps_refresh_secrets_out_of_errors() {
+    let access_token = signed_resolver_access_token();
+    let jwks_server = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+        ),
+    );
+    let metadata_server = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks_server.base_url),
+    );
+    let token_server =
+        OneShotHttpServer::start(200, &[], &format!(r#"{{"access_token":"{access_token}"}}"#));
+    let structure_server = SequenceHttpServer::start(vec![WireReply {
+        status: 429,
+        headers: vec![("Retry-After", "60")],
+        body: r#"{"error":"rate limited"}"#,
+    }]);
+    let resolver = AuthenticatedStructureResolver::with_endpoints(
+        resolver_test_config(),
+        &structure_server.base_url,
+        format!("{}token", token_server.base_url),
+        format!("{}metadata", metadata_server.base_url),
+        Duration::from_secs(1),
+    )
+    .expect("resolver HTTP client");
+    let before = Utc::now();
+    let error = resolver
+        .resolve_structure(1_024_000_001)
+        .await
+        .expect_err("retry boundary must be returned to the collector");
+    assert_eq!(
+        error.kind(),
+        killbot_rust::structure_resolver::StructureResolverFailureKind::Transient
+    );
+    assert!(error
+        .retry_after()
+        .is_some_and(|deadline| deadline >= before + chrono::Duration::seconds(59)));
+    assert!(!error.to_string().contains("refresh-secret"));
+    assert!(!format!("{error:?}").contains("refresh-secret"));
+    structure_server.finish();
+    token_server.finish();
+    metadata_server.finish();
+    jwks_server.finish();
+}
+
+#[tokio::test]
+async fn relative_structure_response_metadata_is_anchored_to_receipt_time() {
+    let started_at = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let delay = chrono::Duration::seconds(5);
+    for (label, headers, expected_retry) in [
+        (
+            "retry-after",
+            vec![
+                ("Cache-Control", "max-age=30"),
+                ("Retry-After", "60"),
+                ("X-ESI-Error-Limit-Remain", "0"),
+                ("X-ESI-Error-Limit-Reset", "120"),
+            ],
+            chrono::Duration::seconds(60),
+        ),
+        (
+            "error-limit-reset",
+            vec![
+                ("Cache-Control", "max-age=30"),
+                ("X-ESI-Error-Limit-Remain", "0"),
+                ("X-ESI-Error-Limit-Reset", "120"),
+            ],
+            chrono::Duration::seconds(120),
+        ),
+    ] {
+        let clock = Arc::new(FixedStructureResolverClock::new(started_at));
+        let access_token = signed_resolver_access_token();
+        let jwks = OneShotHttpServer::start(
+            200,
+            &[],
+            &format!(
+                r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+            ),
+        );
+        let metadata = OneShotHttpServer::start(
+            200,
+            &[],
+            &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks.base_url),
+        );
+        let token =
+            OneShotHttpServer::start(200, &[], &format!(r#"{{"access_token":"{access_token}"}}"#));
+        let structures = SequenceHttpServer::start_with_clock_advance(
+            vec![WireReply {
+                status: 200,
+                headers,
+                body: r#"{"solar_system_id":30002086}"#,
+            }],
+            clock.clone(),
+            delay,
+        );
+        let resolver = AuthenticatedStructureResolver::with_endpoints_and_clock(
+            resolver_test_config(),
+            &structures.base_url,
+            format!("{}token", token.base_url),
+            format!("{}metadata", metadata.base_url),
+            Duration::from_secs(1),
+            clock,
+        )
+        .expect("resolver HTTP client");
+        let resolved = resolver
+            .resolve_structure(1_024_000_001)
+            .await
+            .expect("controlled structure response resolves");
+        assert_eq!(
+            resolved.expires_at,
+            Some(started_at + delay + chrono::Duration::seconds(30)),
+            "{label}"
+        );
+        assert_eq!(
+            resolved.response_metadata.retry_after,
+            Some(started_at + delay + expected_retry),
+            "{label}"
+        );
+        structures.finish();
+        token.finish();
+        metadata.finish();
+        jwks.finish();
+    }
+}
+
+#[tokio::test]
+async fn delayed_structure_success_only_records_evidence_when_fresh_at_completion() {
+    for (label, max_age, expects_evidence) in [
+        ("already stale at receipt", "max-age=0", false),
+        ("fresh at receipt", "max-age=30", true),
+    ] {
+        let database = TemporaryDatabase::new().await;
+        let store = database.store().await;
+        let requested_at = database.now().await;
+        let delay = chrono::Duration::seconds(5);
+        let resolver_clock = Arc::new(FixedStructureResolverClock::new(requested_at));
+        let request_pacer = Arc::new(AdvancingRequestPacer {
+            now: StdMutex::new(requested_at),
+            waits: StdMutex::new(Vec::new()),
+        });
+        let contract = PublicContract {
+            start_location_id: 1_024_000_093,
+            end_location_id: Some(1_024_000_093),
+            ..item_exchange_contract(93)
+        };
+        prepare_resolver_global_deadline_collection(&store, requested_at).await;
+        let access_token = signed_resolver_access_token();
+        let jwks = OneShotHttpServer::start(
+            200,
+            &[],
+            &format!(
+                r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+            ),
+        );
+        let metadata = OneShotHttpServer::start(
+            200,
+            &[],
+            &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks.base_url),
+        );
+        let token =
+            OneShotHttpServer::start(200, &[], &format!(r#"{{"access_token":"{access_token}"}}"#));
+        let absolute_expires = Box::leak(
+            (requested_at + chrono::Duration::seconds(3))
+                .to_rfc2822()
+                .into_boxed_str(),
+        );
+        let structures = SequenceHttpServer::start_with_resolver_and_request_clock_advance(
+            vec![WireReply {
+                status: 200,
+                headers: vec![("Cache-Control", max_age), ("Expires", absolute_expires)],
+                body: r#"{"solar_system_id":30002086}"#,
+            }],
+            resolver_clock.clone(),
+            request_pacer.clone(),
+            delay,
+        );
+        let resolver = Arc::new(
+            AuthenticatedStructureResolver::with_endpoints_and_clock(
+                resolver_test_config(),
+                &structures.base_url,
+                format!("{}token", token.base_url),
+                format!("{}metadata", metadata.base_url),
+                Duration::from_secs(1),
+                resolver_clock,
+            )
+            .expect("construct resolver"),
+        );
+        let report = resolver_deadline_collector_with_request_pacer(
+            store,
+            vec![contract.clone()],
+            resolver,
+            requested_at,
+            request_pacer,
+        )
+        .collect_cycle()
+        .await
+        .expect("a stale resolver success only reduces location precision");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database.url)
+            .await
+            .expect("inspect delayed structure completion");
+        let evidence: Option<(DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT observed_at, expires_at FROM location_evidence WHERE location_id = $1 AND evidence_class = 'access_qualified'",
+        )
+        .bind(contract.start_location_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("read access-qualified evidence");
+        let state: PersistedStructureCompletion = sqlx::query_as(
+                "SELECT observed_at, cache_expires_at, last_success_at, last_failure_kind FROM structure_resolution_state WHERE structure_id = $1",
+            )
+            .bind(contract.start_location_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read structure completion state");
+        let audits = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM location_evidence_audit audit JOIN location_evidence evidence ON evidence.id = audit.location_evidence_id WHERE evidence.location_id = $1",
+        )
+        .bind(contract.start_location_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count structure evidence audits");
+        if expects_evidence {
+            assert_eq!(
+                evidence,
+                Some((
+                    requested_at + delay,
+                    Some(requested_at + delay + chrono::Duration::seconds(30)),
+                )),
+                "{label}"
+            );
+            assert_eq!(
+                state,
+                (
+                    Some(requested_at + delay),
+                    Some(requested_at + delay + chrono::Duration::seconds(30)),
+                    Some(requested_at + delay),
+                    None,
+                ),
+                "{label}"
+            );
+            assert_eq!(audits, 1, "{label}");
+        } else {
+            assert!(!report.events.is_empty(), "{label}");
+            assert!(evidence.is_none(), "{label}");
+            assert_eq!(state.2, None, "{label}");
+            assert_eq!(state.3.as_deref(), Some("transient"), "{label}");
+            assert_eq!(audits, 0, "{label}");
+        }
+        pool.close().await;
+        structures.finish();
+        token.finish();
+        metadata.finish();
+        jwks.finish();
+        database.destroy().await;
+    }
+}
+
+#[tokio::test]
+async fn repeated_structure_401_degrades_globally_without_access_denial_for_another_structure() {
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let clock = Arc::new(FixedStructureResolverClock::new(now));
+    let token = signed_resolver_access_token();
+    let jwks_server = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+        ),
+    );
+    let metadata_server = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks_server.base_url),
+    );
+    let token_body = Box::leak(format!(r#"{{"access_token":"{token}"}}"#).into_boxed_str());
+    let token_server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: token_body,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: token_body,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: token_body,
+        },
+    ]);
+    let structure_server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 401,
+            headers: vec![],
+            body: "",
+        },
+        WireReply {
+            status: 401,
+            headers: vec![],
+            body: "",
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+            body: r#"{"solar_system_id":30002086}"#,
+        },
+    ]);
+    let resolver = AuthenticatedStructureResolver::with_endpoints_and_clock(
+        resolver_test_config(),
+        &structure_server.base_url,
+        format!("{}token", token_server.base_url),
+        format!("{}metadata", metadata_server.base_url),
+        Duration::from_secs(1),
+        clock.clone(),
+    )
+    .expect("resolver");
+    let error = resolver
+        .resolve_structure(1_024_000_001)
+        .await
+        .expect_err("second 401 remains degraded");
+    assert_eq!(
+        error.kind(),
+        killbot_rust::structure_resolver::StructureResolverFailureKind::Degraded
+    );
+    let second = resolver
+        .resolve_structure(1_024_000_002)
+        .await
+        .expect_err("global 401 degradation blocks another structure before another request");
+    assert!(second.is_global_auth_failure());
+    assert_eq!(token_server.requests.lock().unwrap().len(), 2);
+    assert_eq!(structure_server.requests.lock().unwrap().len(), 2);
+    clock.advance(chrono::Duration::seconds(31));
+    resolver
+        .resolve_structure(1_024_000_003)
+        .await
+        .expect("the terminally rejected refreshed JWT is evicted before the retry deadline ends");
+    assert_eq!(token_server.requests.lock().unwrap().len(), 3);
+    assert_eq!(structure_server.requests.lock().unwrap().len(), 3);
+    structure_server.finish();
+    token_server.finish();
+    metadata_server.finish();
+    jwks_server.finish();
+}
+
+async fn prepare_resolver_global_deadline_collection(
+    store: &ContractCollectionStore,
+    now: DateTime<Utc>,
+) {
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(vec![], HashMap::new())),
+    )
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+    .with_request_pacer(Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    }))
+    .collect_cycle()
+    .await
+    .expect("establish the silent regional baseline");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "resolver-global-deadline".to_string(),
+            description: "requires authenticated structure location precision".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                    config::SystemRange {
+                        system_id: 30_002_086,
+                        range: 1.0,
+                    },
+                ])),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist structure-resolution subscription");
+    store
+        .initialize_structure_resolver_runtime(&resolver_test_config().runtime_status(), now)
+        .await
+        .expect("initialize resolver runtime before its first authenticated request");
+}
+
+fn resolver_deadline_collector(
+    store: ContractCollectionStore,
+    contracts: Vec<PublicContract>,
+    resolver: Arc<AuthenticatedStructureResolver>,
+    now: DateTime<Utc>,
+) -> ContractCollector {
+    resolver_deadline_collector_with_request_pacer(
+        store,
+        contracts,
+        resolver,
+        now,
+        Arc::new(AdvancingRequestPacer {
+            now: StdMutex::new(now),
+            waits: StdMutex::new(Vec::new()),
+        }),
+    )
+}
+
+fn resolver_deadline_collector_with_request_pacer(
+    store: ContractCollectionStore,
+    contracts: Vec<PublicContract>,
+    resolver: Arc<AuthenticatedStructureResolver>,
+    now: DateTime<Utc>,
+    request_pacer: Arc<AdvancingRequestPacer>,
+) -> ContractCollector {
+    let items = contracts
+        .iter()
+        .map(|contract| {
+            (
+                contract.contract_id,
+                Ok(EsiResponse::fresh(vec![], expiring_cache())),
+            )
+        })
+        .collect();
+    ContractCollector::new(
+        store,
+        Arc::new(PositionEsi {
+            inner: regional_esi(contracts, items),
+            contexts: HashMap::new(),
+            positions: HashMap::new(),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::new())),
+        Arc::new(NoopDelivery),
+    )
+    .with_structure_resolver(resolver)
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+    .with_request_pacer(request_pacer)
+}
+
+#[tokio::test]
+async fn collector_persists_post_refresh_401_global_deadline_across_restart() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let resolver_clock = Arc::new(FixedStructureResolverClock::new(now));
+    let first = PublicContract {
+        start_location_id: 1_024_000_071,
+        end_location_id: Some(1_024_000_071),
+        ..item_exchange_contract(71)
+    };
+    let different_after_restart = PublicContract {
+        start_location_id: 1_024_000_072,
+        end_location_id: Some(1_024_000_072),
+        ..item_exchange_contract(72)
+    };
+    prepare_resolver_global_deadline_collection(&store, now).await;
+
+    let token = signed_resolver_access_token();
+    let jwks_server = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+        ),
+    );
+    let metadata_server = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks_server.base_url),
+    );
+    let token_body = Box::leak(format!(r#"{{"access_token":"{token}"}}"#).into_boxed_str());
+    let token_server = ControlledHttpServer::start(
+        vec![
+            WireReply {
+                status: 200,
+                headers: vec![],
+                body: token_body,
+            },
+            WireReply {
+                status: 200,
+                headers: vec![],
+                body: token_body,
+            },
+        ],
+        WireReply {
+            status: 500,
+            headers: vec![],
+            body: "",
+        },
+    );
+    let structure_server = ControlledHttpServer::start(
+        vec![
+            WireReply {
+                status: 401,
+                headers: vec![],
+                body: "",
+            },
+            WireReply {
+                status: 401,
+                headers: vec![],
+                body: "",
+            },
+        ],
+        WireReply {
+            status: 500,
+            headers: vec![],
+            body: "",
+        },
+    );
+    let resolver = Arc::new(
+        AuthenticatedStructureResolver::with_endpoints_and_clock(
+            resolver_test_config(),
+            &structure_server.base_url,
+            format!("{}token", token_server.base_url),
+            format!("{}metadata", metadata_server.base_url),
+            Duration::from_secs(1),
+            resolver_clock.clone(),
+        )
+        .expect("construct first resolver"),
+    );
+    resolver_deadline_collector(store, vec![first.clone()], resolver, now)
+        .collect_cycle()
+        .await
+        .expect("terminal resolver authorization failure only reduces location precision");
+    assert_eq!(token_server.requests.lock().unwrap().len(), 2);
+    assert_eq!(structure_server.requests.lock().unwrap().len(), 2);
+
+    let restarted = database.store().await;
+    let restarted_resolver = Arc::new(
+        AuthenticatedStructureResolver::with_endpoints_and_clock(
+            resolver_test_config(),
+            &structure_server.base_url,
+            format!("{}token", token_server.base_url),
+            format!("{}metadata", metadata_server.base_url),
+            Duration::from_secs(1),
+            resolver_clock,
+        )
+        .expect("construct restarted resolver"),
+    );
+    resolver_deadline_collector(
+        restarted.clone(),
+        vec![first.clone(), different_after_restart.clone()],
+        restarted_resolver,
+        now,
+    )
+    .collect_cycle()
+    .await
+    .expect("persisted resolver deadline does not block public collection after restart");
+    assert_eq!(token_server.requests.lock().unwrap().len(), 2);
+    assert_eq!(structure_server.requests.lock().unwrap().len(), 2);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect resolver global deadline");
+    assert_eq!(
+        sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT next_attempt_at FROM structure_resolver_backoff WHERE singleton = TRUE",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read persisted fallback deadline"),
+        now + chrono::Duration::seconds(30)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM structure_resolution_state WHERE structure_id = $1",
+        )
+        .bind(different_after_restart.start_location_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count inadmissible restarted structure state"),
+        0,
+        "the resolver-wide deadline must not create a per-structure denial or parking record"
+    );
+    let first_state: (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT first_denied_at, parked_at FROM structure_resolution_state WHERE structure_id = $1",
+    )
+    .bind(first.start_location_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read terminal authorization structure state");
+    assert_eq!(first_state, (None, None));
+    pool.close().await;
+    structure_server.finish();
+    token_server.finish();
+    metadata_server.finish();
+    jwks_server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_structure_401_rate_headers_pause_the_next_public_esi_wire() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let resolver_clock = Arc::new(FixedStructureResolverClock::new(now));
+    let contract = PublicContract {
+        start_location_id: 1_024_000_073,
+        end_location_id: Some(1_024_000_073),
+        ..item_exchange_contract(73)
+    };
+    prepare_resolver_global_deadline_collection(&store, now).await;
+    let access_token = signed_resolver_access_token();
+    let jwks = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+        ),
+    );
+    let metadata = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks.base_url),
+    );
+    let token_body = Box::leak(format!(r#"{{"access_token":"{access_token}"}}"#).into_boxed_str());
+    let token = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: token_body,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: token_body,
+        },
+    ]);
+    let structures = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 401,
+            headers: vec![],
+            body: "",
+        },
+        WireReply {
+            status: 401,
+            headers: vec![
+                ("Retry-After", "60"),
+                ("X-ESI-Error-Limit-Remain", "0"),
+                ("X-ESI-Error-Limit-Reset", "120"),
+                ("X-Ratelimit-Group", "structures"),
+            ],
+            body: "",
+        },
+    ]);
+    let resolver = Arc::new(
+        AuthenticatedStructureResolver::with_endpoints_and_clock(
+            resolver_test_config(),
+            &structures.base_url,
+            format!("{}token", token.base_url),
+            format!("{}metadata", metadata.base_url),
+            Duration::from_secs(1),
+            resolver_clock,
+        )
+        .expect("construct resolver"),
+    );
+    resolver_deadline_collector(store, vec![contract], resolver, now)
+        .collect_cycle()
+        .await
+        .expect("terminal resolver authorization failure reduces only location precision");
+    assert_eq!(token.requests.lock().unwrap().len(), 2);
+    assert_eq!(structures.requests.lock().unwrap().len(), 2);
+
+    let public_after_structure_401 = Arc::new(ConditionalEsi::default());
+    let blocked =
+        ContractCollector::new(database.store().await, public_after_structure_401.clone())
+            .with_request_pacer(Arc::new(AdvancingRequestPacer {
+                now: StdMutex::new(now),
+                waits: StdMutex::new(Vec::new()),
+            }))
+            .collect_cycle()
+            .await
+            .expect_err("actual structure ESI rate headers pause the next public ESI wire");
+    assert!(blocked
+        .to_string()
+        .contains("persisted global ESI limiter boundary remains active"));
+    assert!(public_after_structure_401
+        .received_etags
+        .lock()
+        .unwrap()
+        .is_empty());
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect persisted actual structure response metadata");
+    let limiter: (DateTime<Utc>, Option<i64>, Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT pause_until, error_limit_remain, error_limit_reset, rate_limit_group FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("actual structure 401 records the shared ESI limiter");
+    assert_eq!(limiter.0, now + chrono::Duration::seconds(60));
+    assert_eq!(limiter.1, Some(0));
+    assert_eq!(limiter.2, Some(120));
+    assert_eq!(limiter.3.as_deref(), Some("structures"));
+    pool.close().await;
+    structures.finish();
+    token.finish();
+    metadata.finish();
+    jwks.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn first_structure_401_metadata_blocks_public_esi_without_forcing_a_token_refresh() {
+    for failure in ["deferred"] {
+        let database = TemporaryDatabase::new().await;
+        let store = database.store().await;
+        let now = database.now().await;
+        let resolver_clock = Arc::new(FixedStructureResolverClock::new(now));
+        let contract = PublicContract {
+            start_location_id: 1_024_000_074,
+            end_location_id: Some(1_024_000_074),
+            ..item_exchange_contract(74)
+        };
+        prepare_resolver_global_deadline_collection(&store, now).await;
+        let access_token = signed_resolver_access_token();
+        let jwks = OneShotHttpServer::start(
+            200,
+            &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+            &format!(
+                r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+            ),
+        );
+        let metadata = OneShotHttpServer::start(
+            200,
+            &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+            &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks.base_url),
+        );
+        let token_body =
+            Box::leak(format!(r#"{{"access_token":"{access_token}"}}"#).into_boxed_str());
+        let token = SequenceHttpServer::start(vec![WireReply {
+            status: 200,
+            headers: vec![],
+            body: token_body,
+        }]);
+        let structures = SequenceHttpServer::start(vec![WireReply {
+            status: 401,
+            headers: vec![
+                ("Retry-After", "60"),
+                ("X-ESI-Error-Limit-Remain", "0"),
+                ("X-ESI-Error-Limit-Reset", "120"),
+                ("X-Ratelimit-Group", "structures"),
+            ],
+            body: "",
+        }]);
+        let resolver = Arc::new(
+            AuthenticatedStructureResolver::with_endpoints_and_clock(
+                resolver_test_config(),
+                &structures.base_url,
+                format!("{}token", token.base_url),
+                format!("{}metadata", metadata.base_url),
+                Duration::from_secs(1),
+                resolver_clock,
+            )
+            .expect("construct resolver"),
+        );
+        resolver_deadline_collector(store, vec![contract], resolver, now)
+            .collect_cycle()
+            .await
+            .expect("resolver failure only reduces location precision");
+        assert_eq!(structures.requests.lock().unwrap().len(), 1, "{failure}");
+        assert_eq!(token.requests.lock().unwrap().len(), 1, "{failure}");
+
+        let public_after_structure_401 = Arc::new(ConditionalEsi::default());
+        let blocked =
+            ContractCollector::new(database.store().await, public_after_structure_401.clone())
+                .with_request_pacer(Arc::new(AdvancingRequestPacer {
+                    now: StdMutex::new(now),
+                    waits: StdMutex::new(Vec::new()),
+                }))
+                .collect_cycle()
+                .await
+                .expect_err(
+                    "the retained first structure response must block the next public ESI wire",
+                );
+        assert!(
+            blocked
+                .to_string()
+                .contains("persisted global ESI limiter boundary remains active"),
+            "{failure}"
+        );
+        assert!(
+            public_after_structure_401
+                .received_etags
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "{failure}"
+        );
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database.url)
+            .await
+            .expect("inspect first structure response limiter metadata");
+        let limiter: (DateTime<Utc>, Option<i64>, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT pause_until, error_limit_remain, error_limit_reset, rate_limit_group FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read retained first structure response limiter metadata");
+        assert_eq!(limiter.0, now + chrono::Duration::seconds(60), "{failure}");
+        assert_eq!(limiter.1, Some(0), "{failure}");
+        assert_eq!(limiter.2, Some(120), "{failure}");
+        assert_eq!(limiter.3.as_deref(), Some("structures"), "{failure}");
+        pool.close().await;
+        structures.finish();
+        token.finish();
+        metadata.finish();
+        jwks.finish();
+        database.destroy().await;
+    }
+}
+
+#[tokio::test]
+async fn structure_401_limiter_boundary_defers_refresh_and_never_reuses_error_representation() {
+    for (label, status, headers, body, expected_etag) in [
+        (
+            "fresh representation",
+            200,
+            vec![
+                ("ETag", "clean-after"),
+                ("Expires", "Wed, 21 Oct 2099 07:28:00 GMT"),
+            ],
+            r#"{"solar_system_id":30002086}"#,
+            "clean-after",
+        ),
+        (
+            "revalidated representation",
+            304,
+            vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+            "",
+            "clean-before",
+        ),
+    ] {
+        let database = TemporaryDatabase::new().await;
+        let store = database.store().await;
+        let now = database.now().await;
+        let resolver_clock = Arc::new(FixedStructureResolverClock::new(now));
+        let later = now + chrono::Duration::seconds(61);
+        let contract = PublicContract {
+            start_location_id: 1_024_000_090,
+            end_location_id: Some(1_024_000_090),
+            ..item_exchange_contract(90)
+        };
+        prepare_resolver_global_deadline_collection(&store, now).await;
+        let generation = match store
+            .reserve_structure_resolution(contract.start_location_id, "1", now)
+            .await
+            .expect("admit a stale clean representation")
+        {
+            StructureResolutionAdmission::Attempt { generation, .. } => generation,
+            admission => panic!("expected resolver admission, got {admission:?}"),
+        };
+        assert!(store
+            .record_structure_resolution_success(
+                &killbot_rust::structure_resolver::ResolvedStructure {
+                    structure_id: contract.start_location_id,
+                    solar_system_id: 30_002_086,
+                    observed_at: now - chrono::Duration::hours(1),
+                    expires_at: Some(now),
+                    etag: Some("clean-before".to_string()),
+                    response_metadata: CacheMetadata::cached_for_seconds(0),
+                    representation_cacheable: true,
+                },
+                "1",
+                generation,
+                now,
+            )
+            .await
+            .expect("persist stale clean representation"));
+
+        let access_token = signed_resolver_access_token();
+        let jwks = OneShotHttpServer::start(
+            200,
+            &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+            &format!(
+                r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+            ),
+        );
+        let metadata = OneShotHttpServer::start(
+            200,
+            &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+            &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks.base_url),
+        );
+        let token_body =
+            Box::leak(format!(r#"{{"access_token":"{access_token}"}}"#).into_boxed_str());
+        let token = SequenceHttpServer::start(vec![
+            WireReply {
+                status: 200,
+                headers: vec![],
+                body: token_body,
+            },
+            WireReply {
+                status: 200,
+                headers: vec![],
+                body: token_body,
+            },
+        ]);
+        let structures = SequenceHttpServer::start(vec![
+            WireReply {
+                status: 401,
+                headers: vec![
+                    ("ETag", "error-validator"),
+                    ("Expires", "Wed, 21 Oct 2099 07:28:00 GMT"),
+                    ("Cache-Control", "max-age=7200"),
+                    ("Retry-After", "60"),
+                    ("X-ESI-Error-Limit-Remain", "0"),
+                    ("X-ESI-Error-Limit-Reset", "120"),
+                    ("X-Ratelimit-Group", "structures"),
+                ],
+                body: "",
+            },
+            WireReply {
+                status,
+                headers,
+                body,
+            },
+        ]);
+        let resolver = Arc::new(
+            AuthenticatedStructureResolver::with_endpoints_and_clock(
+                resolver_test_config(),
+                &structures.base_url,
+                format!("{}token", token.base_url),
+                format!("{}metadata", metadata.base_url),
+                Duration::from_secs(1),
+                resolver_clock.clone(),
+            )
+            .expect("construct resolver"),
+        );
+
+        resolver_deadline_collector(store, vec![contract.clone()], resolver.clone(), now)
+            .collect_cycle()
+            .await
+            .expect("a limited resolver refresh only reduces location precision");
+        assert_eq!(structures.requests.lock().unwrap().len(), 1, "{label}");
+        assert_eq!(token.requests.lock().unwrap().len(), 1, "{label}");
+
+        let public_after_structure_401 = Arc::new(ConditionalEsi::default());
+        let blocked =
+            ContractCollector::new(database.store().await, public_after_structure_401.clone())
+                .with_request_pacer(Arc::new(AdvancingRequestPacer {
+                    now: StdMutex::new(now),
+                    waits: StdMutex::new(Vec::new()),
+                }))
+                .collect_cycle()
+                .await
+                .expect_err("the actual 401 limiter boundary blocks public ESI before its wire");
+        assert!(blocked
+            .to_string()
+            .contains("persisted global ESI limiter boundary remains active"));
+        assert!(public_after_structure_401
+            .received_etags
+            .lock()
+            .unwrap()
+            .is_empty());
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database.url)
+            .await
+            .expect("inspect deferred resolver state");
+        let deferred: (Option<String>, Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT etag, cache_expires_at, next_attempt_at FROM structure_resolution_state WHERE structure_id = $1",
+        )
+        .bind(contract.start_location_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read deferred representation state");
+        assert_eq!(deferred.0.as_deref(), Some("clean-before"), "{label}");
+        assert_eq!(deferred.1, Some(now), "{label}");
+        assert_eq!(
+            deferred.2,
+            Some(now + chrono::Duration::seconds(60)),
+            "{label}"
+        );
+        sqlx::query(
+            "UPDATE esi_collection_limiter_state SET pause_until = $1 WHERE limiter_scope = TRUE",
+        )
+        .bind(Utc::now() - chrono::Duration::seconds(1))
+        .execute(&pool)
+        .await
+        .expect("advance the shared limiter beyond its controlled deadline");
+        pool.close().await;
+
+        resolver_deadline_collector(
+            database.store().await,
+            vec![contract.clone()],
+            resolver,
+            later,
+        )
+        .collect_cycle()
+        .await
+        .expect("a later cycle refreshes the evicted token and structure");
+        assert_eq!(structures.requests.lock().unwrap().len(), 2, "{label}");
+        assert_eq!(token.requests.lock().unwrap().len(), 2, "{label}");
+        {
+            let requests = structures.requests.lock().unwrap();
+            assert!(
+                requests[1].to_ascii_lowercase().contains("if-none-match")
+                    && requests[1].contains("clean-before"),
+                "{label}"
+            );
+            assert!(!requests[1].contains("error-validator"), "{label}");
+        }
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database.url)
+            .await
+            .expect("inspect refreshed representation");
+        let refreshed: (Option<String>, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT etag, solar_system_id, cache_expires_at FROM structure_resolution_state WHERE structure_id = $1",
+        )
+        .bind(contract.start_location_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read clean refreshed representation");
+        assert_eq!(refreshed.0.as_deref(), Some(expected_etag), "{label}");
+        assert_eq!(refreshed.1, 30_002_086, "{label}");
+        assert_eq!(
+            refreshed.2,
+            Some(Utc.with_ymd_and_hms(2099, 10, 21, 7, 28, 0).unwrap()),
+            "{label}"
+        );
+        pool.close().await;
+        structures.finish();
+        token.finish();
+        metadata.finish();
+        jwks.finish();
+        database.destroy().await;
+    }
+}
+
+#[tokio::test]
+async fn structure_401_and_refreshed_response_accumulate_independent_limiter_tuples() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let resolver_clock = Arc::new(FixedStructureResolverClock::new(now));
+    let contract = PublicContract {
+        start_location_id: 1_024_000_092,
+        end_location_id: Some(1_024_000_092),
+        ..item_exchange_contract(92)
+    };
+    prepare_resolver_global_deadline_collection(&store, now).await;
+    let access_token = signed_resolver_access_token();
+    let jwks = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+        ),
+    );
+    let metadata = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks.base_url),
+    );
+    let token_body = Box::leak(format!(r#"{{"access_token":"{access_token}"}}"#).into_boxed_str());
+    let token = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: token_body,
+        },
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: token_body,
+        },
+    ]);
+    let structures = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 401,
+            headers: vec![
+                ("ETag", "error-validator"),
+                ("Expires", "Wed, 21 Oct 2099 07:28:00 GMT"),
+                ("Cache-Control", "max-age=7200"),
+                ("X-ESI-Error-Limit-Remain", "99"),
+                ("X-ESI-Error-Limit-Reset", "60"),
+            ],
+            body: "",
+        },
+        WireReply {
+            status: 200,
+            headers: vec![
+                ("ETag", "clean-validator"),
+                ("Cache-Control", "max-age=3600"),
+                ("X-Ratelimit-Group", "structures"),
+                ("X-Ratelimit-Limit", "100/60s"),
+                ("X-Ratelimit-Remaining", "50"),
+                ("X-Ratelimit-Used", "50"),
+            ],
+            body: r#"{"solar_system_id":30002086}"#,
+        },
+    ]);
+    let resolver = Arc::new(
+        AuthenticatedStructureResolver::with_endpoints_and_clock(
+            resolver_test_config(),
+            &structures.base_url,
+            format!("{}token", token.base_url),
+            format!("{}metadata", metadata.base_url),
+            Duration::from_secs(1),
+            resolver_clock,
+        )
+        .expect("construct resolver"),
+    );
+
+    resolver_deadline_collector(store, vec![contract.clone()], resolver, now)
+        .collect_cycle()
+        .await
+        .expect("non-pausing limiter observations retain clean structure resolution");
+    assert_eq!(structures.requests.lock().unwrap().len(), 2);
+    assert_eq!(token.requests.lock().unwrap().len(), 2);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect accumulated limiter state");
+    let limiter: PersistedEsiLimiter = sqlx::query_as(
+        "SELECT error_limit_remain, error_limit_reset, rate_limit_group, rate_limit_limit, rate_limit_remaining, rate_limit_used FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read accumulated limiter tuples");
+    assert_eq!(limiter.0, Some(99));
+    assert_eq!(limiter.1, Some(60));
+    assert_eq!(limiter.2.as_deref(), Some("structures"));
+    assert_eq!(limiter.3.as_deref(), Some("100/60s"));
+    assert_eq!(limiter.4, Some(50));
+    assert_eq!(limiter.5, Some(50));
+    let representation: (Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT etag, cache_expires_at FROM structure_resolution_state WHERE structure_id = $1",
+    )
+    .bind(contract.start_location_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read clean persisted representation");
+    assert_eq!(representation.0.as_deref(), Some("clean-validator"));
+    assert_eq!(
+        representation.1,
+        Some(now + chrono::Duration::hours(1)),
+        "only the refreshed 200 representation controls freshness"
+    );
+    pool.close().await;
+    structures.finish();
+    token.finish();
+    metadata.finish();
+    jwks.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn no_store_structure_responses_discard_representations_but_honor_limiter_boundaries() {
+    for (label, status, body) in [
+        (
+            "successful response",
+            200,
+            r#"{"solar_system_id":30002086}"#,
+        ),
+        ("transient response", 500, ""),
+    ] {
+        let database = TemporaryDatabase::new().await;
+        let store = database.store().await;
+        let now = database.now().await;
+        let resolver_clock = Arc::new(FixedStructureResolverClock::new(now));
+        let later = now + chrono::Duration::seconds(61);
+        let contract = PublicContract {
+            start_location_id: 1_024_000_091,
+            end_location_id: Some(1_024_000_091),
+            ..item_exchange_contract(91)
+        };
+        prepare_resolver_global_deadline_collection(&store, now).await;
+        let generation = match store
+            .reserve_structure_resolution(contract.start_location_id, "1", now)
+            .await
+            .expect("admit a stale clean representation")
+        {
+            StructureResolutionAdmission::Attempt { generation, .. } => generation,
+            admission => panic!("expected resolver admission, got {admission:?}"),
+        };
+        assert!(store
+            .record_structure_resolution_success(
+                &killbot_rust::structure_resolver::ResolvedStructure {
+                    structure_id: contract.start_location_id,
+                    solar_system_id: 30_002_086,
+                    observed_at: now - chrono::Duration::hours(1),
+                    expires_at: Some(now),
+                    etag: Some("clean-before".to_string()),
+                    response_metadata: CacheMetadata::cached_for_seconds(0),
+                    representation_cacheable: true,
+                },
+                "1",
+                generation,
+                now,
+            )
+            .await
+            .expect("persist stale clean representation"));
+
+        let access_token = signed_resolver_access_token();
+        let jwks = OneShotHttpServer::start(
+            200,
+            &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+            &format!(
+                r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+            ),
+        );
+        let metadata = OneShotHttpServer::start(
+            200,
+            &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+            &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks.base_url),
+        );
+        let token_body =
+            Box::leak(format!(r#"{{"access_token":"{access_token}"}}"#).into_boxed_str());
+        let token = SequenceHttpServer::start(vec![WireReply {
+            status: 200,
+            headers: vec![],
+            body: token_body,
+        }]);
+        let no_store_headers = vec![
+            ("Cache-Control", "no-store, max-age=7200"),
+            ("ETag", "no-store-validator"),
+            ("Expires", "Wed, 21 Oct 2099 07:28:00 GMT"),
+            ("Retry-After", "60"),
+            ("X-ESI-Error-Limit-Remain", "0"),
+            ("X-ESI-Error-Limit-Reset", "120"),
+            ("X-Ratelimit-Group", "structures"),
+        ];
+        let structures = SequenceHttpServer::start(vec![
+            WireReply {
+                status,
+                headers: no_store_headers.clone(),
+                body,
+            },
+            WireReply {
+                status,
+                headers: no_store_headers,
+                body,
+            },
+        ]);
+        let resolver = Arc::new(
+            AuthenticatedStructureResolver::with_endpoints_and_clock(
+                resolver_test_config(),
+                &structures.base_url,
+                format!("{}token", token.base_url),
+                format!("{}metadata", metadata.base_url),
+                Duration::from_secs(1),
+                resolver_clock.clone(),
+            )
+            .expect("construct resolver"),
+        );
+
+        resolver_deadline_collector(store, vec![contract.clone()], resolver.clone(), now)
+            .collect_cycle()
+            .await
+            .expect("no-store resolver response only reduces location precision");
+        assert_eq!(structures.requests.lock().unwrap().len(), 1, "{label}");
+        let public_after_no_store = Arc::new(ConditionalEsi::default());
+        let blocked = ContractCollector::new(database.store().await, public_after_no_store.clone())
+            .with_request_pacer(Arc::new(AdvancingRequestPacer {
+                now: StdMutex::new(now),
+                waits: StdMutex::new(Vec::new()),
+            }))
+            .collect_cycle()
+            .await
+            .expect_err("no-store must not discard its genuine ESI limiter boundary");
+        assert!(blocked
+            .to_string()
+            .contains("persisted global ESI limiter boundary remains active"));
+        assert!(public_after_no_store
+            .received_etags
+            .lock()
+            .unwrap()
+            .is_empty());
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database.url)
+            .await
+            .expect("inspect no-store structure state");
+        let persisted: PersistedStructureRepresentation = sqlx::query_as(
+            "SELECT etag, solar_system_id, observed_at, cache_expires_at, next_attempt_at FROM structure_resolution_state WHERE structure_id = $1",
+        )
+        .bind(contract.start_location_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read no-store structure state");
+        assert_eq!(persisted.0, None, "{label}");
+        assert_eq!(persisted.1, None, "{label}");
+        assert_eq!(persisted.2, None, "{label}");
+        assert_eq!(persisted.3, None, "{label}");
+        assert_eq!(
+            persisted.4,
+            Some(now + chrono::Duration::seconds(60)),
+            "{label}"
+        );
+        sqlx::query(
+            "UPDATE esi_collection_limiter_state SET pause_until = $1 WHERE limiter_scope = TRUE",
+        )
+        .bind(Utc::now() - chrono::Duration::seconds(1))
+        .execute(&pool)
+        .await
+        .expect("advance the shared limiter beyond its controlled deadline");
+        pool.close().await;
+
+        let retried =
+            resolver_deadline_collector(database.store().await, vec![contract], resolver, later)
+                .collect_cycle()
+                .await
+                .expect_err("the retried no-store response re-establishes its limiter boundary");
+        assert!(
+            retried
+                .to_string()
+                .contains("persisted global ESI limiter boundary remains active"),
+            "{label}"
+        );
+        assert_eq!(structures.requests.lock().unwrap().len(), 2, "{label}");
+        {
+            let requests = structures.requests.lock().unwrap();
+            assert!(
+                !requests[1].to_ascii_lowercase().contains("if-none-match")
+                    && !requests[1].contains("no-store-validator"),
+                "{label}"
+            );
+        }
+        structures.finish();
+        token.finish();
+        metadata.finish();
+        jwks.finish();
+        database.destroy().await;
+    }
+}
+
+#[tokio::test]
+async fn transient_structure_response_expires_after_restart_before_another_wire_attempt() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let expires_at = Utc.with_ymd_and_hms(2099, 10, 21, 7, 28, 0).unwrap();
+    let contract = PublicContract {
+        start_location_id: 1_024_000_075,
+        end_location_id: Some(1_024_000_075),
+        ..item_exchange_contract(75)
+    };
+    prepare_resolver_global_deadline_collection(&store, now).await;
+    let access_token = signed_resolver_access_token();
+    let jwks = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+        ),
+    );
+    let metadata = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks.base_url),
+    );
+    let token_body = Box::leak(format!(r#"{{"access_token":"{access_token}"}}"#).into_boxed_str());
+    let token = SequenceHttpServer::start(vec![WireReply {
+        status: 200,
+        headers: vec![],
+        body: token_body,
+    }]);
+    let structures = SequenceHttpServer::start(vec![WireReply {
+        status: 500,
+        headers: vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        body: "",
+    }]);
+    let resolver = Arc::new(
+        AuthenticatedStructureResolver::with_endpoints(
+            resolver_test_config(),
+            &structures.base_url,
+            format!("{}token", token.base_url),
+            format!("{}metadata", metadata.base_url),
+            Duration::from_secs(1),
+        )
+        .expect("construct resolver"),
+    );
+    resolver_deadline_collector(store, vec![contract.clone()], resolver, now)
+        .collect_cycle()
+        .await
+        .expect("transient structure response only reduces location precision");
+    assert_eq!(structures.requests.lock().unwrap().len(), 1);
+
+    let restarted = database.store().await;
+    assert_eq!(
+        restarted
+            .reserve_structure_resolution(
+                contract.start_location_id,
+                "1",
+                now + chrono::Duration::minutes(1),
+            )
+            .await
+            .expect("persisted cache boundary controls restart admission"),
+        StructureResolutionAdmission::WaitUntil(expires_at),
+        "a future structure response expiry without Retry-After must prevent an early retry"
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect persisted transient cache deadline");
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT next_attempt_at FROM structure_resolution_state WHERE structure_id = $1",
+        )
+        .bind(contract.start_location_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read persisted cache boundary"),
+        Some(expires_at)
+    );
+    pool.close().await;
+    structures.finish();
+    token.finish();
+    metadata.finish();
+    jwks.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn collector_persists_token_retry_after_globally_across_restart() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let retry_after = Utc.with_ymd_and_hms(2099, 10, 21, 7, 28, 0).unwrap();
+    let due_first = PublicContract {
+        start_location_id: 1_024_000_081,
+        end_location_id: Some(1_024_000_081),
+        ..item_exchange_contract(81)
+    };
+    let due_second = PublicContract {
+        start_location_id: 1_024_000_082,
+        end_location_id: Some(1_024_000_082),
+        ..item_exchange_contract(82)
+    };
+    let different_after_restart = PublicContract {
+        start_location_id: 1_024_000_083,
+        end_location_id: Some(1_024_000_083),
+        ..item_exchange_contract(83)
+    };
+    prepare_resolver_global_deadline_collection(&store, now).await;
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "public-progress-despite-token-rate-limit".to_string(),
+            description: "public delivery must continue during resolver token backoff".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::Condition(ContractFilterCondition::EventKinds(vec![
+                    ContractEventKind::Listed,
+                ])),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist public progress subscription");
+
+    let token_server = ControlledHttpServer::start(
+        vec![WireReply {
+            status: 429,
+            headers: vec![("Retry-After", "Wed, 21 Oct 2099 07:28:00 GMT")],
+            body: "",
+        }],
+        WireReply {
+            status: 500,
+            headers: vec![],
+            body: "",
+        },
+    );
+    let structure_server = ControlledHttpServer::start(
+        vec![],
+        WireReply {
+            status: 500,
+            headers: vec![],
+            body: "",
+        },
+    );
+    let resolver = Arc::new(
+        AuthenticatedStructureResolver::with_endpoints(
+            resolver_test_config(),
+            &structure_server.base_url,
+            format!("{}token", token_server.base_url),
+            "http://127.0.0.1:9/metadata".to_string(),
+            Duration::from_secs(1),
+        )
+        .expect("construct first resolver"),
+    );
+    resolver_deadline_collector(
+        store,
+        vec![due_first.clone(), due_second.clone()],
+        resolver,
+        now,
+    )
+    .collect_cycle()
+    .await
+    .expect("token rate limiting only reduces authenticated location precision");
+    assert_eq!(token_server.requests.lock().unwrap().len(), 1);
+    assert!(structure_server.requests.lock().unwrap().is_empty());
+
+    let restarted = database.store().await;
+    let restarted_resolver = Arc::new(
+        AuthenticatedStructureResolver::with_endpoints(
+            resolver_test_config(),
+            &structure_server.base_url,
+            format!("{}token", token_server.base_url),
+            "http://127.0.0.1:9/metadata".to_string(),
+            Duration::from_secs(1),
+        )
+        .expect("construct restarted resolver"),
+    );
+    resolver_deadline_collector(
+        restarted.clone(),
+        vec![due_first, due_second, different_after_restart.clone()],
+        restarted_resolver,
+        now,
+    )
+    .collect_cycle()
+    .await
+    .expect("the persisted token Retry-After does not block public collection after restart");
+    assert_eq!(token_server.requests.lock().unwrap().len(), 1);
+    assert!(structure_server.requests.lock().unwrap().is_empty());
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect persisted exact token deadline");
+    assert_eq!(
+        sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT next_attempt_at FROM structure_resolver_backoff WHERE singleton = TRUE",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read persisted token Retry-After"),
+        retry_after
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM structure_resolution_state WHERE structure_id = $1",
+        )
+        .bind(different_after_restart.start_location_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count inadmissible restarted structure state"),
+        0,
+        "the resolver-wide token deadline must not create a per-structure denial or parking record"
+    );
+    assert!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM regional_observation_batches WHERE completed_at IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count public regional batches")
+            >= 3,
+        "token backoff cannot replace the restarted public batch"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM regional_epoch_contract_presence WHERE contract_id = $1",
+        )
+        .bind(different_after_restart.contract_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read restarted public contract"),
+        1,
+        "token backoff cannot prevent public contract retention"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM contract_outbound_deliveries WHERE subscription_id = $1 AND contract_id = $2 AND status = 'sent'",
+        )
+        .bind("public-progress-despite-token-rate-limit")
+        .bind(different_after_restart.contract_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read resolver-independent public delivery"),
+        1,
+        "token rate limiting must still produce an observable public delivery"
+    );
+    pool.close().await;
+    structure_server.finish();
+    token_server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn rotated_refresh_token_is_memory_only_and_used_by_the_next_refresh_without_redaction_leaks()
+{
+    let access_token = signed_resolver_access_token_with(
+        vec!["existing-eve-application", "EVE Online"],
+        (Utc::now() + chrono::Duration::seconds(10)).timestamp() as usize,
+        "https://login.eveonline.com/",
+        vec!["esi-universe.read_structures.v1"],
+        "CHARACTER:EVE:90000001",
+        "resolver-test-key",
+    );
+    let jwks_server = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+        ),
+    );
+    let metadata_server = OneShotHttpServer::start(
+        200,
+        &[("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks_server.base_url),
+    );
+    let token_server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![],
+            body: Box::leak(
+                format!(
+                    r#"{{"access_token":"{access_token}","refresh_token":"rotated-refresh-secret"}}"#
+                )
+                .into_boxed_str(),
+            ),
+        },
+        WireReply {
+            status: 401,
+            headers: vec![],
+            body: r#"{"error":"invalid_grant","error_description":"rotated-refresh-secret"}"#,
+        },
+    ]);
+    let structure_server = SequenceHttpServer::start(vec![WireReply {
+        status: 200,
+        headers: vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        body: r#"{"solar_system_id":30002086}"#,
+    }]);
+    let resolver = AuthenticatedStructureResolver::with_endpoints(
+        resolver_test_config(),
+        &structure_server.base_url,
+        format!("{}token", token_server.base_url),
+        format!("{}metadata", metadata_server.base_url),
+        Duration::from_secs(1),
+    )
+    .expect("resolver HTTP client");
+    resolver
+        .resolve_structure(1_024_000_001)
+        .await
+        .expect("first refresh accepts the rotated secret only in process memory");
+    let error = resolver
+        .resolve_structure(1_024_000_002)
+        .await
+        .expect_err("second refresh consumes the rotated in-memory secret");
+    let requests = token_server.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("refresh_token=refresh-secret"));
+    assert!(requests[1].contains("refresh_token=rotated-refresh-secret"));
+    for secret in [
+        "refresh-secret",
+        "rotated-refresh-secret",
+        "application-secret",
+        &access_token,
+    ] {
+        assert!(!error.to_string().contains(secret));
+        assert!(!format!("{error:?}").contains(secret));
+    }
+    structure_server.finish();
+    token_server.finish();
+    metadata_server.finish();
+    jwks_server.finish();
+}
+
+#[tokio::test]
+async fn public_contract_discovery_never_carries_structure_resolver_authorization() {
+    let server = SequenceHttpServer::start(vec![WireReply {
+        status: 200,
+        headers: vec![],
+        body: "[10000002]",
+    }]);
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("public ESI client");
+    let regions = esi.regions(None).await.expect("public region discovery");
+    assert_eq!(regions.value, Some(vec![10_000_002]));
+    let request = server.requests.lock().unwrap()[0].to_ascii_lowercase();
+    assert!(!request.contains("authorization:"));
+    server.finish();
+}
+
+#[tokio::test]
+async fn structure_resolver_revalidates_expired_persisted_facts_after_restart() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let start = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let second_attempt_at = start + chrono::Duration::minutes(2);
+    let first_contract = PublicContract {
+        start_location_id: 1_024_000_001,
+        end_location_id: Some(1_024_000_001),
+        ..item_exchange_contract(44)
+    };
+    let second_contract = PublicContract {
+        start_location_id: 1_024_000_001,
+        end_location_id: Some(1_024_000_001),
+        ..item_exchange_contract(45)
+    };
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(vec![], HashMap::new())),
+    )
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(start))))
+    .with_request_pacer(Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(start),
+        waits: StdMutex::new(Vec::new()),
+    }))
+    .collect_cycle()
+    .await
+    .expect("establish the silent regional baseline");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "resolver-revalidation".to_string(),
+            description: "requires resolved structure proximity".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                    config::SystemRange {
+                        system_id: 30_002_086,
+                        range: 1.0,
+                    },
+                ])),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist structure-resolution subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let access_token = signed_resolver_access_token();
+    let structure_server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 200,
+            headers: vec![
+                ("ETag", "\"structure-v1\""),
+                ("Expires", "Wed, 21 Oct 2099 07:28:00 GMT"),
+            ],
+            body: r#"{"solar_system_id":30002086}"#,
+        },
+        WireReply {
+            status: 304,
+            headers: vec![("Expires", "Wed, 21 Oct 2099 08:28:00 GMT")],
+            body: "",
+        },
+    ]);
+    let first_jwks = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+        ),
+    );
+    let first_metadata = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(r#"{{"jwks_uri":"{}jwks"}}"#, first_jwks.base_url),
+    );
+    let first_token =
+        OneShotHttpServer::start(200, &[], &format!(r#"{{"access_token":"{access_token}"}}"#));
+    let resolver_config = || {
+        StructureResolverConfig::from_settings([
+            ("STRUCTURE_RESOLVER_ENABLED", "true"),
+            ("STRUCTURE_RESOLVER_CHARACTER_ID", "90000001"),
+            ("STRUCTURE_RESOLVER_REFRESH_TOKEN", "refresh-secret"),
+            ("EVE_CLIENT_ID", "existing-eve-application"),
+            ("EVE_CLIENT_SECRET", "application-secret"),
+        ])
+        .expect("resolver configuration")
+    };
+    initialize_resolver_runtime(&store, "1", start).await;
+    let first_resolver_clock = Arc::new(FixedStructureResolverClock::new(start));
+    let first_resolver = Arc::new(
+        AuthenticatedStructureResolver::with_endpoints_and_clock(
+            resolver_config(),
+            &structure_server.base_url,
+            format!("{}token", first_token.base_url),
+            format!("{}metadata", first_metadata.base_url),
+            Duration::from_secs(1),
+            first_resolver_clock,
+        )
+        .expect("first resolver client"),
+    );
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: regional_esi(
+                vec![first_contract.clone()],
+                HashMap::from([(
+                    first_contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![], expiring_cache())),
+                )]),
+            ),
+            contexts: HashMap::new(),
+            positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .with_structure_resolver(first_resolver)
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(start))))
+    .with_request_pacer(Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(start),
+        waits: StdMutex::new(Vec::new()),
+    }))
+    .collect_cycle()
+    .await
+    .expect("first authenticated structure response resolves the listed contract");
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect persisted resolver state");
+    sqlx::query("UPDATE structure_resolution_state SET cache_expires_at = $2, next_attempt_at = $2 WHERE structure_id = $1")
+        .bind(first_contract.start_location_id)
+        .bind(second_attempt_at - chrono::Duration::seconds(1))
+        .execute(&pool)
+        .await
+        .expect("expire the persisted structure cache under the controlled clock");
+    sqlx::query("UPDATE location_evidence SET expires_at = $2 WHERE location_id = $1 AND evidence_class = 'access_qualified' AND expired_at IS NULL AND superseded_at IS NULL")
+        .bind(first_contract.start_location_id)
+        .bind(second_attempt_at - chrono::Duration::seconds(1))
+        .execute(&pool)
+        .await
+        .expect("expire the retained evidence so the restarted collector must revalidate");
+    pool.close().await;
+    first_token.finish();
+    first_metadata.finish();
+    first_jwks.finish();
+
+    let second_jwks = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+        ),
+    );
+    let second_metadata = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(r#"{{"jwks_uri":"{}jwks"}}"#, second_jwks.base_url),
+    );
+    let second_token =
+        OneShotHttpServer::start(200, &[], &format!(r#"{{"access_token":"{access_token}"}}"#));
+    let restarted_resolver_clock = Arc::new(FixedStructureResolverClock::new(second_attempt_at));
+    let restarted_resolver = Arc::new(
+        AuthenticatedStructureResolver::with_endpoints_and_clock(
+            resolver_config(),
+            &structure_server.base_url,
+            format!("{}token", second_token.base_url),
+            format!("{}metadata", second_metadata.base_url),
+            Duration::from_secs(1),
+            restarted_resolver_clock,
+        )
+        .expect("restarted resolver client"),
+    );
+    ContractCollector::new(
+        database.store().await,
+        Arc::new(PositionEsi {
+            inner: regional_esi(
+                vec![first_contract, second_contract.clone()],
+                HashMap::from([
+                    (44, Ok(EsiResponse::fresh(vec![], expiring_cache()))),
+                    (45, Ok(EsiResponse::fresh(vec![], expiring_cache()))),
+                ]),
+            ),
+            contexts: HashMap::new(),
+            positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .with_structure_resolver(restarted_resolver)
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(
+        second_attempt_at,
+    ))))
+    .with_request_pacer(Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(second_attempt_at),
+        waits: StdMutex::new(Vec::new()),
+    }))
+    .collect_cycle()
+    .await
+    .expect("304 structure revalidation reuses persisted facts and keeps collection healthy");
+    assert_eq!(delivery.sent.lock().unwrap().len(), 2);
+    let requests = structure_server.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0]
+        .to_ascii_lowercase()
+        .contains(&format!("authorization: bearer {access_token}").to_ascii_lowercase()));
+    assert!(requests[1]
+        .to_ascii_lowercase()
+        .contains("if-none-match: \"structure-v1\""));
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect revalidated resolver cache");
+    let revalidated: (String, i64, DateTime<Utc>) = sqlx::query_as(
+        "SELECT etag, solar_system_id, cache_expires_at FROM structure_resolution_state WHERE structure_id = $1",
+    )
+    .bind(second_contract.start_location_id)
+    .fetch_one(&pool)
+    .await
+    .expect("persisted cached structure facts");
+    assert_eq!(revalidated.0, "\"structure-v1\"");
+    assert_eq!(revalidated.1, 30_002_086);
+    assert!(revalidated.2 > second_attempt_at);
+    let evidence = LocationEvidenceService::new(&database.store().await)
+        .resolve(second_contract.start_location_id, second_attempt_at)
+        .await
+        .expect("read revalidated evidence")
+        .expect("304 revalidation retains current access-qualified evidence");
+    assert_eq!(evidence.solar_system_id, 30_002_086);
+    pool.close().await;
+    second_token.finish();
+    second_metadata.finish();
+    second_jwks.finish();
+    structure_server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn structure_response_rate_boundaries_pause_the_next_public_collector_request() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let resolver_clock = Arc::new(FixedStructureResolverClock::new(now));
+    let contract = PublicContract {
+        start_location_id: 1_024_000_031,
+        end_location_id: Some(1_024_000_031),
+        ..item_exchange_contract(44)
+    };
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(vec![], HashMap::new())),
+    )
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+    .with_request_pacer(Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    }))
+    .collect_cycle()
+    .await
+    .expect("establish the silent regional baseline");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "resolver-rate-boundary".to_string(),
+            description: "requires resolved structure proximity".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                    config::SystemRange {
+                        system_id: 30_002_086,
+                        range: 1.0,
+                    },
+                ])),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist structure-resolution subscription");
+    let access_token = signed_resolver_access_token();
+    let jwks = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+        ),
+    );
+    let metadata = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(r#"{{"jwks_uri":"{}jwks"}}"#, jwks.base_url),
+    );
+    let token =
+        OneShotHttpServer::start(200, &[], &format!(r#"{{"access_token":"{access_token}"}}"#));
+    let structure_server = SequenceHttpServer::start(vec![WireReply {
+        status: 429,
+        headers: vec![
+            ("Retry-After", "60"),
+            ("X-ESI-Error-Limit-Remain", "0"),
+            ("X-ESI-Error-Limit-Reset", "120"),
+            ("X-Ratelimit-Group", "structures"),
+            ("X-Ratelimit-Limit", "20/60s"),
+            ("X-Ratelimit-Remaining", "0"),
+            ("X-Ratelimit-Used", "20"),
+        ],
+        body: r#"{"error":"rate limited"}"#,
+    }]);
+    let resolver = Arc::new(
+        AuthenticatedStructureResolver::with_endpoints_and_clock(
+            StructureResolverConfig::from_settings([
+                ("STRUCTURE_RESOLVER_ENABLED", "true"),
+                ("STRUCTURE_RESOLVER_CHARACTER_ID", "90000001"),
+                ("STRUCTURE_RESOLVER_REFRESH_TOKEN", "refresh-secret"),
+                ("EVE_CLIENT_ID", "existing-eve-application"),
+                ("EVE_CLIENT_SECRET", "application-secret"),
+            ])
+            .expect("resolver configuration"),
+            &structure_server.base_url,
+            format!("{}token", token.base_url),
+            format!("{}metadata", metadata.base_url),
+            Duration::from_secs(1),
+            resolver_clock,
+        )
+        .expect("resolver HTTP client"),
+    );
+    initialize_resolver_runtime(&store, "1", now).await;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: regional_esi(
+                vec![contract.clone()],
+                HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![], expiring_cache())),
+                )]),
+            ),
+            contexts: HashMap::new(),
+            positions: HashMap::new(),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::new())),
+        Arc::new(NoopDelivery),
+    )
+    .with_structure_resolver(resolver)
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+    .with_request_pacer(Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    }))
+    .collect_cycle()
+    .await
+    .expect("a structure rate limit degrades only location precision");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect collection state before the blocked restart");
+    let batches_before_blocked_restart =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM regional_observation_batches")
+            .fetch_one(&pool)
+            .await
+            .expect("count completed regional observations before the blocked restart");
+    let public_after_rate_limit = Arc::new(ConditionalEsi::default());
+    let error = ContractCollector::new(database.store().await, public_after_rate_limit.clone())
+        .with_request_pacer(Arc::new(AdvancingRequestPacer {
+            now: StdMutex::new(now),
+            waits: StdMutex::new(Vec::new()),
+        }))
+        .collect_cycle()
+        .await
+        .expect_err("the persisted resolver boundary blocks the next actual public request");
+    assert!(error
+        .to_string()
+        .contains("persisted global ESI limiter boundary remains active"));
+    assert!(public_after_rate_limit
+        .received_etags
+        .lock()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM regional_observation_batches")
+            .fetch_one(&pool)
+            .await
+            .expect("count regional observations after the blocked restart"),
+        batches_before_blocked_restart,
+        "a rejected global admission must not manufacture a regional outcome"
+    );
+    let limiter = sqlx::query(
+        "SELECT pause_until, error_limit_remain, error_limit_reset, rate_limit_group, rate_limit_limit, rate_limit_remaining, rate_limit_used FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("persist resolver retry and rate metadata");
+    let pause_until: DateTime<Utc> = limiter.get("pause_until");
+    assert_eq!(pause_until, now + chrono::Duration::seconds(60));
+    assert_eq!(limiter.get::<Option<i64>, _>("error_limit_remain"), Some(0));
+    assert_eq!(
+        limiter.get::<Option<i64>, _>("error_limit_reset"),
+        Some(120)
+    );
+    assert_eq!(
+        limiter.get::<Option<String>, _>("rate_limit_group"),
+        Some("structures".to_string())
+    );
+    assert_eq!(
+        limiter.get::<Option<String>, _>("rate_limit_limit"),
+        Some("20/60s".to_string())
+    );
+    assert_eq!(
+        limiter.get::<Option<i64>, _>("rate_limit_remaining"),
+        Some(0)
+    );
+    assert_eq!(limiter.get::<Option<i64>, _>("rate_limit_used"), Some(20));
+    pool.close().await;
+    token.finish();
+    metadata.finish();
+    jwks.finish();
+    structure_server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn authenticated_structure_resolution_retains_access_qualified_evidence_with_resolver_identity(
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let evidence = LocationEvidenceService::new(&store)
+        .record_access_qualified(
+            1_024_000_001,
+            30_002_086,
+            Some(10_000_003),
+            "character:90000001",
+            observed_at,
+            observed_at + chrono::Duration::minutes(5),
+            observed_at,
+        )
+        .await
+        .expect("retain a successful authenticated structure response as evidence");
+    assert_eq!(
+        evidence.evidence_class,
+        LocationEvidenceClass::AccessQualified
+    );
+    assert_eq!(evidence.structure_id, Some(1_024_000_001));
+    assert_eq!(evidence.solar_system_id, 30_002_086);
+    assert_eq!(evidence.actor, "character:90000001");
+    assert_eq!(evidence.observed_at, observed_at);
+    assert_eq!(
+        evidence.expires_at,
+        Some(observed_at + chrono::Duration::minutes(5))
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn structure_resolver_denial_is_daily_then_parks_and_credential_revision_reactivates() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let structure_id = 1_024_000_001;
+    let start = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    initialize_resolver_runtime(&store, "credential-v1", start).await;
+    assert_eq!(
+        store
+            .reserve_structure_resolution(structure_id, "credential-v1", start)
+            .await
+            .expect("reserve first resolver request"),
+        StructureResolutionAdmission::Attempt {
+            generation: 1,
+            cached: None,
+        }
+    );
+    store
+        .record_structure_resolution_denial(structure_id, "credential-v1", 1, start, None)
+        .await
+        .expect("record first access denial");
+    assert_eq!(
+        store
+            .reserve_structure_resolution(
+                structure_id,
+                "credential-v1",
+                start + chrono::Duration::hours(23),
+            )
+            .await
+            .expect("observe daily denial boundary"),
+        StructureResolutionAdmission::WaitUntil(start + chrono::Duration::days(1))
+    );
+    for day in 1..7 {
+        let attempted_at = start + chrono::Duration::days(day);
+        assert!(matches!(
+            store
+                .reserve_structure_resolution(structure_id, "credential-v1", attempted_at)
+                .await
+                .expect("admit the next daily denial check"),
+            StructureResolutionAdmission::Attempt { .. }
+        ));
+        store
+            .record_structure_resolution_denial(
+                structure_id,
+                "credential-v1",
+                i64::from(day + 1),
+                attempted_at,
+                None,
+            )
+            .await
+            .expect("record daily access denial");
+    }
+    assert_eq!(
+        store
+            .reserve_structure_resolution(
+                structure_id,
+                "credential-v1",
+                start + chrono::Duration::days(7),
+            )
+            .await
+            .expect("park an identifier denied for a full week"),
+        StructureResolutionAdmission::Parked
+    );
+    initialize_resolver_runtime(&store, "credential-v2", start + chrono::Duration::days(8)).await;
+    assert!(matches!(
+        store
+            .reserve_structure_resolution(
+                structure_id,
+                "credential-v2",
+                start + chrono::Duration::days(8),
+            )
+            .await
+            .expect("credential revision reactivates the parked identifier"),
+        StructureResolutionAdmission::Attempt { .. }
+    ));
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn structure_resolution_admission_is_leased_and_stale_completion_cannot_replace_new_credentials(
+) {
+    let database = TemporaryDatabase::new().await;
+    let first = database.store().await;
+    let second = database.store().await;
+    let structure_id = 1_024_000_099;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    initialize_resolver_runtime(&first, "credential-v1", now).await;
+    let (left, right) = tokio::join!(
+        first.reserve_structure_resolution(structure_id, "credential-v1", now),
+        second.reserve_structure_resolution(structure_id, "credential-v1", now)
+    );
+    let admissions = [
+        left.expect("first admission"),
+        right.expect("second admission"),
+    ];
+    let generation = admissions
+        .iter()
+        .find_map(|admission| match admission {
+            StructureResolutionAdmission::Attempt { generation, .. } => Some(*generation),
+            _ => None,
+        })
+        .expect("exactly one store receives the lease");
+    assert_eq!(
+        admissions
+            .iter()
+            .filter(|admission| matches!(admission, StructureResolutionAdmission::Attempt { .. }))
+            .count(),
+        1
+    );
+    initialize_resolver_runtime(&first, "credential-v2", now).await;
+    let second_generation = match first
+        .reserve_structure_resolution(structure_id, "credential-v2", now)
+        .await
+        .expect("credential revision replaces a prior lease")
+    {
+        StructureResolutionAdmission::Attempt { generation, .. } => generation,
+        admission => panic!("expected new credential lease, got {admission:?}"),
+    };
+    first
+        .record_structure_resolution_success(
+            &killbot_rust::structure_resolver::ResolvedStructure {
+                structure_id,
+                solar_system_id: 30_002_086,
+                observed_at: now,
+                expires_at: Some(now + chrono::Duration::hours(1)),
+                etag: Some("stale-v1".to_string()),
+                response_metadata: CacheMetadata::cached_for_seconds(0),
+                representation_cacheable: true,
+            },
+            "credential-v1",
+            generation,
+            now,
+        )
+        .await
+        .expect("stale completion is harmless");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect lease state");
+    let persisted: (String, Option<String>) = sqlx::query_as(
+        "SELECT credential_revision, etag FROM structure_resolution_state WHERE structure_id = $1",
+    )
+    .bind(structure_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read preserved new credential state");
+    assert_eq!(persisted.0, "credential-v2");
+    assert_ne!(persisted.1.as_deref(), Some("stale-v1"));
+    assert!(second_generation > generation);
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn stale_structure_denial_cannot_change_a_new_credential_generation() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let structure_id = 1_024_000_177;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    initialize_resolver_runtime(&store, "credential-v1", now).await;
+    let first_generation = match store
+        .reserve_structure_resolution(structure_id, "credential-v1", now)
+        .await
+        .expect("admit v1")
+    {
+        StructureResolutionAdmission::Attempt { generation, .. } => generation,
+        admission => panic!("expected v1 attempt, got {admission:?}"),
+    };
+    initialize_resolver_runtime(&store, "credential-v2", now).await;
+    let second_generation = match store
+        .reserve_structure_resolution(structure_id, "credential-v2", now)
+        .await
+        .expect("rotate into v2")
+    {
+        StructureResolutionAdmission::Attempt { generation, .. } => generation,
+        admission => panic!("expected v2 attempt, got {admission:?}"),
+    };
+    assert!(second_generation > first_generation);
+
+    store
+        .record_structure_resolution_denial(
+            structure_id,
+            "credential-v1",
+            first_generation,
+            now,
+            None,
+        )
+        .await
+        .expect("late v1 denial is a harmless no-op");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect v2 state");
+    let state: (String, i32, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT credential_revision, denied_attempts, next_attempt_at FROM structure_resolution_state WHERE structure_id = $1",
+    )
+    .bind(structure_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read v2 state");
+    assert_eq!(state.0, "credential-v2");
+    assert_eq!(state.1, 0, "late v1 denial cannot become a v2 denial");
+    assert_eq!(state.2, Some(now), "late v1 denial cannot delay v2");
+    pool.close().await;
+    assert!(matches!(
+        store
+            .reserve_structure_resolution(
+                structure_id,
+                "credential-v2",
+                now + chrono::Duration::minutes(6),
+            )
+            .await
+            .expect("admit the intended v2 retry"),
+        StructureResolutionAdmission::Attempt { .. }
+    ));
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn stale_structure_transient_failure_cannot_delay_a_new_credential_generation() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let structure_id = 1_024_000_178;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    initialize_resolver_runtime(&store, "credential-v1", now).await;
+    let first_generation = match store
+        .reserve_structure_resolution(structure_id, "credential-v1", now)
+        .await
+        .expect("admit v1")
+    {
+        StructureResolutionAdmission::Attempt { generation, .. } => generation,
+        admission => panic!("expected v1 attempt, got {admission:?}"),
+    };
+    initialize_resolver_runtime(&store, "credential-v2", now).await;
+    let second_generation = match store
+        .reserve_structure_resolution(structure_id, "credential-v2", now)
+        .await
+        .expect("rotate into v2")
+    {
+        StructureResolutionAdmission::Attempt { generation, .. } => generation,
+        admission => panic!("expected v2 attempt, got {admission:?}"),
+    };
+    assert!(second_generation > first_generation);
+
+    assert!(!store
+        .record_structure_resolution_transient_failure(
+            structure_id,
+            "credential-v1",
+            first_generation,
+            now,
+            Some(now + chrono::Duration::hours(1)),
+        )
+        .await
+        .expect("late v1 failure is a harmless no-op"));
+    assert!(matches!(
+        store
+            .reserve_structure_resolution(
+                structure_id,
+                "credential-v2",
+                now + chrono::Duration::minutes(6),
+            )
+            .await
+            .expect("admit the intended v2 retry"),
+        StructureResolutionAdmission::Attempt { .. }
+    ));
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn stale_structure_success_cannot_create_evidence_or_mutate_a_new_generation() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let structure_id = 1_024_000_179;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    initialize_resolver_runtime(&store, "credential-v1", now).await;
+    let first_generation = match store
+        .reserve_structure_resolution(structure_id, "credential-v1", now)
+        .await
+        .expect("admit v1")
+    {
+        StructureResolutionAdmission::Attempt { generation, .. } => generation,
+        admission => panic!("expected v1 attempt, got {admission:?}"),
+    };
+    initialize_resolver_runtime(&store, "credential-v2", now).await;
+    let second_generation = match store
+        .reserve_structure_resolution(structure_id, "credential-v2", now)
+        .await
+        .expect("rotate into v2")
+    {
+        StructureResolutionAdmission::Attempt { generation, .. } => generation,
+        admission => panic!("expected v2 attempt, got {admission:?}"),
+    };
+    assert!(second_generation > first_generation);
+    let stale = store
+        .record_structure_resolution_success_with_evidence(
+            &killbot_rust::structure_resolver::ResolvedStructure {
+                structure_id,
+                solar_system_id: 30_002_086,
+                observed_at: now,
+                expires_at: Some(now + chrono::Duration::hours(1)),
+                etag: Some("stale-v1".to_string()),
+                response_metadata: CacheMetadata::cached_for_seconds(0),
+                representation_cacheable: true,
+            },
+            "credential-v1",
+            first_generation,
+            "character:90000001",
+            now,
+        )
+        .await
+        .expect("late v1 success is a harmless no-op");
+    assert!(
+        stale.is_none(),
+        "only a committed claim can produce evidence"
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect stale success effects");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM location_evidence WHERE location_id = $1",
+        )
+        .bind(structure_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count evidence"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM location_evidence_audit")
+            .fetch_one(&pool)
+            .await
+            .expect("count audit"),
+        0
+    );
+    let state: (String, i64, Option<String>) = sqlx::query_as(
+        "SELECT credential_revision, attempt_generation, etag FROM structure_resolution_state WHERE structure_id = $1",
+    )
+    .bind(structure_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read v2 state");
+    assert_eq!(state.0, "credential-v2");
+    assert_eq!(state.1, second_generation);
+    assert_eq!(state.2, None);
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn runtime_rotation_fences_all_inflight_structure_completion_effects() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let structure_id = 1_024_000_180;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    initialize_resolver_runtime(&store, "credential-v1", now).await;
+    let generation = match store
+        .reserve_structure_resolution(structure_id, "credential-v1", now)
+        .await
+        .expect("admit v1")
+    {
+        StructureResolutionAdmission::Attempt { generation, .. } => generation,
+        admission => panic!("expected v1 attempt, got {admission:?}"),
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to snapshot v1 attempt state");
+    let state_before: (String, i64, Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT credential_revision, attempt_generation, lease_expires_at, next_attempt_at FROM structure_resolution_state WHERE structure_id = $1",
+    )
+    .bind(structure_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read v1 attempt state");
+    let rotated_at = now + chrono::Duration::seconds(1);
+    initialize_resolver_runtime(&store, "credential-v2", rotated_at).await;
+    let runtime_before: (bool, String, String, Option<String>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT enabled, credential_revision, status, last_error, updated_at FROM structure_resolver_runtime WHERE singleton = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read rotated runtime");
+
+    assert!(store
+        .record_structure_resolution_success_with_evidence(
+            &killbot_rust::structure_resolver::ResolvedStructure {
+                structure_id,
+                solar_system_id: 30_002_086,
+                observed_at: now,
+                expires_at: Some(now + chrono::Duration::hours(1)),
+                etag: Some("late-v1".to_string()),
+                response_metadata: CacheMetadata::cached_for_seconds(0),
+                representation_cacheable: true,
+            },
+            "credential-v1",
+            generation,
+            "character:90000001",
+            now + chrono::Duration::seconds(2),
+        )
+        .await
+        .expect("late v1 success is safely ignored")
+        .is_none());
+    assert!(!store
+        .record_structure_resolution_denial(
+            structure_id,
+            "credential-v1",
+            generation,
+            now + chrono::Duration::seconds(2),
+            None,
+        )
+        .await
+        .expect("late v1 denial is safely ignored"));
+    assert!(!store
+        .record_structure_resolution_transient_failure(
+            structure_id,
+            "credential-v1",
+            generation,
+            now + chrono::Duration::seconds(2),
+            None,
+        )
+        .await
+        .expect("late v1 transient failure is safely ignored"));
+
+    let state_after: (String, i64, Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT credential_revision, attempt_generation, lease_expires_at, next_attempt_at FROM structure_resolution_state WHERE structure_id = $1",
+    )
+    .bind(structure_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read unchanged v1 attempt state");
+    assert_eq!(state_after, state_before);
+    let runtime_after: (bool, String, String, Option<String>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT enabled, credential_revision, status, last_error, updated_at FROM structure_resolver_runtime WHERE singleton = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read unchanged runtime");
+    assert_eq!(runtime_after, runtime_before);
+    for table in [
+        "location_evidence",
+        "location_evidence_audit",
+        "contract_outbound_deliveries",
+    ] {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .expect("count unchanged completion effects"),
+            0,
+            "late v1 completion must not mutate {table}"
+        );
+    }
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn resolver_success_locks_location_before_state_and_serializes_public_evidence() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let structure_id = 1_024_000_191;
+    store
+        .initialize_structure_resolver_runtime(&resolver_test_config().runtime_status(), now)
+        .await
+        .expect("initialize active resolver runtime");
+    let generation = match store
+        .reserve_structure_resolution(structure_id, "1", now)
+        .await
+        .expect("reserve resolver success")
+    {
+        StructureResolutionAdmission::Attempt { generation, .. } => generation,
+        admission => panic!("expected resolver lease, got {admission:?}"),
+    };
+    let inspection = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database.url)
+        .await
+        .expect("connect lock inspector");
+    sqlx::query("UPDATE structure_resolution_state SET first_denied_at = $2, parked_at = $2 WHERE structure_id = $1")
+        .bind(structure_id)
+        .bind(now)
+        .execute(&inspection)
+        .await
+        .expect("make the public-evidence reactivation contend on resolver state");
+    const BARRIER_KEY: i64 = 6_001_906;
+    sqlx::query("CREATE FUNCTION block_resolver_success_lock_order_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.solar_system_id IS NOT NULL THEN PERFORM pg_advisory_xact_lock(6001906); END IF; RETURN NEW; END; $$")
+        .execute(&inspection)
+        .await
+        .expect("create resolver success barrier trigger");
+    sqlx::query("CREATE TRIGGER block_resolver_success_lock_order_test BEFORE UPDATE ON structure_resolution_state FOR EACH ROW EXECUTE FUNCTION block_resolver_success_lock_order_test()")
+        .execute(&inspection)
+        .await
+        .expect("install resolver success barrier trigger");
+    let mut barrier_holder = inspection.acquire().await.expect("acquire barrier session");
+    sqlx::query("SELECT pg_advisory_lock($1::BIGINT)")
+        .bind(BARRIER_KEY)
+        .execute(&mut *barrier_holder)
+        .await
+        .expect("hold resolver-state barrier");
+    let resolved = killbot_rust::structure_resolver::ResolvedStructure {
+        structure_id,
+        solar_system_id: 30_002_086,
+        observed_at: now,
+        expires_at: Some(now + chrono::Duration::hours(1)),
+        etag: Some("lock-order".to_string()),
+        response_metadata: CacheMetadata::cached_for_seconds(0),
+        representation_cacheable: true,
+    };
+    let resolver_store = store.clone();
+    let resolver_success = tokio::spawn(async move {
+        resolver_store
+            .record_structure_resolution_success_with_evidence(
+                &resolved,
+                "1",
+                generation,
+                "character:90000001",
+                now,
+            )
+            .await
+    });
+    let mut reached_barrier = false;
+    for _ in 0..50 {
+        reached_barrier = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)",
+        )
+        .fetch_one(&inspection)
+        .await
+        .expect("inspect blocked resolver transaction");
+        if reached_barrier {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        reached_barrier,
+        "resolver success reaches the state-update barrier"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted",
+        )
+        .fetch_one(&inspection)
+        .await
+        .expect("inspect advisory lock order"),
+        2,
+        "resolver holds the location advisory lock before it locks resolver state"
+    );
+    let public_store = store.clone();
+    let public_evidence = tokio::spawn(async move {
+        LocationEvidenceService::new(&public_store)
+            .record_public_npc(structure_id, Some(structure_id), 30_002_086, None, now, now)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    sqlx::query("SELECT pg_advisory_unlock($1::BIGINT)")
+        .bind(BARRIER_KEY)
+        .execute(&mut *barrier_holder)
+        .await
+        .expect("release resolver-state barrier");
+    resolver_success
+        .await
+        .expect("join resolver success")
+        .expect("resolver success transaction avoids a deadlock")
+        .expect("resolver success retains access-qualified evidence");
+    public_evidence
+        .await
+        .expect("join public evidence")
+        .expect("public evidence transaction avoids a deadlock");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM location_evidence WHERE location_id = $1 AND evidence_class IN ('access_qualified', 'public_npc')",
+        )
+        .bind(structure_id)
+        .fetch_one(&inspection)
+        .await
+        .expect("count serialized evidence effects"),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT solar_system_id FROM structure_resolution_state WHERE structure_id = $1",
+        )
+        .bind(structure_id)
+        .fetch_one(&inspection)
+        .await
+        .expect("read resolved structure state"),
+        Some(30_002_086)
+    );
+    barrier_holder.close().await.expect("close barrier session");
+    inspection.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn resolver_sso_backoff_is_global_and_survives_a_new_store() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let restarted = database.store().await;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let deadline = now + chrono::Duration::minutes(2);
+    store
+        .initialize_structure_resolver_runtime(
+            &StructureResolverConfig::from_settings([
+                ("STRUCTURE_RESOLVER_ENABLED", "true"),
+                ("STRUCTURE_RESOLVER_CHARACTER_ID", "90000001"),
+                ("STRUCTURE_RESOLVER_REFRESH_TOKEN", "refresh-secret"),
+                ("EVE_CLIENT_ID", "existing-eve-application"),
+                ("EVE_CLIENT_SECRET", "application-secret"),
+                ("STRUCTURE_RESOLVER_CREDENTIAL_REVISION", "credential-v1"),
+            ])
+            .expect("v1 resolver configuration")
+            .runtime_status(),
+            now,
+        )
+        .await
+        .expect("initialize the authoritative v1 runtime");
+    store
+        .record_structure_resolver_backoff("credential-v1", deadline, now)
+        .await
+        .expect("persist SSO Retry-After globally");
+    for structure_id in [1_024_000_101, 1_024_000_102] {
+        assert_eq!(
+            restarted
+                .reserve_structure_resolution(structure_id, "credential-v1", now)
+                .await
+                .expect("honor persisted global backoff"),
+            StructureResolutionAdmission::WaitUntil(deadline)
+        );
+    }
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn stale_resolver_global_backoff_and_health_cannot_replace_the_current_revision() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let current = StructureResolverConfig::from_settings([
+        ("STRUCTURE_RESOLVER_ENABLED", "true"),
+        ("STRUCTURE_RESOLVER_CHARACTER_ID", "90000001"),
+        ("STRUCTURE_RESOLVER_REFRESH_TOKEN", "refresh-secret"),
+        ("EVE_CLIENT_ID", "existing-eve-application"),
+        ("EVE_CLIENT_SECRET", "application-secret"),
+        ("STRUCTURE_RESOLVER_CREDENTIAL_REVISION", "credential-v2"),
+    ])
+    .expect("v2 resolver configuration")
+    .runtime_status();
+    store
+        .initialize_structure_resolver_runtime(&current, now)
+        .await
+        .expect("initialize the authoritative v2 runtime");
+    store
+        .record_structure_resolver_backoff("credential-v1", now + chrono::Duration::minutes(5), now)
+        .await
+        .expect("stale v1 global failure is a harmless no-op");
+    store
+        .record_structure_resolver_runtime(
+            true,
+            "credential-v1",
+            "degraded",
+            Some("stale v1 error"),
+            now,
+        )
+        .await
+        .expect("stale v1 health is a harmless no-op");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect singleton state");
+    let runtime: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT credential_revision, status, last_error FROM structure_resolver_runtime WHERE singleton = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read runtime");
+    assert_eq!(runtime.0, "credential-v2");
+    assert_eq!(runtime.1, "ready");
+    assert_eq!(runtime.2, None);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM structure_resolver_backoff")
+            .fetch_one(&pool)
+            .await
+            .expect("read global backoff"),
+        0,
+        "stale v1 cannot create a v1 global pause after v2 starts"
+    );
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn resolver_runtime_revision_controls_admission_and_replaces_stale_global_backoff() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let runtime = |revision| {
+        StructureResolverConfig::from_settings([
+            ("STRUCTURE_RESOLVER_ENABLED", "true"),
+            ("STRUCTURE_RESOLVER_CHARACTER_ID", "90000001"),
+            ("STRUCTURE_RESOLVER_REFRESH_TOKEN", "refresh-secret"),
+            ("EVE_CLIENT_ID", "existing-eve-application"),
+            ("EVE_CLIENT_SECRET", "application-secret"),
+            ("STRUCTURE_RESOLVER_CREDENTIAL_REVISION", revision),
+        ])
+        .expect("resolver runtime configuration")
+        .runtime_status()
+    };
+    store
+        .initialize_structure_resolver_runtime(&runtime("credential-v1"), now)
+        .await
+        .expect("initialize v1 runtime");
+    store
+        .record_structure_resolver_backoff(
+            "credential-v1",
+            now + chrono::Duration::minutes(10),
+            now,
+        )
+        .await
+        .expect("persist v1 backoff");
+    store
+        .initialize_structure_resolver_runtime(&runtime("credential-v2"), now)
+        .await
+        .expect("rotate authoritative runtime to v2");
+    let v2_deadline = now + chrono::Duration::minutes(2);
+    assert!(store
+        .record_structure_resolver_backoff("credential-v2", v2_deadline, now)
+        .await
+        .expect("replace stale v1 backoff with v2"));
+
+    let restarted = database.store().await;
+    assert_eq!(
+        restarted
+            .reserve_structure_resolution(1_024_000_301, "credential-v2", now)
+            .await
+            .expect("v2 restart honors its durable deadline"),
+        StructureResolutionAdmission::WaitUntil(v2_deadline)
+    );
+    assert!(matches!(
+        restarted
+            .reserve_structure_resolution(1_024_000_302, "credential-v1", now)
+            .await
+            .expect("stale v1 admission is rejected before creating state"),
+        StructureResolutionAdmission::Inactive
+    ));
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect stale admission effects");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM structure_resolution_state WHERE structure_id = 1024000302",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count stale state rows"),
+        0
+    );
+    let backoff: (String, DateTime<Utc>) = sqlx::query_as(
+        "SELECT credential_revision, next_attempt_at FROM structure_resolver_backoff WHERE singleton = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read durable v2 backoff");
+    assert_eq!(backoff, ("credential-v2".to_string(), v2_deadline));
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn resolver_health_stays_degraded_when_another_structure_succeeds() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let denied = 1_024_000_201;
+    initialize_resolver_runtime(&store, "credential-v1", now).await;
+    store
+        .reserve_structure_resolution(denied, "credential-v1", now)
+        .await
+        .expect("admit denied structure");
+    store
+        .record_structure_resolution_denial(denied, "credential-v1", 1, now, None)
+        .await
+        .expect("persist denial");
+    store
+        .record_structure_resolver_runtime(true, "credential-v1", "ready", None, now)
+        .await
+        .expect("record unrelated success");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect health");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM structure_resolver_runtime WHERE singleton = TRUE"
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("runtime status"),
+        "degraded"
+    );
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn concurrent_resolver_success_and_denial_leave_same_revision_health_degraded() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let structure_id = 1_024_000_202;
+    initialize_resolver_runtime(&store, "credential-v1", now).await;
+    let generation = match store
+        .reserve_structure_resolution(structure_id, "credential-v1", now)
+        .await
+        .expect("admit the denied structure")
+    {
+        StructureResolutionAdmission::Attempt { generation, .. } => generation,
+        admission => panic!("expected resolver attempt, got {admission:?}"),
+    };
+    let inspection = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database.url)
+        .await
+        .expect("connect aggregate-health race inspector");
+    const BARRIER_KEY: i64 = 6_001_907;
+    sqlx::query("CREATE SEQUENCE structure_resolver_health_barrier_sequence")
+        .execute(&inspection)
+        .await
+        .expect("create aggregate-health barrier sequence");
+    sqlx::query("CREATE FUNCTION block_first_structure_resolver_health_last_failure_kind(value TEXT) RETURNS TEXT LANGUAGE plpgsql AS $$ BEGIN IF nextval('structure_resolver_health_barrier_sequence') = 1 THEN PERFORM pg_advisory_xact_lock(6001907); END IF; RETURN value; END; $$")
+        .execute(&inspection)
+        .await
+        .expect("create aggregate-health barrier function");
+    sqlx::query("ALTER TABLE structure_resolution_state RENAME TO structure_resolution_state_base")
+        .execute(&inspection)
+        .await
+        .expect("rename resolver state beneath the aggregate-health view");
+    sqlx::query("CREATE VIEW structure_resolution_state WITH (security_barrier = true) AS SELECT structure_id, credential_revision, etag, solar_system_id, observed_at, cache_expires_at, next_attempt_at, first_denied_at, last_denied_at, denied_attempts, parked_at, transient_failures, last_error, block_first_structure_resolver_health_last_failure_kind(last_failure_kind) AS last_failure_kind, last_success_at, attempt_generation, lease_expires_at, updated_at FROM structure_resolution_state_base")
+        .execute(&inspection)
+        .await
+        .expect("create aggregate-health barrier view");
+    sqlx::query("CREATE FUNCTION update_structure_resolution_state_view() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN UPDATE structure_resolution_state_base SET credential_revision = NEW.credential_revision, etag = NEW.etag, solar_system_id = NEW.solar_system_id, observed_at = NEW.observed_at, cache_expires_at = NEW.cache_expires_at, next_attempt_at = NEW.next_attempt_at, first_denied_at = NEW.first_denied_at, last_denied_at = NEW.last_denied_at, denied_attempts = NEW.denied_attempts, parked_at = NEW.parked_at, transient_failures = NEW.transient_failures, last_error = NEW.last_error, last_failure_kind = NEW.last_failure_kind, last_success_at = NEW.last_success_at, attempt_generation = NEW.attempt_generation, lease_expires_at = NEW.lease_expires_at, updated_at = NEW.updated_at WHERE structure_id = OLD.structure_id; RETURN NEW; END; $$")
+        .execute(&inspection)
+        .await
+        .expect("create resolver-state view update forwarder");
+    sqlx::query("CREATE TRIGGER update_structure_resolution_state_view INSTEAD OF UPDATE ON structure_resolution_state FOR EACH ROW EXECUTE FUNCTION update_structure_resolution_state_view()")
+        .execute(&inspection)
+        .await
+        .expect("forward resolver-state denial updates through the barrier view");
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT last_failure_kind FROM structure_resolution_state WHERE structure_id = $1",
+        )
+        .bind(structure_id)
+        .fetch_one(&inspection)
+        .await
+        .expect("exercise the aggregate-health barrier view"),
+        None
+    );
+    sqlx::query("ALTER SEQUENCE structure_resolver_health_barrier_sequence RESTART WITH 1")
+        .execute(&inspection)
+        .await
+        .expect("rearm the aggregate-health barrier after verifying the view");
+    let race_store = database.store().await;
+    let mut barrier_holder = inspection
+        .acquire()
+        .await
+        .expect("acquire aggregate-health barrier session");
+    sqlx::query("SELECT pg_advisory_lock($1::BIGINT)")
+        .bind(BARRIER_KEY)
+        .execute(&mut *barrier_holder)
+        .await
+        .expect("hold aggregate-health barrier");
+
+    let first_health_store = race_store.clone();
+    let first_health = tokio::spawn(async move {
+        first_health_store
+            .record_structure_resolver_runtime(true, "credential-v1", "ready", None, now)
+            .await
+    });
+    for _ in 0..50 {
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)",
+        )
+        .fetch_one(&inspection)
+        .await
+        .expect("inspect aggregate-health barrier")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)",
+        )
+        .fetch_one(&inspection)
+        .await
+        .expect("confirm aggregate-health barrier"),
+        "the first ready report must pause after it has begun its aggregate read"
+    );
+
+    let (denial_done_tx, mut denial_done_rx) = oneshot::channel();
+    let denial_store = race_store.clone();
+    let denial = tokio::spawn(async move {
+        let result = denial_store
+            .record_structure_resolution_denial(
+                structure_id,
+                "credential-v1",
+                generation,
+                now,
+                None,
+            )
+            .await;
+        let _ = denial_done_tx.send(result.as_ref().is_ok_and(|committed| *committed));
+        result
+    });
+    let denial_completed_before_second_health =
+        tokio::time::timeout(Duration::from_millis(100), &mut denial_done_rx)
+            .await
+            .is_ok();
+    let second_health_store = race_store.clone();
+    let second_health = tokio::spawn(async move {
+        second_health_store
+            .record_structure_resolver_runtime(true, "credential-v1", "ready", None, now)
+            .await
+    });
+
+    sqlx::query("SELECT pg_advisory_unlock($1::BIGINT)")
+        .bind(BARRIER_KEY)
+        .execute(&mut *barrier_holder)
+        .await
+        .expect("release aggregate-health barrier");
+    assert!(first_health
+        .await
+        .expect("join first ready health report")
+        .expect("persist first ready health report"));
+    assert!(denial
+        .await
+        .expect("join denial completion")
+        .expect("persist access denial"));
+    assert!(second_health
+        .await
+        .expect("join second ready health report")
+        .expect("persist derived resolver health"));
+    assert!(
+        !denial_completed_before_second_health,
+        "the active runtime lock must prevent denial state from overtaking the in-flight aggregate"
+    );
+    assert!(sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        "SELECT first_denied_at FROM structure_resolution_state_base WHERE structure_id = $1"
+    )
+    .bind(structure_id)
+    .fetch_one(&inspection)
+    .await
+    .expect("read denial state")
+    .is_some());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM structure_resolver_runtime WHERE singleton = TRUE"
+        )
+        .fetch_one(&inspection)
+        .await
+        .expect("read resolver health after the race"),
+        "degraded",
+        "a current access denial cannot be hidden by a concurrent ready report"
+    );
+    barrier_holder
+        .close()
+        .await
+        .expect("close aggregate-health barrier session");
+    inspection.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn new_current_location_evidence_reactivates_a_parked_structure_but_stale_evidence_does_not()
+{
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let structure_id = 1_024_000_001;
+    let start = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    initialize_resolver_runtime(&store, "credential-v1", start).await;
+    for day in 0..7 {
+        let attempted_at = start + chrono::Duration::days(day);
+        assert!(matches!(
+            store
+                .reserve_structure_resolution(structure_id, "credential-v1", attempted_at)
+                .await
+                .expect("admit daily denial"),
+            StructureResolutionAdmission::Attempt { .. }
+        ));
+        store
+            .record_structure_resolution_denial(
+                structure_id,
+                "credential-v1",
+                i64::from(day + 1),
+                attempted_at,
+                None,
+            )
+            .await
+            .expect("record daily denial");
+    }
+    let parked_at = start + chrono::Duration::days(7);
+    assert_eq!(
+        store
+            .reserve_structure_resolution(structure_id, "credential-v1", parked_at)
+            .await
+            .expect("park after seven days"),
+        StructureResolutionAdmission::Parked
+    );
+    let stale = execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "1024000001",
+            "--structure-id",
+            "1024000001",
+            "--system-id",
+            "30002086",
+            "--observed-at",
+            "2026-08-18T11:00:00Z",
+            "--expires-at",
+            "2026-08-20T12:00:00Z",
+            "--actor",
+            "operator:one",
+            "--provenance",
+            "stale scout report",
+        ],
+        parked_at,
+    )
+    .await;
+    assert!(stale.is_err(), "stale evidence must not be accepted at all");
+    assert!(matches!(
+        store
+            .reserve_structure_resolution(structure_id, "credential-v1", parked_at)
+            .await
+            .expect("stale evidence leaves resolver parked"),
+        StructureResolutionAdmission::Parked
+    ));
+    execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "1024000001",
+            "--structure-id",
+            "1024000001",
+            "--system-id",
+            "30002086",
+            "--observed-at",
+            "2026-08-25T12:00:00Z",
+            "--expires-at",
+            "2026-08-26T12:00:00Z",
+            "--actor",
+            "operator:one",
+            "--provenance",
+            "current scout report",
+        ],
+        parked_at,
+    )
+    .await
+    .expect("new current operator evidence");
+    assert!(matches!(
+        store
+            .reserve_structure_resolution(structure_id, "credential-v1", parked_at)
+            .await
+            .expect("new evidence reactivates the parked identifier"),
+        StructureResolutionAdmission::Attempt { .. }
+    ));
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn failed_parked_reactivation_rolls_back_location_evidence_and_its_audit_atomically() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let structure_id = 1_024_000_188;
+    let start = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    initialize_resolver_runtime(&store, "credential-v1", start).await;
+    for day in 0..7 {
+        let now = start + chrono::Duration::days(day);
+        assert!(matches!(
+            store
+                .reserve_structure_resolution(structure_id, "credential-v1", now)
+                .await
+                .expect("admit denial"),
+            StructureResolutionAdmission::Attempt { .. }
+        ));
+        store
+            .record_structure_resolution_denial(
+                structure_id,
+                "credential-v1",
+                i64::from(day + 1),
+                now,
+                None,
+            )
+            .await
+            .expect("deny");
+    }
+    let now = start + chrono::Duration::days(7);
+    assert_eq!(
+        store
+            .reserve_structure_resolution(structure_id, "credential-v1", now)
+            .await
+            .expect("park"),
+        StructureResolutionAdmission::Parked
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect transaction state");
+    sqlx::query("CREATE FUNCTION fail_structure_reactivation_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic reactivation failure'; END; $$")
+        .execute(&pool).await.expect("create failure trigger");
+    sqlx::query("CREATE TRIGGER fail_structure_reactivation_test BEFORE UPDATE ON structure_resolution_state FOR EACH ROW EXECUTE FUNCTION fail_structure_reactivation_test()")
+        .execute(&pool).await.expect("install failure trigger");
+    let result = execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "1024000188",
+            "--structure-id",
+            "1024000188",
+            "--system-id",
+            "30002086",
+            "--observed-at",
+            "2026-08-25T12:00:00Z",
+            "--expires-at",
+            "2026-08-26T12:00:00Z",
+            "--actor",
+            "operator:one",
+            "--provenance",
+            "rollback regression",
+        ],
+        now,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "reactivation failure aborts the evidence mutation"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM location_evidence WHERE location_id = $1"
+        )
+        .bind(structure_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count evidence"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM location_evidence_audit")
+            .fetch_one(&pool)
+            .await
+            .expect("count audit"),
+        0
+    );
+    assert!(sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        "SELECT parked_at FROM structure_resolution_state WHERE structure_id = $1"
+    )
+    .bind(structure_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read parked state")
+    .is_some());
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn resolver_degradation_is_observational_while_public_collection_prepares_delivery() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let contract = PublicContract {
+        start_location_id: 1_024_000_001,
+        end_location_id: Some(1_024_000_001),
+        ..item_exchange_contract(44)
+    };
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(vec![], HashMap::new())),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline before public delivery");
+    for (id, filter) in [
+        (
+            "public-delivery",
+            ContractFilterNode::Condition(ContractFilterCondition::LocationIds(vec![
+                contract.start_location_id,
+            ])),
+        ),
+        (
+            "resolver-demand",
+            ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                config::SystemRange {
+                    system_id: 30_002_086,
+                    range: 1.0,
+                },
+            ])),
+        ),
+    ] {
+        store
+            .upsert_contract_subscription(&ContractSubscription {
+                guild_id: 42,
+                channel_id: 77,
+                id: id.to_string(),
+                description: id.to_string(),
+                filter: ContractFilter { root: filter },
+                event_actions: ContractEventActions {
+                    listed: ContractEventAction::Post,
+                    ..ContractEventActions::default()
+                },
+            })
+            .await
+            .expect("persist subscription");
+    }
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let resolver = Arc::new(FailingStructureResolver::access_denied());
+    initialize_resolver_runtime(&store, "test-credential-v1", Utc::now()).await;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: regional_esi(
+                vec![contract.clone()],
+                HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![], expiring_cache())),
+                )]),
+            ),
+            contexts: HashMap::new(),
+            positions: HashMap::new(),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .with_structure_resolver(resolver.clone())
+    .collect_cycle()
+    .await
+    .expect("denied authenticated enrichment cannot abort public collection");
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to read resolver runtime state");
+    let runtime = sqlx::query(
+        "SELECT enabled, status, last_error FROM structure_resolver_runtime WHERE singleton = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read resolver runtime state");
+    assert!(runtime.get::<bool, _>("enabled"));
+    assert_eq!(runtime.get::<String, _>("status"), "degraded");
+    assert_eq!(
+        runtime.get::<Option<String>, _>("last_error").as_deref(),
+        Some("structure resolver access denied")
+    );
+    let snapshot = HealthCycle::new(store, Arc::new(FixedHealthClock(StdMutex::new(Utc::now()))))
+        .run_once()
+        .await
+        .expect("resolver health remains observational");
+    assert!(snapshot.checks.iter().any(|check| {
+        check.key == "structure_resolver" && check.status == HealthStatus::Degraded
+    }));
+    pool.close().await;
+    database.destroy().await;
+}
+
+async fn assert_stale_collector_failure_cannot_overwrite_a_newer_ready_runtime(
+    failure: StructureResolverError,
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let structure_id = 1_024_000_192;
+    let contract = PublicContract {
+        start_location_id: structure_id,
+        end_location_id: Some(structure_id),
+        ..item_exchange_contract(192)
+    };
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(vec![], HashMap::new())),
+    )
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+    .collect_cycle()
+    .await
+    .expect("establish public baseline");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "requires-structure-resolution".to_string(),
+            description: "exercise guarded resolver failure persistence".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                    config::SystemRange {
+                        system_id: 30_002_086,
+                        range: 1.0,
+                    },
+                ])),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist resolver-demand subscription");
+    store
+        .initialize_structure_resolver_runtime(&resolver_test_config().runtime_status(), now)
+        .await
+        .expect("initialize resolver runtime");
+    let resolver = Arc::new(GatedStructureResolver::new(failure));
+    let collector = ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: regional_esi(
+                vec![contract],
+                HashMap::from([(192, Ok(EsiResponse::fresh(vec![], expiring_cache())))]),
+            ),
+            contexts: HashMap::new(),
+            positions: HashMap::new(),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::new())),
+        Arc::new(NoopDelivery),
+    )
+    .with_structure_resolver(resolver.clone())
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))));
+    let late_failure = tokio::spawn(async move { collector.collect_cycle().await });
+    resolver.entered.notified().await;
+    let newer_now = now + chrono::Duration::minutes(6);
+    let generation = match store
+        .reserve_structure_resolution(structure_id, "1", newer_now)
+        .await
+        .expect("expired first lease admits a new generation")
+    {
+        StructureResolutionAdmission::Attempt { generation, .. } => generation,
+        admission => panic!("expected generation two lease, got {admission:?}"),
+    };
+    assert!(store
+        .record_structure_resolution_success(
+            &killbot_rust::structure_resolver::ResolvedStructure {
+                structure_id,
+                solar_system_id: 30_002_086,
+                observed_at: newer_now,
+                expires_at: Some(newer_now + chrono::Duration::hours(1)),
+                etag: Some("generation-two".to_string()),
+                response_metadata: CacheMetadata::cached_for_seconds(0),
+                representation_cacheable: true,
+            },
+            "1",
+            generation,
+            newer_now,
+        )
+        .await
+        .expect("commit generation two resolver success"));
+    assert!(store
+        .record_structure_resolver_runtime(true, "1", "ready", None, newer_now)
+        .await
+        .expect("record generation two ready runtime"));
+    resolver.release.notify_one();
+    late_failure
+        .await
+        .expect("join stale collector")
+        .expect("stale resolver failure does not abort public collection");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect resolver runtime after stale failure");
+    let runtime: (String, Option<String>) = sqlx::query_as(
+        "SELECT status, last_error FROM structure_resolver_runtime WHERE singleton = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read latest resolver runtime");
+    assert_eq!(runtime, ("ready".to_string(), None));
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn stale_transient_collector_failure_cannot_overwrite_a_newer_ready_resolver_runtime() {
+    assert_stale_collector_failure_cannot_overwrite_a_newer_ready_runtime(
+        StructureResolverError::transient(None),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stale_denial_collector_failure_cannot_overwrite_a_newer_ready_resolver_runtime() {
+    assert_stale_collector_failure_cannot_overwrite_a_newer_ready_runtime(
+        StructureResolverError::access_denied(None),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn disabled_or_invalid_resolver_configuration_is_persisted_as_degraded_health() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    store
+        .initialize_structure_resolver_runtime(&StructureResolverRuntimeStatus::disabled(), now)
+        .await
+        .expect("persist disabled resolver state");
+    let disabled = HealthCycle::new(
+        store.clone(),
+        Arc::new(FixedHealthClock(StdMutex::new(now))),
+    )
+    .run_once()
+    .await
+    .expect("evaluate disabled resolver health");
+    assert!(disabled.checks.iter().any(|check| {
+        check.key == "structure_resolver"
+            && check.status == HealthStatus::Degraded
+            && check.evidence.contains("disabled")
+    }));
+    store
+        .initialize_structure_resolver_runtime(
+            &StructureResolverRuntimeStatus::invalid_configuration(),
+            now + chrono::Duration::seconds(1),
+        )
+        .await
+        .expect("persist invalid resolver state");
+    let invalid = HealthCycle::new(
+        store,
+        Arc::new(FixedHealthClock(StdMutex::new(
+            now + chrono::Duration::seconds(1),
+        ))),
+    )
+    .run_once()
+    .await
+    .expect("evaluate invalid resolver health");
+    assert!(invalid.checks.iter().any(|check| {
+        check.key == "structure_resolver"
+            && check.status == HealthStatus::Degraded
+            && check.evidence.contains("configuration invalid")
+    }));
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect resolver storage");
+    let columns = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns WHERE table_name IN ('structure_resolver_runtime', 'structure_resolution_state')",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read resolver storage columns");
+    assert!(columns
+        .iter()
+        .all(|column| { !column.contains("token") && !column.contains("secret") }));
+    pool.close().await;
+    database.destroy().await;
+}
+
+struct FailingStructureResolver {
+    calls: AtomicU64,
+    error: StructureResolverError,
+}
+
+impl FailingStructureResolver {
+    fn access_denied() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            error: StructureResolverError::access_denied(None),
+        }
+    }
+}
+
+struct GatedStructureResolver {
+    entered: Notify,
+    release: Notify,
+    failure: StructureResolverError,
+}
+
+impl GatedStructureResolver {
+    fn new(failure: StructureResolverError) -> Self {
+        Self {
+            entered: Notify::new(),
+            release: Notify::new(),
+            failure,
+        }
+    }
+}
+
+#[async_trait]
+impl StructureResolver for GatedStructureResolver {
+    fn credential_revision(&self) -> &str {
+        "1"
+    }
+
+    fn resolver_identity(&self) -> &str {
+        "character:90000001"
+    }
+
+    async fn resolve_structure(
+        &self,
+        _structure_id: i64,
+    ) -> Result<killbot_rust::structure_resolver::ResolvedStructure, StructureResolverError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Err(self.failure.clone())
+    }
+}
+
+#[async_trait]
+impl StructureResolver for FailingStructureResolver {
+    fn credential_revision(&self) -> &str {
+        "test-credential-v1"
+    }
+
+    fn resolver_identity(&self) -> &str {
+        "character:90000001"
+    }
+
+    async fn resolve_structure(
+        &self,
+        _structure_id: i64,
+    ) -> Result<killbot_rust::structure_resolver::ResolvedStructure, StructureResolverError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Err(self.error.clone())
+    }
+}
+
 struct OneShotHttpServer {
     base_url: String,
     handle: JoinHandle<()>,
@@ -119,9 +4534,46 @@ impl SequenceHttpServer {
         Self::start_with_request_pacer(replies, Some(pacer))
     }
 
+    fn start_with_clock_advance(
+        replies: Vec<WireReply>,
+        clock: Arc<FixedStructureResolverClock>,
+        duration: chrono::Duration,
+    ) -> Self {
+        Self::start_with_request_pacer_and_clock_advance(
+            replies,
+            None,
+            Some((clock, duration, None)),
+        )
+    }
+
+    fn start_with_resolver_and_request_clock_advance(
+        replies: Vec<WireReply>,
+        resolver_clock: Arc<FixedStructureResolverClock>,
+        request_pacer: Arc<AdvancingRequestPacer>,
+        duration: chrono::Duration,
+    ) -> Self {
+        Self::start_with_request_pacer_and_clock_advance(
+            replies,
+            None,
+            Some((resolver_clock, duration, Some(request_pacer))),
+        )
+    }
+
     fn start_with_request_pacer(
         replies: Vec<WireReply>,
         pacer: Option<Arc<AdvancingRequestPacer>>,
+    ) -> Self {
+        Self::start_with_request_pacer_and_clock_advance(replies, pacer, None)
+    }
+
+    fn start_with_request_pacer_and_clock_advance(
+        replies: Vec<WireReply>,
+        pacer: Option<Arc<AdvancingRequestPacer>>,
+        clock_advance: Option<(
+            Arc<FixedStructureResolverClock>,
+            chrono::Duration,
+            Option<Arc<AdvancingRequestPacer>>,
+        )>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ESI HTTP listener");
         let address = listener.local_addr().expect("fake ESI listener address");
@@ -142,6 +4594,12 @@ impl SequenceHttpServer {
                     .push(String::from_utf8_lossy(&request[..length]).into_owned());
                 if let Some(pacer) = &pacer {
                     recorded_request_times.lock().unwrap().push(pacer.now());
+                }
+                if let Some((clock, duration, request_pacer)) = &clock_advance {
+                    clock.advance(*duration);
+                    if let Some(request_pacer) = request_pacer {
+                        request_pacer.advance(*duration);
+                    }
                 }
                 let response = format!(
                     "HTTP/1.1 {} test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
@@ -169,6 +4627,81 @@ impl SequenceHttpServer {
 
     fn finish(self) {
         self.handle.join().expect("join fake ESI HTTP listener");
+    }
+}
+
+struct ControlledHttpServer {
+    base_url: String,
+    requests: Arc<StdMutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+impl ControlledHttpServer {
+    fn start(replies: Vec<WireReply>, fallback: WireReply) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind controlled HTTP listener");
+        listener
+            .set_nonblocking(true)
+            .expect("make controlled HTTP listener nonblocking");
+        let address = listener.local_addr().expect("controlled listener address");
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let recorded_requests = requests.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let mut replies = replies.into_iter();
+            while !stopped.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept controlled HTTP request: {error}"),
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("make controlled HTTP connection blocking");
+                let mut request = [0_u8; 4096];
+                let length = stream
+                    .read(&mut request)
+                    .expect("read controlled HTTP request");
+                recorded_requests
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request[..length]).into_owned());
+                let reply = replies.next().unwrap_or_else(|| WireReply {
+                    status: fallback.status,
+                    headers: fallback.headers.clone(),
+                    body: fallback.body,
+                });
+                let response = format!(
+                    "HTTP/1.1 {} test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
+                    reply.status,
+                    reply.body.len(),
+                    reply
+                        .headers
+                        .iter()
+                        .map(|(name, value)| format!("{name}: {value}\r\n"))
+                        .collect::<String>(),
+                    reply.body,
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write controlled HTTP response");
+            }
+        });
+        Self {
+            base_url: format!("http://{address}/"),
+            requests,
+            stop,
+            handle,
+        }
+    }
+
+    fn finish(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.handle.join().expect("join controlled HTTP listener");
     }
 }
 
@@ -254,6 +4787,20 @@ impl TemporaryDatabase {
         ContractCollectionStore::connect(&self.url)
             .await
             .expect("connect contract collection store")
+    }
+
+    async fn now(&self) -> DateTime<Utc> {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&self.url)
+            .await
+            .expect("connect to read the temporary database clock");
+        let now = sqlx::query_scalar("SELECT now()")
+            .fetch_one(&pool)
+            .await
+            .expect("read the temporary database clock");
+        pool.close().await;
+        now
     }
 
     async fn destroy(self) {
@@ -1861,6 +6408,12 @@ struct GatedAdvancingRequestPacer {
     wait_release: Arc<Notify>,
 }
 
+impl AdvancingRequestPacer {
+    fn advance(&self, duration: chrono::Duration) {
+        *self.now.lock().unwrap() += duration;
+    }
+}
+
 struct TimestampedRateBucketEsi {
     pacer: Arc<AdvancingRequestPacer>,
     calls: StdMutex<Vec<(String, DateTime<Utc>)>>,
@@ -1874,6 +6427,15 @@ struct DelayedSameGroupPacingEsi {
     second_started: Arc<Notify>,
     second_release: Arc<Notify>,
     calls: StdMutex<Vec<(i64, DateTime<Utc>)>>,
+}
+
+struct GatedDifferentGroupPacingEsi {
+    first_region: i64,
+    second_region: i64,
+    first_metadata: CacheMetadata,
+    second_metadata: CacheMetadata,
+    second_started: Arc<Notify>,
+    second_release: Arc<Notify>,
 }
 
 struct GatedProbeBatchEsi {
@@ -2300,6 +6862,43 @@ impl PublicContractEsi for DelayedSameGroupPacingEsi {
         _etag: Option<&str>,
     ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
         panic!("the delayed-rate fixture has no contract manifests")
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for GatedDifferentGroupPacingEsi {
+    async fn regions(&self, _etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        Ok(EsiResponse::fresh(
+            vec![self.first_region, self.second_region],
+            CacheMetadata::cached_for_seconds(0),
+        ))
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        assert_eq!(page, 1, "the pacing fixture has one page per region");
+        if region_id == self.first_region {
+            return Ok(EsiResponse::fresh(vec![], self.first_metadata.clone()));
+        }
+        assert_eq!(
+            region_id, self.second_region,
+            "unexpected pacing fixture region"
+        );
+        self.second_started.notify_one();
+        self.second_release.notified().await;
+        Ok(EsiResponse::fresh(vec![], self.second_metadata.clone()))
+    }
+
+    async fn public_contract_items(
+        &self,
+        _contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        panic!("the pacing fixture has no contract manifests")
     }
 }
 
@@ -3045,6 +7644,24 @@ struct ScriptedDelivery {
 struct RecordingContractPingLimiter {
     outcomes: StdMutex<Vec<bool>>,
     channels: StdMutex<Vec<u64>>,
+}
+
+struct FixedStructureResolverClock(StdMutex<DateTime<Utc>>);
+
+impl FixedStructureResolverClock {
+    fn new(now: DateTime<Utc>) -> Self {
+        Self(StdMutex::new(now))
+    }
+
+    fn advance(&self, duration: chrono::Duration) {
+        *self.0.lock().unwrap() += duration;
+    }
+}
+
+impl StructureResolverClock for FixedStructureResolverClock {
+    fn now(&self) -> DateTime<Utc> {
+        *self.0.lock().unwrap()
+    }
 }
 
 struct FixedDeliveryClock(StdMutex<chrono::DateTime<Utc>>);
@@ -7321,6 +11938,8 @@ async fn contract_migrations_apply_to_clean_and_already_current_databases() {
         "contract_outbound_deliveries",
         "contract_resolution_cases",
         "contract_observed_embed_contexts",
+        "structure_resolver_runtime",
+        "structure_resolution_state",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(table)
@@ -10315,6 +14934,212 @@ async fn delayed_same_group_response_retains_active_pacing_for_later_and_restart
         .expect("join restarted collector")
         .expect("restart completes after its retained pacing boundary");
     database.destroy().await;
+}
+
+#[tokio::test]
+async fn later_different_rate_group_replaces_active_pacing_and_survives_restart() {
+    const FIRST_REGION: i64 = 10_000_002;
+    const SECOND_REGION: i64 = 10_000_003;
+
+    let database = TemporaryDatabase::new().await;
+    let started_at = Utc
+        .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+        .single()
+        .expect("fixed cross-group pacing test time");
+    let first_pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(started_at),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let first_esi = Arc::new(GatedDifferentGroupPacingEsi {
+        first_region: FIRST_REGION,
+        second_region: SECOND_REGION,
+        first_metadata: CacheMetadata {
+            rate_limit_group: Some("group-a".to_string()),
+            rate_limit_limit: Some("100/60s".to_string()),
+            rate_limit_remaining: Some(10),
+            rate_limit_used: Some(90),
+            ..expiring_page(1)
+        },
+        second_metadata: CacheMetadata {
+            rate_limit_group: Some("group-b".to_string()),
+            rate_limit_limit: Some("100/60s".to_string()),
+            rate_limit_remaining: Some(1),
+            rate_limit_used: Some(99),
+            ..expiring_page(1)
+        },
+        second_started: Arc::new(Notify::new()),
+        second_release: Arc::new(Notify::new()),
+    });
+    let first_collector = ContractCollector::new(database.store().await, first_esi.clone())
+        .with_request_pacer(first_pacer)
+        .with_max_concurrent_regions(2);
+    let first_cycle = tokio::spawn(async move { first_collector.collect_cycle().await });
+    tokio::time::timeout(Duration::from_secs(1), first_esi.second_started.notified())
+        .await
+        .expect("both regional requests begin before the delayed response");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("observe first group pacing");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let next_request_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+                "SELECT next_request_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+            )
+            .fetch_optional(&pool)
+            .await
+            .expect("read first group pacing")
+            .flatten();
+            if next_request_at == Some(started_at + chrono::Duration::seconds(6)) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first group pacing persists before the later group arrives");
+    first_esi.second_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), first_cycle)
+        .await
+        .expect("release the delayed later-group response")
+        .expect("join first collector")
+        .expect("complete controlled first collector");
+
+    let limiter: PersistedRatePacing = sqlx::query_as(
+            "SELECT rate_limit_group, rate_limit_limit, rate_limit_remaining, rate_limit_used, next_request_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read later group pacing");
+    assert_eq!(limiter.0.as_deref(), Some("group-b"));
+    assert_eq!(limiter.1.as_deref(), Some("100/60s"));
+    assert_eq!(limiter.2, Some(1));
+    assert_eq!(limiter.3, Some(99));
+    assert_eq!(limiter.4, Some(started_at + chrono::Duration::seconds(60)));
+    pool.close().await;
+
+    let restart_pacer = Arc::new(GatedAdvancingRequestPacer {
+        now: StdMutex::new(started_at + chrono::Duration::seconds(7)),
+        waits: StdMutex::new(Vec::new()),
+        wait_entered: Arc::new(Notify::new()),
+        wait_release: Arc::new(Notify::new()),
+    });
+    let restart_esi = Arc::new(ConditionalEsi::default());
+    let restarted = ContractCollector::new(database.store().await, restart_esi.clone())
+        .with_request_pacer(restart_pacer.clone());
+    let restart_cycle = tokio::spawn(async move { restarted.collect_cycle().await });
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        restart_pacer.wait_entered.notified(),
+    )
+    .await
+    .expect("restart waits at the later persisted cross-group boundary");
+    assert_eq!(
+        restart_pacer.waits.lock().unwrap().as_slice(),
+        &[started_at + chrono::Duration::seconds(60)]
+    );
+    assert!(
+        restart_esi.received_etags.lock().unwrap().is_empty(),
+        "no ESI wire is sent before the later persisted boundary"
+    );
+    restart_cycle.abort();
+    let _ = restart_cycle.await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn active_cross_group_pacing_ignores_earlier_and_headerless_responses() {
+    for (label, second_metadata) in [
+        (
+            "earlier different group",
+            CacheMetadata {
+                rate_limit_group: Some("group-a".to_string()),
+                rate_limit_limit: Some("100/60s".to_string()),
+                rate_limit_remaining: Some(10),
+                rate_limit_used: Some(90),
+                ..expiring_page(1)
+            },
+        ),
+        ("headerless response", expiring_page(1)),
+    ] {
+        let database = TemporaryDatabase::new().await;
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+            .single()
+            .expect("fixed cross-group preservation test time");
+        let pacer = Arc::new(AdvancingRequestPacer {
+            now: StdMutex::new(started_at),
+            waits: StdMutex::new(Vec::new()),
+        });
+        let esi = Arc::new(GatedDifferentGroupPacingEsi {
+            first_region: 10_000_002,
+            second_region: 10_000_003,
+            first_metadata: CacheMetadata {
+                rate_limit_group: Some("group-b".to_string()),
+                rate_limit_limit: Some("100/60s".to_string()),
+                rate_limit_remaining: Some(1),
+                rate_limit_used: Some(99),
+                ..expiring_page(1)
+            },
+            second_metadata,
+            second_started: Arc::new(Notify::new()),
+            second_release: Arc::new(Notify::new()),
+        });
+        let collector = ContractCollector::new(database.store().await, esi.clone())
+            .with_request_pacer(pacer)
+            .with_max_concurrent_regions(2);
+        let cycle = tokio::spawn(async move { collector.collect_cycle().await });
+        tokio::time::timeout(Duration::from_secs(1), esi.second_started.notified())
+            .await
+            .expect("both controlled requests start");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database.url)
+            .await
+            .expect("observe active later cross-group pacing");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let next_request_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+                    "SELECT next_request_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+                )
+                .fetch_optional(&pool)
+                .await
+                .expect("read active later pacing")
+                .flatten();
+                if next_request_at == Some(started_at + chrono::Duration::seconds(60)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("later group is active before the complementary response");
+        esi.second_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), cycle)
+            .await
+            .expect("release the complementary response")
+            .expect("join complementary collector")
+            .expect("complete complementary collector");
+        let limiter: (Option<String>, Option<i64>, Option<i64>, Option<DateTime<Utc>>) =
+            sqlx::query_as(
+                "SELECT rate_limit_group, rate_limit_remaining, rate_limit_used, next_request_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read preserved active cross-group tuple");
+        assert_eq!(limiter.0.as_deref(), Some("group-b"), "{label}");
+        assert_eq!(limiter.1, Some(1), "{label}");
+        assert_eq!(limiter.2, Some(99), "{label}");
+        assert_eq!(
+            limiter.3,
+            Some(started_at + chrono::Duration::seconds(60)),
+            "{label}"
+        );
+        pool.close().await;
+        database.destroy().await;
+    }
 }
 
 #[tokio::test]
@@ -15827,7 +20652,7 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         .fetch_one(&clean_pool)
         .await
         .expect("read clean migration ledger");
-    assert_eq!(clean_migration_count, 17);
+    assert_eq!(clean_migration_count, 18);
     let clean_pacing_column_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'esi_collection_limiter_state' AND column_name = 'next_request_at')",
     )

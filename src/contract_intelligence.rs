@@ -1,7 +1,13 @@
 use crate::config::SystemRange;
 use crate::discord_bot::SHIP_GROUP_PRIORITY;
 use crate::feed::{FeedHealthSnapshot, FeedHealthTelemetry};
-use crate::location_evidence::{LocationEvidenceClass, LocationEvidenceService};
+use crate::location_evidence::{
+    lock_location, LocationEvidence, LocationEvidenceClass, LocationEvidenceService,
+};
+use crate::structure_resolver::{
+    ResolvedStructure, StructureResolver, StructureResolverError, StructureResolverFailureKind,
+    StructureResolverRuntimeStatus,
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::header::{HeaderMap, ETAG, EXPIRES, IF_NONE_MATCH, LAST_MODIFIED, RETRY_AFTER};
@@ -895,6 +901,19 @@ impl CacheMetadata {
             observed_at,
         )
     }
+}
+
+pub(crate) fn esi_limiter_deadline_at(
+    metadata: &CacheMetadata,
+    observed_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    [
+        metadata.collection_pause_until_at(observed_at),
+        metadata.collection_pacing_until(observed_at),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
 }
 
 #[derive(Clone, Debug)]
@@ -1897,7 +1916,11 @@ impl PublicContractEsi for HttpPublicContractEsi {
     }
 }
 
-fn cache_metadata(headers: &HeaderMap) -> CacheMetadata {
+pub(crate) fn cache_metadata(headers: &HeaderMap) -> CacheMetadata {
+    cache_metadata_at(headers, Utc::now())
+}
+
+pub(crate) fn cache_metadata_at(headers: &HeaderMap, observed_at: DateTime<Utc>) -> CacheMetadata {
     let mut metadata = CacheMetadata {
         etag: headers
             .get(ETAG)
@@ -1927,19 +1950,19 @@ fn cache_metadata(headers: &HeaderMap) -> CacheMetadata {
         retry_after: headers
             .get(RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
-            .and_then(parse_retry_after),
+            .and_then(|value| parse_retry_after_at(value, observed_at)),
     };
     if let Some(seconds) = headers
         .get("cache-control")
         .and_then(|value| value.to_str().ok())
         .and_then(cache_max_age)
     {
-        metadata.expires_at = Some(Utc::now() + ChronoDuration::seconds(seconds));
+        metadata.expires_at = Some(observed_at + ChronoDuration::seconds(seconds));
     }
     if metadata.retry_after.is_none() && metadata.error_limit_remain.unwrap_or(1) <= 0 {
         metadata.retry_after = metadata
             .error_limit_reset
-            .map(|seconds| Utc::now() + ChronoDuration::seconds(seconds));
+            .map(|seconds| observed_at + ChronoDuration::seconds(seconds));
     }
     metadata
 }
@@ -1957,11 +1980,11 @@ fn parse_http_time(value: &str) -> Option<DateTime<Utc>> {
         .map(|time| time.with_timezone(&Utc))
 }
 
-fn parse_retry_after(value: &str) -> Option<DateTime<Utc>> {
+fn parse_retry_after_at(value: &str, observed_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
     value
         .parse::<i64>()
         .ok()
-        .map(|seconds| Utc::now() + ChronoDuration::seconds(seconds))
+        .map(|seconds| observed_at + ChronoDuration::seconds(seconds))
         .or_else(|| parse_http_time(value))
 }
 
@@ -2008,6 +2031,17 @@ fn rate_limit_pacing_deadline(
 #[derive(Clone)]
 pub struct ContractCollectionStore {
     pool: PgPool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum StructureResolutionAdmission {
+    Inactive,
+    Attempt {
+        generation: i64,
+        cached: Option<Box<ResolvedStructure>>,
+    },
+    WaitUntil(DateTime<Utc>),
+    Parked,
 }
 
 enum EsiRequestAdmission {
@@ -2057,6 +2091,7 @@ struct HealthInputs {
     r2z2_progress_at: Option<DateTime<Utc>>,
     feed_validation_at: Option<DateTime<Utc>>,
     feed_validation_failures: i32,
+    structure_resolver: Option<(bool, String, Option<String>, DateTime<Utc>)>,
 }
 
 impl HealthCycle {
@@ -2103,6 +2138,14 @@ impl HealthCycle {
             observed_at,
             inputs.permanent_delivery_failures,
         ));
+        if let Some((enabled, status, error, updated_at)) = &inputs.structure_resolver {
+            checks.push(structure_resolver_health_check(
+                *enabled,
+                status,
+                error.as_deref(),
+                *updated_at,
+            ));
+        }
         if let Some(feed_snapshot) = &feed_snapshot {
             if self.r2z2_enabled {
                 checks.push(progress_health_check(
@@ -2510,6 +2553,37 @@ fn permanent_delivery_health_check(
             )
         },
         consecutive_failures: permanent_delivery_failures.clamp(0, i64::from(i32::MAX)) as i32,
+    }
+}
+
+fn structure_resolver_health_check(
+    enabled: bool,
+    status: &str,
+    error: Option<&str>,
+    observed_at: DateTime<Utc>,
+) -> HealthCheck {
+    let status = if status == "ready" {
+        HealthStatus::Healthy
+    } else {
+        HealthStatus::Degraded
+    };
+    HealthCheck {
+        key: "structure_resolver".to_string(),
+        status,
+        observed_at,
+        evidence: if status == HealthStatus::Healthy {
+            if enabled {
+                "structure resolver ready".to_string()
+            } else {
+                "structure resolver disabled".to_string()
+            }
+        } else {
+            format!(
+                "structure resolver degraded: {}",
+                error.unwrap_or("authorization or upstream failure")
+            )
+        },
+        consecutive_failures: (status != HealthStatus::Healthy).into(),
     }
 }
 
@@ -4124,6 +4198,416 @@ impl ContractCollectionStore {
         &self.pool
     }
 
+    pub async fn reserve_structure_resolution(
+        &self,
+        structure_id: i64,
+        credential_revision: &str,
+        now: DateTime<Utc>,
+    ) -> Result<StructureResolutionAdmission, sqlx::Error> {
+        if structure_id <= 0 || credential_revision.trim().is_empty() {
+            return Err(sqlx::Error::Protocol(
+                "structure resolver requires a positive identifier and credential revision"
+                    .to_string(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        let active_revision = sqlx::query_scalar::<_, String>(
+            "SELECT credential_revision FROM structure_resolver_runtime WHERE singleton = TRUE AND enabled = TRUE FOR SHARE",
+        )
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if active_revision.as_deref() != Some(credential_revision) {
+            transaction.commit().await?;
+            return Ok(StructureResolutionAdmission::Inactive);
+        }
+        if let Some(global_deadline) = sqlx::query_scalar::<_, DateTime<Utc>>("SELECT next_attempt_at FROM structure_resolver_backoff WHERE singleton = TRUE AND credential_revision = $1")
+            .bind(credential_revision)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .filter(|deadline| *deadline > now)
+        {
+            transaction.commit().await?;
+            return Ok(StructureResolutionAdmission::WaitUntil(global_deadline));
+        }
+        sqlx::query("INSERT INTO structure_resolution_state (structure_id, credential_revision, next_attempt_at, updated_at) VALUES ($1, $2, $3, $3) ON CONFLICT (structure_id) DO UPDATE SET credential_revision = EXCLUDED.credential_revision, etag = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.etag END, solar_system_id = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.solar_system_id END, observed_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.observed_at END, cache_expires_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.cache_expires_at END, next_attempt_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN EXCLUDED.next_attempt_at ELSE structure_resolution_state.next_attempt_at END, lease_expires_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.lease_expires_at END, first_denied_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.first_denied_at END, last_denied_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.last_denied_at END, denied_attempts = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN 0 ELSE structure_resolution_state.denied_attempts END, parked_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.parked_at END, transient_failures = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN 0 ELSE structure_resolution_state.transient_failures END, last_error = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.last_error END, last_failure_kind = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.last_failure_kind END, updated_at = EXCLUDED.updated_at")
+            .bind(structure_id)
+            .bind(credential_revision)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await?;
+        let state = sqlx::query("SELECT etag, solar_system_id, observed_at, cache_expires_at, next_attempt_at, first_denied_at, parked_at, lease_expires_at FROM structure_resolution_state WHERE structure_id = $1 FOR UPDATE")
+            .bind(structure_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+        let parked_at: Option<DateTime<Utc>> = state.get("parked_at");
+        let first_denied_at: Option<DateTime<Utc>> = state.get("first_denied_at");
+        if parked_at.is_some() {
+            transaction.commit().await?;
+            return Ok(StructureResolutionAdmission::Parked);
+        }
+        if first_denied_at.is_some_and(|denied_at| now >= denied_at + ChronoDuration::days(7)) {
+            sqlx::query("UPDATE structure_resolution_state SET parked_at = $2, next_attempt_at = NULL, updated_at = $2 WHERE structure_id = $1")
+                .bind(structure_id)
+                .bind(now)
+                .execute(&mut *transaction)
+                .await?;
+            transaction.commit().await?;
+            return Ok(StructureResolutionAdmission::Parked);
+        }
+        let cache_expires_at: Option<DateTime<Utc>> = state.get("cache_expires_at");
+        let cached = match (
+            state.get::<Option<String>, _>("etag"),
+            state.get::<Option<i64>, _>("solar_system_id"),
+            state.get::<Option<DateTime<Utc>>, _>("observed_at"),
+        ) {
+            (etag, Some(solar_system_id), Some(observed_at)) if solar_system_id > 0 => {
+                Some(ResolvedStructure {
+                    structure_id,
+                    solar_system_id,
+                    observed_at,
+                    expires_at: cache_expires_at,
+                    etag,
+                    response_metadata: CacheMetadata::cached_for_seconds(0),
+                    representation_cacheable: true,
+                })
+            }
+            _ => None,
+        };
+        let next_attempt_at: Option<DateTime<Utc>> = state.get("next_attempt_at");
+        let lease_expires_at: Option<DateTime<Utc>> = state.get("lease_expires_at");
+        let deadline = [cache_expires_at, next_attempt_at, lease_expires_at]
+            .into_iter()
+            .flatten()
+            .filter(|deadline| *deadline > now)
+            .max();
+        if let Some(deadline) = deadline {
+            transaction.commit().await?;
+            return Ok(StructureResolutionAdmission::WaitUntil(deadline));
+        }
+        let generation = sqlx::query_scalar::<_, i64>("UPDATE structure_resolution_state SET attempt_generation = attempt_generation + 1, lease_expires_at = $2, updated_at = $1 WHERE structure_id = $3 AND credential_revision = $4 AND (lease_expires_at IS NULL OR lease_expires_at <= $1) RETURNING attempt_generation")
+            .bind(now)
+            .bind(now + ChronoDuration::minutes(5))
+            .bind(structure_id)
+            .bind(credential_revision)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(generation.map_or(
+            StructureResolutionAdmission::WaitUntil(now + ChronoDuration::seconds(1)),
+            |generation| StructureResolutionAdmission::Attempt {
+                generation,
+                cached: cached.map(Box::new),
+            },
+        ))
+    }
+
+    pub async fn record_structure_resolution_denial(
+        &self,
+        structure_id: i64,
+        credential_revision: &str,
+        generation: i64,
+        now: DateTime<Utc>,
+        retry_after: Option<DateTime<Utc>>,
+    ) -> Result<bool, sqlx::Error> {
+        let daily_check = now + ChronoDuration::days(1);
+        let next_attempt_at =
+            retry_after.map_or(daily_check, |retry_after| retry_after.max(daily_check));
+        let mut transaction = self.pool.begin().await?;
+        if !Self::structure_resolver_runtime_is_active(&mut transaction, credential_revision)
+            .await?
+        {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let completion = sqlx::query("UPDATE structure_resolution_state SET next_attempt_at = $1, first_denied_at = COALESCE(first_denied_at, $2), last_denied_at = $2, denied_attempts = denied_attempts + 1, transient_failures = 0, last_error = 'structure resolver access denied', last_failure_kind = 'access_denied', lease_expires_at = NULL, updated_at = $2 WHERE structure_id = $3 AND credential_revision = $4 AND attempt_generation = $5")
+            .bind(next_attempt_at)
+            .bind(now)
+            .bind(structure_id)
+            .bind(credential_revision)
+            .bind(generation)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(completion.rows_affected() == 1)
+    }
+
+    pub async fn record_structure_resolver_backoff(
+        &self,
+        credential_revision: &str,
+        deadline: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let active_revision = sqlx::query_scalar::<_, String>(
+            "SELECT credential_revision FROM structure_resolver_runtime WHERE singleton = TRUE AND enabled = TRUE FOR UPDATE",
+        )
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if active_revision.as_deref() != Some(credential_revision) {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let update = sqlx::query("INSERT INTO structure_resolver_backoff (singleton, credential_revision, next_attempt_at, updated_at) VALUES (TRUE, $1, $2, $3) ON CONFLICT (singleton) DO UPDATE SET credential_revision = EXCLUDED.credential_revision, next_attempt_at = CASE WHEN structure_resolver_backoff.credential_revision = EXCLUDED.credential_revision THEN GREATEST(structure_resolver_backoff.next_attempt_at, EXCLUDED.next_attempt_at) ELSE EXCLUDED.next_attempt_at END, updated_at = EXCLUDED.updated_at")
+            .bind(credential_revision)
+            .bind(deadline)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(update.rows_affected() == 1)
+    }
+
+    pub async fn record_structure_resolution_success(
+        &self,
+        resolved: &ResolvedStructure,
+        credential_revision: &str,
+        generation: i64,
+        now: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let committed = Self::complete_structure_resolution_success(
+            &mut transaction,
+            resolved,
+            credential_revision,
+            generation,
+            now,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(committed)
+    }
+
+    pub async fn discard_structure_resolution_representation(
+        &self,
+        structure_id: i64,
+        credential_revision: &str,
+        generation: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        if !Self::structure_resolver_runtime_is_active(&mut transaction, credential_revision)
+            .await?
+        {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let update = sqlx::query("UPDATE structure_resolution_state SET etag = NULL, solar_system_id = NULL, observed_at = NULL, cache_expires_at = NULL WHERE structure_id = $1 AND credential_revision = $2 AND attempt_generation = $3")
+            .bind(structure_id)
+            .bind(credential_revision)
+            .bind(generation)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(update.rows_affected() == 1)
+    }
+
+    pub async fn record_structure_resolution_success_with_evidence(
+        &self,
+        resolved: &ResolvedStructure,
+        credential_revision: &str,
+        generation: i64,
+        resolver_identity: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<LocationEvidence>, sqlx::Error> {
+        let Some(expires_at) = resolved.expires_at.filter(|expires_at| *expires_at > now) else {
+            return Ok(None);
+        };
+        let mut transaction = self.pool.begin().await?;
+        lock_location(&mut transaction, resolved.structure_id).await?;
+        if !Self::complete_structure_resolution_success(
+            &mut transaction,
+            resolved,
+            credential_revision,
+            generation,
+            now,
+        )
+        .await?
+        {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        let evidence = LocationEvidenceService::record_access_qualified_in_transaction(
+            &mut transaction,
+            resolved.structure_id,
+            resolved.solar_system_id,
+            None,
+            resolver_identity,
+            resolved.observed_at,
+            expires_at,
+            now,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(Some(evidence))
+    }
+
+    async fn complete_structure_resolution_success(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        resolved: &ResolvedStructure,
+        credential_revision: &str,
+        generation: i64,
+        now: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        if !Self::structure_resolver_runtime_is_active(transaction, credential_revision).await? {
+            return Ok(false);
+        }
+        let cache_expires_at = resolved.expires_at.unwrap_or(now);
+        let completion = sqlx::query("UPDATE structure_resolution_state SET etag = $1, solar_system_id = $2, observed_at = $3, cache_expires_at = $4, next_attempt_at = $4, first_denied_at = NULL, last_denied_at = NULL, denied_attempts = 0, parked_at = NULL, transient_failures = 0, last_error = NULL, last_failure_kind = NULL, last_success_at = $5, lease_expires_at = NULL, updated_at = $5 WHERE structure_id = $6 AND credential_revision = $7 AND attempt_generation = $8")
+            .bind(&resolved.etag)
+            .bind(resolved.solar_system_id)
+            .bind(resolved.observed_at)
+            .bind(cache_expires_at)
+            .bind(now)
+            .bind(resolved.structure_id)
+            .bind(credential_revision)
+            .bind(generation)
+            .execute(&mut **transaction)
+            .await?;
+        Ok(completion.rows_affected() == 1)
+    }
+
+    pub async fn record_structure_resolution_transient_failure(
+        &self,
+        structure_id: i64,
+        credential_revision: &str,
+        generation: i64,
+        now: DateTime<Utc>,
+        retry_after: Option<DateTime<Utc>>,
+    ) -> Result<bool, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        if !Self::structure_resolver_runtime_is_active(&mut transaction, credential_revision)
+            .await?
+        {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let Some(current_failures) = sqlx::query_scalar::<_, i32>("SELECT transient_failures FROM structure_resolution_state WHERE structure_id = $1 AND credential_revision = $2 AND attempt_generation = $3 FOR UPDATE")
+            .bind(structure_id)
+            .bind(credential_revision)
+            .bind(generation)
+            .fetch_optional(&mut *transaction)
+            .await?
+        else {
+            transaction.commit().await?;
+            return Ok(false);
+        };
+        let current_failures = current_failures.clamp(0, 6);
+        let backoff = ChronoDuration::seconds(30_i64.saturating_mul(1_i64 << current_failures));
+        let next_attempt_at =
+            retry_after.map_or(now + backoff, |retry_after| retry_after.max(now + backoff));
+        let completion = sqlx::query("UPDATE structure_resolution_state SET next_attempt_at = $1, transient_failures = LEAST(transient_failures + 1, 7), last_error = 'structure resolver temporarily unavailable', last_failure_kind = 'transient', lease_expires_at = NULL, updated_at = $2 WHERE structure_id = $3 AND credential_revision = $4 AND attempt_generation = $5")
+            .bind(next_attempt_at)
+            .bind(now)
+            .bind(structure_id)
+            .bind(credential_revision)
+            .bind(generation)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(completion.rows_affected() == 1)
+    }
+
+    async fn structure_resolver_runtime_is_active(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        credential_revision: &str,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT credential_revision FROM structure_resolver_runtime WHERE singleton = TRUE AND enabled = TRUE FOR SHARE",
+        )
+        .fetch_optional(&mut **transaction)
+        .await?
+        .as_deref()
+            == Some(credential_revision))
+    }
+
+    pub async fn record_structure_resolver_runtime(
+        &self,
+        enabled: bool,
+        credential_revision: &str,
+        status: &str,
+        last_error: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let active_revision = sqlx::query_scalar::<_, String>(
+            "SELECT credential_revision FROM structure_resolver_runtime WHERE singleton = TRUE FOR UPDATE",
+        )
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if active_revision.as_deref() != Some(credential_revision) {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let aggregate_degraded = enabled
+            && status == "ready"
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM structure_resolution_state WHERE credential_revision = $1 AND (parked_at IS NOT NULL OR last_failure_kind IN ('access_denied', 'degraded')))",
+            )
+            .bind(credential_revision)
+            .fetch_one(&mut *transaction)
+            .await?;
+        let (status, last_error) = if aggregate_degraded {
+            (
+                "degraded",
+                Some("structure resolver has denied or parked locations"),
+            )
+        } else {
+            (status, last_error)
+        };
+        let update = sqlx::query("INSERT INTO structure_resolver_runtime (singleton, enabled, credential_revision, status, last_error, updated_at) VALUES (TRUE, $1, $2, $3, $4, $5) ON CONFLICT (singleton) DO UPDATE SET enabled = EXCLUDED.enabled, status = EXCLUDED.status, last_error = EXCLUDED.last_error, updated_at = EXCLUDED.updated_at WHERE structure_resolver_runtime.credential_revision = EXCLUDED.credential_revision")
+            .bind(enabled)
+            .bind(credential_revision)
+            .bind(status)
+            .bind(last_error)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(update.rows_affected() == 1)
+    }
+
+    pub async fn initialize_structure_resolver_runtime(
+        &self,
+        runtime: &StructureResolverRuntimeStatus,
+        now: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let current = sqlx::query(
+            "SELECT enabled, credential_revision FROM structure_resolver_runtime WHERE singleton = TRUE FOR UPDATE",
+        )
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let changed = current.as_ref().is_none_or(|current| {
+            current.get::<bool, _>("enabled") != runtime.enabled()
+                || current.get::<String, _>("credential_revision") != runtime.credential_revision()
+        });
+        if current.is_none() {
+            sqlx::query("INSERT INTO structure_resolver_runtime (singleton, enabled, credential_revision, status, last_error, updated_at) VALUES (TRUE, $1, $2, $3, $4, $5)")
+                .bind(runtime.enabled())
+                .bind(runtime.credential_revision())
+                .bind(runtime.status())
+                .bind(runtime.last_error())
+                .bind(now)
+                .execute(&mut *transaction)
+                .await?;
+        } else if changed {
+            sqlx::query("UPDATE structure_resolver_runtime SET enabled = $1, credential_revision = $2, status = $3, last_error = $4, updated_at = $5 WHERE singleton = TRUE")
+                .bind(runtime.enabled())
+                .bind(runtime.credential_revision())
+                .bind(runtime.status())
+                .bind(runtime.last_error())
+                .bind(now)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        sqlx::query(
+            "DELETE FROM structure_resolver_backoff WHERE singleton = TRUE AND credential_revision <> $1",
+        )
+        .bind(runtime.credential_revision())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await
+    }
+
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
         Self::connect_with_migrator(database_url, &MIGRATOR, HEALTH_MIGRATION_VERSIONS).await
     }
@@ -4227,6 +4711,19 @@ impl ContractCollectionStore {
         )
         .fetch_one(&self.pool)
         .await?;
+        let structure_resolver = sqlx::query(
+            "SELECT enabled, status, last_error, updated_at FROM structure_resolver_runtime WHERE singleton = TRUE",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| {
+            (
+                row.get("enabled"),
+                row.get("status"),
+                row.get("last_error"),
+                row.get("updated_at"),
+            )
+        });
         let r2z2_telemetry = sqlx::query(
             "SELECT last_progress_at FROM health_feed_telemetry WHERE source = 'r2z2_progress'",
         )
@@ -4258,6 +4755,7 @@ impl ContractCollectionStore {
                 .as_ref()
                 .map(|row| row.get("consecutive_failures"))
                 .unwrap_or(0),
+            structure_resolver,
         })
     }
 
@@ -5284,7 +5782,7 @@ impl ContractCollectionStore {
         .await
     }
 
-    async fn record_esi_limiter_at(
+    pub(crate) async fn record_esi_limiter_at(
         &self,
         metadata: &CacheMetadata,
         observed_at: DateTime<Utc>,
@@ -5307,33 +5805,82 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
             THEN EXCLUDED.pause_until
         ELSE esi_collection_limiter_state.pause_until
     END,
-    error_limit_remain = EXCLUDED.error_limit_remain,
-    error_limit_reset = EXCLUDED.error_limit_reset,
-    rate_limit_group = CASE WHEN esi_collection_limiter_state.pacing_active AND (
-        EXCLUDED.next_request_at IS NULL
-        OR EXCLUDED.rate_limit_group IS NULL
-        OR EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
-    ) THEN esi_collection_limiter_state.rate_limit_group ELSE EXCLUDED.rate_limit_group END,
-    rate_limit_limit = CASE WHEN esi_collection_limiter_state.pacing_active AND (
-        EXCLUDED.next_request_at IS NULL
-        OR EXCLUDED.rate_limit_group IS NULL
-        OR EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+    error_limit_remain = CASE
+        WHEN EXCLUDED.error_limit_remain IS NULL THEN esi_collection_limiter_state.error_limit_remain
+        WHEN esi_collection_limiter_state.error_limit_remain IS NULL
+          OR EXCLUDED.error_limit_remain < esi_collection_limiter_state.error_limit_remain
+            THEN EXCLUDED.error_limit_remain
+        ELSE esi_collection_limiter_state.error_limit_remain
+    END,
+    error_limit_reset = CASE
+        WHEN EXCLUDED.error_limit_remain IS NULL THEN esi_collection_limiter_state.error_limit_reset
+        WHEN esi_collection_limiter_state.error_limit_remain IS NULL
+          OR EXCLUDED.error_limit_remain < esi_collection_limiter_state.error_limit_remain
+            THEN EXCLUDED.error_limit_reset
+        WHEN EXCLUDED.error_limit_remain = esi_collection_limiter_state.error_limit_remain
+            THEN GREATEST(esi_collection_limiter_state.error_limit_reset, EXCLUDED.error_limit_reset)
+        ELSE esi_collection_limiter_state.error_limit_reset
+    END,
+    rate_limit_group = CASE
+        WHEN EXCLUDED.rate_limit_group IS NULL
+          AND EXCLUDED.rate_limit_limit IS NULL
+          AND EXCLUDED.rate_limit_remaining IS NULL
+          AND EXCLUDED.rate_limit_used IS NULL
+            THEN esi_collection_limiter_state.rate_limit_group
+        WHEN esi_collection_limiter_state.pacing_active AND (
+        EXCLUDED.next_request_at IS NULL OR (
+            EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+            AND esi_collection_limiter_state.next_request_at >= EXCLUDED.next_request_at
+        )
+    ) THEN esi_collection_limiter_state.rate_limit_group ELSE COALESCE(EXCLUDED.rate_limit_group, esi_collection_limiter_state.rate_limit_group) END,
+    rate_limit_limit = CASE
+        WHEN EXCLUDED.rate_limit_group IS NULL
+          AND EXCLUDED.rate_limit_limit IS NULL
+          AND EXCLUDED.rate_limit_remaining IS NULL
+          AND EXCLUDED.rate_limit_used IS NULL
+            THEN esi_collection_limiter_state.rate_limit_limit
+        WHEN esi_collection_limiter_state.pacing_active AND (
+        EXCLUDED.next_request_at IS NULL OR (
+            EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+            AND esi_collection_limiter_state.next_request_at >= EXCLUDED.next_request_at
+        )
     ) THEN esi_collection_limiter_state.rate_limit_limit ELSE COALESCE(EXCLUDED.rate_limit_limit, esi_collection_limiter_state.rate_limit_limit) END,
-    rate_limit_remaining = CASE WHEN esi_collection_limiter_state.pacing_active AND (
-        EXCLUDED.next_request_at IS NULL
-        OR EXCLUDED.rate_limit_group IS NULL
-        OR EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+    rate_limit_remaining = CASE
+        WHEN EXCLUDED.rate_limit_group IS NULL
+          AND EXCLUDED.rate_limit_limit IS NULL
+          AND EXCLUDED.rate_limit_remaining IS NULL
+          AND EXCLUDED.rate_limit_used IS NULL
+            THEN esi_collection_limiter_state.rate_limit_remaining
+        WHEN esi_collection_limiter_state.pacing_active AND (
+        EXCLUDED.next_request_at IS NULL OR (
+            EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+            AND esi_collection_limiter_state.next_request_at >= EXCLUDED.next_request_at
+        )
     ) THEN esi_collection_limiter_state.rate_limit_remaining ELSE COALESCE(EXCLUDED.rate_limit_remaining, esi_collection_limiter_state.rate_limit_remaining) END,
-    rate_limit_used = CASE WHEN esi_collection_limiter_state.pacing_active AND (
-        EXCLUDED.next_request_at IS NULL
-        OR EXCLUDED.rate_limit_group IS NULL
-        OR EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+    rate_limit_used = CASE
+        WHEN EXCLUDED.rate_limit_group IS NULL
+          AND EXCLUDED.rate_limit_limit IS NULL
+          AND EXCLUDED.rate_limit_remaining IS NULL
+          AND EXCLUDED.rate_limit_used IS NULL
+            THEN esi_collection_limiter_state.rate_limit_used
+        WHEN esi_collection_limiter_state.pacing_active AND (
+        EXCLUDED.next_request_at IS NULL OR (
+            EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+            AND esi_collection_limiter_state.next_request_at >= EXCLUDED.next_request_at
+        )
     ) THEN esi_collection_limiter_state.rate_limit_used ELSE COALESCE(EXCLUDED.rate_limit_used, esi_collection_limiter_state.rate_limit_used) END,
     next_request_at = CASE
+        WHEN EXCLUDED.rate_limit_group IS NULL
+          AND EXCLUDED.rate_limit_limit IS NULL
+          AND EXCLUDED.rate_limit_remaining IS NULL
+          AND EXCLUDED.rate_limit_used IS NULL
+            THEN esi_collection_limiter_state.next_request_at
         WHEN esi_collection_limiter_state.pacing_active AND (
             EXCLUDED.next_request_at IS NULL
-            OR EXCLUDED.rate_limit_group IS NULL
-            OR EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+            OR (
+                EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+                AND esi_collection_limiter_state.next_request_at >= EXCLUDED.next_request_at
+            )
         ) THEN esi_collection_limiter_state.next_request_at
         WHEN EXCLUDED.next_request_at IS NULL THEN NULL
         WHEN esi_collection_limiter_state.next_request_at IS NULL
@@ -5341,10 +5888,17 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
             THEN EXCLUDED.next_request_at
         ELSE esi_collection_limiter_state.next_request_at
     END,
-    pacing_active = CASE WHEN esi_collection_limiter_state.pacing_active AND (
-        EXCLUDED.next_request_at IS NULL
-        OR EXCLUDED.rate_limit_group IS NULL
-        OR EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+    pacing_active = CASE
+        WHEN EXCLUDED.rate_limit_group IS NULL
+          AND EXCLUDED.rate_limit_limit IS NULL
+          AND EXCLUDED.rate_limit_remaining IS NULL
+          AND EXCLUDED.rate_limit_used IS NULL
+            THEN esi_collection_limiter_state.pacing_active
+        WHEN esi_collection_limiter_state.pacing_active AND (
+        EXCLUDED.next_request_at IS NULL OR (
+            EXCLUDED.rate_limit_group IS DISTINCT FROM esi_collection_limiter_state.rate_limit_group
+            AND esi_collection_limiter_state.next_request_at >= EXCLUDED.next_request_at
+        )
     ) THEN TRUE ELSE EXCLUDED.pacing_active END,
     updated_at = GREATEST(esi_collection_limiter_state.updated_at, EXCLUDED.updated_at)
 "#,
@@ -6577,6 +7131,7 @@ pub struct CollectionReport {
 pub struct ContractCollector {
     store: ContractCollectionStore,
     esi: Arc<dyn PublicContractEsi>,
+    structure_resolver: Option<Arc<dyn StructureResolver>>,
     notifications: Option<ContractNotifications>,
     delivery_clock: Arc<dyn ContractDeliveryClock>,
     request_pacer: Arc<dyn ContractRequestPacer>,
@@ -6663,6 +7218,7 @@ impl ContractCollector {
         Self {
             store,
             esi,
+            structure_resolver: None,
             notifications: None,
             delivery_clock: Arc::new(SystemContractDeliveryClock),
             request_pacer: Arc::new(SystemContractRequestPacer),
@@ -6681,6 +7237,19 @@ impl ContractCollector {
             delivery,
             Arc::new(UnrestrictedContractPingLimiter),
         )
+    }
+
+    pub fn with_structure_resolver(mut self, resolver: Arc<dyn StructureResolver>) -> Self {
+        self.structure_resolver = Some(resolver);
+        self
+    }
+
+    fn with_optional_structure_resolver(
+        mut self,
+        resolver: Option<Arc<dyn StructureResolver>>,
+    ) -> Self {
+        self.structure_resolver = resolver;
+        self
     }
 
     pub fn with_notifications_and_ping_limiter(
@@ -7622,6 +8191,13 @@ impl ContractCollector {
             }
         }
 
+        if (requirements.solar_system || requirements.security_status)
+            && event.context.solar_system_id.is_none()
+        {
+            self.resolve_structure_location_evidence(&mut event, evidence_now)
+                .await?;
+        }
+
         if requirements.security_status {
             if let Some(solar_system_id) = event.context.solar_system_id {
                 if event.context.security_status.is_none()
@@ -7711,6 +8287,348 @@ impl ContractCollector {
             }
         }
         Ok(event)
+    }
+
+    async fn resolve_structure_location_evidence(
+        &self,
+        event: &mut ContractEvent,
+        now: DateTime<Utc>,
+    ) -> Result<(), ContractCollectionError> {
+        let Some(resolver) = &self.structure_resolver else {
+            return Ok(());
+        };
+        let structure_id = event.contract.start_location_id;
+        if !self
+            .context_request_allowed(event.contract.contract_id)
+            .await?
+        {
+            return Ok(());
+        }
+        let admission = match self
+            .store
+            .reserve_structure_resolution(structure_id, resolver.credential_revision(), now)
+            .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                warn!(
+                    contract_id = event.contract.contract_id,
+                    structure_id, "structure resolver state unavailable: {error}"
+                );
+                return Ok(());
+            }
+        };
+        let (generation, cached) = match admission {
+            StructureResolutionAdmission::Inactive
+            | StructureResolutionAdmission::WaitUntil(_)
+            | StructureResolutionAdmission::Parked => return Ok(()),
+            StructureResolutionAdmission::Attempt { generation, cached } => {
+                (generation, cached.map(|cached| *cached))
+            }
+        };
+        let resolution = resolver
+            .resolve_structure_revalidating(structure_id, cached, now)
+            .await;
+        let response_from_structure_esi = match &resolution {
+            Ok(_) => true,
+            Err(error) => error.has_structure_esi_response(),
+        };
+        let response_metadata = match &resolution {
+            Ok(resolved) => &resolved.response_metadata,
+            Err(error) => error.response_metadata(),
+        };
+        let completion_at = resolution
+            .as_ref()
+            .ok()
+            .map(|resolved| self.request_pacer.now().max(resolved.observed_at))
+            .unwrap_or(now);
+        if response_from_structure_esi {
+            if let Err(error) = self
+                .store
+                .record_esi_limiter_at(response_metadata, self.request_pacer.now())
+                .await
+            {
+                warn!(
+                    contract_id = event.contract.contract_id,
+                    structure_id, "could not persist structure resolver ESI limiter state: {error}"
+                );
+                return Ok(());
+            }
+        }
+        match resolution {
+            Ok(resolved)
+                if resolved
+                    .expires_at
+                    .is_some_and(|expires_at| expires_at > completion_at)
+                    && resolved.representation_cacheable =>
+            {
+                let evidence = match self
+                    .store
+                    .record_structure_resolution_success_with_evidence(
+                        &resolved,
+                        resolver.credential_revision(),
+                        generation,
+                        resolver.resolver_identity(),
+                        completion_at,
+                    )
+                    .await
+                {
+                    Ok(Some(evidence)) => evidence,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
+                        warn!(
+                            contract_id = event.contract.contract_id,
+                            structure_id,
+                            "could not retain access-qualified structure evidence: {error}"
+                        );
+                        return Ok(());
+                    }
+                };
+                if let Err(error) = self
+                    .store
+                    .record_structure_resolver_runtime(
+                        true,
+                        resolver.credential_revision(),
+                        "ready",
+                        None,
+                        completion_at,
+                    )
+                    .await
+                {
+                    warn!(
+                        contract_id = event.contract.contract_id,
+                        structure_id, "could not persist resolver health: {error}"
+                    );
+                }
+                event.context.solar_system_id = Some(evidence.solar_system_id);
+                event.context.solar_system_resolution = ContractContextResolution::Resolved;
+                event.context.location_evidence_id = Some(evidence.id);
+                event.context.location_evidence_class = Some(evidence.evidence_class);
+            }
+            Ok(resolved) => {
+                if !resolved.representation_cacheable {
+                    if let Err(error) = self
+                        .store
+                        .discard_structure_resolution_representation(
+                            structure_id,
+                            resolver.credential_revision(),
+                            generation,
+                        )
+                        .await
+                    {
+                        warn!(
+                            contract_id = event.contract.contract_id,
+                            structure_id,
+                            "could not discard no-store structure representation: {error}"
+                        );
+                    }
+                }
+                if let Err(error) = self
+                    .store
+                    .record_structure_resolution_transient_failure(
+                        structure_id,
+                        resolver.credential_revision(),
+                        generation,
+                        completion_at,
+                        Self::structure_resolution_retry_deadline(
+                            &resolved.response_metadata,
+                            resolved.response_metadata.retry_after,
+                            completion_at,
+                        ),
+                    )
+                    .await
+                {
+                    warn!(
+                        contract_id = event.contract.contract_id,
+                        structure_id,
+                        "could not persist structure resolver cache boundary: {error}"
+                    );
+                }
+            }
+            Err(error) if error.kind() == StructureResolverFailureKind::AccessDenied => {
+                if error.response_disallows_representation_storage() {
+                    if let Err(discard_error) = self
+                        .store
+                        .discard_structure_resolution_representation(
+                            structure_id,
+                            resolver.credential_revision(),
+                            generation,
+                        )
+                        .await
+                    {
+                        warn!(
+                            contract_id = event.contract.contract_id,
+                            structure_id,
+                            "could not discard no-store structure representation: {discard_error}"
+                        );
+                    }
+                }
+                match self
+                    .store
+                    .record_structure_resolution_denial(
+                        structure_id,
+                        resolver.credential_revision(),
+                        generation,
+                        now,
+                        error.retry_after(),
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        if let Err(record_error) = self
+                            .store
+                            .record_structure_resolver_runtime(
+                                true,
+                                resolver.credential_revision(),
+                                "degraded",
+                                Some("structure resolver access denied"),
+                                now,
+                            )
+                            .await
+                        {
+                            warn!(
+                                contract_id = event.contract.contract_id,
+                                structure_id, "could not persist resolver health: {record_error}"
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(record_error) => {
+                        warn!(
+                            contract_id = event.contract.contract_id,
+                            structure_id,
+                            "could not persist structure resolver denial: {record_error}"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                if error.response_disallows_representation_storage() {
+                    if let Err(discard_error) = self
+                        .store
+                        .discard_structure_resolution_representation(
+                            structure_id,
+                            resolver.credential_revision(),
+                            generation,
+                        )
+                        .await
+                    {
+                        warn!(
+                            contract_id = event.contract.contract_id,
+                            structure_id,
+                            "could not discard no-store structure representation: {discard_error}"
+                        );
+                    }
+                }
+                if error.is_global_auth_failure() {
+                    let deadline = error
+                        .retry_after()
+                        .unwrap_or(now + ChronoDuration::seconds(30));
+                    match self
+                        .store
+                        .record_structure_resolver_backoff(
+                            resolver.credential_revision(),
+                            deadline,
+                            now,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            if let Err(record_error) = self
+                                .store
+                                .record_structure_resolver_runtime(
+                                    true,
+                                    resolver.credential_revision(),
+                                    "degraded",
+                                    Some("structure resolver authorization or upstream failure"),
+                                    now,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    structure_id,
+                                    "could not persist resolver health: {record_error}"
+                                );
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(record_error) => {
+                            warn!(
+                                structure_id,
+                                "could not persist resolver-wide backoff: {record_error}"
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                match self
+                    .store
+                    .record_structure_resolution_transient_failure(
+                        structure_id,
+                        resolver.credential_revision(),
+                        generation,
+                        now,
+                        Self::transient_structure_resolution_retry_deadline(&error, now),
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        if let Err(record_error) = self
+                            .store
+                            .record_structure_resolver_runtime(
+                                true,
+                                resolver.credential_revision(),
+                                "degraded",
+                                Some("structure resolver authorization or upstream failure"),
+                                now,
+                            )
+                            .await
+                        {
+                            warn!(
+                                contract_id = event.contract.contract_id,
+                                structure_id, "could not persist resolver health: {record_error}"
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(record_error) => {
+                        warn!(
+                            contract_id = event.contract.contract_id,
+                            structure_id,
+                            "could not persist structure resolver retry: {record_error}"
+                        );
+                    }
+                }
+                warn!(
+                    contract_id = event.contract.contract_id,
+                    structure_id, "structure resolver degraded: {error}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn transient_structure_resolution_retry_deadline(
+        error: &StructureResolverError,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        Self::structure_resolution_retry_deadline(
+            error.response_metadata(),
+            error.retry_after(),
+            now,
+        )
+    }
+
+    fn structure_resolution_retry_deadline(
+        response_metadata: &CacheMetadata,
+        retry_after: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        [retry_after, response_metadata.expires_at]
+            .into_iter()
+            .flatten()
+            .filter(|deadline| *deadline > now)
+            .max()
     }
 
     async fn event_with_persisted_observation_context(
@@ -9652,7 +10570,10 @@ fn sanitize_contract_visible_text(value: &str, preserve_name_punctuation: bool) 
     sanitized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn merge_cache_metadata(cached: &CacheMetadata, response: CacheMetadata) -> CacheMetadata {
+pub(crate) fn merge_cache_metadata(
+    cached: &CacheMetadata,
+    response: CacheMetadata,
+) -> CacheMetadata {
     CacheMetadata {
         etag: response.etag.or_else(|| cached.etag.clone()),
         expires_at: response.expires_at.or(cached.expires_at),
@@ -9720,6 +10641,33 @@ pub fn spawn_contract_collection_loop_with_notifications_and_region_concurrency(
     ping_limiter: Arc<dyn ContractPingLimiter>,
     max_concurrent_regions: usize,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_contract_collection_loop_with_notifications_structure_resolver_and_region_concurrency(
+        database_url,
+        store_handle,
+        interval,
+        esi_timeout,
+        ship_groups,
+        delivery,
+        ping_limiter,
+        None,
+        None,
+        max_concurrent_regions,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_contract_collection_loop_with_notifications_structure_resolver_and_region_concurrency(
+    database_url: String,
+    store_handle: ContractStoreHandle,
+    interval: Duration,
+    esi_timeout: Duration,
+    ship_groups: Arc<dyn ShipGroupResolver>,
+    delivery: Arc<dyn ContractDelivery>,
+    ping_limiter: Arc<dyn ContractPingLimiter>,
+    structure_resolver: Option<Arc<dyn StructureResolver>>,
+    structure_resolver_runtime: Option<StructureResolverRuntimeStatus>,
+    max_concurrent_regions: usize,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(
         run_contract_collection_loop_with_notifications_and_region_concurrency(
             database_url,
@@ -9729,6 +10677,8 @@ pub fn spawn_contract_collection_loop_with_notifications_and_region_concurrency(
             ship_groups,
             delivery,
             ping_limiter,
+            structure_resolver,
+            structure_resolver_runtime,
             max_concurrent_regions,
         ),
     )
@@ -9751,6 +10701,8 @@ pub async fn run_contract_collection_loop_with_notifications(
         ship_groups,
         delivery,
         ping_limiter,
+        None,
+        None,
         DEFAULT_CONTRACT_REGIONAL_CONCURRENCY,
     )
     .await;
@@ -9765,6 +10717,8 @@ async fn run_contract_collection_loop_with_notifications_and_region_concurrency(
     ship_groups: Arc<dyn ShipGroupResolver>,
     delivery: Arc<dyn ContractDelivery>,
     ping_limiter: Arc<dyn ContractPingLimiter>,
+    structure_resolver: Option<Arc<dyn StructureResolver>>,
+    structure_resolver_runtime: Option<StructureResolverRuntimeStatus>,
     max_concurrent_regions: usize,
 ) {
     let notifications = ContractNotifications {
@@ -9788,12 +10742,21 @@ async fn run_contract_collection_loop_with_notifications_and_region_concurrency(
             Ok(store) => {
                 let store = Arc::new(store);
                 *store_handle.write().await = Some(store.clone());
+                if let Some(runtime) = &structure_resolver_runtime {
+                    if let Err(error) = store
+                        .initialize_structure_resolver_runtime(runtime, Utc::now())
+                        .await
+                    {
+                        warn!("could not persist structure resolver runtime state: {error}");
+                    }
+                }
                 let collector = ContractCollector::new((*store).clone(), esi.clone())
                     .with_notifications_and_ping_limiter(
                         notifications.ship_groups.clone(),
                         notifications.delivery.clone(),
                         notifications.ping_limiter.clone(),
                     )
+                    .with_optional_structure_resolver(structure_resolver.clone())
                     .with_recovery_gap(collection_recovery_gap(interval))
                     .with_max_concurrent_regions(max_concurrent_regions);
                 match collector.collect_cycle().await {

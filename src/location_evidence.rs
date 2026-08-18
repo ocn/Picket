@@ -191,6 +191,13 @@ impl<'a> LocationEvidenceService<'a> {
             .bind(now)
             .execute(&mut *transaction)
             .await?;
+        reactivate_parked_structure_resolution(
+            &mut transaction,
+            persisted.location_id,
+            persisted.observed_at,
+            now,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(persisted)
     }
@@ -283,7 +290,120 @@ impl<'a> LocationEvidenceService<'a> {
             .bind(now)
             .execute(&mut *transaction)
             .await?;
+        reactivate_parked_structure_resolution(
+            &mut transaction,
+            persisted.location_id,
+            persisted.observed_at,
+            now,
+        )
+        .await?;
         transaction.commit().await?;
+        Ok(persisted)
+    }
+
+    pub async fn record_access_qualified(
+        &self,
+        structure_id: i64,
+        solar_system_id: i64,
+        region_id: Option<i64>,
+        resolver_identity: &str,
+        observed_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<LocationEvidence, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let persisted = Self::record_access_qualified_in_transaction(
+            &mut transaction,
+            structure_id,
+            solar_system_id,
+            region_id,
+            resolver_identity,
+            observed_at,
+            expires_at,
+            now,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(persisted)
+    }
+
+    pub(crate) async fn record_access_qualified_in_transaction(
+        transaction: &mut Transaction<'_, Postgres>,
+        structure_id: i64,
+        solar_system_id: i64,
+        region_id: Option<i64>,
+        resolver_identity: &str,
+        observed_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<LocationEvidence, sqlx::Error> {
+        if observed_at > now {
+            return Err(sqlx::Error::Protocol(
+                "access-qualified evidence observation time cannot be in the future".to_string(),
+            ));
+        }
+        if expires_at <= observed_at {
+            return Err(sqlx::Error::Protocol(
+                "access-qualified evidence expiry must be after its observation time".to_string(),
+            ));
+        }
+        validate_location_facts(
+            structure_id,
+            Some(structure_id),
+            None,
+            solar_system_id,
+            region_id,
+        )
+        .map_err(sqlx::Error::Protocol)?;
+        validate_access_resolver_identity(resolver_identity).map_err(sqlx::Error::Protocol)?;
+        lock_location(transaction, structure_id).await?;
+        let current = sqlx::query("SELECT id, location_id, evidence_class, structure_id, station_id, solar_system_id, region_id, provenance, actor, observed_at, expires_at, expired_at, superseded_at, superseded_by_actor, supersedes_id FROM location_evidence WHERE location_id = $1 AND evidence_class = 'access_qualified' AND superseded_at IS NULL AND expired_at IS NULL FOR UPDATE")
+            .bind(structure_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .map(location_evidence_from_row)
+            .transpose()?;
+        if let Some(current) = &current {
+            if observed_at < current.observed_at {
+                return Ok(current.clone());
+            }
+            sqlx::query("UPDATE location_evidence SET superseded_at = $2, superseded_by_actor = $3 WHERE id = $1")
+                .bind(current.id)
+                .bind(now)
+                .bind(resolver_identity)
+                .execute(&mut **transaction)
+                .await?;
+            sqlx::query("INSERT INTO location_evidence_audit (location_evidence_id, action, actor, provenance, occurred_at) VALUES ($1, 'superseded', $2, 'authenticated ESI structure response', $3)")
+                .bind(current.id)
+                .bind(resolver_identity)
+                .bind(now)
+                .execute(&mut **transaction)
+                .await?;
+        }
+        let row = sqlx::query("INSERT INTO location_evidence (location_id, evidence_class, structure_id, solar_system_id, region_id, provenance, actor, observed_at, expires_at, supersedes_id) VALUES ($1, 'access_qualified', $1, $2, $3, 'authenticated ESI structure response', $4, $5, $6, $7) RETURNING id, location_id, evidence_class, structure_id, station_id, solar_system_id, region_id, provenance, actor, observed_at, expires_at, expired_at, superseded_at, superseded_by_actor, supersedes_id")
+            .bind(structure_id)
+            .bind(solar_system_id)
+            .bind(region_id)
+            .bind(resolver_identity)
+            .bind(observed_at)
+            .bind(expires_at)
+            .bind(current.as_ref().map(|current| current.id))
+            .fetch_one(&mut **transaction)
+            .await?;
+        let persisted = location_evidence_from_row(row)?;
+        sqlx::query("INSERT INTO location_evidence_audit (location_evidence_id, action, actor, provenance, occurred_at) VALUES ($1, 'added', $2, 'authenticated ESI structure response', $3)")
+            .bind(persisted.id)
+            .bind(resolver_identity)
+            .bind(now)
+            .execute(&mut **transaction)
+            .await?;
+        reactivate_parked_structure_resolution(
+            transaction,
+            persisted.location_id,
+            persisted.observed_at,
+            now,
+        )
+        .await?;
         Ok(persisted)
     }
 
@@ -411,12 +531,19 @@ impl<'a> LocationEvidenceService<'a> {
             .bind(evidence.id)
             .execute(&mut *transaction)
             .await?;
+        reactivate_parked_structure_resolution(
+            &mut transaction,
+            evidence.location_id,
+            evidence.observed_at,
+            now,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(evidence)
     }
 }
 
-async fn lock_location(
+pub(crate) async fn lock_location(
     transaction: &mut Transaction<'_, Postgres>,
     location_id: i64,
 ) -> Result<(), sqlx::Error> {
@@ -632,6 +759,38 @@ fn validate_mutation_actor(actor: &str, provenance: &str) -> Result<(), String> 
     } else {
         Ok(())
     }
+}
+
+fn validate_access_resolver_identity(resolver_identity: &str) -> Result<(), String> {
+    let Some(character_id) = resolver_identity.strip_prefix("character:") else {
+        return Err("access-qualified evidence requires a character resolver identity".to_string());
+    };
+    if character_id
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .is_none()
+    {
+        return Err(
+            "access-qualified evidence requires a positive character resolver identity".to_string(),
+        );
+    }
+    Ok(())
+}
+
+async fn reactivate_parked_structure_resolution(
+    transaction: &mut Transaction<'_, Postgres>,
+    location_id: i64,
+    observed_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE structure_resolution_state SET cache_expires_at = NULL, next_attempt_at = $3, first_denied_at = NULL, last_denied_at = NULL, denied_attempts = 0, parked_at = NULL, transient_failures = 0, last_error = NULL, last_failure_kind = NULL, updated_at = $3 WHERE structure_id = $1 AND parked_at IS NOT NULL AND $2 >= parked_at")
+        .bind(location_id)
+        .bind(observed_at)
+        .bind(now)
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
 }
 
 fn parse_command<'a>(
