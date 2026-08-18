@@ -7,17 +7,18 @@ use killbot_rust::contract_intelligence::{
     available_contract_store, collection_retry_delay, contract_regional_concurrency_from,
     new_contract_store_handle, spawn_contract_collection_loop_with_notifications,
     AppStateContractPingLimiter, CacheMetadata, CollectionOutcome, ContractCollectionStore,
-    ContractCollector, ContractContextLimiter, ContractContextRequirements, ContractContextValue,
-    ContractDelivery, ContractDeliveryClock, ContractDeliveryError, ContractEmbedContext,
-    ContractEventAction, ContractEventActions, ContractEventKind, ContractFilter,
-    ContractFilterCondition, ContractFilterNode, ContractItemDirection, ContractItemProbe,
-    ContractLocationContext, ContractObservationContext, ContractPingLimiter, ContractPingType,
-    ContractRequestPacer, ContractResolutionState, ContractSubscription, DeliveryFailureKind,
-    DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HealthCheck, HealthClock, HealthCycle,
-    HealthDiscordPublisher, HealthPublishError, HealthRuntimeConfig, HealthStatus, HealthWatchdog,
-    HealthWatchdogConfig, HealthWatchdogRunner, HttpPublicContractEsi, PreparedContractDelivery,
-    PublicContract, PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
-    SolarSystemPosition, StructureResolutionAdmission,
+    ContractCollector, ContractContextLimiter, ContractContextRequirements,
+    ContractContextResolution, ContractContextValue, ContractDelivery, ContractDeliveryClock,
+    ContractDeliveryError, ContractEmbedContext, ContractEventAction, ContractEventActions,
+    ContractEventKind, ContractFilter, ContractFilterCondition, ContractFilterNode,
+    ContractItemDirection, ContractItemProbe, ContractLocationContext, ContractObservationContext,
+    ContractPingLimiter, ContractPingType, ContractRequestPacer, ContractResolutionState,
+    ContractSubscription, DeliveryFailureKind, DeliveryRecord, DeliveryStatus, EsiError,
+    EsiResponse, HealthCheck, HealthClock, HealthCycle, HealthDiscordPublisher, HealthPublishError,
+    HealthRuntimeConfig, HealthStatus, HealthWatchdog, HealthWatchdogConfig, HealthWatchdogRunner,
+    HttpPublicContractEsi, PreparedContractDelivery, PublicContract, PublicContractEsi,
+    PublicContractItem, ShipGroupLookup, ShipGroupResolver, SolarSystemPosition,
+    StructureResolutionAdmission,
 };
 use killbot_rust::esi::EsiClient;
 use killbot_rust::feed::{FeedError, FeedHealthProvider, FeedHealthTelemetry, KillmailFeed};
@@ -4215,7 +4216,18 @@ async fn resolver_degradation_is_observational_while_public_collection_prepares_
     .await
     .expect("denied authenticated enrichment cannot abort public collection");
     assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
-    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert!(sent.iter().any(|delivery| {
+        delivery.subscription_id == "resolver-demand"
+            && !delivery.ping
+            && delivery
+                .message
+                .fields
+                .iter()
+                .any(|field| field.name == "Alert" && field.value == "Proximity-Unverified")
+    }));
+    drop(sent);
 
     let pool = PgPoolOptions::new()
         .max_connections(1)
@@ -5477,7 +5489,15 @@ async fn deferred_operator_location_rechecks_security_after_evidence_moves_syste
         .collect_cycle()
         .await
         .expect("defer while the old operator system position is unavailable");
-    assert!(delivery.sent.lock().unwrap().is_empty());
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(!sent[0].ping);
+    assert!(sent[0]
+        .message
+        .fields
+        .iter()
+        .any(|field| { field.name == "Alert" && field.value == "Proximity-Unverified" }));
+    drop(sent);
     assert_eq!(
         first_esi.security_calls.lock().unwrap().as_slice(),
         &[30_002_086]
@@ -5553,7 +5573,11 @@ async fn deferred_operator_location_rechecks_security_after_evidence_moves_syste
         moved_esi.security_calls.lock().unwrap().as_slice(),
         &[30_003_089]
     );
-    assert!(delivery.sent.lock().unwrap().is_empty());
+    assert_eq!(
+        delivery.sent.lock().unwrap().len(),
+        1,
+        "a later mismatch leaves the existing U alert untouched for Ticket10"
+    );
     database.destroy().await;
 }
 
@@ -6049,7 +6073,8 @@ async fn adding_after_time_expiry_audits_the_automatic_operator_expiration() {
 }
 
 #[tokio::test]
-async fn operator_evidence_resolves_deferred_player_structure_proximity_after_store_recreation() {
+async fn unresolved_player_structure_proximity_posts_non_pinging_alerts_and_stays_idempotent_after_restart(
+) {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let location_id = 1_035_466_617_951_i64;
@@ -6077,12 +6102,18 @@ async fn operator_evidence_resolves_deferred_player_structure_proximity_after_st
                 id: id.to_string(),
                 description: id.to_string(),
                 filter: ContractFilter {
-                    root: ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(
-                        vec![config::SystemRange {
-                            system_id: center,
-                            range: 1.0,
-                        }],
-                    )),
+                    root: ContractFilterNode::And(vec![
+                        ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                            direction: ContractItemDirection::Offered,
+                            ids: vec![587],
+                        }),
+                        ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                            config::SystemRange {
+                                system_id: center,
+                                range: 1.0,
+                            },
+                        ])),
+                    ]),
                 },
                 event_actions: ContractEventActions {
                     listed: ContractEventAction::Post,
@@ -6112,7 +6143,10 @@ async fn operator_evidence_resolves_deferred_player_structure_proximity_after_st
                         expiring_page(1),
                     )),
                 )]),
-                items: HashMap::from([(44, Ok(EsiResponse::fresh(vec![], expiring_cache())))]),
+                items: HashMap::from([(
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
             },
             contexts: HashMap::new(),
             positions: positions.clone(),
@@ -6120,13 +6154,35 @@ async fn operator_evidence_resolves_deferred_player_structure_proximity_after_st
         }),
     )
     .with_notifications(
-        Arc::new(StaticShipGroups(HashMap::new())),
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
         unknown_delivery.clone(),
     )
     .collect_cycle()
     .await
-    .expect("defer the player-structure proximity match without evidence");
-    assert!(unknown_delivery.sent.lock().unwrap().is_empty());
+    .expect("post an unverified player-structure proximity alert without evidence");
+    let sent = unknown_delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert!(sent.iter().all(|delivery| !delivery.ping));
+    assert!(sent.iter().all(|delivery| {
+        delivery
+            .message
+            .fields
+            .iter()
+            .any(|field| field.name == "Alert" && field.value == "Proximity-Unverified")
+    }));
+    assert!(sent.iter().all(|delivery| {
+        delivery.message.title.starts_with("Unknown ship")
+            && !delivery.message.title.contains("587")
+            && delivery
+                .message
+                .description
+                .as_deref()
+                .is_some_and(|description| {
+                    description.contains("Player-owned structure")
+                        && !description.contains(&location_id.to_string())
+                })
+    }));
+    drop(sent);
     let now = Utc::now();
     execute_operator_location_evidence_cli(
         &store,
@@ -6176,7 +6232,10 @@ async fn operator_evidence_resolves_deferred_player_structure_proximity_after_st
                         expiring_page(1),
                     )),
                 )]),
-                items: HashMap::from([(44, Ok(EsiResponse::fresh(vec![], expiring_cache())))]),
+                items: HashMap::from([(
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
             },
             contexts: HashMap::new(),
             positions,
@@ -6189,12 +6248,394 @@ async fn operator_evidence_resolves_deferred_player_structure_proximity_after_st
     )
     .collect_cycle()
     .await
-    .expect("re-evaluate deferred proximity from retained operator evidence");
+    .expect("re-evaluate the retained unverified proximity after restart");
     let sent = resolved_delivery.sent.lock().unwrap();
-    assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].subscription_id, "near-turnur");
-    assert_eq!(sent[0].contract_id, 44);
+    assert!(
+        sent.is_empty(),
+        "Ticket10 owns the later edit and promotion"
+    );
     drop(sent);
+    assert_eq!(
+        restarted_store
+            .delivery_records()
+            .await
+            .expect("read durable unverified deliveries")
+            .len(),
+        2
+    );
+    let promotion_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect durable unverified promotion state");
+    let durable_unverified_matches: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM contract_deferred_subscription_matches WHERE contract_id = 44 AND event_kind = 'listed' AND proximity_unverified = TRUE",
+    )
+    .fetch_one(&promotion_pool)
+    .await
+    .expect("retain U identities for Ticket10 promotion");
+    promotion_pool.close().await;
+    assert_eq!(
+        durable_unverified_matches, 2,
+        "a later definite re-evaluation neither duplicates nor consumes the U alert identity"
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn proximity_unverified_outbox_and_ticket10_marker_roll_back_together_on_failure() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let location_id = 1_035_466_617_951_i64;
+    let mut contract = item_exchange_contract(44);
+    contract.start_location_id = location_id;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish a silent baseline");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "atomic-unverified".to_string(),
+            description: "atomically retain unverified identity".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::And(vec![
+                    ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                        direction: ContractItemDirection::Offered,
+                        ids: vec![587],
+                    }),
+                    ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                        config::SystemRange {
+                            system_id: 30_002_086,
+                            range: 1.0,
+                        },
+                    ])),
+                ]),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::PostAndPing,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist an otherwise eligible proximity subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to install deterministic deferred-marker failure");
+    sqlx::query(
+        "CREATE FUNCTION reject_unverified_marker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced deferred marker failure'; END; $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create forced failure function");
+    sqlx::query(
+        "CREATE TRIGGER reject_unverified_marker BEFORE INSERT ON contract_deferred_subscription_matches FOR EACH ROW EXECUTE FUNCTION reject_unverified_marker()",
+    )
+    .execute(&pool)
+    .await
+    .expect("fail the marker write after an outbox insert would have happened");
+
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let result = ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![contract], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: HashMap::new(),
+            positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    )
+    .collect_cycle()
+    .await;
+
+    assert!(
+        result.is_err(),
+        "the injected marker failure aborts the cycle"
+    );
+    assert!(delivery.sent.lock().unwrap().is_empty());
+    let outbox_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM contract_outbound_deliveries WHERE subscription_id = 'atomic-unverified' AND contract_id = 44",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect the rolled-back outbox");
+    let marker_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM contract_deferred_subscription_matches WHERE subscription_id = 'atomic-unverified' AND contract_id = 44 AND proximity_unverified = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect the rolled-back Ticket10 marker");
+    assert_eq!(
+        outbox_count, 0,
+        "a failed marker cannot leave a deliverable U alert"
+    );
+    assert_eq!(
+        marker_count, 0,
+        "a failed outbox cannot leave a promotion identity"
+    );
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn an_ordinary_deferred_match_upgrades_to_a_durable_unverified_marker_before_later_confirmation(
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let location_id = 1_035_466_617_951_i64;
+    let mut contract = item_exchange_contract(44);
+    contract.start_location_id = location_id;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish a silent baseline");
+    let subscription = ContractSubscription {
+        guild_id: 42,
+        channel_id: 77,
+        id: "deferred-then-unverified".to_string(),
+        description: "upgrade ordinary deferral to Ticket10 continuity".to_string(),
+        filter: ContractFilter {
+            root: ContractFilterNode::And(vec![
+                ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                    direction: ContractItemDirection::Offered,
+                    ids: vec![587],
+                }),
+                ContractFilterNode::Condition(
+                    ContractFilterCondition::ObservedAffiliationAlliances(vec![99_000_111]),
+                ),
+                ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                    config::SystemRange {
+                        system_id: 30_002_086,
+                        range: 1.0,
+                    },
+                ])),
+            ]),
+        },
+        event_actions: ContractEventActions {
+            listed: ContractEventAction::PostAndPing,
+            ..ContractEventActions::default()
+        },
+    };
+    store
+        .upsert_contract_subscription(&subscription)
+        .await
+        .expect("persist the composite deferred subscription");
+    let first_delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: HashMap::new(),
+            positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        first_delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("retain the non-location deferral before proximity becomes the only uncertainty");
+    assert!(first_delivery.sent.lock().unwrap().is_empty());
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect deferred continuity state");
+    let first_marker: bool = sqlx::query_scalar(
+        "SELECT proximity_unverified FROM contract_deferred_subscription_matches WHERE subscription_id = 'deferred-then-unverified' AND contract_id = 44",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read the ordinary deferred row");
+    assert!(
+        !first_marker,
+        "non-location uncertainty is not a premature U marker"
+    );
+
+    drop(store);
+    let restarted_store = database.store().await;
+    let unresolved_delivery = Arc::new(RecordingDelivery {
+        store: restarted_store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        restarted_store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: HashMap::from([(
+                44,
+                ContractObservationContext {
+                    observed_affiliation_alliance_id: Some(99_000_111),
+                    observed_affiliation_alliance_resolution: ContractContextResolution::Resolved,
+                    ..ContractObservationContext::default()
+                },
+            )]),
+            positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        unresolved_delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("post the visible U alert once affiliation resolves");
+    let sent = unresolved_delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(!sent[0].ping);
+    assert!(sent[0]
+        .message
+        .fields
+        .iter()
+        .any(|field| field.name == "Alert" && field.value == "Proximity-Unverified"));
+    drop(sent);
+    let upgraded_marker: bool = sqlx::query_scalar(
+        "SELECT proximity_unverified FROM contract_deferred_subscription_matches WHERE subscription_id = 'deferred-then-unverified' AND contract_id = 44",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the visible U alert atomically upgrades its Ticket10 marker");
+    assert!(upgraded_marker);
+
+    let now = Utc::now();
+    execute_operator_location_evidence_cli(
+        &restarted_store,
+        &[
+            "add",
+            "--location-id",
+            "1035466617951",
+            "--structure-id",
+            "1035466617951",
+            "--system-id",
+            "30002086",
+            "--region-id",
+            "10000003",
+            "--expires-at",
+            &(now + chrono::Duration::days(1)).to_rfc3339(),
+            "--actor",
+            "operator:continuity",
+            "--provenance",
+            "definitive later location evidence",
+        ],
+        now,
+    )
+    .await
+    .expect("add the later definitive location evidence");
+    let confirmed_delivery = Arc::new(RecordingDelivery {
+        store: restarted_store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        restarted_store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![contract], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: HashMap::from([(
+                44,
+                ContractObservationContext {
+                    observed_affiliation_alliance_id: Some(99_000_111),
+                    observed_affiliation_alliance_resolution: ContractContextResolution::Resolved,
+                    ..ContractObservationContext::default()
+                },
+            )]),
+            positions: HashMap::from([
+                (30_002_086, position_at_light_years(0.0)),
+                (30_000_044, position_at_light_years(0.0)),
+            ]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        confirmed_delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("re-evaluate the confirmed event without Ticket10 promotion");
+    assert!(confirmed_delivery.sent.lock().unwrap().is_empty());
+    let retained_marker: bool = sqlx::query_scalar(
+        "SELECT proximity_unverified FROM contract_deferred_subscription_matches WHERE subscription_id = 'deferred-then-unverified' AND contract_id = 44",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("retain the U marker for Ticket10 after a later confirmation");
+    assert!(retained_marker);
+    pool.close().await;
     database.destroy().await;
 }
 
@@ -6513,6 +6954,10 @@ struct SnapshottingEsi {
     inner: FakeEsi,
     contexts: StdMutex<Vec<Result<EsiResponse<ContractEmbedContext>, EsiError>>>,
     calls: StdMutex<Vec<i64>>,
+}
+
+struct NamedFakeEsi {
+    inner: FakeEsi,
 }
 
 #[derive(Default)]
@@ -7163,6 +7608,49 @@ impl PublicContractEsi for SnapshottingEsi {
     ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
         self.calls.lock().unwrap().push(contract.contract_id);
         self.contexts.lock().unwrap().remove(0)
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for NamedFakeEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+
+    async fn observed_contract_embed_context(
+        &self,
+        _contract: &PublicContract,
+        _items: &[PublicContractItem],
+    ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
+        Ok(EsiResponse::fresh(
+            ContractEmbedContext {
+                item_names: std::collections::BTreeMap::from([
+                    (587, "Rifter".to_string()),
+                    (19_720, "Ragnarok".to_string()),
+                ]),
+                ..ContractEmbedContext::default()
+            },
+            CacheMetadata::cached_for_seconds(60),
+        ))
     }
 }
 
@@ -8631,6 +9119,7 @@ async fn pre_expiry_no_content_confirms_only_pure_matched_ship_sales_and_purchas
 async fn contract_cycle_release_seam_preserves_all_public_lifecycle_outcomes_and_deliveries() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
+    let unresolved_structure = 1_035_466_617_952_i64;
     let mut sale = item_exchange_contract(44);
     sale.date_expired = Utc::now() + chrono::Duration::hours(1);
     let mut purchase = item_exchange_contract(45);
@@ -8643,6 +9132,16 @@ async fn contract_cycle_release_seam_preserves_all_public_lifecycle_outcomes_and
     unknown.date_expired = Utc::now() + chrono::Duration::hours(1);
     let mut listed = item_exchange_contract(48);
     listed.date_expired = Utc::now() + chrono::Duration::hours(1);
+    for contract in [
+        &mut sale,
+        &mut purchase,
+        &mut expired,
+        &mut unknown,
+        &mut listed,
+    ] {
+        contract.start_location_id = unresolved_structure;
+        contract.end_location_id = Some(unresolved_structure);
+    }
 
     let delivery = Arc::new(RecordingDelivery {
         store: store.clone(),
@@ -8703,7 +9202,7 @@ async fn contract_cycle_release_seam_preserves_all_public_lifecycle_outcomes_and
     .expect("establish a silent regional baseline");
     assert!(delivery.sent.lock().unwrap().is_empty());
 
-    for subscription in [
+    for mut subscription in [
         contract_subscription(
             "listed",
             ContractItemDirection::Offered,
@@ -8741,6 +9240,17 @@ async fn contract_cycle_release_seam_preserves_all_public_lifecycle_outcomes_and
             ContractEventAction::Post,
         ),
     ] {
+        if subscription.id != "nonmatching" {
+            subscription.filter.root = ContractFilterNode::And(vec![
+                subscription.filter.root,
+                ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                    config::SystemRange {
+                        system_id: 30_002_086,
+                        range: 8.0,
+                    },
+                ])),
+            ]);
+        }
         store
             .upsert_contract_subscription(&subscription)
             .await
@@ -8859,6 +9369,13 @@ async fn contract_cycle_release_seam_preserves_all_public_lifecycle_outcomes_and
         .iter()
         .all(|delivery| delivery.subscription_id != "nonmatching"));
     assert!(sent.iter().all(|delivery| !delivery.ping));
+    assert!(sent.iter().all(|delivery| {
+        delivery
+            .message
+            .fields
+            .iter()
+            .any(|field| field.name == "Alert" && field.value == "Proximity-Unverified")
+    }));
     drop(sent);
     let delivery_records = store
         .delivery_records()
@@ -10079,7 +10596,7 @@ async fn light_year_ranges_do_not_fetch_positions_after_a_cheap_local_miss() {
 }
 
 #[tokio::test]
-async fn unavailable_light_year_positions_remain_deferred_even_through_not() {
+async fn unavailable_light_year_positions_post_unverified_alerts_even_through_not() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let baseline = item_exchange_contract(44);
@@ -10149,8 +10666,18 @@ async fn unavailable_light_year_positions_remain_deferred_even_through_not() {
         .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
         .collect_cycle()
         .await
-        .expect("defer incomplete positions");
-    assert!(delivery.sent.lock().unwrap().is_empty());
+        .expect("post incomplete-position alerts without converting them to a definite match");
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert!(sent.iter().all(|delivery| !delivery.ping));
+    assert!(sent.iter().all(|delivery| {
+        delivery
+            .message
+            .fields
+            .iter()
+            .any(|field| field.name == "Alert" && field.value == "Proximity-Unverified")
+    }));
+    drop(sent);
     assert!(esi.position_calls.lock().unwrap().contains(&30_002_086));
     database.destroy().await;
 }
@@ -13052,6 +13579,171 @@ async fn terminal_light_year_range_uses_the_observation_snapshot_after_restart()
         &[30_002_086],
         "terminal filtering may load the static center but never the event's current location"
     );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_light_year_range_reuses_location_resolved_at_observation_time() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let baseline = item_exchange_contract(44);
+    let mut listed = item_exchange_contract(45);
+    listed.start_location_id = 1_035_466_617_946;
+    listed.end_location_id = Some(listed.start_location_id);
+
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(
+            vec![baseline.clone()],
+            HashMap::from([(
+                baseline.contract_id,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        )),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline before observing the structure location");
+
+    execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "1035466617946",
+            "--structure-id",
+            "1035466617946",
+            "--system-id",
+            "30000044",
+            "--region-id",
+            "10000002",
+            "--expires-at",
+            "2026-08-19T12:00:00Z",
+            "--actor",
+            "operator:observation",
+            "--provenance",
+            "verified before the public contract disappeared",
+        ],
+        now,
+    )
+    .await
+    .expect("retain the observation-time structure mapping");
+    let terminal_subscription = ContractSubscription {
+        guild_id: 42,
+        channel_id: 77,
+        id: "sale-observation-range".to_string(),
+        description: "persist a terminal-only observation-time location".to_string(),
+        filter: ContractFilter {
+            root: ContractFilterNode::And(vec![
+                ContractFilterNode::Condition(ContractFilterCondition::EventKinds(vec![
+                    ContractEventKind::SaleConfirmed,
+                ])),
+                ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                    direction: ContractItemDirection::Offered,
+                    ids: vec![587],
+                }),
+                ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                    config::SystemRange {
+                        system_id: 30_002_086,
+                        range: 8.0,
+                    },
+                ])),
+            ]),
+        },
+        event_actions: ContractEventActions {
+            sale_confirmed: ContractEventAction::Post,
+            ..ContractEventActions::default()
+        },
+    };
+    store
+        .upsert_contract_subscription(&terminal_subscription)
+        .await
+        .expect("persist the terminal-only range subscription before observation");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let listing_esi = Arc::new(PositionEsi {
+        inner: regional_esi(
+            vec![baseline.clone(), listed.clone()],
+            HashMap::from([
+                (
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    45,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+            ]),
+        ),
+        contexts: HashMap::new(),
+        positions: HashMap::from([
+            (30_000_044, position_at_light_years(0.0)),
+            (30_002_086, position_at_light_years(0.0)),
+        ]),
+        position_calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), listing_esi)
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+        .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+        .collect_cycle()
+        .await
+        .expect("resolve and deliver the listed contract from operator evidence");
+
+    let snapshot = store
+        .observed_embed_context(10_000_002, listed.contract_id)
+        .await
+        .expect("read the observation-time snapshot")
+        .expect("persist the observation-time snapshot");
+    assert_eq!(
+        snapshot.location.solar_system_position,
+        Some(position_at_light_years(0.0)),
+        "a terminal-only action must retain the listing-time location before the contract disappears"
+    );
+    assert!(
+        delivery.sent.lock().unwrap().is_empty(),
+        "collecting terminal context must not deliver the Listed event"
+    );
+    let restarted_esi = Arc::new(PositionedResolutionEsi {
+        inner: ResolutionEsi {
+            inner: regional_esi(
+                vec![baseline],
+                HashMap::from([(
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            ),
+            probes: StdMutex::new(vec![Ok(ContractItemProbe::NoContent(expiring_cache()))]),
+            probe_calls: StdMutex::new(Vec::new()),
+        },
+        positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+        position_calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), restarted_esi.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+            delivery.clone(),
+        )
+        .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+        .collect_cycle()
+        .await
+        .expect("resolve the terminal event after restart");
+
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0]
+        .message
+        .fields
+        .iter()
+        .all(|field| field.name != "Alert"));
+    assert!(
+        restarted_esi.position_calls.lock().unwrap().is_empty(),
+        "the restarted terminal filter reuses the observation snapshot without a location lookup"
+    );
+    drop(sent);
+
     database.destroy().await;
 }
 
@@ -16367,15 +17059,16 @@ async fn recursive_contract_filters_match_every_public_fact_once_per_contract() 
         })
         .collect();
     assert_eq!(matching_ship_deliveries.len(), 2);
-    assert!(matching_ship_deliveries
-        .iter()
-        .all(|delivery| delivery.message.title.contains("587")));
+    assert!(matching_ship_deliveries.iter().all(|delivery| {
+        delivery.message.title.starts_with("Unknown ship")
+            && !delivery.message.title.contains("587")
+    }));
 
     database.destroy().await;
 }
 
 #[tokio::test]
-async fn unknown_location_does_not_make_a_negated_context_filter_eligible() {
+async fn unknown_location_posts_an_unverified_alert_through_a_negated_context_filter() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let baseline = item_exchange_contract(44);
@@ -16480,14 +17173,28 @@ async fn unknown_location_does_not_make_a_negated_context_filter_eligible() {
     let sent = delivery.sent.lock().unwrap();
     assert_eq!(
         sent.len(),
-        1,
-        "the plain corporation condition should match"
+        2,
+        "the plain match and the unresolved proximity branch both remain visible"
     );
-    assert_eq!(sent[0].subscription_id, "corporation-only");
+    assert!(sent.iter().any(|delivery| {
+        delivery.subscription_id == "corporation-only"
+            && delivery
+                .message
+                .fields
+                .iter()
+                .all(|field| field.name != "Alert")
+    }));
     assert!(
-        sent.iter()
-            .all(|delivery| delivery.subscription_id != "corporation-unknown-location"),
-        "an unknown location must not satisfy Not(SolarSystems)"
+        sent.iter().any(|delivery| {
+            delivery.subscription_id == "corporation-unknown-location"
+                && !delivery.ping
+                && delivery
+                    .message
+                    .fields
+                    .iter()
+                    .any(|field| field.name == "Alert" && field.value == "Proximity-Unverified")
+        }),
+        "an unknown location stays indeterminate through Not(SolarSystems)"
     );
 
     database.destroy().await;
@@ -16736,23 +17443,23 @@ async fn a_local_or_match_skips_unneeded_context_enrichment() {
 }
 
 #[tokio::test]
-async fn a_deferred_or_candidate_context_match_selects_the_higher_priority_ship() {
+async fn a_confirmed_or_branch_does_not_wait_for_an_unresolved_proximity_candidate() {
     let (first_context_calls, first_deliveries, titles) =
         resolve_candidate_branch_after_unknown_location(30_000_142).await;
 
     assert_eq!(first_context_calls, 1);
-    assert_eq!(first_deliveries, 0);
-    assert_eq!(titles, vec!["Type 19720 listed for 1.5B"]);
+    assert_eq!(first_deliveries, 1);
+    assert_eq!(titles, vec!["Unknown ship listed for 1.5B"]);
 }
 
 #[tokio::test]
-async fn a_deferred_or_candidate_context_miss_keeps_the_local_primary_ship() {
+async fn a_confirmed_or_branch_is_not_duplicated_when_later_proximity_mismatches() {
     let (first_context_calls, first_deliveries, titles) =
         resolve_candidate_branch_after_unknown_location(30_000_143).await;
 
     assert_eq!(first_context_calls, 1);
-    assert_eq!(first_deliveries, 0);
-    assert_eq!(titles, vec!["Type 587 listed for 1.5B"]);
+    assert_eq!(first_deliveries, 1);
+    assert_eq!(titles, vec!["Unknown ship listed for 1.5B"]);
 }
 
 #[tokio::test]
@@ -16873,19 +17580,29 @@ async fn contract_notifications_render_only_filter_matched_ship_items() {
 
     ContractCollector::new(
         store.clone(),
-        Arc::new(FakeEsi {
-            regions: vec![10_000_002],
-            pages: HashMap::from([(
-                (10_000_002, 1),
-                Ok(EsiResponse::fresh(vec![baseline.clone()], expiring_page(1))),
-            )]),
-            items: HashMap::from([(
-                44,
-                Ok(EsiResponse::fresh(
-                    vec![offered_ship.clone()],
-                    expiring_cache(),
-                )),
-            )]),
+        Arc::new(SnapshottingEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![baseline.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    44,
+                    Ok(EsiResponse::fresh(
+                        vec![offered_ship.clone()],
+                        expiring_cache(),
+                    )),
+                )]),
+            },
+            contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+                ContractEmbedContext {
+                    item_names: std::collections::BTreeMap::from([(587, "Rifter".to_string())]),
+                    ..ContractEmbedContext::default()
+                },
+                CacheMetadata::cached_for_seconds(60),
+            ))]),
+            calls: StdMutex::new(Vec::new()),
         }),
     )
     .collect_cycle()
@@ -16936,28 +17653,41 @@ async fn contract_notifications_render_only_filter_matched_ship_items() {
 
     ContractCollector::new(
         store.clone(),
-        Arc::new(FakeEsi {
-            regions: vec![10_000_002],
-            pages: HashMap::from([(
-                (10_000_002, 1),
-                Ok(EsiResponse::fresh(vec![baseline, listed], expiring_page(1))),
-            )]),
-            items: HashMap::from([
-                (
-                    44,
-                    Ok(EsiResponse::fresh(
-                        vec![offered_ship.clone()],
-                        expiring_cache(),
-                    )),
-                ),
-                (
-                    45,
-                    Ok(EsiResponse::fresh(
-                        vec![offered_ship, requested_ship],
-                        expiring_cache(),
-                    )),
-                ),
-            ]),
+        Arc::new(SnapshottingEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![baseline, listed], expiring_page(1))),
+                )]),
+                items: HashMap::from([
+                    (
+                        44,
+                        Ok(EsiResponse::fresh(
+                            vec![offered_ship.clone()],
+                            expiring_cache(),
+                        )),
+                    ),
+                    (
+                        45,
+                        Ok(EsiResponse::fresh(
+                            vec![offered_ship, requested_ship],
+                            expiring_cache(),
+                        )),
+                    ),
+                ]),
+            },
+            contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+                ContractEmbedContext {
+                    item_names: std::collections::BTreeMap::from([
+                        (587, "Rifter".to_string()),
+                        (19_720, "Ragnarok".to_string()),
+                    ]),
+                    ..ContractEmbedContext::default()
+                },
+                CacheMetadata::cached_for_seconds(60),
+            ))]),
+            calls: StdMutex::new(Vec::new()),
         }),
     )
     .with_notifications(
@@ -16974,14 +17704,15 @@ async fn contract_notifications_render_only_filter_matched_ship_items() {
         .iter()
         .find(|delivery| delivery.subscription_id == "requested-branch")
         .expect("requested-item delivery");
-    assert_eq!(requested.message.title, "Type 19720 listed for 2.5B");
+    assert_eq!(requested.message.title, "Ragnarok listed for 2.5B");
     assert!(requested
         .message
         .description
         .as_deref()
         .is_some_and(|description| description
-            .starts_with("`<url=\"contract:0//45\">Type 19720 - Location 60003760</url>`")
-            && !description.contains("Type 587")));
+            .starts_with("`<url=\"contract:0//45\">Ragnarok - Unknown location</url>`")
+            && !description.contains("Type 587")
+            && !description.contains("19720")));
     let isk_only = sent
         .iter()
         .find(|delivery| delivery.subscription_id == "offered-isk")
@@ -16992,7 +17723,7 @@ async fn contract_notifications_render_only_filter_matched_ship_items() {
         .description
         .as_deref()
         .is_some_and(|description| description
-            .starts_with("`<url=\"contract:0//45\">Public contract - Location 60003760</url>`")
+            .starts_with("`<url=\"contract:0//45\">Public contract - Unknown location</url>")
             && !description.contains("Type 587")
             && !description.contains("Type 19720")));
     assert!(sent
@@ -17043,19 +17774,26 @@ async fn primary_display_ship_is_selected_only_from_matching_ship_items() {
 
     ContractCollector::new(
         store.clone(),
-        Arc::new(FakeEsi {
-            regions: vec![10_000_002],
-            pages: HashMap::from([(
-                (10_000_002, 1),
-                Ok(EsiResponse::fresh(vec![baseline.clone()], expiring_page(1))),
-            )]),
-            items: HashMap::from([(
-                44,
-                Ok(EsiResponse::fresh(
-                    vec![matching_ship.clone()],
-                    expiring_cache(),
-                )),
-            )]),
+        Arc::new(SnapshottingEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![baseline.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    44,
+                    Ok(EsiResponse::fresh(
+                        vec![matching_ship.clone()],
+                        expiring_cache(),
+                    )),
+                )]),
+            },
+            contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+                ContractEmbedContext::default(),
+                CacheMetadata::cached_for_seconds(60),
+            ))]),
+            calls: StdMutex::new(Vec::new()),
         }),
     )
     .collect_cycle()
@@ -17078,28 +17816,44 @@ async fn primary_display_ship_is_selected_only_from_matching_ship_items() {
 
     ContractCollector::new(
         store.clone(),
-        Arc::new(FakeEsi {
-            regions: vec![10_000_002],
-            pages: HashMap::from([(
-                (10_000_002, 1),
-                Ok(EsiResponse::fresh(vec![baseline, listed], expiring_page(1))),
-            )]),
-            items: HashMap::from([
-                (
-                    44,
-                    Ok(EsiResponse::fresh(
-                        vec![matching_ship.clone()],
-                        expiring_cache(),
-                    )),
-                ),
-                (
-                    45,
-                    Ok(EsiResponse::fresh(
-                        vec![unrelated_nonship, matching_ship],
-                        expiring_cache(),
-                    )),
-                ),
+        Arc::new(SnapshottingEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![baseline, listed], expiring_page(1))),
+                )]),
+                items: HashMap::from([
+                    (
+                        44,
+                        Ok(EsiResponse::fresh(
+                            vec![matching_ship.clone()],
+                            expiring_cache(),
+                        )),
+                    ),
+                    (
+                        45,
+                        Ok(EsiResponse::fresh(
+                            vec![unrelated_nonship, matching_ship],
+                            expiring_cache(),
+                        )),
+                    ),
+                ]),
+            },
+            contexts: StdMutex::new(vec![
+                Ok(EsiResponse::fresh(
+                    ContractEmbedContext::default(),
+                    CacheMetadata::cached_for_seconds(60),
+                )),
+                Ok(EsiResponse::fresh(
+                    ContractEmbedContext {
+                        item_names: std::collections::BTreeMap::from([(587, "Rifter".to_string())]),
+                        ..ContractEmbedContext::default()
+                    },
+                    CacheMetadata::cached_for_seconds(60),
+                )),
             ]),
+            calls: StdMutex::new(Vec::new()),
         }),
     )
     .with_notifications(
@@ -17112,7 +17866,16 @@ async fn primary_display_ship_is_selected_only_from_matching_ship_items() {
 
     assert_eq!(
         delivery.sent.lock().unwrap()[0].message.title,
-        "Type 587 listed for 1.5B"
+        "Rifter listed for 1.5B"
+    );
+    assert_eq!(
+        store
+            .observed_embed_context(10_000_002, 45)
+            .await
+            .expect("read the enriched live observation")
+            .and_then(|context| context.item_names.get(&587).cloned())
+            .as_deref(),
+        Some("Rifter")
     );
 
     database.destroy().await;
@@ -17201,22 +17964,24 @@ async fn primary_display_ship_uses_all_matching_or_branches_independent_of_branc
 
     ContractCollector::new(
         store.clone(),
-        Arc::new(FakeEsi {
-            regions: vec![10_000_002],
-            pages: HashMap::from([(
-                (10_000_002, 1),
-                Ok(EsiResponse::fresh(vec![baseline, listed], expiring_page(1))),
-            )]),
-            items: HashMap::from([
-                (44, Ok(EsiResponse::fresh(vec![], expiring_cache()))),
-                (
-                    45,
-                    Ok(EsiResponse::fresh(
-                        vec![offered_hel, offered_titan],
-                        expiring_cache(),
-                    )),
-                ),
-            ]),
+        Arc::new(NamedFakeEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![baseline, listed], expiring_page(1))),
+                )]),
+                items: HashMap::from([
+                    (44, Ok(EsiResponse::fresh(vec![], expiring_cache()))),
+                    (
+                        45,
+                        Ok(EsiResponse::fresh(
+                            vec![offered_hel, offered_titan],
+                            expiring_cache(),
+                        )),
+                    ),
+                ]),
+            },
         }),
     )
     .with_notifications(
@@ -17231,7 +17996,7 @@ async fn primary_display_ship_uses_all_matching_or_branches_independent_of_branc
     assert_eq!(sent.len(), 2);
     assert!(sent
         .iter()
-        .all(|delivery| delivery.message.title == "Type 19720 listed for 1.5B"));
+        .all(|delivery| delivery.message.title == "Ragnarok listed for 1.5B"));
     drop(sent);
 
     database.destroy().await;
@@ -17312,32 +18077,34 @@ async fn primary_display_ship_uses_all_group_matches_independent_of_manifest_ord
 
     ContractCollector::new(
         store.clone(),
-        Arc::new(FakeEsi {
-            regions: vec![10_000_002],
-            pages: HashMap::from([(
-                (10_000_002, 1),
-                Ok(EsiResponse::fresh(
-                    vec![baseline, first_listed, second_listed],
-                    expiring_page(1),
-                )),
-            )]),
-            items: HashMap::from([
-                (44, Ok(EsiResponse::fresh(vec![], expiring_cache()))),
-                (
-                    45,
+        Arc::new(NamedFakeEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
                     Ok(EsiResponse::fresh(
-                        vec![offered_hel.clone(), offered_titan.clone()],
-                        expiring_cache(),
+                        vec![baseline, first_listed, second_listed],
+                        expiring_page(1),
                     )),
-                ),
-                (
-                    46,
-                    Ok(EsiResponse::fresh(
-                        vec![offered_titan, offered_hel],
-                        expiring_cache(),
-                    )),
-                ),
-            ]),
+                )]),
+                items: HashMap::from([
+                    (44, Ok(EsiResponse::fresh(vec![], expiring_cache()))),
+                    (
+                        45,
+                        Ok(EsiResponse::fresh(
+                            vec![offered_hel.clone(), offered_titan.clone()],
+                            expiring_cache(),
+                        )),
+                    ),
+                    (
+                        46,
+                        Ok(EsiResponse::fresh(
+                            vec![offered_titan, offered_hel],
+                            expiring_cache(),
+                        )),
+                    ),
+                ]),
+            },
         }),
     )
     .with_notifications(
@@ -17352,7 +18119,7 @@ async fn primary_display_ship_uses_all_group_matches_independent_of_manifest_ord
     assert_eq!(sent.len(), 2);
     assert!(sent
         .iter()
-        .all(|delivery| delivery.message.title == "Type 19720 listed for 1.5B"));
+        .all(|delivery| delivery.message.title == "Ragnarok listed for 1.5B"));
     drop(sent);
 
     database.destroy().await;
@@ -17468,22 +18235,24 @@ async fn a_transient_additional_group_candidate_defers_primary_selection() {
 
     ContractCollector::new(
         store.clone(),
-        Arc::new(FakeEsi {
-            regions: vec![10_000_002],
-            pages: HashMap::from([(
-                (10_000_002, 1),
-                Ok(EsiResponse::fresh(vec![baseline, listed], expiring_page(1))),
-            )]),
-            items: HashMap::from([
-                (44, Ok(EsiResponse::fresh(vec![], expiring_cache()))),
-                (
-                    45,
-                    Ok(EsiResponse::fresh(
-                        vec![offered_hel, offered_titan],
-                        expiring_cache(),
-                    )),
-                ),
-            ]),
+        Arc::new(NamedFakeEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![baseline, listed], expiring_page(1))),
+                )]),
+                items: HashMap::from([
+                    (44, Ok(EsiResponse::fresh(vec![], expiring_cache()))),
+                    (
+                        45,
+                        Ok(EsiResponse::fresh(
+                            vec![offered_hel, offered_titan],
+                            expiring_cache(),
+                        )),
+                    ),
+                ]),
+            },
         }),
     )
     .with_notifications(groups, delivery.clone())
@@ -17493,7 +18262,7 @@ async fn a_transient_additional_group_candidate_defers_primary_selection() {
 
     let sent = delivery.sent.lock().unwrap();
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].message.title, "Type 19720 listed for 1.5B");
+    assert_eq!(sent[0].message.title, "Ragnarok listed for 1.5B");
     drop(sent);
 
     database.destroy().await;
@@ -17588,19 +18357,21 @@ async fn a_transient_primary_ship_lookup_defers_instead_of_committing_a_fallback
 
     ContractCollector::new(
         store.clone(),
-        Arc::new(FakeEsi {
-            regions: vec![10_000_002],
-            pages: HashMap::from([(
-                (10_000_002, 1),
-                Ok(EsiResponse::fresh(vec![baseline, listed], expiring_page(1))),
-            )]),
-            items: HashMap::from([
-                (
-                    44,
-                    Ok(EsiResponse::fresh(vec![ship.clone()], expiring_cache())),
-                ),
-                (45, Ok(EsiResponse::fresh(vec![ship], expiring_cache()))),
-            ]),
+        Arc::new(NamedFakeEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![baseline, listed], expiring_page(1))),
+                )]),
+                items: HashMap::from([
+                    (
+                        44,
+                        Ok(EsiResponse::fresh(vec![ship.clone()], expiring_cache())),
+                    ),
+                    (45, Ok(EsiResponse::fresh(vec![ship], expiring_cache()))),
+                ]),
+            },
         }),
     )
     .with_notifications(groups, delivery.clone())
@@ -17610,7 +18381,7 @@ async fn a_transient_primary_ship_lookup_defers_instead_of_committing_a_fallback
     assert_eq!(delivery.sent.lock().unwrap().len(), 1);
     assert_eq!(
         delivery.sent.lock().unwrap()[0].message.title,
-        "Type 587 listed for 1.5B"
+        "Rifter listed for 1.5B"
     );
 
     database.destroy().await;
@@ -20652,7 +21423,7 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         .fetch_one(&clean_pool)
         .await
         .expect("read clean migration ledger");
-    assert_eq!(clean_migration_count, 18);
+    assert_eq!(clean_migration_count, 19);
     let clean_pacing_column_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'esi_collection_limiter_state' AND column_name = 'next_request_at')",
     )
@@ -20662,6 +21433,16 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
     assert!(
         clean_pacing_column_exists,
         "clean migration adds ESI pacing state"
+    );
+    let clean_unverified_column_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'contract_deferred_subscription_matches' AND column_name = 'proximity_unverified')",
+    )
+    .fetch_one(&clean_pool)
+    .await
+    .expect("read clean durable unverified state column");
+    assert!(
+        clean_unverified_column_exists,
+        "clean migration adds durable proximity-unverified state"
     );
     let batch_table_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
         .bind("regional_observation_batches")
@@ -20865,6 +21646,16 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
     assert!(
         upgraded_pacing_column_exists,
         "current production migration adds ESI pacing state"
+    );
+    let upgraded_unverified_column_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'contract_deferred_subscription_matches' AND column_name = 'proximity_unverified')",
+    )
+    .fetch_one(&upgraded_pool)
+    .await
+    .expect("read upgraded durable unverified state column");
+    assert!(
+        upgraded_unverified_column_exists,
+        "current production migration adds durable proximity-unverified state"
     );
     for table in ["location_evidence", "location_evidence_audit"] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
