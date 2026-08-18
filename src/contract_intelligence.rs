@@ -45,8 +45,10 @@ const RESOLUTION_PROBE_RETRY_MAX_SECONDS: i64 = 15 * 60;
 pub const DEFAULT_CONTRACT_REGIONAL_CONCURRENCY: usize = 2;
 pub const MAX_CONTRACT_REGIONAL_CONCURRENCY: usize = 4;
 const DISCORD_NONCE_ENFORCEMENT_WINDOW: ChronoDuration = ChronoDuration::minutes(5);
+const CONTRACT_DELIVERY_LEASE: ChronoDuration = ChronoDuration::minutes(2);
 const CONTRACT_REPAIR_LEASE: ChronoDuration = ChronoDuration::minutes(2);
 const CONTRACT_REPAIR_STALE_COMPLETION_DELAY: ChronoDuration = ChronoDuration::seconds(5);
+const MAX_PROXIMITY_EVIDENCE_REFRESHES: usize = 2;
 const CONTRACT_REPAIR_RETRY_BASE_SECONDS: i64 = 5;
 const CONTRACT_REPAIR_RETRY_MAX_SECONDS: i64 = 5 * 60;
 const DEFAULT_COLLECTION_RECOVERY_GAP: ChronoDuration = ChronoDuration::minutes(15);
@@ -3957,6 +3959,7 @@ pub struct PreparedContractDelivery {
     pub nonce: String,
     pub enforce_nonce: bool,
     pub message: ContractNotificationMessage,
+    pub(crate) delivery_claim_token: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3981,10 +3984,17 @@ struct DeliveryOrdering {
 enum PrepareDeliveryOutcome {
     Prepared,
     Existing,
+    EvidenceBecameAvailable,
     ExistingSent {
         delivery_id: i64,
         message: ContractNotificationMessage,
     },
+}
+
+enum PrepareProximityResolutionOutcome {
+    Resolved,
+    EvidenceChanged,
+    Unchanged,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -5875,7 +5885,7 @@ impl ContractCollectionStore {
     }
 
     async fn deferred_contract_matches(&self) -> Result<Vec<DeferredContractMatch>, sqlx::Error> {
-        sqlx::query("SELECT contract_subscriptions.guild_id, contract_subscriptions.channel_id, contract_subscriptions.subscription_id, contract_subscriptions.description, contract_subscriptions.filter, contract_subscriptions.event_actions, contract_deferred_subscription_matches.event, contract_deferred_subscription_matches.proximity_unverified FROM contract_deferred_subscription_matches JOIN contract_subscriptions USING (guild_id, channel_id, subscription_id) WHERE contract_subscriptions.deleted_at IS NULL ORDER BY contract_deferred_subscription_matches.created_at, contract_subscriptions.guild_id, contract_subscriptions.channel_id, contract_subscriptions.subscription_id")
+        sqlx::query("SELECT contract_subscriptions.guild_id, contract_subscriptions.channel_id, contract_subscriptions.subscription_id, contract_subscriptions.description, contract_subscriptions.filter, contract_subscriptions.event_actions, contract_deferred_subscription_matches.event, contract_deferred_subscription_matches.proximity_unverified FROM contract_deferred_subscription_matches JOIN contract_subscriptions USING (guild_id, channel_id, subscription_id) WHERE contract_subscriptions.deleted_at IS NULL AND NOT contract_deferred_subscription_matches.proximity_unverified ORDER BY contract_deferred_subscription_matches.created_at, contract_subscriptions.guild_id, contract_subscriptions.channel_id, contract_subscriptions.subscription_id")
             .fetch_all(&self.pool)
             .await?
             .into_iter()
@@ -5889,6 +5899,36 @@ impl ContractCollectionStore {
                 })
             })
             .collect()
+    }
+
+    async fn proximity_unverified_matches_for_location(
+        &self,
+        location_id: i64,
+    ) -> Result<Vec<DeferredContractMatch>, sqlx::Error> {
+        sqlx::query("SELECT contract_subscriptions.guild_id, contract_subscriptions.channel_id, contract_subscriptions.subscription_id, contract_subscriptions.description, contract_subscriptions.filter, contract_subscriptions.event_actions, contract_deferred_subscription_matches.event FROM contract_deferred_subscription_matches JOIN contract_subscriptions USING (guild_id, channel_id, subscription_id) WHERE contract_subscriptions.deleted_at IS NULL AND contract_deferred_subscription_matches.proximity_unverified AND contract_deferred_subscription_matches.event #>> '{contract,start_location_id}' = $1 ORDER BY contract_deferred_subscription_matches.created_at, contract_subscriptions.guild_id, contract_subscriptions.channel_id, contract_subscriptions.subscription_id")
+            .bind(location_id.to_string())
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let event = serde_json::from_value(row.get("event")).map_err(json_to_sqlx)?;
+                Ok(DeferredContractMatch {
+                    subscription: contract_subscription_from_row(row)?,
+                    event,
+                    proximity_unverified: true,
+                })
+            })
+            .collect()
+    }
+
+    async fn proximity_unverified_locations_ready_for_reconciliation(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<i64>, sqlx::Error> {
+        sqlx::query_scalar("SELECT DISTINCT (matches.event #>> '{contract,start_location_id}')::BIGINT FROM contract_deferred_subscription_matches AS matches WHERE matches.proximity_unverified AND (EXISTS (SELECT 1 FROM (SELECT evidence.id FROM location_evidence AS evidence WHERE evidence.location_id = (matches.event #>> '{contract,start_location_id}')::BIGINT AND evidence.observed_at <= $1 AND evidence.superseded_at IS NULL AND evidence.expired_at IS NULL AND (evidence.expires_at IS NULL OR evidence.expires_at > $1) ORDER BY CASE evidence.evidence_class WHEN 'public_npc' THEN 0 WHEN 'access_qualified' THEN 1 WHEN 'operator' THEN 2 ELSE 3 END, evidence.observed_at DESC, evidence.id DESC LIMIT 1) AS selected WHERE selected.id IS DISTINCT FROM NULLIF(matches.event #>> '{context,location_evidence_id}', '')::BIGINT) OR (NOT EXISTS (SELECT 1 FROM location_evidence AS evidence WHERE evidence.location_id = (matches.event #>> '{contract,start_location_id}')::BIGINT AND evidence.observed_at <= $1 AND evidence.superseded_at IS NULL AND evidence.expired_at IS NULL AND (evidence.expires_at IS NULL OR evidence.expires_at > $1)) AND EXISTS (SELECT 1 FROM structure_resolution_state AS state WHERE state.structure_id = (matches.event #>> '{contract,start_location_id}')::BIGINT AND state.parked_at IS NULL AND state.next_attempt_at IS NOT NULL AND state.next_attempt_at <= $1 AND (state.lease_expires_at IS NULL OR state.lease_expires_at <= $1)))) ORDER BY 1")
+            .bind(now)
+            .fetch_all(&self.pool)
+            .await
     }
 
     async fn defer_contract_match(
@@ -5944,6 +5984,115 @@ impl ContractCollectionStore {
         Ok(())
     }
 
+    async fn prepare_proximity_resolution(
+        &self,
+        subscription: &ContractSubscription,
+        event: &ContractEvent,
+        in_range_message: Option<&ContractNotificationMessage>,
+        ordering: Option<DeliveryOrdering>,
+    ) -> Result<PrepareProximityResolutionOutcome, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        lock_location(&mut transaction, event.contract.start_location_id).await?;
+        let selected_evidence = LocationEvidenceService::resolve_in_transaction(
+            &mut transaction,
+            event.contract.start_location_id,
+            Utc::now(),
+        )
+        .await?;
+        let Some(selected_evidence) = selected_evidence else {
+            transaction.commit().await?;
+            return Ok(PrepareProximityResolutionOutcome::Unchanged);
+        };
+        if event
+            .context
+            .location_evidence_id
+            .is_some_and(|id| id != selected_evidence.id)
+        {
+            transaction.commit().await?;
+            return Ok(PrepareProximityResolutionOutcome::EvidenceChanged);
+        }
+        let unresolved = sqlx::query_scalar::<_, i64>("SELECT 1::BIGINT FROM contract_deferred_subscription_matches WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND contract_id = $4 AND event_kind = $5 AND proximity_unverified FOR UPDATE")
+            .bind(subscription.guild_id as i64)
+            .bind(subscription.channel_id as i64)
+            .bind(&subscription.id)
+            .bind(event.contract.contract_id)
+            .bind(event.kind.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?;
+        if unresolved.is_none() {
+            transaction.commit().await?;
+            return Ok(PrepareProximityResolutionOutcome::Unchanged);
+        }
+        let original = sqlx::query("SELECT id, status, discord_message_id, message, ping_type, proximity_promotion_ping FROM contract_outbound_deliveries WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND contract_id = $4 AND event_kind = $5 AND delivery_kind = 'event' FOR UPDATE")
+            .bind(subscription.guild_id as i64)
+            .bind(subscription.channel_id as i64)
+            .bind(&subscription.id)
+            .bind(event.contract.contract_id)
+            .bind(event.kind.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let Some(original) = original else {
+            transaction.commit().await?;
+            return Ok(PrepareProximityResolutionOutcome::Unchanged);
+        };
+        if original.get::<String, _>("status") != "sent"
+            || original
+                .get::<Option<String>, _>("discord_message_id")
+                .is_none()
+        {
+            transaction.commit().await?;
+            return Ok(PrepareProximityResolutionOutcome::Unchanged);
+        }
+        let stored_message: ContractNotificationMessage =
+            serde_json::from_value(original.get("message")).map_err(json_to_sqlx)?;
+        let desired_message = in_range_message
+            .cloned()
+            .unwrap_or_else(|| proximity_out_of_range_contract_message(&stored_message));
+        let desired_value = serde_json::to_value(&desired_message).map_err(json_to_sqlx)?;
+        sqlx::query("UPDATE contract_outbound_deliveries SET desired_message = $2, repair_status = 'pending', repair_revision = CASE WHEN repair_status <> 'pending' OR desired_message IS DISTINCT FROM $2 THEN repair_revision + 1 ELSE repair_revision END, repair_prepared_at = CASE WHEN repair_status = 'pending' THEN repair_prepared_at ELSE now() END, repair_next_attempt_at = CASE WHEN repair_status = 'pending' THEN repair_next_attempt_at ELSE NULL END, repair_failure_kind = CASE WHEN repair_status = 'pending' THEN repair_failure_kind ELSE NULL END, repair_last_error = CASE WHEN repair_status = 'pending' THEN repair_last_error ELSE NULL END, repair_failed_at = CASE WHEN repair_status = 'pending' THEN repair_failed_at ELSE NULL END, repair_failure_resolved_at = CASE WHEN repair_status = 'pending' THEN repair_failure_resolved_at ELSE NULL END WHERE id = $1 AND status = 'sent' AND discord_message_id IS NOT NULL AND (message IS DISTINCT FROM $2 OR desired_message IS DISTINCT FROM $2)")
+            .bind(original.get::<i64, _>("id"))
+            .bind(desired_value)
+            .execute(&mut *transaction)
+            .await?;
+        if let Some(ordering) = ordering {
+            let promotion_id = sqlx::query_scalar::<_, i64>("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, delivery_kind, event, message, ping, ping_type, status, delivery_nonce, strategic_priority, relevant_isk, confirmed_at) VALUES ($1,$2,$3,$4,$5,'proximity_promotion',$6,$7,$8,$9,'prepared',$10,$11,$12,$13) ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind, delivery_kind) DO NOTHING RETURNING id")
+                .bind(subscription.guild_id as i64)
+                .bind(subscription.channel_id as i64)
+                .bind(&subscription.id)
+                .bind(event.contract.contract_id)
+                .bind(event.kind.as_str())
+                .bind(serde_json::to_value(event).map_err(json_to_sqlx)?)
+                .bind(serde_json::to_value(&desired_message).map_err(json_to_sqlx)?)
+                .bind(original.get::<bool, _>("proximity_promotion_ping"))
+                .bind(original.get::<String, _>("ping_type"))
+                .bind("pending")
+                .bind(i64::try_from(ordering.strategic_priority).unwrap_or(i64::MAX))
+                .bind(ordering.relevant_isk)
+                .bind(ordering.confirmed_at)
+                .fetch_optional(&mut *transaction)
+                .await?;
+            if let Some(promotion_id) = promotion_id {
+                sqlx::query(
+                    "UPDATE contract_outbound_deliveries SET delivery_nonce = $2 WHERE id = $1",
+                )
+                .bind(promotion_id)
+                .bind(format!("ci-{promotion_id}"))
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+        sqlx::query("DELETE FROM contract_deferred_subscription_matches WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND contract_id = $4 AND event_kind = $5 AND proximity_unverified")
+            .bind(subscription.guild_id as i64)
+            .bind(subscription.channel_id as i64)
+            .bind(&subscription.id)
+            .bind(event.contract.contract_id)
+            .bind(event.kind.as_str())
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(PrepareProximityResolutionOutcome::Resolved)
+    }
+
     async fn prepare_delivery(
         &self,
         subscription: &ContractSubscription,
@@ -5954,6 +6103,7 @@ impl ContractCollectionStore {
         ordering: DeliveryOrdering,
     ) -> Result<PrepareDeliveryOutcome, sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
+        lock_location(&mut transaction, event.contract.start_location_id).await?;
         let outcome = self
             .prepare_delivery_in_transaction(
                 &mut transaction,
@@ -5974,10 +6124,25 @@ impl ContractCollectionStore {
         subscription: &ContractSubscription,
         event: &ContractEvent,
         message: &ContractNotificationMessage,
+        promotion_ping: bool,
         ping_type: ContractPingType,
         ordering: DeliveryOrdering,
     ) -> Result<PrepareDeliveryOutcome, sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
+        lock_location(&mut transaction, event.contract.start_location_id).await?;
+        let selected_evidence = LocationEvidenceService::resolve_in_transaction(
+            &mut transaction,
+            event.contract.start_location_id,
+            Utc::now(),
+        )
+        .await?;
+        if selected_evidence
+            .as_ref()
+            .is_some_and(|evidence| event.context.location_evidence_id != Some(evidence.id))
+        {
+            transaction.commit().await?;
+            return Ok(PrepareDeliveryOutcome::EvidenceBecameAvailable);
+        }
         let outcome = self
             .prepare_delivery_in_transaction(
                 &mut transaction,
@@ -5989,6 +6154,17 @@ impl ContractCollectionStore {
                 ordering,
             )
             .await?;
+        if matches!(&outcome, PrepareDeliveryOutcome::Prepared) {
+            sqlx::query("UPDATE contract_outbound_deliveries SET proximity_promotion_ping = $1 WHERE guild_id = $2 AND channel_id = $3 AND subscription_id = $4 AND contract_id = $5 AND event_kind = $6 AND delivery_kind = 'event'")
+                .bind(promotion_ping)
+                .bind(subscription.guild_id as i64)
+                .bind(subscription.channel_id as i64)
+                .bind(&subscription.id)
+                .bind(event.contract.contract_id)
+                .bind(event.kind.as_str())
+                .execute(&mut *transaction)
+                .await?;
+        }
         self.defer_contract_match_in_transaction(&mut transaction, subscription, event, true)
             .await?;
         transaction.commit().await?;
@@ -6005,7 +6181,7 @@ impl ContractCollectionStore {
         ping_type: ContractPingType,
         ordering: DeliveryOrdering,
     ) -> Result<PrepareDeliveryOutcome, sqlx::Error> {
-        let delivery_id = sqlx::query_scalar::<_, i64>("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, strategic_priority, relevant_isk, confirmed_at) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,'prepared',$10,$11,$12,$13 WHERE EXISTS (SELECT 1 FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND deleted_at IS NULL) ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind) DO NOTHING RETURNING id")
+        let delivery_id = sqlx::query_scalar::<_, i64>("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, strategic_priority, relevant_isk, confirmed_at) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,'prepared',$10,$11,$12,$13 WHERE EXISTS (SELECT 1 FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND deleted_at IS NULL) ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind, delivery_kind) DO NOTHING RETURNING id")
             .bind(subscription.guild_id as i64)
             .bind(subscription.channel_id as i64)
             .bind(&subscription.id)
@@ -6031,7 +6207,7 @@ impl ContractCollectionStore {
             .await?;
             return Ok(PrepareDeliveryOutcome::Prepared);
         }
-        let existing = sqlx::query("SELECT id, status, message FROM contract_outbound_deliveries WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND contract_id = $4 AND event_kind = $5")
+        let existing = sqlx::query("SELECT id, status, message FROM contract_outbound_deliveries WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND contract_id = $4 AND event_kind = $5 AND delivery_kind = 'event'")
             .bind(subscription.guild_id as i64)
             .bind(subscription.channel_id as i64)
             .bind(&subscription.id)
@@ -6077,10 +6253,14 @@ impl ContractCollectionStore {
         attempted_at: DateTime<Utc>,
     ) -> Result<Option<PreparedContractDelivery>, sqlx::Error> {
         let nonce_window_until = attempted_at + DISCORD_NONCE_ENFORCEMENT_WINDOW;
-        let row = sqlx::query("UPDATE contract_outbound_deliveries SET attempt_count = attempt_count + 1, first_attempt_at = COALESCE(first_attempt_at, $2), last_attempt_at = $2, nonce_window_until = COALESCE(nonce_window_until, $3) WHERE id = $1 AND status = 'prepared' RETURNING id, guild_id, channel_id, subscription_id, contract_id, event_kind, message, ping, ping_type, delivery_nonce, nonce_window_until")
+        let claim_token = format!("delivery-{:032x}", rand::thread_rng().gen::<u128>());
+        let lease_until = attempted_at + CONTRACT_DELIVERY_LEASE;
+        let row = sqlx::query("UPDATE contract_outbound_deliveries SET attempt_count = attempt_count + 1, first_attempt_at = COALESCE(first_attempt_at, $2), last_attempt_at = $2, nonce_window_until = COALESCE(nonce_window_until, $3), delivery_claim_token = $4, delivery_claimed_at = $2, delivery_lease_until = $5 WHERE id = $1 AND status = 'prepared' AND (delivery_lease_until IS NULL OR delivery_lease_until <= $2) RETURNING id, guild_id, channel_id, subscription_id, contract_id, event_kind, message, ping, ping_type, delivery_nonce, nonce_window_until, delivery_claim_token")
             .bind(delivery_id)
             .bind(attempted_at)
             .bind(nonce_window_until)
+            .bind(&claim_token)
+            .bind(lease_until)
             .fetch_optional(&self.pool)
             .await?;
         row.map(|row| {
@@ -6111,17 +6291,22 @@ impl ContractCollectionStore {
 
     async fn mark_delivery_sent(
         &self,
-        delivery_id: i64,
+        delivery: &PreparedContractDelivery,
         discord_message_id: &str,
     ) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("UPDATE contract_outbound_deliveries SET status = 'sent', discord_message_id = $2, sent_at = now(), failure_resolved_at = CASE WHEN failure_kind IS NULL THEN failure_resolved_at ELSE now() END WHERE id = $1 AND status = 'prepared'")
-            .bind(delivery_id)
+        let claim_token = delivery.delivery_claim_token.as_deref().ok_or_else(|| {
+            sqlx::Error::Protocol("delivery completion is missing its claim token".to_string())
+        })?;
+        let result = sqlx::query("UPDATE contract_outbound_deliveries SET status = 'sent', discord_message_id = $2, sent_at = now(), failure_resolved_at = CASE WHEN failure_kind IS NULL THEN failure_resolved_at ELSE now() END, delivery_claim_token = NULL, delivery_claimed_at = NULL, delivery_lease_until = NULL WHERE id = $1 AND status = 'prepared' AND delivery_claim_token = $3")
+            .bind(delivery.delivery_id)
             .bind(discord_message_id)
+            .bind(claim_token)
             .execute(&self.pool)
             .await?;
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol(format!(
-                "contract delivery {delivery_id} was not prepared when Discord returned success"
+                "contract delivery {} was not claimed when Discord returned success",
+                delivery.delivery_id
             )));
         }
         Ok(())
@@ -6225,19 +6410,24 @@ impl ContractCollectionStore {
 
     async fn mark_delivery_failed(
         &self,
-        delivery_id: i64,
+        delivery: &PreparedContractDelivery,
         error: &ContractDeliveryError,
         failed_at: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("UPDATE contract_outbound_deliveries SET status = 'failed', failure_kind = 'permanent', last_error = $2, failed_at = $3, failure_resolved_at = NULL WHERE id = $1 AND status = 'prepared'")
-            .bind(delivery_id)
+        let claim_token = delivery.delivery_claim_token.as_deref().ok_or_else(|| {
+            sqlx::Error::Protocol("delivery failure is missing its claim token".to_string())
+        })?;
+        let result = sqlx::query("UPDATE contract_outbound_deliveries SET status = 'failed', failure_kind = 'permanent', last_error = $2, failed_at = $3, failure_resolved_at = NULL, delivery_claim_token = NULL, delivery_claimed_at = NULL, delivery_lease_until = NULL WHERE id = $1 AND status = 'prepared' AND delivery_claim_token = $4")
+            .bind(delivery.delivery_id)
             .bind(sanitize_contract_failure_detail(error.message()))
             .bind(failed_at)
+            .bind(claim_token)
             .execute(&self.pool)
             .await?;
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol(format!(
-                "contract delivery {delivery_id} was not prepared when Discord returned a permanent failure"
+                "contract delivery {} was not claimed when Discord returned a permanent failure",
+                delivery.delivery_id
             )));
         }
         Ok(())
@@ -6245,7 +6435,7 @@ impl ContractCollectionStore {
 
     async fn mark_delivery_retryable(
         &self,
-        delivery_id: i64,
+        delivery: &PreparedContractDelivery,
         error: &ContractDeliveryError,
     ) -> Result<(), sqlx::Error> {
         let failure_kind = match error {
@@ -6257,15 +6447,20 @@ impl ContractCollectionStore {
                 ))
             }
         };
-        let result = sqlx::query("UPDATE contract_outbound_deliveries SET failure_kind = $2, last_error = $3, failure_resolved_at = NULL WHERE id = $1 AND status = 'prepared'")
-            .bind(delivery_id)
+        let claim_token = delivery.delivery_claim_token.as_deref().ok_or_else(|| {
+            sqlx::Error::Protocol("delivery retry is missing its claim token".to_string())
+        })?;
+        let result = sqlx::query("UPDATE contract_outbound_deliveries SET failure_kind = $2, last_error = $3, failure_resolved_at = NULL, delivery_claim_token = NULL, delivery_claimed_at = NULL, delivery_lease_until = NULL WHERE id = $1 AND status = 'prepared' AND delivery_claim_token = $4")
+            .bind(delivery.delivery_id)
             .bind(failure_kind)
             .bind(sanitize_contract_failure_detail(error.message()))
+            .bind(claim_token)
             .execute(&self.pool)
             .await?;
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol(format!(
-                "contract delivery {delivery_id} was not prepared when Discord returned a retryable failure"
+                "contract delivery {} was not claimed when Discord returned a retryable failure",
+                delivery.delivery_id
             )));
         }
         Ok(())
@@ -7492,6 +7687,7 @@ fn prepared_contract_delivery_from_row(
         nonce: row.get("delivery_nonce"),
         enforce_nonce: false,
         message: serde_json::from_value(row.get("message")).map_err(json_to_sqlx)?,
+        delivery_claim_token: row.try_get("delivery_claim_token").ok(),
     })
 }
 
@@ -7878,6 +8074,8 @@ enum NotificationResolution {
     Complete,
     Deferred,
     ProximityUnverified,
+    ProximityResolved,
+    EvidenceChanged,
 }
 
 #[derive(Default)]
@@ -8739,6 +8937,7 @@ impl ContractCollector {
             return Ok(());
         };
         let ship_groups = CycleShipGroupResolver::new(&*notifications.ship_groups);
+        self.reconcile_proximity_evidence(&ship_groups).await?;
         let deferred_matches = self.store.deferred_contract_matches().await?;
         for deferred in deferred_matches {
             let event = self
@@ -8749,7 +8948,7 @@ impl ContractCollector {
                 )
                 .await?;
             match self
-                .notify_subscription(&deferred.subscription, &event, &ship_groups)
+                .notify_subscription(&deferred.subscription, &event, &ship_groups, false)
                 .await?
             {
                 NotificationResolution::Complete if !deferred.proximity_unverified => {
@@ -8759,11 +8958,86 @@ impl ContractCollector {
                 }
                 NotificationResolution::Complete
                 | NotificationResolution::Deferred
-                | NotificationResolution::ProximityUnverified => {}
+                | NotificationResolution::ProximityUnverified
+                | NotificationResolution::ProximityResolved
+                | NotificationResolution::EvidenceChanged => {}
             }
         }
         self.notify_events(events, notifications, &ship_groups)
-            .await
+            .await?;
+        self.reconcile_proximity_evidence(&ship_groups).await?;
+        self.deliver_prepared_notifications(notifications).await
+    }
+
+    pub async fn reconcile_proximity_notifications(&self) -> Result<(), ContractCollectionError> {
+        let Some(notifications) = &self.notifications else {
+            return Ok(());
+        };
+        let ship_groups = CycleShipGroupResolver::new(&*notifications.ship_groups);
+        self.reconcile_proximity_evidence(&ship_groups).await?;
+        self.deliver_prepared_notifications(notifications).await
+    }
+
+    async fn reconcile_proximity_evidence(
+        &self,
+        ship_groups: &dyn ShipGroupResolver,
+    ) -> Result<(), ContractCollectionError> {
+        let now = self.delivery_clock.now();
+        for location_id in self
+            .store
+            .proximity_unverified_locations_ready_for_reconciliation(now)
+            .await?
+        {
+            let matches = self
+                .store
+                .proximity_unverified_matches_for_location(location_id)
+                .await?;
+            for deferred in matches {
+                let mut retained_context_subscription = deferred.subscription.clone();
+                match deferred.event.kind {
+                    ContractEventKind::Listed => {
+                        retained_context_subscription.event_actions.listed =
+                            ContractEventAction::Post
+                    }
+                    ContractEventKind::SaleConfirmed => {
+                        retained_context_subscription.event_actions.sale_confirmed =
+                            ContractEventAction::Post
+                    }
+                    ContractEventKind::PurchaseConfirmed => {
+                        retained_context_subscription
+                            .event_actions
+                            .purchase_confirmed = ContractEventAction::Post
+                    }
+                    ContractEventKind::Expired => {
+                        retained_context_subscription.event_actions.expired =
+                            ContractEventAction::Post
+                    }
+                    ContractEventKind::ClosedOutcomeUnknown => {
+                        retained_context_subscription
+                            .event_actions
+                            .closed_outcome_unknown = ContractEventAction::Post
+                    }
+                }
+                let event = self
+                    .event_with_observed_context(
+                        &deferred.event,
+                        std::slice::from_ref(&retained_context_subscription),
+                        ship_groups,
+                    )
+                    .await?;
+                match self
+                    .notify_subscription(&deferred.subscription, &event, ship_groups, true)
+                    .await?
+                {
+                    NotificationResolution::ProximityResolved => {}
+                    NotificationResolution::Complete
+                    | NotificationResolution::Deferred
+                    | NotificationResolution::ProximityUnverified
+                    | NotificationResolution::EvidenceChanged => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn notify_fresh_events(
@@ -8791,7 +9065,7 @@ impl ContractCollector {
                 .await?;
             for subscription in &subscriptions {
                 match self
-                    .notify_subscription(subscription, &event, ship_groups)
+                    .notify_subscription(subscription, &event, ship_groups, false)
                     .await?
                 {
                     NotificationResolution::Complete => {}
@@ -8801,6 +9075,8 @@ impl ContractCollector {
                             .await?;
                     }
                     NotificationResolution::ProximityUnverified => {}
+                    NotificationResolution::ProximityResolved => {}
+                    NotificationResolution::EvidenceChanged => {}
                 }
             }
         }
@@ -8816,18 +9092,28 @@ impl ContractCollector {
     ) -> Result<ContractEvent, ContractCollectionError> {
         let evidence_now = self.delivery_clock.now();
         let mut event = self.event_with_persisted_observation_context(event).await?;
-        let location_is_retainable_evidence = matches!(
+        let retained_evidence_requires_public_refresh = matches!(
             event.context.location_evidence_class,
             Some(LocationEvidenceClass::AccessQualified | LocationEvidenceClass::Operator)
         );
-        if matches!(event.kind, ContractEventKind::Listed) && location_is_retainable_evidence {
-            event.context.solar_system_id = None;
-            event.context.solar_system_position = None;
-            event.context.security_status = None;
-            event.context.solar_system_resolution = ContractContextResolution::Indeterminate;
-            event.context.solar_system_position_resolution =
-                ContractContextResolution::Indeterminate;
-            event.context.security_status_resolution = ContractContextResolution::Indeterminate;
+        let selected_evidence = if event.context.location_evidence_id.is_some() {
+            LocationEvidenceService::new(&self.store)
+                .resolve(event.contract.start_location_id, evidence_now)
+                .await?
+        } else {
+            None
+        };
+        let authoritative_evidence_changed =
+            event
+                .context
+                .location_evidence_id
+                .is_some_and(|retained_id| {
+                    selected_evidence.is_some_and(|evidence| evidence.id != retained_id)
+                });
+        if matches!(event.kind, ContractEventKind::Listed)
+            && (retained_evidence_requires_public_refresh || authoritative_evidence_changed)
+        {
+            clear_location_evidence_context(&mut event);
             event.context.location_evidence_id = None;
             event.context.location_evidence_class = None;
         }
@@ -8875,6 +9161,39 @@ impl ContractCollector {
         event.context.normalize_resolutions();
 
         if !matches!(event.kind, ContractEventKind::Listed) {
+            if requirements.solar_system
+                || requirements.security_status
+                || !requirements.ly_ranges.is_empty()
+            {
+                if let Some(evidence) = LocationEvidenceService::new(&self.store)
+                    .resolve(event.contract.start_location_id, evidence_now)
+                    .await?
+                {
+                    if event.context.location_evidence_id != Some(evidence.id) {
+                        clear_location_evidence_context(&mut event);
+                    }
+                    event.context.solar_system_id = Some(evidence.solar_system_id);
+                    event.context.solar_system_resolution = ContractContextResolution::Resolved;
+                    event.context.location_evidence_id = Some(evidence.id);
+                    event.context.location_evidence_class = Some(evidence.evidence_class);
+                }
+            }
+            if !requirements.ly_ranges.is_empty() && event.context.solar_system_position.is_none() {
+                if let Some(system_id) = event
+                    .context
+                    .solar_system_id
+                    .and_then(|system_id| u32::try_from(system_id).ok())
+                {
+                    if let Some(position) = self
+                        .cached_solar_system_position(event.contract.contract_id, system_id)
+                        .await?
+                    {
+                        event.context.solar_system_position = Some(position);
+                        event.context.solar_system_position_resolution =
+                            ContractContextResolution::Resolved;
+                    }
+                }
+            }
             self.load_range_center_positions(&mut event, &requirements)
                 .await?;
             mark_terminal_context_unavailable(&mut event.context, requirements);
@@ -9565,15 +9884,74 @@ impl ContractCollector {
         subscription: &ContractSubscription,
         event: &ContractEvent,
         ship_groups: &dyn ShipGroupResolver,
+        resolving_proximity_unverified: bool,
+    ) -> Result<NotificationResolution, ContractCollectionError> {
+        let mut refreshed = event.clone();
+        for refresh in 0..=MAX_PROXIMITY_EVIDENCE_REFRESHES {
+            match self
+                .notify_subscription_once(
+                    subscription,
+                    &refreshed,
+                    ship_groups,
+                    resolving_proximity_unverified,
+                )
+                .await?
+            {
+                NotificationResolution::EvidenceChanged
+                    if refresh < MAX_PROXIMITY_EVIDENCE_REFRESHES =>
+                {
+                    refreshed = self
+                        .event_with_observed_context(
+                            &refreshed,
+                            std::slice::from_ref(subscription),
+                            ship_groups,
+                        )
+                        .await?;
+                }
+                NotificationResolution::EvidenceChanged => {
+                    return Ok(NotificationResolution::Deferred);
+                }
+                resolution => return Ok(resolution),
+            }
+        }
+        Ok(NotificationResolution::Deferred)
+    }
+
+    async fn notify_subscription_once(
+        &self,
+        subscription: &ContractSubscription,
+        event: &ContractEvent,
+        ship_groups: &dyn ShipGroupResolver,
+        resolving_proximity_unverified: bool,
     ) -> Result<NotificationResolution, ContractCollectionError> {
         let action = contract_event_action(subscription, &event.kind);
-        if matches!(action, ContractEventAction::Ignore) {
+        if matches!(action, ContractEventAction::Ignore) && !resolving_proximity_unverified {
             return Ok(NotificationResolution::Complete);
         }
         let mut evaluator = ContractFilterEvaluator::new(event, ship_groups);
         let proximity_unverified = match evaluator.matches(&subscription.filter.root).await {
             ContractFilterMatch::Matched => false,
-            ContractFilterMatch::Unmatched => return Ok(NotificationResolution::Complete),
+            ContractFilterMatch::Unmatched => {
+                return if resolving_proximity_unverified {
+                    match self
+                        .store
+                        .prepare_proximity_resolution(subscription, event, None, None)
+                        .await?
+                    {
+                        PrepareProximityResolutionOutcome::Resolved => {
+                            Ok(NotificationResolution::ProximityResolved)
+                        }
+                        PrepareProximityResolutionOutcome::EvidenceChanged => {
+                            Ok(NotificationResolution::EvidenceChanged)
+                        }
+                        PrepareProximityResolutionOutcome::Unchanged => {
+                            Ok(NotificationResolution::Deferred)
+                        }
+                    }
+                } else {
+                    Ok(NotificationResolution::Complete)
+                };
+            }
             ContractFilterMatch::Deferred => return Ok(NotificationResolution::Deferred),
             ContractFilterMatch::UnresolvedProximity => true,
         };
@@ -9666,10 +10044,27 @@ impl ContractCollector {
                     subscription,
                     &event,
                     &message,
+                    ping_type.is_some(),
                     ping_type.unwrap_or_default(),
                     ordering,
                 )
                 .await?
+        } else if resolving_proximity_unverified {
+            return match self
+                .store
+                .prepare_proximity_resolution(subscription, &event, Some(&message), Some(ordering))
+                .await?
+            {
+                PrepareProximityResolutionOutcome::Resolved => {
+                    Ok(NotificationResolution::ProximityResolved)
+                }
+                PrepareProximityResolutionOutcome::EvidenceChanged => {
+                    Ok(NotificationResolution::EvidenceChanged)
+                }
+                PrepareProximityResolutionOutcome::Unchanged => {
+                    Ok(NotificationResolution::Deferred)
+                }
+            };
         } else {
             self.store
                 .prepare_delivery(
@@ -9682,6 +10077,9 @@ impl ContractCollector {
                 )
                 .await?
         };
+        if matches!(preparation, PrepareDeliveryOutcome::EvidenceBecameAvailable) {
+            return Ok(NotificationResolution::EvidenceChanged);
+        }
         if let PrepareDeliveryOutcome::ExistingSent {
             delivery_id,
             message: stored_message,
@@ -9802,14 +10200,14 @@ impl ContractCollector {
         match notifications.delivery.send(prepared.clone()).await {
             Ok(message_id) => {
                 self.store
-                    .mark_delivery_sent(prepared.delivery_id, &message_id)
+                    .mark_delivery_sent(&prepared, &message_id)
                     .await?;
                 Ok(false)
             }
             Err(ContractDeliveryError::Permanent(error)) => {
                 let error = ContractDeliveryError::Permanent(error);
                 self.store
-                    .mark_delivery_failed(prepared.delivery_id, &error, attempted_at)
+                    .mark_delivery_failed(&prepared, &error, attempted_at)
                     .await?;
                 warn!(
                     delivery_id = prepared.delivery_id,
@@ -9823,7 +10221,7 @@ impl ContractCollector {
                 error @ (ContractDeliveryError::Transient(_) | ContractDeliveryError::Ambiguous(_)),
             ) => {
                 self.store
-                    .mark_delivery_retryable(prepared.delivery_id, &error)
+                    .mark_delivery_retryable(&prepared, &error)
                     .await?;
                 warn!(
                     delivery_id = prepared.delivery_id,
@@ -9849,21 +10247,41 @@ impl ContractCollector {
         {
             enriched.embed_context.merge_missing_from(&snapshot);
         }
-        enriched.embed_context.location.solar_system_id = enriched
-            .embed_context
-            .location
-            .solar_system_id
-            .or(enriched.context.solar_system_id);
-        enriched.embed_context.location.security_status =
-            enriched.embed_context.location.security_status.or(enriched
+        let authoritative_location_changed = enriched.context.location_evidence_id.is_some()
+            && enriched.context.solar_system_id.is_some()
+            && enriched.embed_context.location.solar_system_id != enriched.context.solar_system_id;
+        if authoritative_location_changed {
+            enriched.embed_context.location.location_name = None;
+            enriched.embed_context.location.location_kind = None;
+            enriched.embed_context.location.solar_system_name = None;
+            enriched.embed_context.location.region_id = None;
+            enriched.embed_context.location.region_name = None;
+        }
+        if enriched.context.location_evidence_id.is_some() {
+            enriched.embed_context.location.solar_system_id = enriched.context.solar_system_id;
+            enriched.embed_context.location.security_status = enriched
                 .context
                 .security_status
-                .filter(|value| value.is_finite()));
-        enriched.embed_context.location.solar_system_position = enriched
-            .embed_context
-            .location
-            .solar_system_position
-            .or(enriched.context.solar_system_position);
+                .filter(|value| value.is_finite());
+            enriched.embed_context.location.solar_system_position =
+                enriched.context.solar_system_position;
+        } else {
+            enriched.embed_context.location.solar_system_id = enriched
+                .embed_context
+                .location
+                .solar_system_id
+                .or(enriched.context.solar_system_id);
+            enriched.embed_context.location.security_status =
+                enriched.embed_context.location.security_status.or(enriched
+                    .context
+                    .security_status
+                    .filter(|value| value.is_finite()));
+            enriched.embed_context.location.solar_system_position = enriched
+                .embed_context
+                .location
+                .solar_system_position
+                .or(enriched.context.solar_system_position);
+        }
         enriched.embed_context.issuer_alliance_id = enriched
             .embed_context
             .issuer_alliance_id
@@ -10254,6 +10672,24 @@ impl ContractCollector {
             .map_err(|error| ContractCollectionError::Cache(error.to_string()))?;
         Ok((parsed, metadata))
     }
+}
+
+fn clear_location_evidence_context(event: &mut ContractEvent) {
+    event.context.solar_system_id = None;
+    event.context.solar_system_position = None;
+    event.context.solar_system_resolution = ContractContextResolution::Indeterminate;
+    event.context.solar_system_position_resolution = ContractContextResolution::Indeterminate;
+    event.context.range_center_positions.clear();
+    event.context.security_status = None;
+    event.context.security_status_resolution = ContractContextResolution::Indeterminate;
+    event.embed_context.location.location_name = None;
+    event.embed_context.location.location_kind = None;
+    event.embed_context.location.solar_system_id = None;
+    event.embed_context.location.solar_system_name = None;
+    event.embed_context.location.solar_system_position = None;
+    event.embed_context.location.security_status = None;
+    event.embed_context.location.region_id = None;
+    event.embed_context.location.region_name = None;
 }
 
 fn apply_solar_system_context(
@@ -11279,6 +11715,20 @@ fn repaired_contract_message(
     }
 }
 
+fn proximity_out_of_range_contract_message(
+    stored: &ContractNotificationMessage,
+) -> ContractNotificationMessage {
+    let mut message = stored.clone();
+    message.fields.retain(|field| field.name != "Alert");
+    message.fields.push(ContractEmbedField {
+        name: "Alert".to_string(),
+        value: "Proximity-Verified: Out of Range".to_string(),
+        inline: false,
+    });
+    bound_embed_message(&mut message);
+    message
+}
+
 const MAX_EMBED_TITLE_CHARACTERS: usize = 256;
 const MAX_EMBED_DESCRIPTION_CHARACTERS: usize = 4096;
 const MAX_EMBED_FIELD_NAME_CHARACTERS: usize = 256;
@@ -11669,6 +12119,133 @@ pub async fn run_contract_collection_loop(
     run_contract_collection_loop_inner(database_url, interval, esi_timeout, None).await;
 }
 
+pub const DEFAULT_PROXIMITY_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
+pub const MAX_PROXIMITY_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
+
+pub fn proximity_reconciliation_interval_from(value: Option<&str>) -> Result<Duration, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_PROXIMITY_RECONCILIATION_INTERVAL);
+    };
+    let seconds = value.parse::<u64>().map_err(|_| {
+        "CONTRACT_PROXIMITY_RECONCILIATION_INTERVAL_SECS must be an integer from 1 through 30"
+            .to_string()
+    })?;
+    if !(1..=MAX_PROXIMITY_RECONCILIATION_INTERVAL.as_secs()).contains(&seconds) {
+        return Err(
+            "CONTRACT_PROXIMITY_RECONCILIATION_INTERVAL_SECS must be an integer from 1 through 30"
+                .to_string(),
+        );
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+pub fn proximity_reconciliation_interval_from_environment() -> Result<Duration, String> {
+    proximity_reconciliation_interval_from_environment_value(std::env::var(
+        "CONTRACT_PROXIMITY_RECONCILIATION_INTERVAL_SECS",
+    ))
+}
+
+fn proximity_reconciliation_interval_from_environment_value(
+    value: Result<String, std::env::VarError>,
+) -> Result<Duration, String> {
+    match value {
+        Ok(value) => proximity_reconciliation_interval_from(Some(&value)),
+        Err(std::env::VarError::NotPresent) => proximity_reconciliation_interval_from(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(
+                "CONTRACT_PROXIMITY_RECONCILIATION_INTERVAL_SECS must be valid Unicode".to_string(),
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_proximity_reconciliation_loop(
+    database_url: String,
+    interval: Duration,
+    esi_timeout: Duration,
+    ship_groups: Arc<dyn ShipGroupResolver>,
+    delivery: Arc<dyn ContractDelivery>,
+    ping_limiter: Arc<dyn ContractPingLimiter>,
+    structure_resolver: Option<Arc<dyn StructureResolver>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let esi = loop {
+            match HttpPublicContractEsi::new(esi_timeout) {
+                Ok(esi) => break Arc::new(esi),
+                Err(error) => {
+                    warn!("proximity reconciliation HTTP client unavailable: {error}");
+                    tokio::time::sleep(interval).await;
+                }
+            }
+        };
+        run_proximity_reconciliation_loop(
+            database_url,
+            interval,
+            esi,
+            ship_groups,
+            delivery,
+            ping_limiter,
+            structure_resolver,
+        )
+        .await;
+    })
+}
+
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_proximity_reconciliation_loop_with_esi(
+    database_url: String,
+    interval: Duration,
+    esi: Arc<dyn PublicContractEsi>,
+    ship_groups: Arc<dyn ShipGroupResolver>,
+    delivery: Arc<dyn ContractDelivery>,
+    ping_limiter: Arc<dyn ContractPingLimiter>,
+    structure_resolver: Option<Arc<dyn StructureResolver>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_proximity_reconciliation_loop(
+        database_url,
+        interval,
+        esi,
+        ship_groups,
+        delivery,
+        ping_limiter,
+        structure_resolver,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_proximity_reconciliation_loop(
+    database_url: String,
+    interval: Duration,
+    esi: Arc<dyn PublicContractEsi>,
+    ship_groups: Arc<dyn ShipGroupResolver>,
+    delivery: Arc<dyn ContractDelivery>,
+    ping_limiter: Arc<dyn ContractPingLimiter>,
+    structure_resolver: Option<Arc<dyn StructureResolver>>,
+) {
+    let mut cadence = tokio::time::interval_at(tokio::time::Instant::now(), interval);
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        cadence.tick().await;
+        match ContractCollectionStore::connect(&database_url).await {
+            Ok(store) => {
+                let collector = ContractCollector::new(store, esi.clone())
+                    .with_notifications_and_ping_limiter(
+                        ship_groups.clone(),
+                        delivery.clone(),
+                        ping_limiter.clone(),
+                    )
+                    .with_optional_structure_resolver(structure_resolver.clone());
+                if let Err(error) = collector.reconcile_proximity_notifications().await {
+                    warn!("proximity reconciliation cycle failed: {error}");
+                }
+            }
+            Err(error) => warn!("proximity reconciliation database unavailable: {error}"),
+        }
+    }
+}
+
 pub fn spawn_contract_collection_loop_with_notifications(
     database_url: String,
     store_handle: ContractStoreHandle,
@@ -11982,6 +12559,18 @@ mod embed_tests {
             std::env::VarError::NotUnicode(std::ffi::OsString::from_vec(vec![0x80])),
         ))
         .expect_err("a configured non-Unicode value must not become the default");
+        assert!(error.contains("valid Unicode"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_proximity_reconciliation_cadence_is_rejected() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let error = proximity_reconciliation_interval_from_environment_value(Err(
+            std::env::VarError::NotUnicode(std::ffi::OsString::from_vec(vec![0x80])),
+        ))
+        .expect_err("a non-Unicode cadence must not become the default");
         assert!(error.contains("valid Unicode"));
     }
 
@@ -12782,6 +13371,7 @@ mod embed_tests {
                 nonce: MANUAL_CONTRACT_EMBED_NONCE.to_string(),
                 enforce_nonce: false,
                 message,
+                delivery_claim_token: None,
             })
             .await
             .expect("send manual contract embed");

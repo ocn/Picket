@@ -2297,6 +2297,7 @@ mod tests {
             nonce: "ci-1".to_string(),
             enforce_nonce: true,
             message: message.clone(),
+            delivery_claim_token: None,
         };
         let mut ping_builder = CreateMessage::default();
         configure_contract_delivery_message(&mut ping_builder, &delivery);

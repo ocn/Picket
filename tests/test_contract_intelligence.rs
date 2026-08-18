@@ -6,7 +6,8 @@ use killbot_rust::config::{self, AppConfig, AppState};
 use killbot_rust::contract_intelligence::{
     available_contract_store, collection_retry_delay, contract_regional_concurrency_from,
     execute_operator_delivery_cli, new_contract_store_handle,
-    spawn_contract_collection_loop_with_notifications, AppStateContractPingLimiter, CacheMetadata,
+    proximity_reconciliation_interval_from, spawn_contract_collection_loop_with_notifications,
+    spawn_proximity_reconciliation_loop_with_esi, AppStateContractPingLimiter, CacheMetadata,
     CollectionOutcome, ContractCollectionStore, ContractCollector, ContractContextLimiter,
     ContractContextRequirements, ContractContextResolution, ContractContextValue, ContractDelivery,
     ContractDeliveryClock, ContractDeliveryError, ContractEmbedContext, ContractEventAction,
@@ -52,6 +53,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
+use tempfile::tempdir;
 use tokio::sync::{mpsc, oneshot, Barrier, Mutex, Notify, Semaphore};
 use url::Url;
 
@@ -6078,8 +6080,7 @@ async fn adding_after_time_expiry_audits_the_automatic_operator_expiration() {
 }
 
 #[tokio::test]
-async fn unresolved_player_structure_proximity_posts_non_pinging_alerts_and_stays_idempotent_after_restart(
-) {
+async fn operator_location_evidence_reconciles_unverified_alerts_by_location_after_restart() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let location_id = 1_035_466_617_951_i64;
@@ -6099,7 +6100,15 @@ async fn unresolved_player_structure_proximity_posts_non_pinging_alerts_and_stay
     .collect_cycle()
     .await
     .expect("establish a silent public-contract baseline");
-    for (id, center) in [("near-turnur", 30_002_086), ("near-kurniainen", 30_003_089)] {
+    for (id, center, action) in [
+        (
+            "near-turnur-ping",
+            30_002_086,
+            ContractEventAction::PostAndPing,
+        ),
+        ("near-turnur-post", 30_002_086, ContractEventAction::Post),
+        ("near-kurniainen", 30_003_089, ContractEventAction::Post),
+    ] {
         store
             .upsert_contract_subscription(&ContractSubscription {
                 guild_id: 42,
@@ -6121,7 +6130,7 @@ async fn unresolved_player_structure_proximity_posts_non_pinging_alerts_and_stay
                     ]),
                 },
                 event_actions: ContractEventActions {
-                    listed: ContractEventAction::Post,
+                    listed: action,
                     ..ContractEventActions::default()
                 },
             })
@@ -6166,7 +6175,7 @@ async fn unresolved_player_structure_proximity_posts_non_pinging_alerts_and_stay
     .await
     .expect("post an unverified player-structure proximity alert without evidence");
     let sent = unknown_delivery.sent.lock().unwrap();
-    assert_eq!(sent.len(), 2);
+    assert_eq!(sent.len(), 3);
     assert!(sent.iter().all(|delivery| !delivery.ping));
     assert!(sent.iter().all(|delivery| {
         delivery
@@ -6188,8 +6197,78 @@ async fn unresolved_player_structure_proximity_posts_non_pinging_alerts_and_stay
                 })
     }));
     drop(sent);
+    for (id, action) in [
+        ("near-turnur-ping", ContractEventAction::Ignore),
+        ("near-turnur-post", ContractEventAction::PostAndPingEveryone),
+    ] {
+        store
+            .upsert_contract_subscription(&ContractSubscription {
+                guild_id: 42,
+                channel_id: 77,
+                id: id.to_string(),
+                description: id.to_string(),
+                filter: ContractFilter {
+                    root: ContractFilterNode::And(vec![
+                        ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                            direction: ContractItemDirection::Offered,
+                            ids: vec![587],
+                        }),
+                        ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                            config::SystemRange {
+                                system_id: 30_002_086,
+                                range: 1.0,
+                            },
+                        ])),
+                    ]),
+                },
+                event_actions: ContractEventActions {
+                    listed: action,
+                    ..ContractEventActions::default()
+                },
+            })
+            .await
+            .expect("change a future lifecycle action without changing the retained alert");
+    }
+    let repeated_unverified = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(
+                        vec![player_structure_contract.clone()],
+                        expiring_page(1),
+                    )),
+                )]),
+                items: HashMap::from([(
+                    44,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: HashMap::new(),
+            positions: positions.clone(),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        repeated_unverified.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("re-evaluate unresolved proximity after an action configuration change");
+    assert!(
+        repeated_unverified.sent.lock().unwrap().is_empty(),
+        "the original unverified identities remain the only original messages"
+    );
     let now = Utc::now();
-    execute_operator_location_evidence_cli(
+    let repair_clock = Arc::new(FixedDeliveryClock(StdMutex::new(now)));
+    let evidence = execute_operator_location_evidence_cli(
         &store,
         &[
             "add",
@@ -6221,9 +6300,14 @@ async fn unresolved_player_structure_proximity_posts_non_pinging_alerts_and_stay
         .expect("operator evidence remains selected before expiry");
     assert_eq!(selected.evidence_class, LocationEvidenceClass::Operator);
     assert_eq!(selected.solar_system_id, 30_002_086);
-    let resolved_delivery = Arc::new(RecordingDelivery {
-        store: restarted_store.clone(),
+    let resolved_delivery = Arc::new(ScriptedPromotionRepairDelivery {
         sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![
+            Err(ContractDeliveryError::transient("Discord rate limited")),
+            Err(ContractDeliveryError::transient("Discord rate limited")),
+            Err(ContractDeliveryError::transient("Discord rate limited")),
+        ]),
     });
     ContractCollector::new(
         restarted_store.clone(),
@@ -6233,7 +6317,7 @@ async fn unresolved_player_structure_proximity_posts_non_pinging_alerts_and_stay
                 pages: HashMap::from([(
                     (10_000_002, 1),
                     Ok(EsiResponse::fresh(
-                        vec![player_structure_contract],
+                        vec![player_structure_contract.clone()],
                         expiring_page(1),
                     )),
                 )]),
@@ -6251,22 +6335,39 @@ async fn unresolved_player_structure_proximity_posts_non_pinging_alerts_and_stay
         Arc::new(StaticShipGroups(HashMap::new())),
         resolved_delivery.clone(),
     )
-    .collect_cycle()
+    .with_delivery_clock(repair_clock.clone())
+    .reconcile_proximity_notifications()
     .await
-    .expect("re-evaluate the retained unverified proximity after restart");
+    .expect("reconcile retained U after evidence without starting a public collection cycle");
     let sent = resolved_delivery.sent.lock().unwrap();
-    assert!(
-        sent.is_empty(),
-        "Ticket10 owns the later edit and promotion"
-    );
+    assert_eq!(sent.len(), 2, "only the in-range alerts are promoted");
+    assert!(sent
+        .iter()
+        .any(|delivery| { delivery.subscription_id == "near-turnur-ping" && delivery.ping }));
+    assert!(sent
+        .iter()
+        .any(|delivery| { delivery.subscription_id == "near-turnur-post" && !delivery.ping }));
     drop(sent);
+    let edits = resolved_delivery.edits.lock().unwrap();
+    assert_eq!(
+        edits.len(),
+        3,
+        "both in-range and out-of-range alerts are corrected"
+    );
+    assert!(edits.iter().all(|edit| !edit
+        .message
+        .fields
+        .iter()
+        .any(|field| { field.name == "Alert" && field.value == "Proximity-Unverified" })));
+    drop(edits);
     assert_eq!(
         restarted_store
             .delivery_records()
             .await
             .expect("read durable unverified deliveries")
             .len(),
-        2
+        5,
+        "each in-range result creates exactly one separate promotion identity"
     );
     let promotion_pool = PgPoolOptions::new()
         .max_connections(1)
@@ -6278,12 +6379,346 @@ async fn unresolved_player_structure_proximity_posts_non_pinging_alerts_and_stay
     )
     .fetch_one(&promotion_pool)
     .await
-    .expect("retain U identities for Ticket10 promotion");
+    .expect("consume resolved U identities after their original messages are corrected");
     promotion_pool.close().await;
     assert_eq!(
-        durable_unverified_matches, 2,
-        "a later definite re-evaluation neither duplicates nor consumes the U alert identity"
+        durable_unverified_matches, 0,
+        "evidence-triggered reconciliation consumes all matching U identities"
     );
+    let before_deadline = Arc::new(ReconcilingDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(database.store().await, Arc::new(FailingContractEsi))
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::new())),
+            before_deadline.clone(),
+        )
+        .with_delivery_clock(repair_clock.clone())
+        .collect_cycle()
+        .await
+        .expect("a restart honors the durable repair retry deadline");
+    assert!(before_deadline.sent.lock().unwrap().is_empty());
+    assert!(before_deadline.edits.lock().unwrap().is_empty());
+    *repair_clock.0.lock().unwrap() += chrono::Duration::seconds(5);
+    let after_restart = Arc::new(ReconcilingDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(database.store().await, Arc::new(FailingContractEsi))
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::new())),
+            after_restart.clone(),
+        )
+        .with_delivery_clock(repair_clock.clone())
+        .collect_cycle()
+        .await
+        .expect("a later restart applies each durable original-message repair once");
+    assert!(after_restart.sent.lock().unwrap().is_empty());
+    assert_eq!(after_restart.edits.lock().unwrap().len(), 3);
+    let evidence_id = match evidence {
+        OperatorLocationEvidenceCliResult::Added(evidence) => evidence.id.to_string(),
+        result => panic!("expected added evidence, got {result:?}"),
+    };
+    execute_operator_location_evidence_cli(
+        &restarted_store,
+        &[
+            "supersede",
+            "--id",
+            &evidence_id,
+            "--system-id",
+            "30002086",
+            "--region-id",
+            "10000003",
+            "--expires-at",
+            &(now + chrono::Duration::days(2)).to_rfc3339(),
+            "--actor",
+            "operator:146451271497416704",
+            "--provenance",
+            "repeat definitive location evidence",
+        ],
+        now,
+    )
+    .await
+    .expect("replace the location evidence after the resolved alerts are retained");
+    let repeated = Arc::new(ReconcilingDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(database.store().await, Arc::new(FailingContractEsi))
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), repeated.clone())
+        .with_delivery_clock(repair_clock)
+        .collect_cycle()
+        .await
+        .expect("repeated evidence cannot recreate a resolved promotion or correction");
+    assert!(repeated.sent.lock().unwrap().is_empty());
+    assert!(repeated.edits.lock().unwrap().is_empty());
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn proximity_evidence_reconciles_unverified_alerts_for_every_contract_lifecycle_action() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let location_id = 1_035_466_617_951_i64;
+    let mut contract = item_exchange_contract(45);
+    contract.start_location_id = location_id;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish a silent public-contract baseline");
+    let lifecycles = [
+        (
+            "listed",
+            ContractEventKind::Listed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ),
+        (
+            "sale-confirmed",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::PostAndPing,
+        ),
+        (
+            "purchase-confirmed",
+            ContractEventKind::PurchaseConfirmed,
+            ContractItemDirection::Requested,
+            ContractEventAction::PostAndPingEveryone,
+        ),
+        (
+            "expired",
+            ContractEventKind::Expired,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ),
+        (
+            "closed",
+            ContractEventKind::ClosedOutcomeUnknown,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ),
+    ];
+    for (id, _, direction, _) in lifecycles {
+        store
+            .upsert_contract_subscription(&ContractSubscription {
+                guild_id: 42,
+                channel_id: 77,
+                id: id.to_string(),
+                description: format!("{id} proximity lifecycle"),
+                filter: ContractFilter {
+                    root: ContractFilterNode::And(vec![
+                        ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                            direction,
+                            ids: vec![587],
+                        }),
+                        ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                            config::SystemRange {
+                                system_id: 30_002_086,
+                                range: 1.0,
+                            },
+                        ])),
+                    ]),
+                },
+                event_actions: ContractEventActions {
+                    listed: ContractEventAction::Post,
+                    ..ContractEventActions::default()
+                },
+            })
+            .await
+            .expect("persist a proximity lifecycle subscription");
+    }
+    let initially_unverified = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    45,
+                    Ok(EsiResponse::fresh(
+                        vec![offered_ship(1), requested_ship(2)],
+                        expiring_cache(),
+                    )),
+                )]),
+            },
+            contexts: HashMap::new(),
+            positions: HashMap::new(),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        initially_unverified.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("prepare one unverified original message per lifecycle action");
+    assert_eq!(initially_unverified.sent.lock().unwrap().len(), 5);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to reshape the lifecycle fixtures after original send");
+    for (id, kind, _, action) in lifecycles {
+        let event_actions = match kind {
+            ContractEventKind::Listed => ContractEventActions {
+                listed: action,
+                ..ContractEventActions::default()
+            },
+            ContractEventKind::SaleConfirmed => ContractEventActions {
+                sale_confirmed: action,
+                ..ContractEventActions::default()
+            },
+            ContractEventKind::PurchaseConfirmed => ContractEventActions {
+                purchase_confirmed: action,
+                ..ContractEventActions::default()
+            },
+            ContractEventKind::Expired => ContractEventActions {
+                expired: action,
+                ..ContractEventActions::default()
+            },
+            ContractEventKind::ClosedOutcomeUnknown => ContractEventActions {
+                closed_outcome_unknown: action,
+                ..ContractEventActions::default()
+            },
+        };
+        sqlx::query(
+            "UPDATE contract_subscriptions SET event_actions = $1 WHERE guild_id = 42 AND channel_id = 77 AND subscription_id = $2",
+        )
+        .bind(serde_json::to_value(event_actions).expect("serialize lifecycle actions"))
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("apply the lifecycle action to the persisted subscription");
+        for table in [
+            "contract_deferred_subscription_matches",
+            "contract_outbound_deliveries",
+        ] {
+            let query = format!(
+                "UPDATE {table} SET event_kind = $1, event = jsonb_set(event, '{{kind}}', to_jsonb($1::text), true) WHERE guild_id = 42 AND channel_id = 77 AND subscription_id = $2"
+            );
+            sqlx::query(&query)
+                .bind(match kind {
+                    ContractEventKind::Listed => "listed",
+                    ContractEventKind::SaleConfirmed => "sale_confirmed",
+                    ContractEventKind::PurchaseConfirmed => "purchase_confirmed",
+                    ContractEventKind::Expired => "expired",
+                    ContractEventKind::ClosedOutcomeUnknown => "closed_outcome_unknown",
+                })
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("reshape retained proximity event to its lifecycle action");
+        }
+        sqlx::query(
+            "UPDATE contract_outbound_deliveries SET proximity_promotion_ping = $1 WHERE guild_id = 42 AND channel_id = 77 AND subscription_id = $2",
+        )
+        .bind(action.ping_type().is_some())
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("retain the original lifecycle ping eligibility");
+    }
+    pool.close().await;
+
+    let now = Utc::now();
+    execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            "1035466617951",
+            "--structure-id",
+            "1035466617951",
+            "--system-id",
+            "30002086",
+            "--region-id",
+            "10000003",
+            "--expires-at",
+            &(now + chrono::Duration::days(1)).to_rfc3339(),
+            "--actor",
+            "operator:146451271497416704",
+            "--provenance",
+            "definitive location evidence for every lifecycle action",
+        ],
+        now,
+    )
+    .await
+    .expect("record evidence for the retained location identifier");
+    let reconciled = Arc::new(ReconcilingDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![contract], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    45,
+                    Ok(EsiResponse::fresh(
+                        vec![offered_ship(1), requested_ship(2)],
+                        expiring_cache(),
+                    )),
+                )]),
+            },
+            contexts: HashMap::new(),
+            positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        reconciled.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("reconcile every retained lifecycle event from location evidence");
+    let sent = reconciled.sent.lock().unwrap();
+    assert_eq!(sent.len(), 5, "one promotion per lifecycle action");
+    for (id, kind, _, action) in lifecycles {
+        assert!(sent.iter().any(|delivery| {
+            delivery.subscription_id == id
+                && delivery.event_kind == kind
+                && delivery.ping == action.ping_type().is_some()
+        }));
+    }
+    drop(sent);
+    let edits = reconciled.edits.lock().unwrap();
+    for (_, kind, _, _) in lifecycles {
+        assert!(edits.iter().any(|edit| {
+            edit.event_kind == kind
+                && !edit
+                    .message
+                    .fields
+                    .iter()
+                    .any(|field| field.name == "Alert" && field.value == "Proximity-Unverified")
+        }));
+    }
+    drop(edits);
     database.destroy().await;
 }
 
@@ -6357,7 +6792,7 @@ async fn proximity_unverified_outbox_and_ticket10_marker_roll_back_together_on_f
         store: store.clone(),
         sent: StdMutex::new(Vec::new()),
     });
-    let result = ContractCollector::new(
+    let collector = ContractCollector::new(
         store.clone(),
         Arc::new(PositionEsi {
             inner: FakeEsi {
@@ -6379,9 +6814,27 @@ async fn proximity_unverified_outbox_and_ticket10_marker_roll_back_together_on_f
     .with_notifications(
         Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
         delivery.clone(),
-    )
-    .collect_cycle()
-    .await;
+    );
+    let mut evidence_writer = pool.begin().await.expect("begin blocked evidence writer");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(location_id)
+        .execute(&mut *evidence_writer)
+        .await
+        .expect("acquire the shared location lock before U preparation");
+    let mut pending_u_preparation = tokio::spawn(async move { collector.collect_cycle().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut pending_u_preparation)
+            .await
+            .is_err(),
+        "U preparation must wait for the same location lock as an evidence writer"
+    );
+    evidence_writer
+        .commit()
+        .await
+        .expect("release the shared location lock");
+    let result = pending_u_preparation
+        .await
+        .expect("join the U preparation task after releasing the evidence lock");
 
     assert!(
         result.is_err(),
@@ -6592,9 +7045,9 @@ async fn an_ordinary_deferred_match_upgrades_to_a_durable_unverified_marker_befo
     )
     .await
     .expect("add the later definitive location evidence");
-    let confirmed_delivery = Arc::new(RecordingDelivery {
-        store: restarted_store.clone(),
+    let confirmed_delivery = Arc::new(ReconcilingDelivery {
         sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
     });
     ContractCollector::new(
         restarted_store.clone(),
@@ -6631,15 +7084,22 @@ async fn an_ordinary_deferred_match_upgrades_to_a_durable_unverified_marker_befo
     )
     .collect_cycle()
     .await
-    .expect("re-evaluate the confirmed event without Ticket10 promotion");
-    assert!(confirmed_delivery.sent.lock().unwrap().is_empty());
-    let retained_marker: bool = sqlx::query_scalar(
-        "SELECT proximity_unverified FROM contract_deferred_subscription_matches WHERE subscription_id = 'deferred-then-unverified' AND contract_id = 44",
+    .expect("reconcile the confirmed event through the original message and promotion identity");
+    let sent = confirmed_delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(
+        sent[0].ping,
+        "the original lifecycle action permits one ping"
+    );
+    drop(sent);
+    assert_eq!(confirmed_delivery.edits.lock().unwrap().len(), 1);
+    let retained_marker: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM contract_deferred_subscription_matches WHERE subscription_id = 'deferred-then-unverified' AND contract_id = 44 AND proximity_unverified",
     )
     .fetch_one(&pool)
     .await
-    .expect("retain the U marker for Ticket10 after a later confirmation");
-    assert!(retained_marker);
+    .expect("consume the U marker after a later confirmation");
+    assert_eq!(retained_marker, 0);
     pool.close().await;
     database.destroy().await;
 }
@@ -6820,6 +7280,14 @@ struct FakeEsi {
     regions: Vec<i64>,
     pages: HashMap<(i64, u32), Result<EsiResponse<Vec<PublicContract>>, EsiError>>,
     items: HashMap<i64, Result<EsiResponse<Vec<PublicContractItem>>, EsiError>>,
+}
+
+#[derive(Default)]
+struct NoPublicCollectionEsi {
+    calls: AtomicU64,
+    positions: HashMap<u32, SolarSystemPosition>,
+    embed_contexts: HashMap<i64, ContractEmbedContext>,
+    embed_contexts_enabled: AtomicBool,
 }
 
 struct GatedRegionalEsi {
@@ -7066,6 +7534,83 @@ impl PublicContractEsi for FakeEsi {
             .get(&contract_id)
             .expect("fake ESI manifest configured")
             .clone()
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for NoPublicCollectionEsi {
+    async fn regions(&self, _etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Err(EsiError::retryable(
+            "reconciliation must not collect regions",
+            None,
+        ))
+    }
+
+    async fn public_contracts_page(
+        &self,
+        _region_id: i64,
+        _page: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Err(EsiError::retryable(
+            "reconciliation must not collect pages",
+            None,
+        ))
+    }
+
+    async fn public_contract_items(
+        &self,
+        _contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Err(EsiError::retryable(
+            "reconciliation must not collect manifests",
+            None,
+        ))
+    }
+
+    async fn observed_contract_context(
+        &self,
+        _contract: &PublicContract,
+        _requirements: ContractContextRequirements,
+    ) -> Result<EsiResponse<ContractObservationContext>, EsiError> {
+        Ok(EsiResponse::fresh(
+            ContractObservationContext::default(),
+            CacheMetadata::cached_for_seconds(60),
+        ))
+    }
+
+    async fn observed_contract_embed_context(
+        &self,
+        contract: &PublicContract,
+        _items: &[PublicContractItem],
+    ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
+        Ok(EsiResponse::fresh(
+            if self.embed_contexts_enabled.load(Ordering::Relaxed) {
+                self.embed_contexts
+                    .get(&contract.contract_id)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                ContractEmbedContext::default()
+            },
+            CacheMetadata::cached_for_seconds(60),
+        ))
+    }
+
+    async fn solar_system_position(
+        &self,
+        solar_system_id: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<SolarSystemPosition>, EsiError> {
+        self.positions
+            .get(&solar_system_id)
+            .copied()
+            .map(|position| EsiResponse::fresh(position, CacheMetadata::cached_for_seconds(60)))
+            .ok_or_else(|| EsiError::retryable("position unavailable", None))
     }
 }
 
@@ -8140,6 +8685,17 @@ struct ScriptedRepairDelivery {
     edit_outcomes: StdMutex<Vec<Result<(), ContractDeliveryError>>>,
 }
 
+struct ReconcilingDelivery {
+    sent: StdMutex<Vec<PreparedContractDelivery>>,
+    edits: StdMutex<Vec<ContractMessageEdit>>,
+}
+
+struct ScriptedPromotionRepairDelivery {
+    sent: StdMutex<Vec<PreparedContractDelivery>>,
+    edits: StdMutex<Vec<ContractMessageEdit>>,
+    edit_outcomes: StdMutex<Vec<Result<(), ContractDeliveryError>>>,
+}
+
 struct IsolatedRepairDelivery {
     sent: StdMutex<Vec<PreparedContractDelivery>>,
     edits: StdMutex<Vec<ContractMessageEdit>>,
@@ -8677,6 +9233,38 @@ impl ContractDelivery for ScriptedRepairDelivery {
 }
 
 #[async_trait]
+impl ContractDelivery for ReconcilingDelivery {
+    async fn send(
+        &self,
+        delivery: PreparedContractDelivery,
+    ) -> Result<String, ContractDeliveryError> {
+        self.sent.lock().unwrap().push(delivery);
+        Ok("proximity-promotion-message".to_string())
+    }
+
+    async fn edit(&self, edit: ContractMessageEdit) -> Result<(), ContractDeliveryError> {
+        self.edits.lock().unwrap().push(edit);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ContractDelivery for ScriptedPromotionRepairDelivery {
+    async fn send(
+        &self,
+        delivery: PreparedContractDelivery,
+    ) -> Result<String, ContractDeliveryError> {
+        self.sent.lock().unwrap().push(delivery);
+        Ok("proximity-promotion-message".to_string())
+    }
+
+    async fn edit(&self, edit: ContractMessageEdit) -> Result<(), ContractDeliveryError> {
+        self.edits.lock().unwrap().push(edit);
+        self.edit_outcomes.lock().unwrap().remove(0)
+    }
+}
+
+#[async_trait]
 impl ContractDelivery for IsolatedRepairDelivery {
     async fn send(
         &self,
@@ -8935,6 +9523,1351 @@ fn contract_regional_concurrency_is_conservative_and_strict() {
             "{value:?} must not silently change the collection rate"
         );
     }
+}
+
+#[test]
+fn proximity_reconciliation_cadence_reserves_headroom_with_a_thirty_second_maximum() {
+    assert_eq!(
+        proximity_reconciliation_interval_from(None).unwrap(),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        proximity_reconciliation_interval_from(Some("30")).unwrap(),
+        Duration::from_secs(30)
+    );
+    for value in ["0", "31", "60", "thirty", " 30", "30 "] {
+        assert!(
+            proximity_reconciliation_interval_from(Some(value)).is_err(),
+            "{value:?} must not silently loosen the reconciliation deadline"
+        );
+    }
+}
+
+#[tokio::test]
+async fn spawned_proximity_reconciliation_loop_repairs_and_promotes_seeded_unverified_alert_without_public_collection(
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let location_id = 1_035_466_617_951_i64;
+    let mut contract = item_exchange_contract(91);
+    contract.start_location_id = location_id;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the public-contract baseline before seeding the unresolved alert");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "spawned-reconciliation".to_string(),
+            description: "spawned reconciliation proof".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::And(vec![
+                    ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                        direction: ContractItemDirection::Offered,
+                        ids: vec![587],
+                    }),
+                    ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                        config::SystemRange {
+                            system_id: 30_002_086,
+                            range: 1.0,
+                        },
+                    ])),
+                ]),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::PostAndPing,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist the seeded proximity subscription");
+    let seeded_delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: HashMap::new(),
+            positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        seeded_delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("seed one durable proximity-unverified original alert");
+    assert_eq!(seeded_delivery.sent.lock().unwrap().len(), 1);
+    assert!(seeded_delivery.sent.lock().unwrap()[0]
+        .message
+        .fields
+        .iter()
+        .any(|field| field.name == "Alert" && field.value == "Proximity-Unverified"));
+
+    LocationEvidenceService::new(&store)
+        .record_public_npc(
+            location_id,
+            Some(location_id),
+            30_002_086,
+            Some(10_000_003),
+            Utc::now(),
+            Utc::now(),
+        )
+        .await
+        .expect("write the definitive public location evidence before the spawned cycle");
+    let esi = Arc::new(NoPublicCollectionEsi {
+        calls: AtomicU64::new(0),
+        positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+        embed_contexts: HashMap::new(),
+        embed_contexts_enabled: AtomicBool::new(false),
+    });
+    let delivery = Arc::new(ReconcilingDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+    });
+    let loop_handle = spawn_proximity_reconciliation_loop_with_esi(
+        database.url.clone(),
+        Duration::from_secs(1),
+        esi.clone(),
+        Arc::new(StaticShipGroups(HashMap::new())),
+        delivery.clone(),
+        Arc::new(AppStateContractPingLimiter::new(
+            app_state_for_ping_limiter(),
+        )),
+        None,
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if delivery.sent.lock().unwrap().len() == 1 && delivery.edits.lock().unwrap().len() == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the spawned loop reconciles the seeded alert within the configured one-minute bound");
+    loop_handle.abort();
+    assert_eq!(
+        esi.calls.load(Ordering::Relaxed),
+        0,
+        "the independent reconciliation loop may only read retained evidence and dispatch work"
+    );
+    assert_eq!(
+        delivery.sent.lock().unwrap().len(),
+        1,
+        "one promotion identity is dispatched"
+    );
+    assert!(
+        delivery.sent.lock().unwrap()[0].ping,
+        "the promotion preserves the original ping eligibility"
+    );
+    assert_eq!(
+        delivery.edits.lock().unwrap().len(),
+        1,
+        "the original alert is edited in place"
+    );
+    assert!(!delivery.edits.lock().unwrap()[0]
+        .message
+        .fields
+        .iter()
+        .any(|field| field.name == "Alert" && field.value == "Proximity-Unverified"));
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn evidence_written_after_the_proximity_evaluator_cannot_create_a_stranded_unverified_alert()
+{
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let location_id = 1_035_466_617_952_i64;
+    let mut contract = item_exchange_contract(92);
+    contract.start_location_id = location_id;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the public-contract baseline before the U/evidence race");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "u-after-evidence".to_string(),
+            description: "serialize late evidence with an unresolved proximity decision"
+                .to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::And(vec![
+                    ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                        direction: ContractItemDirection::Offered,
+                        ids: vec![587],
+                    }),
+                    ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                        config::SystemRange {
+                            system_id: 30_002_086,
+                            range: 1.0,
+                        },
+                    ])),
+                ]),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist the race subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let collector = ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: HashMap::new(),
+            positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    );
+    let inspection = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database.url)
+        .await
+        .expect("connect the U/evidence lock inspector");
+    let mut evidence_writer = inspection
+        .begin()
+        .await
+        .expect("begin the serialized evidence writer");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(location_id)
+        .execute(&mut *evidence_writer)
+        .await
+        .expect("hold the location lock until the evaluator reaches U preparation");
+    let collection = tokio::spawn(async move { collector.collect_cycle().await });
+    let mut u_waits_for_evidence = false;
+    for _ in 0..100 {
+        u_waits_for_evidence = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)",
+        )
+        .fetch_one(&inspection)
+        .await
+        .expect("inspect the evaluator waiting on the location lock");
+        if u_waits_for_evidence {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        u_waits_for_evidence,
+        "the evaluator must complete before U preparation waits for the evidence writer"
+    );
+    let now = Utc::now();
+    sqlx::query("INSERT INTO location_evidence (location_id, evidence_class, structure_id, solar_system_id, region_id, provenance, actor, observed_at) VALUES ($1, 'public_npc', $1, 30002086, 10000003, 'race fixture', 'system:public-esi', $2)")
+        .bind(location_id)
+        .bind(now)
+        .execute(&mut *evidence_writer)
+        .await
+        .expect("write definitive evidence while U preparation is waiting");
+    evidence_writer
+        .commit()
+        .await
+        .expect("publish definitive evidence before the U transaction may proceed");
+    collection
+        .await
+        .expect("join U/evidence race collector")
+        .expect("late evidence is handled without failing collection");
+
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+    assert!(
+        !delivery.sent.lock().unwrap()[0]
+            .message
+            .fields
+            .iter()
+            .any(|field| field.name == "Alert" && field.value == "Proximity-Unverified"),
+        "late definitive evidence must produce the conclusive original instead of a stranded U"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM contract_deferred_subscription_matches WHERE subscription_id = 'u-after-evidence' AND contract_id = 92 AND proximity_unverified")
+            .fetch_one(&inspection)
+            .await
+            .expect("count unresolved U markers after the race"),
+        0,
+        "the atomic recheck prevents a stranded U marker"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM contract_outbound_deliveries WHERE subscription_id = 'u-after-evidence' AND contract_id = 92")
+            .fetch_one(&inspection)
+            .await
+            .expect("count conclusive delivery identities after the race"),
+        1,
+        "the late re-evaluation retains only the original identity"
+    );
+    inspection.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn higher_precedence_evidence_written_while_reconciliation_waits_is_the_final_resolution() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let location_id = 1_035_466_617_953_i64;
+    let mut contract = item_exchange_contract(93);
+    contract.start_location_id = location_id;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the public-contract baseline before the precedence race");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "precedence-race".to_string(),
+            description: "higher precedence wins a blocked reconciliation".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::And(vec![
+                    ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                        direction: ContractItemDirection::Offered,
+                        ids: vec![587],
+                    }),
+                    ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                        config::SystemRange {
+                            system_id: 30_002_086,
+                            range: 1.0,
+                        },
+                    ])),
+                ]),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::PostAndPing,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist the precedence-race subscription");
+    let initial = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: HashMap::new(),
+            positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        initial.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("seed the original U alert before evidence becomes available");
+    assert_eq!(initial.sent.lock().unwrap().len(), 1);
+
+    let now = Utc::now();
+    LocationEvidenceService::new(&store)
+        .record_access_qualified(
+            location_id,
+            30_002_086,
+            Some(10_000_003),
+            "character:90000001",
+            now,
+            now + chrono::Duration::hours(1),
+            now,
+        )
+        .await
+        .expect("write lower-precedence access-qualified evidence used by the initial reconciliation evaluator");
+    let delivery = Arc::new(ReconcilingDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+    });
+    let failing_resolver = Arc::new(FailingStructureResolver::access_denied());
+    let collector = ContractCollector::new(
+        store.clone(),
+        Arc::new(NoPublicCollectionEsi {
+            calls: AtomicU64::new(0),
+            positions: HashMap::from([
+                (30_002_086, position_at_light_years(0.0)),
+                (30_003_089, position_at_light_years(20.0)),
+            ]),
+            embed_contexts: HashMap::new(),
+            embed_contexts_enabled: AtomicBool::new(false),
+        }),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .with_structure_resolver(failing_resolver.clone());
+    let inspection = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database.url)
+        .await
+        .expect("connect the precedence-race lock inspector");
+    let mut writer = inspection
+        .begin()
+        .await
+        .expect("begin the higher-precedence evidence writer");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(location_id)
+        .execute(&mut *writer)
+        .await
+        .expect("hold the shared location lock until reconciliation reaches its commit point");
+    let reconciliation =
+        tokio::spawn(async move { collector.reconcile_proximity_notifications().await });
+    let mut reconciliation_waits = false;
+    for _ in 0..100 {
+        reconciliation_waits = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)",
+        )
+        .fetch_one(&inspection)
+        .await
+        .expect("inspect the reconciliation waiting on the evidence writer");
+        if reconciliation_waits {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        reconciliation_waits,
+        "reconciliation evaluated lower evidence before it blocked on the shared location lock"
+    );
+    sqlx::query("INSERT INTO location_evidence (location_id, evidence_class, structure_id, solar_system_id, region_id, provenance, actor, observed_at) VALUES ($1, 'public_npc', $1, 30003089, 10000002, 'race fixture', 'system:public-esi', $2)")
+        .bind(location_id)
+        .bind(Utc::now())
+        .execute(&mut *writer)
+        .await
+        .expect("write higher-precedence public evidence before reconciliation may continue");
+    writer
+        .commit()
+        .await
+        .expect("publish the authoritative evidence");
+    reconciliation
+        .await
+        .expect("join precedence-race reconciliation")
+        .expect("reconcile with the authoritative evidence");
+
+    assert!(
+        delivery.sent.lock().unwrap().is_empty(),
+        "out-of-range authoritative evidence creates no promotion"
+    );
+    assert_eq!(
+        delivery.edits.lock().unwrap().len(),
+        1,
+        "the original U is corrected once"
+    );
+    assert!(!delivery.edits.lock().unwrap()[0]
+        .message
+        .fields
+        .iter()
+        .any(|field| field.name == "Alert" && field.value == "Proximity-Unverified"));
+    let selected = LocationEvidenceService::new(&store)
+        .resolve(location_id, Utc::now())
+        .await
+        .expect("read final selected evidence")
+        .expect("authoritative evidence remains current");
+    assert_eq!(selected.evidence_class, LocationEvidenceClass::PublicNpc);
+    assert_eq!(selected.solar_system_id, 30_003_089);
+    assert_eq!(
+        failing_resolver.calls.load(Ordering::Relaxed),
+        0,
+        "a resolver degradation cannot replace retained access-qualified or public evidence"
+    );
+    inspection.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn access_qualified_and_public_npc_evidence_each_reconcile_unverified_alerts_without_resolver_regression(
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let access_location_id = 1_035_466_617_954_i64;
+    let public_location_id = 1_035_466_617_955_i64;
+    let mut access_contract = item_exchange_contract(94);
+    access_contract.start_location_id = access_location_id;
+    let mut public_contract = item_exchange_contract(95);
+    public_contract.start_location_id = public_location_id;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the baseline before retaining two U identities");
+    for id in ["access-qualified-only", "public-npc-only"] {
+        store
+            .upsert_contract_subscription(&ContractSubscription {
+                guild_id: 42,
+                channel_id: 77,
+                id: id.to_string(),
+                description: id.to_string(),
+                filter: ContractFilter {
+                    root: ContractFilterNode::And(vec![
+                        ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                            direction: ContractItemDirection::Offered,
+                            ids: vec![587],
+                        }),
+                        ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                            config::SystemRange {
+                                system_id: 30_002_086,
+                                range: 1.0,
+                            },
+                        ])),
+                    ]),
+                },
+                event_actions: ContractEventActions {
+                    listed: ContractEventAction::PostAndPing,
+                    ..ContractEventActions::default()
+                },
+            })
+            .await
+            .expect("persist one evidence-class reconciliation subscription");
+    }
+    let initial = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(
+                        vec![access_contract.clone(), public_contract.clone()],
+                        expiring_page(1),
+                    )),
+                )]),
+                items: HashMap::from([
+                    (
+                        access_contract.contract_id,
+                        Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                    ),
+                    (
+                        public_contract.contract_id,
+                        Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+                    ),
+                ]),
+            },
+            contexts: HashMap::new(),
+            positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        initial.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("create one U original per evidence-class fixture");
+    assert_eq!(
+        initial.sent.lock().unwrap().len(),
+        4,
+        "each contract matches each subscription before evidence"
+    );
+
+    let now = Utc::now();
+    LocationEvidenceService::new(&store)
+        .record_access_qualified(
+            access_location_id,
+            30_002_086,
+            Some(10_000_003),
+            "character:90000001",
+            now,
+            now + chrono::Duration::hours(1),
+            now,
+        )
+        .await
+        .expect("retain the access-qualified-only location");
+    LocationEvidenceService::new(&store)
+        .record_public_npc(
+            public_location_id,
+            Some(public_location_id),
+            30_002_086,
+            Some(10_000_003),
+            now,
+            now,
+        )
+        .await
+        .expect("retain the public-npc-only location");
+    let delivery = Arc::new(ReconcilingDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+    });
+    let degraded_resolver = Arc::new(FailingStructureResolver::access_denied());
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(NoPublicCollectionEsi {
+            calls: AtomicU64::new(0),
+            positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+            embed_contexts: HashMap::new(),
+            embed_contexts_enabled: AtomicBool::new(false),
+        }),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .with_structure_resolver(degraded_resolver.clone())
+    .reconcile_proximity_notifications()
+    .await
+    .expect("retained definitive evidence reconciles without depending on the resolver");
+
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(
+        sent.len(),
+        4,
+        "each retained U identity receives one eligible promotion"
+    );
+    assert!(sent.iter().all(|promotion| promotion.ping));
+    drop(sent);
+    assert_eq!(
+        delivery.edits.lock().unwrap().len(),
+        4,
+        "each original U is durably edited once"
+    );
+    assert_eq!(
+        store
+            .delivery_records()
+            .await
+            .expect("read original and promotion delivery identities")
+            .len(),
+        8,
+        "each evidence-class fixture retains one original and one promotion identity"
+    );
+    let selected_access = LocationEvidenceService::new(&store)
+        .resolve(access_location_id, Utc::now())
+        .await
+        .expect("read access-qualified selection")
+        .expect("access evidence remains current");
+    let selected_public = LocationEvidenceService::new(&store)
+        .resolve(public_location_id, Utc::now())
+        .await
+        .expect("read public selection")
+        .expect("public evidence remains current");
+    assert_eq!(
+        selected_access.evidence_class,
+        LocationEvidenceClass::AccessQualified
+    );
+    assert_eq!(
+        selected_public.evidence_class,
+        LocationEvidenceClass::PublicNpc
+    );
+    assert_eq!(
+        degraded_resolver.calls.load(Ordering::Relaxed),
+        0,
+        "resolver degradation cannot regress either retained evidence class"
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn concurrent_collection_and_reconciliation_dispatchers_claim_one_prepared_promotion() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let subscription = contract_subscription(
+        "concurrent-promotion-dispatch",
+        ContractItemDirection::Offered,
+        vec![587],
+        vec![],
+        ContractEventAction::PostAndPing,
+    );
+    store
+        .upsert_contract_subscription(&subscription)
+        .await
+        .expect("persist the prepared promotion owner");
+    let raw_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed the durable promotion");
+    sqlx::query("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, delivery_kind, event, message, ping, ping_type, status, delivery_nonce) VALUES (42, 77, 'concurrent-promotion-dispatch', 96, 'listed', 'proximity_promotion', '{}'::jsonb, '{\"title\":\"promotion\",\"fields\":[]}'::jsonb, TRUE, 'here', 'prepared', 'ci-concurrent-promotion')")
+        .execute(&raw_pool)
+        .await
+        .expect("seed exactly one prepared promotion");
+    raw_pool.close().await;
+
+    let delivery = Arc::new(FirstDeliveryGate {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        gate_open: AtomicBool::new(true),
+    });
+    let ping_limiter = Arc::new(RecordingContractPingLimiter {
+        outcomes: StdMutex::new(vec![true, true]),
+        channels: StdMutex::new(Vec::new()),
+    });
+    let workers = Arc::new(Barrier::new(3));
+    let first_collector = ContractCollector::new(
+        store.clone(),
+        Arc::new(NoPublicCollectionEsi {
+            calls: AtomicU64::new(0),
+            positions: HashMap::new(),
+            embed_contexts: HashMap::new(),
+            embed_contexts_enabled: AtomicBool::new(false),
+        }),
+    )
+    .with_notifications_and_ping_limiter(
+        Arc::new(StaticShipGroups(HashMap::new())),
+        delivery.clone(),
+        ping_limiter.clone(),
+    );
+    let first_workers = workers.clone();
+    let first = tokio::spawn(async move {
+        first_workers.wait().await;
+        first_collector.reconcile_proximity_notifications().await
+    });
+    let second_collector = ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .with_notifications_and_ping_limiter(
+        Arc::new(StaticShipGroups(HashMap::new())),
+        delivery.clone(),
+        ping_limiter.clone(),
+    );
+    let second_workers = workers.clone();
+    let second = tokio::spawn(async move {
+        second_workers.wait().await;
+        second_collector.collect_cycle().await.map(|_| ())
+    });
+    workers.wait().await;
+    tokio::time::timeout(Duration::from_secs(2), delivery.entered.notified())
+        .await
+        .expect("one dispatcher reaches the prepared promotion before either completion");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    delivery.release.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(2), first)
+        .await
+        .expect("join the reconciliation dispatcher")
+        .expect("reconciliation task remains live")
+        .expect("reconciliation completes after the claim owner sends");
+    tokio::time::timeout(Duration::from_secs(2), second)
+        .await
+        .expect("join the collection dispatcher")
+        .expect("collection task remains live")
+        .expect("collection completes after another dispatcher owns the claim");
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+    assert_eq!(ping_limiter.channels.lock().unwrap().as_slice(), &[77]);
+    assert_eq!(
+        store
+            .delivery_records()
+            .await
+            .expect("read the completed promotion")
+            .len(),
+        1,
+        "the durable promotion identity remains singular"
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn listed_public_evidence_supersession_reconciles_unverified_alert_with_authoritative_context(
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let location_id = 1_035_466_617_957_i64;
+    let mut contract = item_exchange_contract(97);
+    contract.start_location_id = location_id;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the baseline before the listed U fixture");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "listed-public-supersession".to_string(),
+            description: "listed public evidence supersession".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::And(vec![
+                    ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                        direction: ContractItemDirection::Offered,
+                        ids: vec![587],
+                    }),
+                    ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                        config::SystemRange {
+                            system_id: 30_002_086,
+                            range: 1.0,
+                        },
+                    ])),
+                ]),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::PostAndPing,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist the listed U subscription");
+    let initial = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: HashMap::new(),
+            positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        initial.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("create a genuine listed proximity-unverified original");
+    assert_eq!(initial.sent.lock().unwrap().len(), 1);
+
+    let evidence_a = LocationEvidenceService::new(&store)
+        .record_public_npc(
+            location_id,
+            Some(location_id),
+            30_003_089,
+            Some(10_000_002),
+            Utc::now(),
+            Utc::now(),
+        )
+        .await
+        .expect("retain the initial public A evidence with no available position");
+    let reconciliation_esi = Arc::new(NoPublicCollectionEsi {
+        calls: AtomicU64::new(0),
+        positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+        embed_contexts: HashMap::from([(
+            contract.contract_id,
+            ContractEmbedContext {
+                location: ContractLocationContext {
+                    solar_system_id: Some(30_002_086),
+                    solar_system_name: Some("System B".to_string()),
+                    solar_system_position: Some(position_at_light_years(0.0)),
+                    ..ContractLocationContext::default()
+                },
+                ..ContractEmbedContext::default()
+            },
+        )]),
+        embed_contexts_enabled: AtomicBool::new(false),
+    });
+    ContractCollector::new(store.clone(), reconciliation_esi.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+            Arc::new(ReconcilingDelivery {
+                sent: StdMutex::new(Vec::new()),
+                edits: StdMutex::new(Vec::new()),
+            }),
+        )
+        .reconcile_proximity_notifications()
+        .await
+        .expect("same public A evidence keeps the listed alert unverified without polling");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect the retained listed U context");
+    let retained: Value = sqlx::query_scalar("SELECT event FROM contract_deferred_subscription_matches WHERE subscription_id = 'listed-public-supersession' AND contract_id = $1 AND proximity_unverified")
+        .bind(contract.contract_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the listed U retains the same public A evidence identity");
+    assert_eq!(
+        retained["context"]["location_evidence_id"].as_i64(),
+        Some(evidence_a.id)
+    );
+    let stale_a = ContractEmbedContext {
+        location: ContractLocationContext {
+            solar_system_id: Some(30_003_089),
+            solar_system_name: Some("System A".to_string()),
+            ..ContractLocationContext::default()
+        },
+        ..ContractEmbedContext::default()
+    };
+    sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,now()) ON CONFLICT (region_id, contract_id) DO UPDATE SET context = EXCLUDED.context, observed_at = EXCLUDED.observed_at")
+        .bind(10_000_002_i64)
+        .bind(contract.contract_id)
+        .bind(serde_json::to_value(stale_a).expect("serialize stale A snapshot"))
+        .execute(&pool)
+        .await
+        .expect("seed stale public A embed context before public B supersession");
+    pool.close().await;
+    LocationEvidenceService::new(&store)
+        .record_public_npc(
+            location_id,
+            Some(location_id),
+            30_002_086,
+            Some(10_000_003),
+            Utc::now(),
+            Utc::now(),
+        )
+        .await
+        .expect("supersede public A with authoritative public B");
+    reconciliation_esi
+        .embed_contexts_enabled
+        .store(true, Ordering::Relaxed);
+    let resolved = Arc::new(ReconcilingDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), reconciliation_esi)
+        .with_notifications_and_ping_limiter(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+            resolved.clone(),
+            Arc::new(AppStateContractPingLimiter::new(
+                app_state_for_ping_limiter(),
+            )),
+        )
+        .reconcile_proximity_notifications()
+        .await
+        .expect("one reconciliation applies authoritative public B");
+    assert_eq!(resolved.edits.lock().unwrap().len(), 1);
+    assert_eq!(resolved.sent.lock().unwrap().len(), 1);
+    for message in resolved
+        .edits
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|edit| serde_json::to_string(&edit.message).expect("serialize repaired message"))
+        .chain(resolved.sent.lock().unwrap().iter().map(|delivery| {
+            serde_json::to_string(&delivery.message).expect("serialize promotion message")
+        }))
+    {
+        assert!(
+            message.contains("System B"),
+            "authoritative B renders: {message}"
+        );
+        assert!(
+            !message.contains("System A"),
+            "stale A never renders: {message}"
+        );
+    }
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn retained_evidence_reconciles_each_terminal_lifecycle_without_recursive_retry() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let location_id = 1_035_466_617_956_i64;
+    let mut sale = item_exchange_contract(201);
+    let mut purchase = item_exchange_contract(202);
+    purchase.price = 0.0;
+    purchase.reward = 1_500_000_000.0;
+    let mut expired = item_exchange_contract(203);
+    expired.date_expired = Utc::now() - chrono::Duration::minutes(1);
+    let mut closed = item_exchange_contract(204);
+    for contract in [&mut sale, &mut purchase, &mut expired, &mut closed] {
+        contract.start_location_id = location_id;
+        contract.end_location_id = Some(location_id);
+    }
+    let baseline = ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![
+                        sale.clone(),
+                        purchase.clone(),
+                        expired.clone(),
+                        closed.clone(),
+                    ],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    sale.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    purchase.contract_id,
+                    Ok(EsiResponse::fresh(
+                        vec![requested_ship(2)],
+                        expiring_cache(),
+                    )),
+                ),
+                (
+                    expired.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(3)], expiring_cache())),
+                ),
+                (
+                    closed.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(4)], expiring_cache())),
+                ),
+            ]),
+        }),
+    );
+    baseline
+        .collect_cycle()
+        .await
+        .expect("establish terminal lifecycle baseline");
+    for mut subscription in [
+        confirmed_ship_subscription(
+            "terminal-sale",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::PostAndPing,
+        ),
+        confirmed_ship_subscription(
+            "terminal-purchase",
+            ContractEventKind::PurchaseConfirmed,
+            ContractItemDirection::Requested,
+            ContractEventAction::PostAndPing,
+        ),
+        terminal_ship_subscription(
+            "terminal-expired",
+            ContractEventKind::Expired,
+            ContractEventAction::PostAndPing,
+        ),
+        terminal_ship_subscription(
+            "terminal-closed",
+            ContractEventKind::ClosedOutcomeUnknown,
+            ContractEventAction::PostAndPing,
+        ),
+    ] {
+        subscription.filter.root = ContractFilterNode::And(vec![
+            subscription.filter.root,
+            ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                config::SystemRange {
+                    system_id: 30_002_086,
+                    range: 1.0,
+                },
+            ])),
+        ]);
+        store
+            .upsert_contract_subscription(&subscription)
+            .await
+            .expect("persist terminal proximity subscription");
+    }
+    let initial = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let terminal_report = ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionedResolutionEsi {
+            inner: ResolutionEsi {
+                inner: FakeEsi {
+                    regions: vec![10_000_002],
+                    pages: HashMap::from([(
+                        (10_000_002, 1),
+                        Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                    )]),
+                    items: HashMap::new(),
+                },
+                probes: StdMutex::new(vec![
+                    Ok(ContractItemProbe::NoContent(expiring_cache())),
+                    Ok(ContractItemProbe::NoContent(expiring_cache())),
+                    Ok(ContractItemProbe::NotFound(expiring_cache())),
+                    Ok(ContractItemProbe::NotFound(expiring_cache())),
+                    Ok(ContractItemProbe::NotFound(expiring_cache())),
+                    Ok(ContractItemProbe::NotFound(expiring_cache())),
+                    Ok(ContractItemProbe::NotFound(expiring_cache())),
+                    Ok(ContractItemProbe::NotFound(expiring_cache())),
+                ]),
+                probe_calls: StdMutex::new(Vec::new()),
+            },
+            positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        initial.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("produce the genuine sale, purchase, expired, and closed terminal events");
+    assert_eq!(
+        initial.sent.lock().unwrap().len(),
+        4,
+        "each genuine terminal lifecycle first produced one U original; events={:?}",
+        terminal_report
+            .events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+    );
+    LocationEvidenceService::new(&store)
+        .record_access_qualified(
+            location_id,
+            30_003_089,
+            Some(10_000_003),
+            "character:90000001",
+            Utc::now(),
+            Utc::now() + chrono::Duration::hours(1),
+            Utc::now(),
+        )
+        .await
+        .expect("retain lower-precedence terminal location evidence after U delivery");
+    let reconciled = Arc::new(ReconcilingDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+    });
+    let reconciliation_esi = Arc::new(NoPublicCollectionEsi {
+        calls: AtomicU64::new(0),
+        positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+        embed_contexts: HashMap::from([
+            (
+                201,
+                ContractEmbedContext {
+                    location: ContractLocationContext {
+                        solar_system_id: Some(30_002_086),
+                        solar_system_name: Some("System B".to_string()),
+                        solar_system_position: Some(position_at_light_years(0.0)),
+                        ..ContractLocationContext::default()
+                    },
+                    ..ContractEmbedContext::default()
+                },
+            ),
+            (
+                202,
+                ContractEmbedContext {
+                    location: ContractLocationContext {
+                        solar_system_id: Some(30_002_086),
+                        solar_system_name: Some("System B".to_string()),
+                        solar_system_position: Some(position_at_light_years(0.0)),
+                        ..ContractLocationContext::default()
+                    },
+                    ..ContractEmbedContext::default()
+                },
+            ),
+            (
+                203,
+                ContractEmbedContext {
+                    location: ContractLocationContext {
+                        solar_system_id: Some(30_002_086),
+                        solar_system_name: Some("System B".to_string()),
+                        solar_system_position: Some(position_at_light_years(0.0)),
+                        ..ContractLocationContext::default()
+                    },
+                    ..ContractEmbedContext::default()
+                },
+            ),
+            (
+                204,
+                ContractEmbedContext {
+                    location: ContractLocationContext {
+                        solar_system_id: Some(30_002_086),
+                        solar_system_name: Some("System B".to_string()),
+                        solar_system_position: Some(position_at_light_years(0.0)),
+                        ..ContractLocationContext::default()
+                    },
+                    ..ContractEmbedContext::default()
+                },
+            ),
+        ]),
+        embed_contexts_enabled: AtomicBool::new(false),
+    });
+    ContractCollector::new(store.clone(), reconciliation_esi.clone())
+        .with_notifications_and_ping_limiter(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+            reconciled.clone(),
+            Arc::new(AppStateContractPingLimiter::new(
+                app_state_for_ping_limiter(),
+            )),
+        )
+        .reconcile_proximity_notifications()
+        .await
+        .expect("lower-precedence terminal evidence remains an unresolved U reconciliation");
+    assert!(reconciled.sent.lock().unwrap().is_empty());
+    assert!(reconciled.edits.lock().unwrap().is_empty());
+    let stale_context = ContractEmbedContext {
+        location: ContractLocationContext {
+            location_name: Some("Location A".to_string()),
+            solar_system_id: Some(30_003_089),
+            solar_system_name: Some("System A".to_string()),
+            solar_system_position: Some(position_at_light_years(20.0)),
+            region_name: Some("Region A".to_string()),
+            ..ContractLocationContext::default()
+        },
+        ..ContractEmbedContext::default()
+    };
+    let snapshot_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed stale terminal embed snapshots");
+    for contract_id in [201_i64, 202, 203, 204] {
+        sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,now()) ON CONFLICT (region_id, contract_id) DO UPDATE SET context = EXCLUDED.context, observed_at = EXCLUDED.observed_at")
+            .bind(10_000_002_i64)
+            .bind(contract_id)
+            .bind(serde_json::to_value(&stale_context).expect("serialize stale A context"))
+            .execute(&snapshot_pool)
+            .await
+            .expect("seed stale A terminal snapshot");
+    }
+    snapshot_pool.close().await;
+    LocationEvidenceService::new(&store)
+        .record_public_npc(
+            location_id,
+            Some(location_id),
+            30_002_086,
+            Some(10_000_003),
+            Utc::now(),
+            Utc::now(),
+        )
+        .await
+        .expect("retain definitive terminal location evidence");
+    let selected = LocationEvidenceService::new(&store)
+        .resolve(location_id, Utc::now())
+        .await
+        .expect("read authoritative terminal location evidence")
+        .expect("public terminal evidence is current");
+    assert_eq!(selected.evidence_class, LocationEvidenceClass::PublicNpc);
+    assert_eq!(selected.solar_system_id, 30_002_086);
+    reconciliation_esi
+        .embed_contexts_enabled
+        .store(true, Ordering::Relaxed);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        ContractCollector::new(store.clone(), reconciliation_esi)
+            .with_notifications_and_ping_limiter(
+                Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+                reconciled.clone(),
+                Arc::new(AppStateContractPingLimiter::new(
+                    app_state_for_ping_limiter(),
+                )),
+            )
+            .reconcile_proximity_notifications(),
+    )
+    .await
+    .expect("terminal reconciliation must finish instead of recursively retrying")
+    .expect("reconcile every retained terminal lifecycle");
+    assert_eq!(
+        reconciled.edits.lock().unwrap().len(),
+        4,
+        "each terminal original is edited once"
+    );
+    assert_eq!(
+        reconciled.sent.lock().unwrap().len(),
+        4,
+        "each terminal reconciliation creates one promotion"
+    );
+    for message in reconciled
+        .edits
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|edit| serde_json::to_string(&edit.message).expect("serialize repaired message"))
+        .chain(reconciled.sent.lock().unwrap().iter().map(|delivery| {
+            serde_json::to_string(&delivery.message).expect("serialize promoted message")
+        }))
+    {
+        assert!(
+            message.contains("System B"),
+            "authoritative B renders: {message}"
+        );
+        assert!(
+            !message.contains("System A") && !message.contains("Location A"),
+            "stale A never renders: {message}"
+        );
+    }
+    database.destroy().await;
 }
 
 #[tokio::test]
@@ -12570,6 +14503,11 @@ async fn contract_migrations_apply_to_clean_and_already_current_databases() {
     let current_store = ContractCollectionStore::connect(&database.url)
         .await
         .expect("reapply migrations to an already-current database");
+    let current_migration_count: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
+        .fetch_one(&validation_pool)
+        .await
+        .expect("read already-current migration ledger");
+    assert_eq!(current_migration_count, 22);
     assert_eq!(
         current_store
             .storage_counts()
@@ -12738,6 +14676,178 @@ async fn contract_delivery_migration_replaces_the_subscription_cascade_with_rest
     assert_eq!(delete_rule, "RESTRICT");
     verify_pool.close().await;
 
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn proximity_promotion_migration_backfills_legacy_unverified_ping_eligibility() {
+    let database = TemporaryDatabase::new().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to Ticket07 database");
+    let migration_directory = tempdir().expect("create temporary pre-upgrade migrations");
+    for (name, sql) in [
+        (
+            "20260813000000_create_contract_intelligence.sql",
+            include_str!("../migrations/20260813000000_create_contract_intelligence.sql"),
+        ),
+        (
+            "20260813000001_add_contract_collection_representation_metadata.sql",
+            include_str!(
+                "../migrations/20260813000001_add_contract_collection_representation_metadata.sql"
+            ),
+        ),
+        (
+            "20260813000002_add_contract_subscriptions_and_deliveries.sql",
+            include_str!(
+                "../migrations/20260813000002_add_contract_subscriptions_and_deliveries.sql"
+            ),
+        ),
+        (
+            "20260813000003_preserve_contract_delivery_history.sql",
+            include_str!("../migrations/20260813000003_preserve_contract_delivery_history.sql"),
+        ),
+        (
+            "20260813000004_add_contract_acceptance_resolution.sql",
+            include_str!("../migrations/20260813000004_add_contract_acceptance_resolution.sql"),
+        ),
+        (
+            "20260813000005_add_contract_nonfinancial_terminal_states.sql",
+            include_str!(
+                "../migrations/20260813000005_add_contract_nonfinancial_terminal_states.sql"
+            ),
+        ),
+        (
+            "20260813000006_add_contract_embed_context.sql",
+            include_str!("../migrations/20260813000006_add_contract_embed_context.sql"),
+        ),
+        (
+            "20260813000007_make_contract_delivery_restart_safe.sql",
+            include_str!("../migrations/20260813000007_make_contract_delivery_restart_safe.sql"),
+        ),
+        (
+            "20260813000008_persist_contract_delivery_ping_type.sql",
+            include_str!("../migrations/20260813000008_persist_contract_delivery_ping_type.sql"),
+        ),
+        (
+            "20260814000000_recover_contract_collection.sql",
+            include_str!("../migrations/20260814000000_recover_contract_collection.sql"),
+        ),
+        (
+            "20260814000001_record_contract_failure_lifecycles.sql",
+            include_str!("../migrations/20260814000001_record_contract_failure_lifecycles.sql"),
+        ),
+        (
+            "20260814000002_defer_contract_manifests.sql",
+            include_str!("../migrations/20260814000002_defer_contract_manifests.sql"),
+        ),
+        (
+            "20260817000000_add_regional_observation_batches.sql",
+            include_str!("../migrations/20260817000000_add_regional_observation_batches.sql"),
+        ),
+        (
+            "20260817000001_add_health_snapshots.sql",
+            include_str!("../migrations/20260817000001_add_health_snapshots.sql"),
+        ),
+        (
+            "20260817000002_add_location_evidence.sql",
+            include_str!("../migrations/20260817000002_add_location_evidence.sql"),
+        ),
+        (
+            "20260817000003_add_esi_collection_pacing.sql",
+            include_str!("../migrations/20260817000003_add_esi_collection_pacing.sql"),
+        ),
+        (
+            "20260817000004_add_health_watchdog_state.sql",
+            include_str!("../migrations/20260817000004_add_health_watchdog_state.sql"),
+        ),
+        (
+            "20260818000000_add_structure_resolver_state.sql",
+            include_str!("../migrations/20260818000000_add_structure_resolver_state.sql"),
+        ),
+        (
+            "20260818000001_add_proximity_unverified_deferred_state.sql",
+            include_str!(
+                "../migrations/20260818000001_add_proximity_unverified_deferred_state.sql"
+            ),
+        ),
+        (
+            "20260818000002_make_contract_delivery_repair_durable.sql",
+            include_str!("../migrations/20260818000002_make_contract_delivery_repair_durable.sql"),
+        ),
+    ] {
+        std::fs::write(migration_directory.path().join(name), sql)
+            .expect("write exact prior migration");
+    }
+    Migrator::new(migration_directory.path())
+        .await
+        .expect("load exact Ticket07 migrations")
+        .run(&pool)
+        .await
+        .expect("migrate to Ticket07 state");
+
+    for (subscription_id, action, contract_id, event_kind) in [
+        (
+            "legacy-sale-ping",
+            "sale_confirmed",
+            91_i64,
+            "sale_confirmed",
+        ),
+        (
+            "legacy-purchase-ping",
+            "purchase_confirmed",
+            92_i64,
+            "purchase_confirmed",
+        ),
+        ("legacy-post-only", "expired", 93_i64, "expired"),
+    ] {
+        let event_actions = match subscription_id {
+            "legacy-post-only" => format!(r#"{{"{action}":"post"}}"#),
+            _ => format!(r#"{{"{action}":"post_and_ping"}}"#),
+        };
+        sqlx::query("INSERT INTO contract_subscriptions (guild_id, channel_id, subscription_id, description, filter, event_actions) VALUES (42, 77, $1, 'legacy U', '{}'::jsonb, $2::jsonb)")
+            .bind(subscription_id)
+            .bind(event_actions)
+            .execute(&pool)
+            .await
+            .expect("seed historic subscription");
+        sqlx::query("INSERT INTO contract_deferred_subscription_matches (guild_id, channel_id, subscription_id, contract_id, event_kind, event, proximity_unverified) VALUES (42, 77, $1, $2, $3, '{\"contract\":{\"start_location_id\":30000142}}'::jsonb, TRUE)")
+            .bind(subscription_id)
+            .bind(contract_id)
+            .bind(event_kind)
+            .execute(&pool)
+            .await
+            .expect("seed historic unresolved match");
+        sqlx::query("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce) VALUES (42, 77, $1, $2, $3, '{}'::jsonb, '{\"title\":\"legacy\",\"fields\":[]}'::jsonb, FALSE, 'here', 'sent', $4)")
+            .bind(subscription_id)
+            .bind(contract_id)
+            .bind(event_kind)
+            .bind(format!("ci-{contract_id}"))
+            .execute(&pool)
+            .await
+            .expect("seed historic delivery");
+    }
+    std::fs::write(
+        migration_directory
+            .path()
+            .join("20260818000003_reconcile_proximity_unverified_alerts.sql"),
+        include_str!("../migrations/20260818000003_reconcile_proximity_unverified_alerts.sql"),
+    )
+    .expect("write Ticket10 migration");
+    Migrator::new(migration_directory.path())
+        .await
+        .expect("load Ticket10 migration")
+        .run(&pool)
+        .await
+        .expect("upgrade legacy unresolved deliveries");
+    let eligibility: Vec<(i64, bool)> = sqlx::query_as("SELECT contract_id, proximity_promotion_ping FROM contract_outbound_deliveries ORDER BY contract_id")
+        .fetch_all(&pool)
+        .await
+        .expect("read migrated promotion eligibility");
+    assert_eq!(eligibility, vec![(91, true), (92, true), (93, false)]);
+    pool.close().await;
     database.destroy().await;
 }
 
@@ -22748,7 +24858,7 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         .fetch_one(&clean_pool)
         .await
         .expect("read clean migration ledger");
-    assert_eq!(clean_migration_count, 20);
+    assert_eq!(clean_migration_count, 22);
     let clean_pacing_column_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'esi_collection_limiter_state' AND column_name = 'next_request_at')",
     )
@@ -22826,6 +24936,11 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         "repair_attempt_count",
         "repair_next_attempt_at",
         "repair_failure_kind",
+        "delivery_kind",
+        "proximity_promotion_ping",
+        "delivery_claim_token",
+        "delivery_claimed_at",
+        "delivery_lease_until",
     ] {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'contract_outbound_deliveries' AND column_name = $1)",
