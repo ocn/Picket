@@ -5,20 +5,22 @@ use killbot_rust::commands::health::{render_health_response, HEALTH_OPERATOR_ID}
 use killbot_rust::config::{self, AppConfig, AppState};
 use killbot_rust::contract_intelligence::{
     available_contract_store, collection_retry_delay, contract_regional_concurrency_from,
-    new_contract_store_handle, spawn_contract_collection_loop_with_notifications,
-    AppStateContractPingLimiter, CacheMetadata, CollectionOutcome, ContractCollectionStore,
-    ContractCollector, ContractContextLimiter, ContractContextRequirements,
-    ContractContextResolution, ContractContextValue, ContractDelivery, ContractDeliveryClock,
-    ContractDeliveryError, ContractEmbedContext, ContractEventAction, ContractEventActions,
-    ContractEventKind, ContractFilter, ContractFilterCondition, ContractFilterNode,
-    ContractItemDirection, ContractItemProbe, ContractLocationContext, ContractObservationContext,
+    execute_operator_delivery_cli, new_contract_store_handle,
+    spawn_contract_collection_loop_with_notifications, AppStateContractPingLimiter, CacheMetadata,
+    CollectionOutcome, ContractCollectionStore, ContractCollector, ContractContextLimiter,
+    ContractContextRequirements, ContractContextResolution, ContractContextValue, ContractDelivery,
+    ContractDeliveryClock, ContractDeliveryError, ContractEmbedContext, ContractEventAction,
+    ContractEventActions, ContractEventKind, ContractFilter, ContractFilterCondition,
+    ContractFilterNode, ContractItemDirection, ContractItemProbe, ContractLocationContext,
+    ContractMessageEdit, ContractNotificationMessage, ContractObservationContext,
     ContractPingLimiter, ContractPingType, ContractRequestPacer, ContractResolutionState,
     ContractSubscription, DeliveryFailureKind, DeliveryRecord, DeliveryStatus, EsiError,
     EsiResponse, HealthCheck, HealthClock, HealthCycle, HealthDiscordPublisher, HealthPublishError,
     HealthRuntimeConfig, HealthStatus, HealthWatchdog, HealthWatchdogConfig, HealthWatchdogRunner,
     HttpPublicContractEsi, PreparedContractDelivery, PublicContract, PublicContractEsi,
     PublicContractItem, ShipGroupLookup, ShipGroupResolver, SolarSystemPosition,
-    StructureResolutionAdmission,
+    StructureResolutionAdmission, CONTRACT_DELIVERY_OPERATOR_ACTOR,
+    CONTRACT_DELIVERY_OPERATOR_TOKEN_MAX_BYTES,
 };
 use killbot_rust::esi::EsiClient;
 use killbot_rust::feed::{FeedError, FeedHealthProvider, FeedHealthTelemetry, KillmailFeed};
@@ -35,7 +37,7 @@ use killbot_rust::structure_resolver::{
 use moka::future::Cache;
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha384};
+use sha2::{Digest, Sha256, Sha384};
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, Row};
@@ -44,6 +46,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -8131,6 +8134,25 @@ struct ScriptedDelivery {
     outcomes: StdMutex<Vec<Result<String, ContractDeliveryError>>>,
 }
 
+struct ScriptedRepairDelivery {
+    sent: StdMutex<Vec<PreparedContractDelivery>>,
+    edits: StdMutex<Vec<ContractMessageEdit>>,
+    edit_outcomes: StdMutex<Vec<Result<(), ContractDeliveryError>>>,
+}
+
+struct IsolatedRepairDelivery {
+    sent: StdMutex<Vec<PreparedContractDelivery>>,
+    edits: StdMutex<Vec<ContractMessageEdit>>,
+}
+
+struct GatedRepairDelivery {
+    edits: StdMutex<Vec<ContractMessageEdit>>,
+    edit_outcome: StdMutex<Result<(), ContractDeliveryError>>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    released: AtomicBool,
+}
+
 struct RecordingContractPingLimiter {
     outcomes: StdMutex<Vec<bool>>,
     channels: StdMutex<Vec<u64>>,
@@ -8633,6 +8655,63 @@ impl ContractDelivery for ScriptedDelivery {
         assert_eq!(record.status, DeliveryStatus::Prepared);
         self.attempts.lock().unwrap().push(delivery);
         self.outcomes.lock().unwrap().remove(0)
+    }
+}
+
+#[async_trait]
+impl ContractDelivery for ScriptedRepairDelivery {
+    async fn send(
+        &self,
+        delivery: PreparedContractDelivery,
+    ) -> Result<String, ContractDeliveryError> {
+        self.sent.lock().unwrap().push(delivery);
+        Err(ContractDeliveryError::permanent(
+            "unexpected replacement contract alert",
+        ))
+    }
+
+    async fn edit(&self, edit: ContractMessageEdit) -> Result<(), ContractDeliveryError> {
+        self.edits.lock().unwrap().push(edit);
+        self.edit_outcomes.lock().unwrap().remove(0)
+    }
+}
+
+#[async_trait]
+impl ContractDelivery for IsolatedRepairDelivery {
+    async fn send(
+        &self,
+        delivery: PreparedContractDelivery,
+    ) -> Result<String, ContractDeliveryError> {
+        self.sent.lock().unwrap().push(delivery);
+        Ok("unrelated-contract-message".to_string())
+    }
+
+    async fn edit(&self, edit: ContractMessageEdit) -> Result<(), ContractDeliveryError> {
+        self.edits.lock().unwrap().push(edit);
+        Err(ContractDeliveryError::permanent(
+            "Missing Permissions for the repair",
+        ))
+    }
+}
+
+#[async_trait]
+impl ContractDelivery for GatedRepairDelivery {
+    async fn send(
+        &self,
+        _delivery: PreparedContractDelivery,
+    ) -> Result<String, ContractDeliveryError> {
+        Err(ContractDeliveryError::permanent(
+            "unexpected replacement contract alert",
+        ))
+    }
+
+    async fn edit(&self, edit: ContractMessageEdit) -> Result<(), ContractDeliveryError> {
+        self.edits.lock().unwrap().push(edit);
+        self.entered.notify_one();
+        while !self.released.load(Ordering::SeqCst) {
+            self.release.notified().await;
+        }
+        self.edit_outcome.lock().unwrap().clone()
     }
 }
 
@@ -14224,6 +14303,1250 @@ async fn a_listing_without_a_manifest_cannot_match_or_notify_a_ship_subscription
         .await
         .expect("read absent deliveries")
         .is_empty());
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn committed_contract_repair_retries_after_restart_without_a_replacement_alert() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "durable-repair",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::PostAndPingEveryone,
+        ))
+        .await
+        .expect("persist the delivery subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed the original sent delivery");
+    let original_message = serde_json::json!({
+        "title": "Type 587 listed",
+        "description": "original render",
+        "fields": [],
+    });
+    let delivery_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'durable-repair', 45, 'listed', '{}'::jsonb, $1, TRUE, 'everyone', 'sent', 'ci-durable-repair', 'original-message') RETURNING id",
+    )
+    .bind(original_message)
+    .fetch_one(&pool)
+    .await
+    .expect("seed original sent delivery");
+    pool.close().await;
+
+    let corrected = ContractNotificationMessage {
+        title: "Rifter listed".to_string(),
+        description: Some("corrected render".to_string()),
+        fields: vec![],
+        thumbnail_url: None,
+        footer: None,
+    };
+    assert!(store
+        .prepare_delivery_repair(delivery_id, corrected.clone())
+        .await
+        .expect("commit the desired correction before Discord"));
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect committed repair state before adapter dispatch");
+    let persisted: (String, Value) = sqlx::query_as(
+        "SELECT repair_status, desired_message FROM contract_outbound_deliveries WHERE id = $1",
+    )
+    .bind(delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read durable desired repair state");
+    assert_eq!(persisted.0, "pending");
+    assert_eq!(
+        serde_json::from_value::<ContractNotificationMessage>(persisted.1)
+            .expect("deserialize desired repair message"),
+        corrected
+    );
+    pool.close().await;
+
+    let initial_adapter = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![
+            Err(ContractDeliveryError::transient("Discord rate limited")),
+            Err(ContractDeliveryError::transient("Discord rate limited")),
+            Err(ContractDeliveryError::transient("Discord rate limited")),
+            Err(ContractDeliveryError::transient("Discord rate limited")),
+        ]),
+    });
+    let repair_clock = Arc::new(FixedDeliveryClock(StdMutex::new(
+        Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap(),
+    )));
+    assert!(
+        ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+            .with_notifications(
+                Arc::new(StaticShipGroups(HashMap::new())),
+                initial_adapter.clone(),
+            )
+            .with_delivery_clock(repair_clock.clone())
+            .collect_cycle()
+            .await
+            .is_err()
+    );
+    assert_eq!(initial_adapter.sent.lock().unwrap().len(), 0);
+    assert_eq!(initial_adapter.edits.lock().unwrap().len(), 1);
+    let inspection = store
+        .inspect_contract_delivery(delivery_id)
+        .await
+        .expect("inspect persisted repair backoff")
+        .expect("repair remains durable");
+    assert_eq!(
+        inspection.next_repair_attempt_at,
+        Some(Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 5).unwrap())
+    );
+
+    let restarted_adapter = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![Ok(())]),
+    });
+    assert!(
+        ContractCollector::new(database.store().await, Arc::new(FailingContractEsi))
+            .with_notifications(
+                Arc::new(StaticShipGroups(HashMap::new())),
+                restarted_adapter.clone(),
+            )
+            .with_delivery_clock(repair_clock.clone())
+            .collect_cycle()
+            .await
+            .is_err()
+    );
+    assert_eq!(restarted_adapter.sent.lock().unwrap().len(), 0);
+    let edits = restarted_adapter.edits.lock().unwrap();
+    assert!(
+        edits.is_empty(),
+        "restart must honor the persisted retry deadline"
+    );
+    drop(edits);
+    *repair_clock.0.lock().unwrap() += chrono::Duration::seconds(5);
+    let recovered_adapter = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![Ok(())]),
+    });
+    assert!(
+        ContractCollector::new(database.store().await, Arc::new(FailingContractEsi))
+            .with_notifications(
+                Arc::new(StaticShipGroups(HashMap::new())),
+                recovered_adapter.clone(),
+            )
+            .with_delivery_clock(repair_clock)
+            .collect_cycle()
+            .await
+            .is_err()
+    );
+    let edits = recovered_adapter.edits.lock().unwrap();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].discord_message_id, "original-message");
+    assert_eq!(edits[0].message, corrected);
+    drop(edits);
+    let records = database
+        .store()
+        .await
+        .delivery_records()
+        .await
+        .expect("read repaired delivery");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, delivery_id);
+    assert_eq!(records[0].status, DeliveryStatus::Sent);
+    assert_eq!(
+        records[0].discord_message_id.as_deref(),
+        Some("original-message")
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn permanent_contract_repair_is_critical_and_only_the_operator_can_requeue_it() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "operator-repair",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::PostAndPingEveryone,
+        ))
+        .await
+        .expect("persist the delivery subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed the sent delivery");
+    let delivery_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'operator-repair', 45, 'listed', '{}'::jsonb, '{\"title\":\"Type 587 listed\",\"fields\":[]}', TRUE, 'everyone', 'sent', 'ci-operator-repair', 'original-operator-message') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed sent delivery");
+    pool.close().await;
+    store
+        .prepare_delivery_repair(
+            delivery_id,
+            ContractNotificationMessage {
+                title: "Rifter listed".to_string(),
+                description: Some("repaired operator render".to_string()),
+                fields: vec![],
+                thumbnail_url: None,
+                footer: None,
+            },
+        )
+        .await
+        .expect("commit desired repair");
+
+    let permanent_adapter = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![Err(ContractDeliveryError::permanent(
+            "Missing Permissions",
+        ))]),
+    });
+    assert!(
+        ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+            .with_notifications(
+                Arc::new(StaticShipGroups(HashMap::new())),
+                permanent_adapter.clone(),
+            )
+            .collect_cycle()
+            .await
+            .is_err()
+    );
+    assert_eq!(permanent_adapter.sent.lock().unwrap().len(), 0);
+    assert_eq!(permanent_adapter.edits.lock().unwrap().len(), 1);
+    assert_eq!(
+        store
+            .delivery_failure(delivery_id)
+            .await
+            .expect("read permanent repair failure"),
+        Some((
+            DeliveryFailureKind::Permanent,
+            "Missing Permissions".to_string()
+        ))
+    );
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(
+        Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap(),
+    )));
+    let health = HealthCycle::new(store.clone(), clock.clone())
+        .run_once()
+        .await
+        .expect("evaluate permanent repair health evidence");
+    assert!(health.checks.iter().any(|check| {
+        check.key == "permanent_delivery_failure" && check.status == HealthStatus::Critical
+    }));
+
+    let delivery_id_value = delivery_id.to_string();
+    let unauthorized = execute_operator_delivery_cli(
+        &store,
+        &[
+            "requeue",
+            "--id",
+            &delivery_id_value,
+            "--actor",
+            "discord:untrusted",
+        ],
+        clock.now(),
+    )
+    .await
+    .expect_err("an unauthorized actor cannot requeue the permanent repair");
+    assert!(unauthorized.contains("not authorized"));
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect unauthorized requeue state");
+    let unchanged: (String, String, i64) = sqlx::query_as(
+        "SELECT status, repair_status, (SELECT count(*) FROM contract_delivery_audit WHERE delivery_id = $1) FROM contract_outbound_deliveries WHERE id = $1",
+    )
+    .bind(delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read unchanged permanent repair");
+    assert_eq!(
+        unchanged,
+        ("failed".to_string(), "permanent".to_string(), 0)
+    );
+    pool.close().await;
+
+    execute_operator_delivery_cli(
+        &store,
+        &[
+            "inspect",
+            "--id",
+            &delivery_id_value,
+            "--actor",
+            CONTRACT_DELIVERY_OPERATOR_ACTOR,
+        ],
+        clock.now(),
+    )
+    .await
+    .expect("operator can inspect the permanent repair");
+    execute_operator_delivery_cli(
+        &store,
+        &[
+            "requeue",
+            "--id",
+            &delivery_id_value,
+            "--actor",
+            CONTRACT_DELIVERY_OPERATOR_ACTOR,
+        ],
+        clock.now(),
+    )
+    .await
+    .expect("operator requeues the original repair after remediation");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect requeued repair state");
+    let requeued: (String, String, String, bool, String, i64) = sqlx::query_as(
+        "SELECT status, repair_status, discord_message_id, ping, ping_type, (SELECT count(*) FROM contract_delivery_audit WHERE delivery_id = $1 AND action = 'requeued' AND actor = $2) FROM contract_outbound_deliveries WHERE id = $1",
+    )
+    .bind(delivery_id)
+    .bind(CONTRACT_DELIVERY_OPERATOR_ACTOR)
+    .fetch_one(&pool)
+    .await
+    .expect("read requeued repair state");
+    assert_eq!(
+        requeued,
+        (
+            "sent".to_string(),
+            "pending".to_string(),
+            "original-operator-message".to_string(),
+            true,
+            "everyone".to_string(),
+            1,
+        )
+    );
+    pool.close().await;
+
+    let recovered_adapter = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![Ok(())]),
+    });
+    assert!(
+        ContractCollector::new(database.store().await, Arc::new(FailingContractEsi))
+            .with_notifications(
+                Arc::new(StaticShipGroups(HashMap::new())),
+                recovered_adapter.clone(),
+            )
+            .collect_cycle()
+            .await
+            .is_err()
+    );
+    assert!(recovered_adapter.sent.lock().unwrap().is_empty());
+    assert_eq!(recovered_adapter.edits.lock().unwrap().len(), 1);
+    assert_eq!(
+        database
+            .store()
+            .await
+            .delivery_records()
+            .await
+            .expect("read recovered delivery")[0]
+            .discord_message_id
+            .as_deref(),
+        Some("original-operator-message")
+    );
+
+    database.destroy().await;
+}
+
+fn run_contract_delivery_cli(
+    database_url: &str,
+    operator_token_sha256: &str,
+    token_from_stdin: Option<&str>,
+    arguments: &[&str],
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_killbot-rust"));
+    command
+        .arg("contract-delivery")
+        .args(arguments)
+        .env("CONTRACT_DATABASE_URL", database_url)
+        .env(
+            "CONTRACT_DELIVERY_OPERATOR_ID",
+            CONTRACT_DELIVERY_OPERATOR_ACTOR,
+        )
+        .env(
+            "CONTRACT_DELIVERY_OPERATOR_TOKEN_SHA256",
+            operator_token_sha256,
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("launch contract-delivery CLI");
+    if let Some(token) = token_from_stdin {
+        child
+            .stdin
+            .as_mut()
+            .expect("CLI stdin is piped")
+            .write_all(token.as_bytes())
+            .expect("write capability token to CLI stdin");
+    }
+    drop(child.stdin.take());
+    child
+        .wait_with_output()
+        .expect("wait for contract-delivery CLI")
+}
+
+fn cli_output(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[tokio::test]
+async fn contract_delivery_cli_requires_stdin_capability_and_audits_only_the_configured_operator() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "operator-cli-capability",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the operator CLI subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed a permanent delivery failure");
+    let delivery_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, failure_kind, delivery_nonce) VALUES (42, 77, 'operator-cli-capability', 45, 'listed', '{}'::jsonb, '{\"title\":\"CLI repair\",\"fields\":[]}', FALSE, 'here', 'failed', 'permanent', 'ci-operator-cli-capability') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed a permanent delivery failure");
+    pool.close().await;
+
+    let token = "contract-delivery-test-token-not-for-argv";
+    let token_digest = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let delivery_id_value = delivery_id.to_string();
+    let inspect_arguments = ["inspect", "--id", delivery_id_value.as_str()];
+
+    let public_actor = run_contract_delivery_cli(
+        &database.url,
+        &token_digest,
+        Some(token),
+        &[
+            "inspect",
+            "--id",
+            &delivery_id_value,
+            "--actor",
+            "discord:000000000000000001",
+        ],
+    );
+    assert!(!public_actor.status.success());
+    assert!(cli_output(&public_actor).contains("does not accept --actor"));
+
+    let absent_token =
+        run_contract_delivery_cli(&database.url, &token_digest, None, &inspect_arguments);
+    assert!(!absent_token.status.success());
+    assert!(cli_output(&absent_token).contains("capability rejected"));
+
+    let wrong_token = run_contract_delivery_cli(
+        &database.url,
+        &token_digest,
+        Some("wrong-contract-delivery-token"),
+        &inspect_arguments,
+    );
+    assert!(!wrong_token.status.success());
+    assert!(cli_output(&wrong_token).contains("capability rejected"));
+
+    let oversized_token = "x".repeat(CONTRACT_DELIVERY_OPERATOR_TOKEN_MAX_BYTES + 1);
+    let oversized = run_contract_delivery_cli(
+        &database.url,
+        &token_digest,
+        Some(&oversized_token),
+        &inspect_arguments,
+    );
+    assert!(!oversized.status.success());
+    assert!(cli_output(&oversized).contains("capability rejected"));
+    assert!(
+        store
+            .inspect_contract_delivery(delivery_id)
+            .await
+            .expect("inspect delivery after rejected oversized capability")
+            .expect("seeded delivery remains available")
+            .audit
+            .is_empty(),
+        "oversized stdin capability must not mutate the delivery or audit trail"
+    );
+
+    let inspected = run_contract_delivery_cli(
+        &database.url,
+        &token_digest,
+        Some(token),
+        &inspect_arguments,
+    );
+    assert!(inspected.status.success());
+    assert!(cli_output(&inspected).contains("\"result\":\"inspected\""));
+
+    let requeued = run_contract_delivery_cli(
+        &database.url,
+        &token_digest,
+        Some(token),
+        &["requeue", "--id", &delivery_id_value],
+    );
+    assert!(requeued.status.success());
+    assert!(cli_output(&requeued).contains("\"result\":\"requeued\""));
+
+    for output in [
+        &public_actor,
+        &absent_token,
+        &wrong_token,
+        &oversized,
+        &inspected,
+        &requeued,
+    ] {
+        assert!(
+            !cli_output(output).contains(token),
+            "the stdin capability token is never emitted"
+        );
+    }
+    let inspection = store
+        .inspect_contract_delivery(delivery_id)
+        .await
+        .expect("inspect delivery after CLI requeue")
+        .expect("seeded delivery remains available");
+    assert_eq!(inspection.status, DeliveryStatus::Prepared);
+    assert_eq!(inspection.audit.len(), 1);
+    assert_eq!(inspection.audit[0].actor, CONTRACT_DELIVERY_OPERATOR_ACTOR);
+    assert!(!serde_json::to_string(&inspection)
+        .expect("serialize delivery audit")
+        .contains(token));
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn contract_delivery_inspection_serializes_typed_status_and_rejects_unknown_stored_status() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "typed-inspection-status",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist typed inspection subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed typed inspection delivery");
+    let delivery_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce) VALUES (42, 77, 'typed-inspection-status', 45, 'listed', '{}'::jsonb, '{\"title\":\"Typed inspection\",\"fields\":[]}', FALSE, 'here', 'sent', 'ci-typed-inspection-status') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed sent typed inspection delivery");
+    let inspection = store
+        .inspect_contract_delivery(delivery_id)
+        .await
+        .expect("inspect valid typed status")
+        .expect("seeded delivery exists");
+    assert_eq!(inspection.status, DeliveryStatus::Sent);
+    assert_eq!(
+        serde_json::to_value(&inspection).expect("serialize typed delivery inspection")["status"],
+        "sent"
+    );
+
+    sqlx::query("ALTER TABLE contract_outbound_deliveries DROP CONSTRAINT contract_outbound_deliveries_status_check")
+        .execute(&pool)
+        .await
+        .expect("permit corrupted delivery status fixture");
+    sqlx::query("UPDATE contract_outbound_deliveries SET status = 'unknown-status' WHERE id = $1")
+        .bind(delivery_id)
+        .execute(&pool)
+        .await
+        .expect("seed unknown delivery status");
+    let error = store
+        .inspect_contract_delivery(delivery_id)
+        .await
+        .expect_err("unknown persisted delivery status is rejected");
+    assert!(error
+        .to_string()
+        .contains("unknown delivery status: unknown-status"));
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_failed_contract_repair_does_not_block_an_unrelated_prepared_delivery() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    for subscription_id in ["repair-isolation", "unrelated-isolation"] {
+        store
+            .upsert_contract_subscription(&contract_subscription(
+                subscription_id,
+                ContractItemDirection::Offered,
+                vec![587],
+                vec![],
+                ContractEventAction::Post,
+            ))
+            .await
+            .expect("persist isolation subscription");
+    }
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed isolated deliveries");
+    let repair_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'repair-isolation', 45, 'listed', '{}'::jsonb, '{\"title\":\"Original repair\",\"fields\":[]}', FALSE, 'here', 'sent', 'ci-repair-isolation', 'repair-original-message') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed sent repair delivery");
+    let unrelated_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce) VALUES (42, 77, 'unrelated-isolation', 46, 'listed', '{}'::jsonb, '{\"title\":\"Unrelated listing\",\"fields\":[]}', FALSE, 'here', 'prepared', 'ci-unrelated-isolation') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed unrelated prepared delivery");
+    pool.close().await;
+    store
+        .prepare_delivery_repair(
+            repair_id,
+            ContractNotificationMessage {
+                title: "Corrected repair".to_string(),
+                description: None,
+                fields: vec![],
+                thumbnail_url: None,
+                footer: None,
+            },
+        )
+        .await
+        .expect("commit the durable repair");
+    let adapter = Arc::new(IsolatedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+    });
+    assert!(
+        ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+            .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), adapter.clone())
+            .collect_cycle()
+            .await
+            .is_err()
+    );
+    assert_eq!(adapter.sent.lock().unwrap().len(), 1);
+    assert_eq!(adapter.sent.lock().unwrap()[0].delivery_id, unrelated_id);
+    assert_eq!(adapter.edits.lock().unwrap().len(), 1);
+    let records = store
+        .delivery_records()
+        .await
+        .expect("read isolated delivery records");
+    assert_eq!(
+        records
+            .iter()
+            .find(|record| record.id == repair_id)
+            .expect("repair record")
+            .status,
+        DeliveryStatus::Failed
+    );
+    assert_eq!(
+        records
+            .iter()
+            .find(|record| record.id == unrelated_id)
+            .expect("unrelated record")
+            .status,
+        DeliveryStatus::Sent
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn contract_repair_waits_for_a_persisted_platform_retry_deadline() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "retry-deadline-repair",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the delivery subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed the sent delivery");
+    let delivery_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'retry-deadline-repair', 45, 'listed', '{}'::jsonb, '{\"title\":\"Type 587 listed\",\"fields\":[]}', FALSE, 'here', 'sent', 'ci-retry-deadline-repair', 'original-retry-message') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed sent delivery");
+    pool.close().await;
+    store
+        .prepare_delivery_repair(
+            delivery_id,
+            ContractNotificationMessage {
+                title: "Rifter listed".to_string(),
+                description: None,
+                fields: vec![],
+                thumbnail_url: None,
+                footer: None,
+            },
+        )
+        .await
+        .expect("commit desired repair");
+    let attempted_at = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let retry_at = attempted_at + chrono::Duration::seconds(60);
+    let adapter = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![Err(ContractDeliveryError::transient_after(
+            "Discord Retry-After",
+            retry_at,
+        ))]),
+    });
+    assert!(
+        ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+            .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), adapter.clone())
+            .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(attempted_at))))
+            .collect_cycle()
+            .await
+            .is_err()
+    );
+    assert_eq!(adapter.edits.lock().unwrap().len(), 1);
+    let inspection = store
+        .inspect_contract_delivery(delivery_id)
+        .await
+        .expect("inspect retry deadline")
+        .expect("delivery remains durable");
+    assert_eq!(inspection.next_repair_attempt_at, Some(retry_at));
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn newer_contract_repair_keeps_a_persisted_platform_retry_deadline() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "retry-deadline-replacement",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the delivery subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed the sent delivery");
+    let delivery_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'retry-deadline-replacement', 45, 'listed', '{}'::jsonb, '{\"title\":\"Type 587 listed\",\"fields\":[]}', FALSE, 'here', 'sent', 'ci-retry-deadline-replacement', 'original-retry-message') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed sent delivery");
+    pool.close().await;
+    store
+        .prepare_delivery_repair(
+            delivery_id,
+            ContractNotificationMessage {
+                title: "First correction".to_string(),
+                description: None,
+                fields: vec![],
+                thumbnail_url: None,
+                footer: None,
+            },
+        )
+        .await
+        .expect("commit the first desired repair");
+    let retry_at = Utc.with_ymd_and_hms(2026, 8, 18, 12, 1, 0).unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("persist a Discord retry deadline");
+    sqlx::query(
+        "UPDATE contract_outbound_deliveries SET repair_next_attempt_at = $2 WHERE id = $1",
+    )
+    .bind(delivery_id)
+    .bind(retry_at)
+    .execute(&pool)
+    .await
+    .expect("persist retry deadline");
+    pool.close().await;
+
+    let newer = ContractNotificationMessage {
+        title: "Newer correction".to_string(),
+        description: Some("regenerated while Discord is rate limited".to_string()),
+        fields: vec![],
+        thumbnail_url: None,
+        footer: None,
+    };
+    store
+        .prepare_delivery_repair(delivery_id, newer.clone())
+        .await
+        .expect("persist the newer desired repair");
+    let inspection = store
+        .inspect_contract_delivery(delivery_id)
+        .await
+        .expect("inspect retry deadline")
+        .expect("delivery remains durable");
+    assert_eq!(inspection.desired_message, Some(newer));
+    assert_eq!(inspection.next_repair_attempt_at, Some(retry_at));
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn stale_contract_repair_retry_after_blocks_a_regenerated_revision_until_its_deadline() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "stale-retry-after",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist stale retry subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed stale retry repair");
+    let delivery_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'stale-retry-after', 45, 'listed', '{}'::jsonb, '{\"title\":\"Original repair\",\"fields\":[]}', FALSE, 'here', 'sent', 'ci-stale-retry-after', 'stale-retry-message') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed sent stale retry repair");
+    pool.close().await;
+
+    let first = ContractNotificationMessage {
+        title: "First correction".to_string(),
+        description: None,
+        fields: vec![],
+        thumbnail_url: None,
+        footer: None,
+    };
+    let newer = ContractNotificationMessage {
+        title: "Newer correction".to_string(),
+        description: Some("regenerated while the first edit waits for Discord".to_string()),
+        fields: vec![],
+        thumbnail_url: None,
+        footer: None,
+    };
+    store
+        .prepare_delivery_repair(delivery_id, first)
+        .await
+        .expect("commit v1 repair");
+    let attempted_at = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let retry_at = attempted_at + chrono::Duration::seconds(60);
+    let clock = Arc::new(FixedDeliveryClock(StdMutex::new(attempted_at)));
+    let gated = Arc::new(GatedRepairDelivery {
+        edits: StdMutex::new(Vec::new()),
+        edit_outcome: StdMutex::new(Err(ContractDeliveryError::transient_after(
+            "Discord HTTP 429 Retry-After",
+            retry_at,
+        ))),
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        released: AtomicBool::new(false),
+    });
+    let entered = gated.entered.notified();
+    let first_collector = ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), gated.clone())
+        .with_delivery_clock(clock.clone());
+    let first_dispatch = tokio::spawn(async move { first_collector.collect_cycle().await });
+    tokio::time::timeout(Duration::from_secs(2), entered)
+        .await
+        .expect("v1 repair is claimed and in flight");
+    store
+        .prepare_delivery_repair(delivery_id, newer.clone())
+        .await
+        .expect("regenerate v2 during v1 edit");
+    let revision_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect regenerated retry revision");
+    assert_eq!(
+        sqlx::query_as::<_, (i64, Option<i64>)>(
+            "SELECT repair_revision, repair_claimed_revision FROM contract_outbound_deliveries WHERE id = $1",
+        )
+        .bind(delivery_id)
+        .fetch_one(&revision_pool)
+        .await
+        .expect("read v2 retry revision"),
+        (2, Some(1)),
+        "the stale completion must report v1 after v2 was committed"
+    );
+    revision_pool.close().await;
+    gated.released.store(true, Ordering::SeqCst);
+    gated.release.notify_one();
+    assert!(first_dispatch
+        .await
+        .expect("join stale v1 dispatcher")
+        .is_err());
+    let inspection = store
+        .inspect_contract_delivery(delivery_id)
+        .await
+        .expect("inspect stale retry repair")
+        .expect("delivery remains durable");
+    assert_eq!(inspection.desired_message, Some(newer.clone()));
+    assert_eq!(inspection.next_repair_attempt_at, Some(retry_at));
+
+    let before_deadline = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![Ok(())]),
+    });
+    assert!(
+        ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+            .with_notifications(
+                Arc::new(StaticShipGroups(HashMap::new())),
+                before_deadline.clone(),
+            )
+            .with_delivery_clock(clock.clone())
+            .collect_cycle()
+            .await
+            .is_err()
+    );
+    assert!(before_deadline.edits.lock().unwrap().is_empty());
+    assert!(before_deadline.sent.lock().unwrap().is_empty());
+
+    *clock.0.lock().unwrap() = retry_at;
+    let after_deadline = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![Ok(())]),
+    });
+    assert!(
+        ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+            .with_notifications(
+                Arc::new(StaticShipGroups(HashMap::new())),
+                after_deadline.clone(),
+            )
+            .with_delivery_clock(clock)
+            .collect_cycle()
+            .await
+            .is_err()
+    );
+    assert_eq!(after_deadline.edits.lock().unwrap().len(), 1);
+    assert_eq!(after_deadline.edits.lock().unwrap()[0].message, newer);
+    assert!(after_deadline.sent.lock().unwrap().is_empty());
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn stale_delivery_scoped_permanent_repair_failure_blocks_regenerated_revision_and_is_critical(
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "stale-permanent-repair",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist stale permanent subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed stale permanent repair");
+    let delivery_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'stale-permanent-repair', 45, 'listed', '{}'::jsonb, '{\"title\":\"Original repair\",\"fields\":[]}', FALSE, 'here', 'sent', 'ci-stale-permanent-repair', 'stale-permanent-message') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed sent stale permanent repair");
+    pool.close().await;
+
+    store
+        .prepare_delivery_repair(
+            delivery_id,
+            ContractNotificationMessage {
+                title: "First correction".to_string(),
+                description: None,
+                fields: vec![],
+                thumbnail_url: None,
+                footer: None,
+            },
+        )
+        .await
+        .expect("commit v1 repair");
+    let newer = ContractNotificationMessage {
+        title: "Newer correction".to_string(),
+        description: Some("regenerated while the original message is unavailable".to_string()),
+        fields: vec![],
+        thumbnail_url: None,
+        footer: None,
+    };
+    let now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let clock = Arc::new(FixedDeliveryClock(StdMutex::new(now)));
+    let gated = Arc::new(GatedRepairDelivery {
+        edits: StdMutex::new(Vec::new()),
+        edit_outcome: StdMutex::new(Err(ContractDeliveryError::permanent_delivery(
+            "Discord HTTP 404, JSON code 10008",
+        ))),
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        released: AtomicBool::new(false),
+    });
+    let entered = gated.entered.notified();
+    let first_collector = ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), gated.clone())
+        .with_delivery_clock(clock.clone());
+    let first_dispatch = tokio::spawn(async move { first_collector.collect_cycle().await });
+    tokio::time::timeout(Duration::from_secs(2), entered)
+        .await
+        .expect("v1 repair is claimed and in flight");
+    store
+        .prepare_delivery_repair(delivery_id, newer.clone())
+        .await
+        .expect("regenerate v2 during v1 edit");
+    let revision_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect regenerated permanent revision");
+    assert_eq!(
+        sqlx::query_as::<_, (i64, Option<i64>)>(
+            "SELECT repair_revision, repair_claimed_revision FROM contract_outbound_deliveries WHERE id = $1",
+        )
+        .bind(delivery_id)
+        .fetch_one(&revision_pool)
+        .await
+        .expect("read v2 permanent revision"),
+        (2, Some(1)),
+        "the delivery-scoped permanent error must arrive from stale v1"
+    );
+    revision_pool.close().await;
+    gated.released.store(true, Ordering::SeqCst);
+    gated.release.notify_one();
+    assert!(first_dispatch
+        .await
+        .expect("join stale permanent dispatcher")
+        .is_err());
+
+    let inspection = store
+        .inspect_contract_delivery(delivery_id)
+        .await
+        .expect("inspect stale permanent repair")
+        .expect("delivery remains durable");
+    assert_eq!(inspection.status, DeliveryStatus::Failed);
+    assert_eq!(inspection.desired_message, Some(newer));
+    assert_eq!(
+        inspection.repair_failure_kind,
+        Some(DeliveryFailureKind::Permanent)
+    );
+    assert!(inspection.next_repair_attempt_at.is_none());
+
+    *clock.0.lock().unwrap() += chrono::Duration::hours(1);
+    let restarted = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![Ok(())]),
+    });
+    assert!(
+        ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+            .with_notifications(
+                Arc::new(StaticShipGroups(HashMap::new())),
+                restarted.clone()
+            )
+            .with_delivery_clock(clock.clone())
+            .collect_cycle()
+            .await
+            .is_err()
+    );
+    assert!(restarted.edits.lock().unwrap().is_empty());
+    assert!(restarted.sent.lock().unwrap().is_empty());
+
+    let snapshot = HealthCycle::new(
+        database.store().await,
+        Arc::new(FixedHealthClock(StdMutex::new(*clock.0.lock().unwrap()))),
+    )
+    .run_once()
+    .await
+    .expect("persist permanent repair health evidence");
+    assert_eq!(snapshot.status, HealthStatus::Critical);
+    assert!(snapshot.checks.iter().any(|check| {
+        check.key == "permanent_delivery_failure" && check.status == HealthStatus::Critical
+    }));
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn claimed_contract_repair_fences_concurrent_dispatchers_and_stale_completion() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "repair-claim",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist repair subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed the sent repair delivery");
+    let delivery_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'repair-claim', 45, 'listed', '{}'::jsonb, '{\"title\":\"Original repair\",\"fields\":[]}', FALSE, 'here', 'sent', 'ci-repair-claim', 'repair-original-message') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed sent repair delivery");
+    pool.close().await;
+    let first = ContractNotificationMessage {
+        title: "First correction".to_string(),
+        description: None,
+        fields: vec![],
+        thumbnail_url: None,
+        footer: None,
+    };
+    store
+        .prepare_delivery_repair(delivery_id, first.clone())
+        .await
+        .expect("commit initial desired repair");
+    let delivery_clock = Arc::new(FixedDeliveryClock(StdMutex::new(Utc::now())));
+    let gated = Arc::new(GatedRepairDelivery {
+        edits: StdMutex::new(Vec::new()),
+        edit_outcome: StdMutex::new(Ok(())),
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        released: AtomicBool::new(false),
+    });
+    let entered = gated.entered.notified();
+    let first_collector = ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), gated.clone())
+        .with_delivery_clock(delivery_clock.clone());
+    let mut first_dispatch = tokio::spawn(async move { first_collector.collect_cycle().await });
+    tokio::time::timeout(Duration::from_secs(2), entered)
+        .await
+        .expect("first dispatcher claims and begins the original repair");
+    let newer = ContractNotificationMessage {
+        title: "Newer correction".to_string(),
+        description: Some("regenerated while the first edit is in flight".to_string()),
+        fields: vec![],
+        thumbnail_url: None,
+        footer: None,
+    };
+    store
+        .prepare_delivery_repair(delivery_id, newer.clone())
+        .await
+        .expect("commit a newer desired revision during the first edit");
+    let concurrent = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![Ok(())]),
+    });
+    *delivery_clock.0.lock().unwrap() +=
+        chrono::Duration::minutes(2) + chrono::Duration::seconds(1);
+    assert!(tokio::time::timeout(
+        Duration::from_secs(2),
+        ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+            .with_notifications(
+                Arc::new(StaticShipGroups(HashMap::new())),
+                concurrent.clone(),
+            )
+            .with_delivery_clock(delivery_clock.clone())
+            .collect_cycle(),
+    )
+    .await
+    .expect("new lease holder must not wait for the expired original repair lease")
+    .is_err());
+    let concurrent_edits = concurrent.edits.lock().unwrap();
+    assert_eq!(concurrent_edits.len(), 1);
+    assert_eq!(concurrent_edits[0].message, newer);
+    drop(concurrent_edits);
+    gated.released.store(true, Ordering::SeqCst);
+    gated.release.notify_one();
+    let first_result = tokio::time::timeout(Duration::from_secs(2), &mut first_dispatch).await;
+    let first_error = first_result
+        .expect("first dispatcher completes after its edit is released")
+        .expect("join first dispatcher")
+        .expect_err("late completion is accompanied by the simulated ESI outage");
+    assert!(
+        first_error.to_string().contains("ESI is unavailable"),
+        "late repair completion must not fail its durable recovery: {first_error}"
+    );
+    let after_late_completion = store
+        .inspect_contract_delivery(delivery_id)
+        .await
+        .expect("inspect late completion")
+        .expect("delivery exists");
+    assert_eq!(after_late_completion.desired_message, Some(newer.clone()));
+    *delivery_clock.0.lock().unwrap() += chrono::Duration::seconds(5);
+    let recovery = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![Ok(())]),
+    });
+    assert!(tokio::time::timeout(
+        Duration::from_secs(2),
+        ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+            .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), recovery.clone())
+            .with_delivery_clock(delivery_clock)
+            .collect_cycle(),
+    )
+    .await
+    .expect("late old success durably requeues the authoritative revision")
+    .is_err());
+    let edits = recovery.edits.lock().unwrap();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].message, newer);
+    drop(edits);
+    assert_eq!(
+        store
+            .inspect_contract_delivery(delivery_id)
+            .await
+            .expect("inspect repaired delivery")
+            .expect("delivery exists")
+            .desired_message,
+        None,
+        "only the newest revision is acknowledged"
+    );
 
     database.destroy().await;
 }
@@ -21425,7 +22748,7 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         .fetch_one(&clean_pool)
         .await
         .expect("read clean migration ledger");
-    assert_eq!(clean_migration_count, 19);
+    assert_eq!(clean_migration_count, 20);
     let clean_pacing_column_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'esi_collection_limiter_state' AND column_name = 'next_request_at')",
     )
@@ -21496,6 +22819,35 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
             .expect("read clean health table");
         assert!(exists, "clean migration creates {table}");
     }
+    for column in [
+        "desired_message",
+        "repair_status",
+        "repair_prepared_at",
+        "repair_attempt_count",
+        "repair_next_attempt_at",
+        "repair_failure_kind",
+    ] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'contract_outbound_deliveries' AND column_name = $1)",
+        )
+        .bind(column)
+        .fetch_one(&clean_pool)
+        .await
+        .expect("read clean durable repair column");
+        assert!(
+            exists,
+            "clean migration creates contract_outbound_deliveries.{column}"
+        );
+    }
+    let repair_audit_table_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind("contract_delivery_audit")
+        .fetch_one(&clean_pool)
+        .await
+        .expect("read clean contract delivery repair audit table");
+    assert!(
+        repair_audit_table_exists,
+        "clean migration creates the contract delivery repair audit table"
+    );
     let clean_started_at_is_not_null: bool = sqlx::query_scalar(
         "SELECT is_nullable = 'NO' FROM information_schema.columns WHERE table_name = 'bot_heartbeats' AND column_name = 'started_at'",
     )

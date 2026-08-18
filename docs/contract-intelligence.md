@@ -14,7 +14,7 @@ The collector first records a complete regional baseline silently. A complete la
 | `expired` | Contract ceased to be public at its known expiry boundary without earlier acceptance evidence |
 | `closed_outcome_unknown` | Contract ceased to be public and no supported terminal outcome could be established |
 
-`awaiting_resolution` is internal only and has no alert action. No alert is provisional, edited, or retracted. Public ESI cache headers bound latency; the application does not claim a real-time post-disappearance contract-status lookup.
+`awaiting_resolution` is internal only and has no alert action. No alert is provisional or retracted; a previously committed contract-delivery message can be repaired durably in place. Public ESI cache headers bound latency; the application does not claim a real-time post-disappearance contract-status lookup.
 
 ## Configuration and startup
 
@@ -29,6 +29,21 @@ docker compose ps
 ```
 
 For a non-Compose process, set `CONTRACT_DATABASE_URL` and optionally `CONTRACT_COLLECTION_INTERVAL_SECS` (default: 300 seconds); use `127.0.0.1:5433` for the local exposed Compose port. `CONTRACT_REGIONAL_CONCURRENCY` defaults to `2` and accepts only `1` through `4`; set it to `1` to roll back collection scheduling to sequential regional attempts without changing schema or retained observations. An absent value uses the default; malformed, out-of-range, or non-Unicode values disable only contract collection at startup and leave the killmail feed running. PostgreSQL URI userinfo reserves characters including `:`, `/`, `?`, `#`, `[`, `]`, and `@`; percent-encode them (and a literal `%`) in the URL, while `CONTRACT_DATABASE_PASSWORD` remains the raw password. Each successful connection runs the SQLx migrations. If `CONTRACT_DATABASE_URL` is absent, contract collection and its commands are unavailable, while the killmail feed continues unchanged.
+
+## Durable delivery repair
+
+`CONTRACT_DELIVERY_OPERATOR_ID` must be `discord:146451271497416704`; `CONTRACT_DELIVERY_OPERATOR_TOKEN_SHA256` must be the 64-character hexadecimal SHA-256 digest of a separate 64-character raw token generated from 32 random bytes. Compose passes both settings only to `discordbot`. The token is supplied on standard input (capped at 128 bytes) and is never accepted as an argument, printed, or written to the audit table.
+
+Inspect or requeue an unresolved permanent delivery with the real binary inside the bot container. The `--actor` option is rejected: the configured identity is attached only after the stdin capability succeeds.
+
+```sh
+read -r -s CONTRACT_DELIVERY_REPAIR_TOKEN
+printf %s "$CONTRACT_DELIVERY_REPAIR_TOKEN" | docker compose exec -T discordbot ./killbot-rust contract-delivery inspect --id 123
+printf %s "$CONTRACT_DELIVERY_REPAIR_TOKEN" | docker compose exec -T discordbot ./killbot-rust contract-delivery requeue --id 123
+unset CONTRACT_DELIVERY_REPAIR_TOKEN
+```
+
+`requeue` records only the configured operator ID and re-enables the durable work after the underlying Discord condition is corrected.
 
 ## Optional Structure Resolver
 
@@ -105,7 +120,7 @@ Review the title, compact fields, no ping, and standalone `contract:0//<id>` Con
 
 ## Deliberate exclusions
 
-This release has no authenticated-contract feed, counterparty tracking, provisional alert, Discord edit/retraction, JSON-to-PostgreSQL migration, or horizontal-scaling machinery.
+This release has no authenticated-contract feed, counterparty tracking, provisional alert, Discord retraction, JSON-to-PostgreSQL migration, or horizontal-scaling machinery. It performs durable edits only to repair its own existing contract-delivery messages; an edit never creates a replacement post.
 
 ## External references
 

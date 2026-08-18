@@ -1156,6 +1156,7 @@ dependencies = [
  "serenity",
  "sha2",
  "sqlx",
+ "subtle",
  "tempfile",
  "test-log",
  "tokio",

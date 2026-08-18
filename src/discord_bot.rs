@@ -5,8 +5,9 @@ use crate::config::{
     PingType, SimpleFilter, StandingSource, Subscription, System,
 };
 use crate::contract_intelligence::{
-    ContractDelivery, ContractDeliveryError, ContractNotificationMessage, HealthDiscordPublisher,
-    HealthPublishError, PreparedContractDelivery, ShipGroupLookup, ShipGroupResolver,
+    ContractDelivery, ContractDeliveryError, ContractMessageEdit, ContractNotificationMessage,
+    HealthDiscordPublisher, HealthPublishError, PreparedContractDelivery, ShipGroupLookup,
+    ShipGroupResolver,
 };
 use crate::esi::Celestial;
 use crate::models::{Attacker, ZkData};
@@ -25,6 +26,7 @@ use serenity::prelude::*;
 use serenity::utils::Colour;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info, trace, warn};
 
 pub(crate) const SHIP_GROUP_PRIORITY: &[u32] = &[
@@ -209,6 +211,27 @@ pub struct PreparedDispatch {
 
 pub struct DiscordContractDelivery {
     http: Arc<Http>,
+    edit_client: reqwest::Client,
+    edit_api_base: String,
+}
+
+const CONTRACT_REPAIR_HTTP_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn contract_repair_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(CONTRACT_REPAIR_HTTP_TIMEOUT)
+        .build()
+        .expect("construct contract repair HTTP client")
+}
+
+fn contract_repair_authorization_header(
+    token: &str,
+) -> Result<reqwest::header::HeaderValue, ContractDeliveryError> {
+    let mut value = token.parse::<reqwest::header::HeaderValue>().map_err(|_| {
+        ContractDeliveryError::permanent("Discord bot token is not a valid HTTP header")
+    })?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 pub struct DiscordHealthPublisher {
@@ -364,7 +387,20 @@ fn health_publish_error_from_response(
 
 impl DiscordContractDelivery {
     pub fn new(http: Arc<Http>) -> Self {
-        Self { http }
+        Self {
+            http,
+            edit_client: contract_repair_http_client(),
+            edit_api_base: "https://discord.com/api/v10".to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_edit_api_base(http: Arc<Http>, edit_api_base: String) -> Self {
+        Self {
+            http,
+            edit_client: contract_repair_http_client(),
+            edit_api_base,
+        }
     }
 }
 
@@ -381,6 +417,73 @@ impl ContractDelivery for DiscordContractDelivery {
             .await
             .map_err(contract_delivery_error)?;
         Ok(message.id.to_string())
+    }
+
+    async fn edit(&self, edit: ContractMessageEdit) -> Result<(), ContractDeliveryError> {
+        let message_id = edit.discord_message_id.parse::<u64>().map_err(|error| {
+            ContractDeliveryError::permanent(format!(
+                "invalid Discord message ID {}: {error}",
+                edit.discord_message_id
+            ))
+        })?;
+        let payload = serde_json::json!({
+            "embeds": [contract_notification_embed(&edit.message).0],
+            "allowed_mentions": { "parse": [] },
+        });
+        let response = self
+            .edit_client
+            .patch(format!(
+                "{}/channels/{}/messages/{message_id}",
+                self.edit_api_base, edit.channel_id
+            ))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                contract_repair_authorization_header(&self.http.token)?,
+            )
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|_| ContractDeliveryError::transient("Discord edit transport failure"))?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<f64>().ok());
+        let body = response.json::<Value>().await.unwrap_or(Value::Null);
+        let code = body.get("code").and_then(Value::as_i64).unwrap_or_default() as isize;
+        if status.as_u16() == 429 {
+            let seconds = retry_after
+                .or_else(|| body.get("retry_after").and_then(Value::as_f64))
+                .unwrap_or(1.0);
+            let deadline =
+                Utc::now() + chrono::Duration::milliseconds((seconds.max(0.0) * 1000.0) as i64);
+            return Err(ContractDeliveryError::transient_after(
+                "Discord HTTP 429",
+                deadline,
+            ));
+        }
+        let detail = format!("Discord HTTP {}, JSON code {code}", status.as_u16());
+        if is_temporary_discord_delivery_code(code)
+            || (status.is_server_error() && !is_permanent_discord_delivery_code(code))
+        {
+            return Err(ContractDeliveryError::transient(detail));
+        }
+        if matches!(status.as_u16(), 400 | 401 | 403 | 404 | 405)
+            || is_permanent_discord_delivery_code(code)
+        {
+            let delivery_scoped = matches!(status.as_u16(), 401 | 403 | 404 | 405)
+                || matches!(code, 10003 | 10008 | 50001 | 50008 | 50013 | 50014 | 50025);
+            return Err(if delivery_scoped {
+                ContractDeliveryError::permanent_delivery(detail)
+            } else {
+                ContractDeliveryError::permanent(detail)
+            });
+        }
+        Err(ContractDeliveryError::ambiguous(detail))
     }
 }
 
@@ -437,7 +540,10 @@ fn is_temporary_discord_delivery_code(code: isize) -> bool {
 }
 
 fn is_permanent_discord_delivery_code(code: isize) -> bool {
-    matches!(code, 10003 | 50001 | 50008 | 50013 | 50014 | 50025 | 50035)
+    matches!(
+        code,
+        10003 | 10008 | 50001 | 50008 | 50013 | 50014 | 50025 | 50035
+    )
 }
 
 pub struct DiscordShipGroupResolver {
@@ -2074,6 +2180,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn contract_repair_authorization_header_is_sensitive_and_redacted() {
+        let token = "Bot controlled-contract-repair-token";
+        let header = contract_repair_authorization_header(token).expect("valid token header");
+        assert!(header.is_sensitive());
+        assert!(!format!("{header:?}").contains(token));
+        assert!(CONTRACT_REPAIR_HTTP_TIMEOUT < Duration::from_secs(120));
+    }
+
+    #[test]
     fn known_groups_preferred_over_unknown() {
         // 2 unknown with high counts + 2 known with low counts
         let input = vec![(9990, 50), (9991, 30), (358, 10), (832, 5)];
@@ -2261,6 +2376,14 @@ mod tests {
                 serenity::http::StatusCode::FORBIDDEN,
                 50013,
                 "Missing Permissions",
+            )),
+            ContractDeliveryError::Permanent(_)
+        ));
+        assert!(matches!(
+            contract_delivery_error(discord_http_error(
+                serenity::http::StatusCode::NOT_FOUND,
+                10008,
+                "Unknown Message",
             )),
             ContractDeliveryError::Permanent(_)
         ));
