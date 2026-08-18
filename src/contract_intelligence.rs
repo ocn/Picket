@@ -3995,6 +3995,7 @@ pub struct ContractDeliveryFailure {
 struct DeferredContractMatch {
     subscription: ContractSubscription,
     event: ContractEvent,
+    proximity_unverified: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -5306,13 +5307,32 @@ impl ContractCollectionStore {
         let observed_at = context.observed_at.unwrap_or_else(Utc::now);
         context.observed_at = Some(observed_at);
         let mut transaction = self.pool.begin().await?;
-        sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,$4) ON CONFLICT (region_id, contract_id) DO NOTHING")
-            .bind(region_id)
-            .bind(contract_id)
-            .bind(serde_json::to_value(context).map_err(json_to_sqlx)?)
-            .bind(observed_at)
-            .execute(&mut *transaction)
-            .await?;
+        let persisted = sqlx::query_scalar::<_, Value>(
+            "SELECT context FROM contract_observed_embed_contexts WHERE region_id = $1 AND contract_id = $2 FOR UPDATE",
+        )
+        .bind(region_id)
+        .bind(contract_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(persisted) = persisted {
+            let mut persisted =
+                serde_json::from_value::<ContractEmbedContext>(persisted).map_err(json_to_sqlx)?;
+            persisted.merge_missing_from(&context);
+            sqlx::query("UPDATE contract_observed_embed_contexts SET context = $3, updated_at = now() WHERE region_id = $1 AND contract_id = $2")
+                .bind(region_id)
+                .bind(contract_id)
+                .bind(serde_json::to_value(persisted).map_err(json_to_sqlx)?)
+                .execute(&mut *transaction)
+                .await?;
+        } else {
+            sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,$4)")
+                .bind(region_id)
+                .bind(contract_id)
+                .bind(serde_json::to_value(context).map_err(json_to_sqlx)?)
+                .bind(observed_at)
+                .execute(&mut *transaction)
+                .await?;
+        }
         sqlx::query("UPDATE contract_collection_failures SET resolved_at = now() WHERE region_id = $1 AND contract_id = $2 AND resource_key = $3 AND failure_kind = 'embed_context_enrichment' AND resolved_at IS NULL AND classification IS NULL")
             .bind(region_id)
             .bind(contract_id)
@@ -5556,15 +5576,17 @@ impl ContractCollectionStore {
     }
 
     async fn deferred_contract_matches(&self) -> Result<Vec<DeferredContractMatch>, sqlx::Error> {
-        sqlx::query("SELECT contract_subscriptions.guild_id, contract_subscriptions.channel_id, contract_subscriptions.subscription_id, contract_subscriptions.description, contract_subscriptions.filter, contract_subscriptions.event_actions, contract_deferred_subscription_matches.event FROM contract_deferred_subscription_matches JOIN contract_subscriptions USING (guild_id, channel_id, subscription_id) WHERE contract_subscriptions.deleted_at IS NULL ORDER BY contract_deferred_subscription_matches.created_at, contract_subscriptions.guild_id, contract_subscriptions.channel_id, contract_subscriptions.subscription_id")
+        sqlx::query("SELECT contract_subscriptions.guild_id, contract_subscriptions.channel_id, contract_subscriptions.subscription_id, contract_subscriptions.description, contract_subscriptions.filter, contract_subscriptions.event_actions, contract_deferred_subscription_matches.event, contract_deferred_subscription_matches.proximity_unverified FROM contract_deferred_subscription_matches JOIN contract_subscriptions USING (guild_id, channel_id, subscription_id) WHERE contract_subscriptions.deleted_at IS NULL ORDER BY contract_deferred_subscription_matches.created_at, contract_subscriptions.guild_id, contract_subscriptions.channel_id, contract_subscriptions.subscription_id")
             .fetch_all(&self.pool)
             .await?
             .into_iter()
             .map(|row| {
                 let event = serde_json::from_value(row.get("event")).map_err(json_to_sqlx)?;
+                let proximity_unverified = row.get("proximity_unverified");
                 Ok(DeferredContractMatch {
                     subscription: contract_subscription_from_row(row)?,
                     event,
+                    proximity_unverified,
                 })
             })
             .collect()
@@ -5574,15 +5596,35 @@ impl ContractCollectionStore {
         &self,
         subscription: &ContractSubscription,
         event: &ContractEvent,
+        proximity_unverified: bool,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("INSERT INTO contract_deferred_subscription_matches (guild_id, channel_id, subscription_id, contract_id, event_kind, event) SELECT $1,$2,$3,$4,$5,$6 WHERE EXISTS (SELECT 1 FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND deleted_at IS NULL) ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind) DO UPDATE SET event = EXCLUDED.event, updated_at = now()")
+        let mut transaction = self.pool.begin().await?;
+        self.defer_contract_match_in_transaction(
+            &mut transaction,
+            subscription,
+            event,
+            proximity_unverified,
+        )
+        .await?;
+        transaction.commit().await
+    }
+
+    async fn defer_contract_match_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        subscription: &ContractSubscription,
+        event: &ContractEvent,
+        proximity_unverified: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT INTO contract_deferred_subscription_matches (guild_id, channel_id, subscription_id, contract_id, event_kind, event, proximity_unverified) SELECT $1,$2,$3,$4,$5,$6,$7 WHERE EXISTS (SELECT 1 FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND deleted_at IS NULL) ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind) DO UPDATE SET event = EXCLUDED.event, proximity_unverified = contract_deferred_subscription_matches.proximity_unverified OR EXCLUDED.proximity_unverified, updated_at = now()")
             .bind(subscription.guild_id as i64)
             .bind(subscription.channel_id as i64)
             .bind(&subscription.id)
             .bind(event.contract.contract_id)
             .bind(event.kind.as_str())
             .bind(serde_json::to_value(event).map_err(json_to_sqlx)?)
-            .execute(&self.pool)
+            .bind(proximity_unverified)
+            .execute(&mut **transaction)
             .await?;
         Ok(())
     }
@@ -5613,6 +5655,53 @@ impl ContractCollectionStore {
         ordering: DeliveryOrdering,
     ) -> Result<(), sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
+        self.prepare_delivery_in_transaction(
+            &mut transaction,
+            subscription,
+            event,
+            message,
+            ping,
+            ping_type,
+            ordering,
+        )
+        .await?;
+        transaction.commit().await
+    }
+
+    async fn prepare_proximity_unverified_delivery(
+        &self,
+        subscription: &ContractSubscription,
+        event: &ContractEvent,
+        message: &ContractNotificationMessage,
+        ping_type: ContractPingType,
+        ordering: DeliveryOrdering,
+    ) -> Result<(), sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        self.prepare_delivery_in_transaction(
+            &mut transaction,
+            subscription,
+            event,
+            message,
+            false,
+            ping_type,
+            ordering,
+        )
+        .await?;
+        self.defer_contract_match_in_transaction(&mut transaction, subscription, event, true)
+            .await?;
+        transaction.commit().await
+    }
+
+    async fn prepare_delivery_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        subscription: &ContractSubscription,
+        event: &ContractEvent,
+        message: &ContractNotificationMessage,
+        ping: bool,
+        ping_type: ContractPingType,
+        ordering: DeliveryOrdering,
+    ) -> Result<(), sqlx::Error> {
         let delivery_id = sqlx::query_scalar::<_, i64>("INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, strategic_priority, relevant_isk, confirmed_at) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,'prepared',$10,$11,$12,$13 WHERE EXISTS (SELECT 1 FROM contract_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND subscription_id = $3 AND deleted_at IS NULL) ON CONFLICT (guild_id, channel_id, subscription_id, contract_id, event_kind) DO NOTHING RETURNING id")
             .bind(subscription.guild_id as i64)
             .bind(subscription.channel_id as i64)
@@ -5627,7 +5716,7 @@ impl ContractCollectionStore {
             .bind(i64::try_from(ordering.strategic_priority).unwrap_or(i64::MAX))
             .bind(ordering.relevant_isk)
             .bind(ordering.confirmed_at)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await?;
         if let Some(delivery_id) = delivery_id {
             sqlx::query(
@@ -5635,10 +5724,10 @@ impl ContractCollectionStore {
             )
             .bind(delivery_id)
             .bind(format!("ci-{delivery_id}"))
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await?;
         }
-        transaction.commit().await
+        Ok(())
     }
 
     async fn prepared_deliveries(&self) -> Result<Vec<PreparedContractDelivery>, sqlx::Error> {
@@ -7149,6 +7238,7 @@ struct ContractNotifications {
 enum NotificationResolution {
     Complete,
     Deferred,
+    ProximityUnverified,
 }
 
 #[derive(Default)]
@@ -8023,12 +8113,14 @@ impl ContractCollector {
                 .notify_subscription(&deferred.subscription, &event, &ship_groups)
                 .await?
             {
-                NotificationResolution::Complete => {
+                NotificationResolution::Complete if !deferred.proximity_unverified => {
                     self.store
                         .resolve_deferred_contract_match(&deferred.subscription, &deferred.event)
                         .await?;
                 }
-                NotificationResolution::Deferred => {}
+                NotificationResolution::Complete
+                | NotificationResolution::Deferred
+                | NotificationResolution::ProximityUnverified => {}
             }
         }
         self.notify_events(events, notifications, &ship_groups)
@@ -8059,14 +8151,17 @@ impl ContractCollector {
                 .event_with_observed_context(event, &subscriptions, ship_groups)
                 .await?;
             for subscription in &subscriptions {
-                if matches!(
-                    self.notify_subscription(subscription, &event, ship_groups)
-                        .await?,
-                    NotificationResolution::Deferred
-                ) {
-                    self.store
-                        .defer_contract_match(subscription, &event)
-                        .await?;
+                match self
+                    .notify_subscription(subscription, &event, ship_groups)
+                    .await?
+                {
+                    NotificationResolution::Complete => {}
+                    NotificationResolution::Deferred => {
+                        self.store
+                            .defer_contract_match(subscription, &event, false)
+                            .await?;
+                    }
+                    NotificationResolution::ProximityUnverified => {}
                 }
             }
         }
@@ -8099,16 +8194,41 @@ impl ContractCollector {
         }
         let mut requirements = ContractContextRequirements::default();
         for subscription in subscriptions {
-            if matches!(
+            if !matches!(
                 contract_event_action(subscription, &event.kind),
                 ContractEventAction::Ignore
             ) {
-                continue;
+                let mut evaluator = ContractFilterEvaluator::new(&event, ship_groups);
+                let plan =
+                    plan_contract_filter_context(&subscription.filter.root, &mut evaluator, true)
+                        .await;
+                requirements = requirements.union(plan.requirements);
             }
-            let mut evaluator = ContractFilterEvaluator::new(&event, ship_groups);
-            let plan =
-                plan_contract_filter_context(&subscription.filter.root, &mut evaluator, true).await;
-            requirements = requirements.union(plan.requirements);
+            if matches!(event.kind, ContractEventKind::Listed) {
+                for terminal_kind in [
+                    ContractEventKind::SaleConfirmed,
+                    ContractEventKind::PurchaseConfirmed,
+                    ContractEventKind::Expired,
+                    ContractEventKind::ClosedOutcomeUnknown,
+                ] {
+                    if matches!(
+                        contract_event_action(subscription, &terminal_kind),
+                        ContractEventAction::Ignore
+                    ) {
+                        continue;
+                    }
+                    let mut terminal_event = event.clone();
+                    terminal_event.kind = terminal_kind;
+                    let mut evaluator = ContractFilterEvaluator::new(&terminal_event, ship_groups);
+                    let plan = plan_contract_filter_context(
+                        &subscription.filter.root,
+                        &mut evaluator,
+                        true,
+                    )
+                    .await;
+                    requirements = requirements.union(plan.requirements);
+                }
+            }
         }
         if requirements.is_empty() {
             return Ok(event);
@@ -8286,7 +8406,42 @@ impl ContractCollector {
                     ContractContextResolution::TemporarilyUnavailable;
             }
         }
+        self.persist_listing_observation_context(&event).await?;
         Ok(event)
+    }
+
+    async fn persist_listing_observation_context(
+        &self,
+        event: &ContractEvent,
+    ) -> Result<(), ContractCollectionError> {
+        let mut context = event.embed_context.clone();
+        context.location.solar_system_id = context
+            .location
+            .solar_system_id
+            .or(event.context.solar_system_id);
+        context.location.solar_system_position = context
+            .location
+            .solar_system_position
+            .or(event.context.solar_system_position);
+        context.location.security_status = context.location.security_status.or(event
+            .context
+            .security_status
+            .filter(|value| value.is_finite()));
+        context.issuer_alliance_id = context
+            .issuer_alliance_id
+            .or(event.context.observed_affiliation_alliance_id);
+        if context.location.solar_system_id.is_none()
+            && context.location.solar_system_position.is_none()
+            && context.location.security_status.is_none()
+            && context.issuer_alliance_id.is_none()
+        {
+            return Ok(());
+        }
+        context.observed_at = context.observed_at.or(Some(self.delivery_clock.now()));
+        self.store
+            .save_observed_embed_context(event.region_id, event.contract.contract_id, &context)
+            .await?;
+        Ok(())
     }
 
     async fn resolve_structure_location_evidence(
@@ -8777,29 +8932,62 @@ impl ContractCollector {
             return Ok(NotificationResolution::Complete);
         }
         let mut evaluator = ContractFilterEvaluator::new(event, ship_groups);
-        match evaluator.matches(&subscription.filter.root).await {
-            ContractFilterMatch::Matched => {}
+        let proximity_unverified = match evaluator.matches(&subscription.filter.root).await {
+            ContractFilterMatch::Matched => false,
             ContractFilterMatch::Unmatched => return Ok(NotificationResolution::Complete),
             ContractFilterMatch::Deferred => return Ok(NotificationResolution::Deferred),
-        }
+            ContractFilterMatch::UnresolvedProximity => true,
+        };
         let required_direction = match event.kind {
             ContractEventKind::Listed => None,
             ContractEventKind::SaleConfirmed => Some(ContractItemDirection::Offered),
             ContractEventKind::PurchaseConfirmed => Some(ContractItemDirection::Requested),
             ContractEventKind::Expired | ContractEventKind::ClosedOutcomeUnknown => None,
         };
-        if required_direction.is_some_and(|direction| !evaluator.has_matching_ship_item(direction))
-        {
-            return Ok(NotificationResolution::Complete);
-        }
-        let (primary_item, strategic_priority) = match evaluator.primary_display_item().await {
-            PrimaryDisplayItem::Resolved {
-                item,
-                strategic_priority,
-            } => (item, strategic_priority),
-            PrimaryDisplayItem::Deferred => return Ok(NotificationResolution::Deferred),
+        let (primary_item, strategic_priority) = if proximity_unverified {
+            let mut selection_evaluator = ContractFilterEvaluator::new(event, ship_groups);
+            let selection = plan_contract_filter_context(
+                &subscription.filter.root,
+                &mut selection_evaluator,
+                true,
+            )
+            .await;
+            if selection.waits_for_non_context
+                || required_direction.is_some_and(|direction| {
+                    !selection
+                        .all_ship_items()
+                        .iter()
+                        .any(|(item_direction, _)| *item_direction == direction)
+                })
+            {
+                return Ok(NotificationResolution::Deferred);
+            }
+            let matching_ship_items = selection.all_ship_items();
+            match selection_evaluator
+                .primary_display_item_for(&matching_ship_items)
+                .await
+            {
+                PrimaryDisplayItem::Resolved {
+                    item,
+                    strategic_priority,
+                } => (item, strategic_priority),
+                PrimaryDisplayItem::Deferred => return Ok(NotificationResolution::Deferred),
+            }
+        } else {
+            if required_direction
+                .is_some_and(|direction| !evaluator.has_matching_ship_item(direction))
+            {
+                return Ok(NotificationResolution::Complete);
+            }
+            match evaluator.primary_display_item().await {
+                PrimaryDisplayItem::Resolved {
+                    item,
+                    strategic_priority,
+                } => (item, strategic_priority),
+                PrimaryDisplayItem::Deferred => return Ok(NotificationResolution::Deferred),
+            }
         };
-        let event = self.enrich_event_for_embed(event).await?;
+        let event = self.enrich_event_for_embed(event, primary_item).await?;
         let (issuer_history, corporation_history) = self
             .store
             .contract_party_history(
@@ -8812,9 +9000,10 @@ impl ContractCollector {
             primary_item,
             &issuer_history,
             &corporation_history,
+            proximity_unverified,
         );
         let ping_type = action.ping_type();
-        let ping = ping_type.is_some();
+        let ping = !proximity_unverified && ping_type.is_some();
         let relevant_isk = event.contract.price.max(event.contract.reward);
         let confirmed_at = match event.kind {
             ContractEventKind::SaleConfirmed | ContractEventKind::PurchaseConfirmed => event
@@ -8827,21 +9016,38 @@ impl ContractCollector {
             }
             ContractEventKind::Listed => event.contract.date_issued,
         };
-        self.store
-            .prepare_delivery(
-                subscription,
-                &event,
-                &message,
-                ping,
-                ping_type.unwrap_or_default(),
-                DeliveryOrdering {
-                    strategic_priority,
-                    relevant_isk,
-                    confirmed_at,
-                },
-            )
-            .await?;
-        Ok(NotificationResolution::Complete)
+        let ordering = DeliveryOrdering {
+            strategic_priority,
+            relevant_isk,
+            confirmed_at,
+        };
+        if proximity_unverified {
+            self.store
+                .prepare_proximity_unverified_delivery(
+                    subscription,
+                    &event,
+                    &message,
+                    ping_type.unwrap_or_default(),
+                    ordering,
+                )
+                .await?;
+        } else {
+            self.store
+                .prepare_delivery(
+                    subscription,
+                    &event,
+                    &message,
+                    ping,
+                    ping_type.unwrap_or_default(),
+                    ordering,
+                )
+                .await?;
+        }
+        Ok(if proximity_unverified {
+            NotificationResolution::ProximityUnverified
+        } else {
+            NotificationResolution::Complete
+        })
     }
 
     async fn deliver_prepared_notifications(
@@ -8919,6 +9125,7 @@ impl ContractCollector {
     async fn enrich_event_for_embed(
         &self,
         event: &ContractEvent,
+        primary_item: Option<&PublicContractItem>,
     ) -> Result<ContractEvent, ContractCollectionError> {
         let mut enriched = event.clone();
         if let Some(snapshot) = self
@@ -8947,6 +9154,62 @@ impl ContractCollector {
             .embed_context
             .issuer_alliance_id
             .or(enriched.context.observed_affiliation_alliance_id);
+        let primary_name_missing = primary_item.is_some_and(|item| {
+            !enriched
+                .embed_context
+                .item_names
+                .contains_key(&item.type_id)
+        });
+        if primary_name_missing
+            && self
+                .context_request_allowed(event.contract.contract_id)
+                .await?
+        {
+            let items = event
+                .offered_items
+                .iter()
+                .chain(&event.requested_items)
+                .cloned()
+                .collect::<Vec<_>>();
+            let limiter = PersistedContractContextLimiter {
+                store: self.store.clone(),
+                request_pacer: self.request_pacer.clone(),
+            };
+            match self
+                .record_context_esi_result(
+                    event.contract.contract_id,
+                    self.esi
+                        .observed_contract_embed_context_limited(&event.contract, &items, &limiter)
+                        .await,
+                )
+                .await?
+            {
+                Some(response) => {
+                    enriched
+                        .embed_context
+                        .merge_missing_from(&response.value.unwrap_or_default());
+                    self.store
+                        .save_observed_embed_context(
+                            event.region_id,
+                            event.contract.contract_id,
+                            &enriched.embed_context,
+                        )
+                        .await?;
+                }
+                None => {
+                    self.store
+                        .record_failure(
+                            Some(event.region_id),
+                            Some(event.contract.contract_id),
+                            Some(&embed_context_resource_key(event.contract.contract_id)),
+                            "embed_context_enrichment",
+                            "notification embed enrichment will be retried",
+                            self.store.active_esi_limiter_deadline().await?,
+                        )
+                        .await?;
+                }
+            }
+        }
         Ok(enriched)
     }
 
@@ -9488,6 +9751,7 @@ enum ContractFilterMatch {
     Matched,
     Unmatched,
     Deferred,
+    UnresolvedProximity,
 }
 
 struct ContractFilterEvaluator<'a> {
@@ -9525,15 +9789,20 @@ impl<'a> ContractFilterEvaluator<'a> {
     }
 
     async fn primary_display_item(&mut self) -> PrimaryDisplayItem<'a> {
+        let matching_ship_items = self.matching_ship_items.clone();
+        self.primary_display_item_for(&matching_ship_items).await
+    }
+
+    async fn primary_display_item_for(
+        &mut self,
+        matching_ship_items: &HashSet<(ContractItemDirection, i64)>,
+    ) -> PrimaryDisplayItem<'a> {
         if self.matching_ship_items_deferred {
             return PrimaryDisplayItem::Deferred;
         }
         let mut primary: Option<(&PublicContractItem, usize)> = None;
         for (direction, item) in contract_items_with_direction(self.event) {
-            if !self
-                .matching_ship_items
-                .contains(&(direction, item.record_id))
-            {
+            if !matching_ship_items.contains(&(direction, item.record_id)) {
                 continue;
             }
             let priority = match self.group_for_type(item.type_id).await {
@@ -9663,13 +9932,16 @@ fn plan_contract_filter_context<'borrow, 'event>(
                     }
                 }
                 let result = evaluate_contract_filter_condition(condition, evaluator, false).await;
-                if !matches!(result, ContractFilterMatch::Deferred) {
+                if !matches!(
+                    result,
+                    ContractFilterMatch::Deferred | ContractFilterMatch::UnresolvedProximity
+                ) {
                     return ContractFilterContextPlan::resolved(result);
                 }
                 let requirements = condition.context_requirements();
                 let waits_for_non_context = requirements.is_empty();
                 ContractFilterContextPlan {
-                    result,
+                    result: ContractFilterMatch::Deferred,
                     requirements,
                     waits_for_non_context,
                     confirmed_ship_items: HashSet::new(),
@@ -9699,6 +9971,13 @@ fn plan_contract_filter_context<'borrow, 'event>(
                             );
                         }
                         ContractFilterMatch::Deferred => {
+                            deferred = true;
+                            requirements = requirements.union(plan.requirements);
+                            waits_for_non_context |= plan.waits_for_non_context;
+                            potential_ship_items.extend(plan.confirmed_ship_items);
+                            potential_ship_items.extend(plan.potential_ship_items);
+                        }
+                        ContractFilterMatch::UnresolvedProximity => {
                             deferred = true;
                             requirements = requirements.union(plan.requirements);
                             waits_for_non_context |= plan.waits_for_non_context;
@@ -9736,7 +10015,8 @@ fn plan_contract_filter_context<'borrow, 'event>(
                     match plan.result {
                         ContractFilterMatch::Matched => matched_plans.push(plan),
                         ContractFilterMatch::Unmatched => {}
-                        ContractFilterMatch::Deferred => deferred_plans.push(plan),
+                        ContractFilterMatch::Deferred
+                        | ContractFilterMatch::UnresolvedProximity => deferred_plans.push(plan),
                     }
                 }
                 if matched_plans.is_empty() {
@@ -9802,6 +10082,7 @@ fn plan_contract_filter_context<'borrow, 'event>(
                         ContractFilterMatch::Matched => ContractFilterMatch::Unmatched,
                         ContractFilterMatch::Unmatched => ContractFilterMatch::Matched,
                         ContractFilterMatch::Deferred => ContractFilterMatch::Deferred,
+                        ContractFilterMatch::UnresolvedProximity => ContractFilterMatch::Deferred,
                     },
                     requirements: plan.requirements,
                     waits_for_non_context: plan.waits_for_non_context,
@@ -9832,6 +10113,7 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
                 let initial_matches = evaluator.matching_ship_items.clone();
                 let initial_matches_deferred = evaluator.matching_ship_items_deferred;
                 let mut deferred = false;
+                let mut unresolved_proximity = false;
                 for node in nodes {
                     match evaluate_contract_filter_node(
                         node,
@@ -9847,16 +10129,21 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
                             return ContractFilterMatch::Unmatched;
                         }
                         ContractFilterMatch::Deferred => deferred = true,
+                        ContractFilterMatch::UnresolvedProximity => unresolved_proximity = true,
                     }
                 }
-                if deferred {
+                if deferred || unresolved_proximity {
                     let branch_may_add_ship_items = collect_matching_ship_items
                         && evaluator.matching_ship_items != initial_matches;
                     evaluator.matching_ship_items = initial_matches;
                     evaluator.matching_ship_items_deferred = initial_matches_deferred
                         || evaluator.matching_ship_items_deferred
                         || branch_may_add_ship_items;
-                    ContractFilterMatch::Deferred
+                    if deferred {
+                        ContractFilterMatch::Deferred
+                    } else {
+                        ContractFilterMatch::UnresolvedProximity
+                    }
                 } else {
                     ContractFilterMatch::Matched
                 }
@@ -9866,8 +10153,10 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
                 let initial_matches_deferred = evaluator.matching_ship_items_deferred;
                 let mut matching_ship_items = initial_matches.clone();
                 let mut matching_ship_items_deferred = initial_matches_deferred;
+                let mut unresolved_ship_items = false;
                 let mut matched = false;
                 let mut deferred = false;
+                let mut unresolved_proximity = false;
                 for node in nodes {
                     evaluator.matching_ship_items = initial_matches.clone();
                     evaluator.matching_ship_items_deferred = initial_matches_deferred;
@@ -9887,7 +10176,13 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
                         ContractFilterMatch::Unmatched => {}
                         ContractFilterMatch::Deferred => {
                             deferred = true;
-                            matching_ship_items_deferred |= evaluator.matching_ship_items_deferred
+                            unresolved_ship_items |= evaluator.matching_ship_items_deferred
+                                || (collect_matching_ship_items
+                                    && evaluator.matching_ship_items != initial_matches);
+                        }
+                        ContractFilterMatch::UnresolvedProximity => {
+                            unresolved_proximity = true;
+                            unresolved_ship_items |= evaluator.matching_ship_items_deferred
                                 || (collect_matching_ship_items
                                     && evaluator.matching_ship_items != initial_matches);
                         }
@@ -9897,10 +10192,15 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
                     evaluator.matching_ship_items = matching_ship_items;
                     evaluator.matching_ship_items_deferred = matching_ship_items_deferred;
                     ContractFilterMatch::Matched
-                } else if deferred {
+                } else if deferred || unresolved_proximity {
                     evaluator.matching_ship_items = initial_matches;
-                    evaluator.matching_ship_items_deferred = matching_ship_items_deferred;
-                    ContractFilterMatch::Deferred
+                    evaluator.matching_ship_items_deferred =
+                        matching_ship_items_deferred || unresolved_ship_items;
+                    if deferred {
+                        ContractFilterMatch::Deferred
+                    } else {
+                        ContractFilterMatch::UnresolvedProximity
+                    }
                 } else {
                     evaluator.matching_ship_items = initial_matches;
                     evaluator.matching_ship_items_deferred = initial_matches_deferred;
@@ -9912,6 +10212,9 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
                     ContractFilterMatch::Matched => ContractFilterMatch::Unmatched,
                     ContractFilterMatch::Unmatched => ContractFilterMatch::Matched,
                     ContractFilterMatch::Deferred => ContractFilterMatch::Deferred,
+                    ContractFilterMatch::UnresolvedProximity => {
+                        ContractFilterMatch::UnresolvedProximity
+                    }
                 }
             }
         }
@@ -9977,7 +10280,7 @@ async fn evaluate_contract_filter_condition(
             money_match(relevant_isk(event, *direction), |amount| amount <= *value)
         }
         ContractFilterCondition::Regions(ids) => bool_match(ids.contains(&event.region_id)),
-        ContractFilterCondition::SolarSystems(ids) => context_match(
+        ContractFilterCondition::SolarSystems(ids) => proximity_context_match(
             event.context.solar_system_id,
             event.context.solar_system_resolution,
             |system_id| ids.contains(&system_id),
@@ -9988,7 +10291,7 @@ async fn evaluate_contract_filter_condition(
                 .solar_system_position
                 .filter(|position| position.is_finite())
             else {
-                return ContractFilterMatch::Deferred;
+                return ContractFilterMatch::UnresolvedProximity;
             };
             let mut deferred = false;
             for range in ranges {
@@ -10007,12 +10310,12 @@ async fn evaluate_contract_filter_condition(
                 }
             }
             if deferred {
-                ContractFilterMatch::Deferred
+                ContractFilterMatch::UnresolvedProximity
             } else {
                 ContractFilterMatch::Unmatched
             }
         }
-        ContractFilterCondition::SecurityRange { min, max } => context_match(
+        ContractFilterCondition::SecurityRange { min, max } => proximity_context_match(
             event.context.security_status,
             event.context.security_status_resolution,
             |security_status| {
@@ -10071,6 +10374,20 @@ fn context_match<T>(
     }
 }
 
+fn proximity_context_match<T>(
+    value: Option<T>,
+    resolution: ContractContextResolution,
+    predicate: impl FnOnce(T) -> bool,
+) -> ContractFilterMatch {
+    match value {
+        Some(value) => bool_match(predicate(value)),
+        None if matches!(resolution, ContractContextResolution::DefinitivelyAbsent) => {
+            ContractFilterMatch::Unmatched
+        }
+        None => ContractFilterMatch::UnresolvedProximity,
+    }
+}
+
 fn items_for_direction(
     event: &ContractEvent,
     direction: ContractItemDirection,
@@ -10115,11 +10432,12 @@ fn contract_notification_message(
     primary_item: Option<&PublicContractItem>,
     issuer_history: &ContractPartyHistory,
     corporation_history: &ContractPartyHistory,
+    proximity_unverified: bool,
 ) -> ContractNotificationMessage {
     let primary_name = primary_item
         .and_then(|item| event.embed_context.item_names.get(&item.type_id))
         .map(|name| sanitize_contract_text(name))
-        .or_else(|| primary_item.map(|item| format!("Type {}", item.type_id)))
+        .or_else(|| primary_item.map(|_| "Unknown ship".to_string()))
         .unwrap_or_else(|| "Public contract".to_string());
     let title_location = contract_title_location(&event.embed_context.location);
     let title_isk = title_isk(event, primary_item);
@@ -10183,6 +10501,13 @@ fn contract_notification_message(
         message.fields.push(ContractEmbedField {
             name: "History".to_string(),
             value: history.join("\n"),
+            inline: false,
+        });
+    }
+    if proximity_unverified {
+        message.fields.push(ContractEmbedField {
+            name: "Alert".to_string(),
+            value: "Proximity-Unverified".to_string(),
             inline: false,
         });
     }
@@ -10322,7 +10647,15 @@ fn contract_link_place(context: &ContractLocationContext, location_id: i64) -> S
         .or(context.region_name.as_deref())
         .map(sanitize_contract_text)
         .filter(|place| !place.is_empty())
-        .unwrap_or_else(|| format!("Location {location_id}"))
+        .unwrap_or_else(|| unresolved_contract_location(location_id).to_string())
+}
+
+fn unresolved_contract_location(location_id: i64) -> &'static str {
+    if u32::try_from(location_id).is_err() {
+        "Player-owned structure"
+    } else {
+        "Unknown location"
+    }
 }
 
 fn contract_address(contract_id: i64, label: &str, place: &str) -> String {
@@ -11037,6 +11370,7 @@ mod embed_tests {
                 Some(&item(1, 19_720, true)),
                 &history,
                 &history,
+                false,
             );
             assert!(message.title.contains(expected));
             assert_eq!(field(&message, "Event"), None);
@@ -11056,6 +11390,7 @@ mod embed_tests {
             None,
             &history,
             &history,
+            false,
         );
         assert_eq!(
             full.description.as_deref(),
@@ -11069,11 +11404,11 @@ mod embed_tests {
             solar_system_id: Some(30_000_142),
             ..ContractLocationContext::default()
         };
-        let fallback = contract_notification_message(&fallback, None, &history, &history);
+        let fallback = contract_notification_message(&fallback, None, &history, &history, false);
         assert_eq!(
             fallback.description.as_deref(),
             Some(
-                "`<url=\"contract:0//45\">Public contract - Location 60003760</url>`\nissuer: [Issuer Alliance] Issuer Name"
+                "`<url=\"contract:0//45\">Public contract - Unknown location</url>`\nissuer: [Issuer Alliance] Issuer Name"
             )
         );
 
@@ -11083,7 +11418,8 @@ mod embed_tests {
             location_kind: Some("Station".to_string()),
             ..ContractLocationContext::default()
         };
-        let station_only = contract_notification_message(&station_only, None, &history, &history);
+        let station_only =
+            contract_notification_message(&station_only, None, &history, &history, false);
         assert_eq!(
             station_only.description.as_deref(),
             Some(
@@ -11096,21 +11432,22 @@ mod embed_tests {
             region_id: Some(10_000_002),
             ..ContractLocationContext::default()
         };
-        let region_only = contract_notification_message(&region_only, None, &history, &history);
+        let region_only =
+            contract_notification_message(&region_only, None, &history, &history, false);
         assert_eq!(
             region_only.description.as_deref(),
             Some(
-                "`<url=\"contract:0//45\">Public contract - Location 60003760</url>`\nissuer: [Issuer Alliance] Issuer Name"
+                "`<url=\"contract:0//45\">Public contract - Unknown location</url>`\nissuer: [Issuer Alliance] Issuer Name"
             )
         );
 
         let mut raw_only = event(ContractEventKind::Listed);
         raw_only.embed_context.location = ContractLocationContext::default();
-        let raw_only = contract_notification_message(&raw_only, None, &history, &history);
+        let raw_only = contract_notification_message(&raw_only, None, &history, &history, false);
         assert_eq!(
             raw_only.description.as_deref(),
             Some(
-                "`<url=\"contract:0//45\">Public contract - Location 60003760</url>`\nissuer: [Issuer Alliance] Issuer Name"
+                "`<url=\"contract:0//45\">Public contract - Unknown location</url>`\nissuer: [Issuer Alliance] Issuer Name"
             )
         );
     }
@@ -11123,6 +11460,7 @@ mod embed_tests {
             Some(&item(1, 19_720, true)),
             &history,
             &history,
+            false,
         );
         assert!(message.title.starts_with("Ragnarok listed"));
         assert_eq!(
@@ -11171,6 +11509,7 @@ mod embed_tests {
             Some(&item(1, 19_720, true)),
             &history,
             &history,
+            false,
         );
 
         assert_eq!(
@@ -11240,8 +11579,13 @@ mod embed_tests {
                 observed_at: Utc::now() - ChronoDuration::hours(1),
             }),
         };
-        let message =
-            contract_notification_message(&event, Some(&item(1, 19_720, true)), &history, &history);
+        let message = contract_notification_message(
+            &event,
+            Some(&item(1, 19_720, true)),
+            &history,
+            &history,
+            false,
+        );
         let description = message
             .description
             .as_deref()
@@ -11321,6 +11665,7 @@ mod embed_tests {
             Some(&event.offered_items[0]),
             &issuer_history,
             &corporation_history,
+            false,
         );
         assert_eq!(message.title, "Hel sold for 77.5B in Jita (The Forge)");
         assert!(message
@@ -11433,6 +11778,7 @@ mod embed_tests {
             Some(&event.offered_items[0]),
             &history,
             &history,
+            false,
         );
         let description = message.description.expect("sanitized contract description");
         let contract_link = description.lines().next().expect("contract link");
