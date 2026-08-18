@@ -16,6 +16,7 @@ pub mod location_evidence;
 pub mod models;
 pub mod pipeline;
 pub mod processor;
+pub mod structure_resolver;
 
 use crate::commands::contract_subscribe::ContractSubscribeCommand;
 use crate::commands::contract_unsubscribe::ContractUnsubscribeCommand;
@@ -31,6 +32,10 @@ use commands::{Command, PingCommand};
 use config::FeedProvider;
 use discord_bot::CommandMap;
 use feed::KillmailFeed;
+use structure_resolver::{
+    AuthenticatedStructureResolver, StructureResolver, StructureResolverConfig,
+    StructureResolverRuntimeStatus,
+};
 
 pub struct AppStateContainer;
 
@@ -242,9 +247,35 @@ pub async fn run() {
             }
         };
         let health_database_url = database_url.clone();
+        let (structure_resolver, structure_resolver_runtime): (
+            Option<Arc<dyn StructureResolver>>,
+            Option<StructureResolverRuntimeStatus>,
+        ) = match StructureResolverConfig::from_environment() {
+            Ok(config) if config.is_enabled() => {
+                let runtime = config.runtime_status();
+                match AuthenticatedStructureResolver::new(config, timeout) {
+                    Ok(resolver) => (Some(Arc::new(resolver)), Some(runtime)),
+                    Err(error) => {
+                        warn!("structure resolver disabled after HTTP initialization failure: {error}");
+                        (
+                            None,
+                            Some(StructureResolverRuntimeStatus::initialization_failed()),
+                        )
+                    }
+                }
+            }
+            Ok(config) => (None, Some(config.runtime_status())),
+            Err(error) => {
+                warn!("structure resolver disabled by invalid configuration: {error}");
+                (
+                    None,
+                    Some(StructureResolverRuntimeStatus::invalid_configuration()),
+                )
+            }
+        };
         match contract_intelligence::contract_regional_concurrency_from_environment() {
             Ok(max_concurrent_regions) => {
-                contract_intelligence::spawn_contract_collection_loop_with_notifications_and_region_concurrency(
+                contract_intelligence::spawn_contract_collection_loop_with_notifications_structure_resolver_and_region_concurrency(
                     database_url,
                     store_handle,
                     Duration::from_secs(interval),
@@ -254,6 +285,8 @@ pub async fn run() {
                     Arc::new(contract_intelligence::AppStateContractPingLimiter::new(
                         app_state.clone(),
                     )),
+                    structure_resolver,
+                    structure_resolver_runtime,
                     max_concurrent_regions,
                 );
             }
