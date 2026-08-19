@@ -2662,7 +2662,7 @@ async fn structure_resolver_revalidates_expired_persisted_facts_after_restart() 
                 ("ETag", "\"structure-v1\""),
                 ("Expires", "Wed, 21 Oct 2099 07:28:00 GMT"),
             ],
-            body: r#"{"solar_system_id":30002086}"#,
+            body: r#"{"name":"Turnur - Summit's Beacon","solar_system_id":30002086}"#,
         },
         WireReply {
             status: 304,
@@ -2808,7 +2808,18 @@ async fn structure_resolver_revalidates_expired_persisted_facts_after_restart() 
     .collect_cycle()
     .await
     .expect("304 structure revalidation reuses persisted facts and keeps collection healthy");
-    assert_eq!(delivery.sent.lock().unwrap().len(), 2);
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert!(
+        sent[1]
+            .message
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("Turnur Summit's Beacon")),
+        "{:?}",
+        sent[1].message.description
+    );
+    drop(sent);
     let requests = structure_server.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 2);
     assert!(requests[0]
@@ -14905,6 +14916,13 @@ async fn contract_migrations_apply_to_clean_and_already_current_databases() {
             .expect("read migrated table from clean database");
         assert!(exists, "migration created {table}");
     }
+    let structure_name_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'structure_resolution_state' AND column_name = 'structure_name')",
+    )
+    .fetch_one(&validation_pool)
+    .await
+    .expect("read durable structure-name column");
+    assert!(structure_name_exists);
     assert_eq!(
         clean_store
             .storage_counts()
@@ -14923,7 +14941,7 @@ async fn contract_migrations_apply_to_clean_and_already_current_databases() {
         .fetch_one(&validation_pool)
         .await
         .expect("read already-current migration ledger");
-    assert_eq!(current_migration_count, 25);
+    assert_eq!(current_migration_count, 26);
     assert_eq!(
         current_store
             .storage_counts()
@@ -26894,7 +26912,7 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         .fetch_one(&clean_pool)
         .await
         .expect("read clean migration ledger");
-    assert_eq!(clean_migration_count, 25);
+    assert_eq!(clean_migration_count, 26);
     let clean_pacing_column_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'esi_collection_limiter_state' AND column_name = 'next_request_at')",
     )
