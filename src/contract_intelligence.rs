@@ -5616,6 +5616,12 @@ impl ContractCollectionStore {
         if let Some(persisted) = persisted {
             let mut persisted =
                 serde_json::from_value::<ContractEmbedContext>(persisted).map_err(json_to_sqlx)?;
+            if persisted.location.solar_system_id.is_some()
+                && context.location.solar_system_id.is_some()
+                && persisted.location.solar_system_id != context.location.solar_system_id
+            {
+                persisted.location = context.location.clone();
+            }
             persisted.merge_missing_from(&context);
             sqlx::query("UPDATE contract_observed_embed_contexts SET context = $3, updated_at = now() WHERE region_id = $1 AND contract_id = $2")
                 .bind(region_id)
@@ -9658,7 +9664,10 @@ impl ContractCollector {
                 .context
                 .location_evidence_id
                 .is_some_and(|retained_id| {
-                    selected_evidence.is_some_and(|evidence| evidence.id != retained_id)
+                    selected_evidence.as_ref().is_some_and(|evidence| {
+                        evidence.id != retained_id
+                            || event.context.solar_system_id != Some(evidence.solar_system_id)
+                    })
                 });
         if matches!(event.kind, ContractEventKind::Listed)
             && (retained_evidence_requires_public_refresh || authoritative_evidence_changed)
@@ -9668,6 +9677,7 @@ impl ContractCollector {
             event.context.location_evidence_class = None;
         }
         let mut requirements = ContractContextRequirements::default();
+        let mut presentation_location_required = false;
         for subscription in subscriptions {
             if !matches!(
                 contract_event_action(subscription, &event.kind),
@@ -9677,6 +9687,8 @@ impl ContractCollector {
                 let plan =
                     plan_contract_filter_context(&subscription.filter.root, &mut evaluator, true)
                         .await;
+                presentation_location_required |=
+                    matches!(plan.result, ContractFilterMatch::Matched);
                 requirements = requirements.union(plan.requirements);
             }
             if matches!(event.kind, ContractEventKind::Listed) {
@@ -9701,9 +9713,14 @@ impl ContractCollector {
                         true,
                     )
                     .await;
+                    presentation_location_required |=
+                        matches!(plan.result, ContractFilterMatch::Matched);
                     requirements = requirements.union(plan.requirements);
                 }
             }
+        }
+        if presentation_location_required {
+            requirements.solar_system = true;
         }
         if requirements.is_empty() {
             return Ok(event);
@@ -9912,6 +9929,29 @@ impl ContractCollector {
             } else {
                 event.context.observed_affiliation_alliance_resolution =
                     ContractContextResolution::TemporarilyUnavailable;
+            }
+        }
+        if requirements.solar_system {
+            if let Some(solar_system_id) = event
+                .context
+                .solar_system_id
+                .and_then(|solar_system_id| u32::try_from(solar_system_id).ok())
+            {
+                if event.embed_context.location.solar_system_id != Some(i64::from(solar_system_id))
+                {
+                    event.embed_context.location.location_name = None;
+                    event.embed_context.location.location_kind = None;
+                    event.embed_context.location.solar_system_name = None;
+                    event.embed_context.location.solar_system_position = None;
+                    event.embed_context.location.security_status = None;
+                }
+                event.embed_context.location.solar_system_id = Some(i64::from(solar_system_id));
+                event.embed_context.location.region_id = Some(event.region_id);
+                if event.embed_context.location.solar_system_name.is_none() {
+                    event.embed_context.location.solar_system_name = self
+                        .cached_solar_system_name(event.contract.contract_id, solar_system_id)
+                        .await?;
+                }
             }
         }
         self.persist_listing_observation_context(&event).await?;

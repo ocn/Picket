@@ -2501,6 +2501,102 @@ async fn public_contract_discovery_never_carries_structure_resolver_authorizatio
 }
 
 #[tokio::test]
+async fn matching_region_subscription_resolves_structure_location_for_the_embed() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let structure_id = 1_024_000_000_099;
+    let region_id = 10_000_042;
+    let mut contract = item_exchange_contract(99);
+    contract.start_location_id = structure_id;
+    contract.end_location_id = Some(structure_id);
+
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![region_id],
+            pages: HashMap::from([(
+                (region_id, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent regional baseline");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "region-presentation-location".to_string(),
+            description: "resolve location for a matching regional post".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::Condition(ContractFilterCondition::Regions(vec![
+                    region_id,
+                ])),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist the regional subscription");
+    store
+        .initialize_structure_resolver_runtime(&resolver_test_config().runtime_status(), Utc::now())
+        .await
+        .expect("initialize the authenticated resolver runtime");
+    let resolver = Arc::new(SuccessfulStructureResolver {
+        calls: AtomicU64::new(0),
+        solar_system_id: 30_002_086,
+    });
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: FakeEsi {
+                regions: vec![region_id],
+                pages: HashMap::from([(
+                    (region_id, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: HashMap::new(),
+            positions: HashMap::new(),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    )
+    .with_structure_resolver(resolver.clone())
+    .collect_cycle()
+    .await
+    .expect("collect and deliver the matching regional contract");
+
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0]
+        .message
+        .description
+        .as_deref()
+        .is_some_and(|description| description.contains("Turnur")));
+    drop(sent);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn structure_resolver_revalidates_expired_persisted_facts_after_restart() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
@@ -4464,12 +4560,45 @@ struct FailingStructureResolver {
     error: StructureResolverError,
 }
 
+struct SuccessfulStructureResolver {
+    calls: AtomicU64,
+    solar_system_id: i64,
+}
+
 impl FailingStructureResolver {
     fn access_denied() -> Self {
         Self {
             calls: AtomicU64::new(0),
             error: StructureResolverError::access_denied(None),
         }
+    }
+}
+
+#[async_trait]
+impl StructureResolver for SuccessfulStructureResolver {
+    fn credential_revision(&self) -> &str {
+        "1"
+    }
+
+    fn resolver_identity(&self) -> &str {
+        "character:90000001"
+    }
+
+    async fn resolve_structure(
+        &self,
+        structure_id: i64,
+    ) -> Result<killbot_rust::structure_resolver::ResolvedStructure, StructureResolverError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let observed_at = Utc::now();
+        Ok(killbot_rust::structure_resolver::ResolvedStructure {
+            structure_id,
+            solar_system_id: self.solar_system_id,
+            observed_at,
+            expires_at: Some(observed_at + chrono::Duration::hours(1)),
+            etag: Some("region-presentation-location".to_string()),
+            response_metadata: CacheMetadata::cached_for_seconds(60),
+            representation_cacheable: true,
+        })
     }
 }
 
@@ -22683,7 +22812,7 @@ async fn a_definite_ship_group_mismatch_skips_later_context_enrichment() {
 }
 
 #[tokio::test]
-async fn a_local_or_match_skips_unneeded_context_enrichment() {
+async fn a_local_or_match_fetches_only_presentation_location_context() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let baseline = item_exchange_contract(44);
@@ -22751,9 +22880,9 @@ async fn a_local_or_match_skips_unneeded_context_enrichment() {
         .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
         .collect_cycle()
         .await
-        .expect("match the local Or branch without resolving the unused location branch");
+        .expect("match the local Or branch and resolve location only for presentation");
 
-    assert_eq!(*esi.context_calls.lock().unwrap(), 0);
+    assert_eq!(*esi.context_calls.lock().unwrap(), 1);
     assert_eq!(delivery.sent.lock().unwrap().len(), 1);
 
     database.destroy().await;
