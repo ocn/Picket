@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{
     migrate::{Migrate, MigrateError, Migrator},
     postgres::PgPoolOptions,
-    PgPool, Row,
+    PgPool, Postgres, Row, Transaction,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -4195,11 +4195,39 @@ pub struct ContractDeliveryRerenderCandidate {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContractDeliveryRerenderExclusion {
+    pub delivery_id: i64,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContractDeliveryRerenderReport {
     pub channel_id: u64,
     pub dry_run: bool,
     pub eligible_count: usize,
     pub candidates: Vec<ContractDeliveryRerenderCandidate>,
+    pub excluded_count: usize,
+    pub excluded: Vec<ContractDeliveryRerenderExclusion>,
+}
+
+#[derive(Clone, Debug)]
+enum ContractDeliveryRerenderSelector {
+    Limit(usize),
+    DeliveryIds(Vec<i64>),
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedContractDeliveryRerenderCandidate {
+    candidate: ContractDeliveryRerenderCandidate,
+    subscription: ContractSubscription,
+    event: ContractEvent,
+    stored_message: ContractNotificationMessage,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ContractDeliveryRerenderSelection {
+    candidates: Vec<ValidatedContractDeliveryRerenderCandidate>,
+    excluded: Vec<ContractDeliveryRerenderExclusion>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -5867,53 +5895,180 @@ impl ContractCollectionStore {
     async fn rerender_contract_delivery_candidates(
         &self,
         channel_id: u64,
-        limit: usize,
-    ) -> Result<Vec<ContractDeliveryRerenderCandidate>, sqlx::Error> {
-        sqlx::query("SELECT deliveries.id, deliveries.contract_id, deliveries.event_kind, deliveries.discord_message_id FROM contract_outbound_deliveries AS deliveries JOIN contract_subscriptions AS subscriptions ON subscriptions.guild_id = deliveries.guild_id AND subscriptions.channel_id = deliveries.channel_id AND subscriptions.subscription_id = deliveries.subscription_id WHERE deliveries.channel_id = $1 AND deliveries.status = 'sent' AND deliveries.discord_message_id IS NOT NULL AND subscriptions.deleted_at IS NULL AND deliveries.repair_status = 'none' AND COALESCE(deliveries.failure_kind, '') <> 'permanent' AND COALESCE(deliveries.repair_failure_kind, '') <> 'permanent' AND COALESCE((deliveries.message ->> 'presentation_revision')::INTEGER, 0) < $2 ORDER BY deliveries.id LIMIT $3")
-            .bind(channel_id as i64)
-            .bind(CONTRACT_NOTIFICATION_PRESENTATION_REVISION as i32)
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await?
-            .into_iter()
-            .map(|row| {
-                Ok(ContractDeliveryRerenderCandidate {
-                    delivery_id: row.get("id"),
-                    contract_id: row.get("contract_id"),
-                    event_kind: contract_delivery_event_kind_from_str(&row.get::<String, _>("event_kind"))?,
-                    discord_message_id: row.get("discord_message_id"),
+        selector: &ContractDeliveryRerenderSelector,
+    ) -> Result<ContractDeliveryRerenderSelection, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let selection = self
+            .select_contract_delivery_rerender_candidates(
+                &mut transaction,
+                channel_id,
+                selector,
+                false,
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(selection)
+    }
+
+    async fn select_contract_delivery_rerender_candidates(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        channel_id: u64,
+        selector: &ContractDeliveryRerenderSelector,
+        lock_for_queue: bool,
+    ) -> Result<ContractDeliveryRerenderSelection, sqlx::Error> {
+        const ELIGIBLE_RERENDER_DELIVERIES: &str = "FROM contract_outbound_deliveries AS deliveries JOIN contract_subscriptions AS subscriptions ON subscriptions.guild_id = deliveries.guild_id AND subscriptions.channel_id = deliveries.channel_id AND subscriptions.subscription_id = deliveries.subscription_id WHERE deliveries.channel_id = $1 AND deliveries.status = 'sent' AND deliveries.discord_message_id IS NOT NULL AND subscriptions.deleted_at IS NULL AND deliveries.repair_status = 'none' AND COALESCE(deliveries.failure_kind, '') <> 'permanent' AND COALESCE(deliveries.repair_failure_kind, '') <> 'permanent' AND (CASE WHEN jsonb_typeof(deliveries.message -> 'presentation_revision') = 'number' AND length(deliveries.message ->> 'presentation_revision') <= 9 AND (deliveries.message ->> 'presentation_revision') ~ '^[0-9]+$' THEN (deliveries.message ->> 'presentation_revision')::INTEGER ELSE 0 END) < $2";
+        let selected_rows = match selector {
+            ContractDeliveryRerenderSelector::Limit(_) => {
+                let query = if lock_for_queue {
+                    format!("SELECT deliveries.id, deliveries.contract_id, deliveries.event_kind, deliveries.discord_message_id, deliveries.event, deliveries.message, subscriptions.guild_id, subscriptions.channel_id, subscriptions.subscription_id, subscriptions.description, subscriptions.filter, subscriptions.event_actions {ELIGIBLE_RERENDER_DELIVERIES} ORDER BY deliveries.id FOR UPDATE OF deliveries SKIP LOCKED")
+                } else {
+                    format!("SELECT deliveries.id, deliveries.contract_id, deliveries.event_kind, deliveries.discord_message_id, deliveries.event, deliveries.message, subscriptions.guild_id, subscriptions.channel_id, subscriptions.subscription_id, subscriptions.description, subscriptions.filter, subscriptions.event_actions {ELIGIBLE_RERENDER_DELIVERIES} ORDER BY deliveries.id")
+                };
+                sqlx::query(&query)
+                    .bind(channel_id as i64)
+                    .bind(CONTRACT_NOTIFICATION_PRESENTATION_REVISION as i32)
+                    .fetch_all(&mut **transaction)
+                    .await?
+            }
+            ContractDeliveryRerenderSelector::DeliveryIds(delivery_ids) => {
+                let query = if lock_for_queue {
+                    format!("SELECT deliveries.id, deliveries.contract_id, deliveries.event_kind, deliveries.discord_message_id, deliveries.event, deliveries.message, subscriptions.guild_id, subscriptions.channel_id, subscriptions.subscription_id, subscriptions.description, subscriptions.filter, subscriptions.event_actions {ELIGIBLE_RERENDER_DELIVERIES} AND deliveries.id = ANY($3) ORDER BY array_position($3::BIGINT[], deliveries.id) FOR UPDATE OF deliveries SKIP LOCKED")
+                } else {
+                    format!("SELECT deliveries.id, deliveries.contract_id, deliveries.event_kind, deliveries.discord_message_id, deliveries.event, deliveries.message, subscriptions.guild_id, subscriptions.channel_id, subscriptions.subscription_id, subscriptions.description, subscriptions.filter, subscriptions.event_actions {ELIGIBLE_RERENDER_DELIVERIES} AND deliveries.id = ANY($3) ORDER BY array_position($3::BIGINT[], deliveries.id)")
+                };
+                sqlx::query(&query)
+                    .bind(channel_id as i64)
+                    .bind(CONTRACT_NOTIFICATION_PRESENTATION_REVISION as i32)
+                    .bind(delivery_ids)
+                    .fetch_all(&mut **transaction)
+                    .await?
+            }
+        };
+        let mut selection = ContractDeliveryRerenderSelection::default();
+        let mut selected_ids = BTreeSet::new();
+        let limit = match selector {
+            ContractDeliveryRerenderSelector::Limit(limit) => Some(*limit),
+            ContractDeliveryRerenderSelector::DeliveryIds(_) => None,
+        };
+        for row in selected_rows {
+            let delivery_id: i64 = row.get("id");
+            selected_ids.insert(delivery_id);
+            let event_kind =
+                contract_delivery_event_kind_from_str(&row.get::<String, _>("event_kind"));
+            let event = serde_json::from_value::<ContractEvent>(row.get("event"));
+            let stored_message =
+                serde_json::from_value::<ContractNotificationMessage>(row.get("message"));
+            let subscription: Result<ContractSubscription, sqlx::Error> = (|| {
+                Ok(ContractSubscription {
+                    guild_id: row.get::<i64, _>("guild_id") as u64,
+                    channel_id: row.get::<i64, _>("channel_id") as u64,
+                    id: row.get("subscription_id"),
+                    description: row.get("description"),
+                    filter: serde_json::from_value(row.get("filter")).map_err(json_to_sqlx)?,
+                    event_actions: serde_json::from_value(row.get("event_actions"))
+                        .map_err(json_to_sqlx)?,
                 })
-            })
-            .collect()
+            })();
+            let malformed_reason = match (&event_kind, &event, &stored_message, &subscription) {
+                (Err(_), _, _, _) => Some("invalid_delivery_event_kind"),
+                (_, Err(_), _, _) => Some("invalid_retained_event"),
+                (_, _, Err(_), _) => Some("invalid_retained_message"),
+                (_, _, _, Err(_)) => Some("invalid_retained_subscription"),
+                (Ok(event_kind), Ok(event), Ok(_), Ok(_)) if *event_kind != event.kind => {
+                    Some("retained_event_kind_mismatch")
+                }
+                _ => None,
+            };
+            if let Some(reason) = malformed_reason {
+                selection.excluded.push(ContractDeliveryRerenderExclusion {
+                    delivery_id,
+                    reason: reason.to_string(),
+                });
+                continue;
+            }
+            let event_kind = event_kind.expect("validated event kind");
+            let event = event.expect("validated retained event");
+            let stored_message = stored_message.expect("validated retained message");
+            let subscription = subscription.expect("validated retained subscription");
+            selection
+                .candidates
+                .push(ValidatedContractDeliveryRerenderCandidate {
+                    candidate: ContractDeliveryRerenderCandidate {
+                        delivery_id,
+                        contract_id: row.get("contract_id"),
+                        event_kind,
+                        discord_message_id: row.get("discord_message_id"),
+                    },
+                    subscription,
+                    event,
+                    stored_message,
+                });
+            if limit.is_some_and(|limit| selection.candidates.len() == limit) {
+                break;
+            }
+        }
+        if let ContractDeliveryRerenderSelector::DeliveryIds(delivery_ids) = selector {
+            let missing = delivery_ids
+                .iter()
+                .filter(|delivery_id| !selected_ids.contains(delivery_id))
+                .map(i64::to_string)
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(sqlx::Error::Protocol(format!(
+                    "selected deliveries are not eligible outdated retained deliveries for channel {channel_id}: {}",
+                    missing.join(",")
+                )));
+            }
+            if !selection.excluded.is_empty() {
+                return Err(sqlx::Error::Protocol(format!(
+                    "selected deliveries have malformed retained data: {}",
+                    selection
+                        .excluded
+                        .iter()
+                        .map(|excluded| excluded.delivery_id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )));
+            }
+        }
+        Ok(selection)
     }
 
     async fn queue_contract_delivery_rerenders(
         &self,
         channel_id: u64,
-        limit: usize,
+        selector: &ContractDeliveryRerenderSelector,
         actor: &str,
         occurred_at: DateTime<Utc>,
-    ) -> Result<Vec<ContractDeliveryRerenderCandidate>, sqlx::Error> {
+    ) -> Result<ContractDeliveryRerenderSelection, sqlx::Error> {
         if actor != CONTRACT_DELIVERY_OPERATOR_ACTOR {
             return Err(sqlx::Error::Protocol(
                 "delivery rerender actor is not authorized".to_string(),
             ));
         }
-        let mut transaction = self.pool.begin().await?;
-        let rows = sqlx::query("SELECT deliveries.id, deliveries.contract_id, deliveries.event_kind, deliveries.discord_message_id, deliveries.event, deliveries.message FROM contract_outbound_deliveries AS deliveries JOIN contract_subscriptions AS subscriptions ON subscriptions.guild_id = deliveries.guild_id AND subscriptions.channel_id = deliveries.channel_id AND subscriptions.subscription_id = deliveries.subscription_id WHERE deliveries.channel_id = $1 AND deliveries.status = 'sent' AND deliveries.discord_message_id IS NOT NULL AND subscriptions.deleted_at IS NULL AND deliveries.repair_status = 'none' AND COALESCE(deliveries.failure_kind, '') <> 'permanent' AND COALESCE(deliveries.repair_failure_kind, '') <> 'permanent' AND COALESCE((deliveries.message ->> 'presentation_revision')::INTEGER, 0) < $2 ORDER BY deliveries.id LIMIT $3 FOR UPDATE OF deliveries SKIP LOCKED")
-            .bind(channel_id as i64)
-            .bind(CONTRACT_NOTIFICATION_PRESENTATION_REVISION as i32)
-            .bind(limit as i64)
-            .fetch_all(&mut *transaction)
+        let selected = self
+            .rerender_contract_delivery_candidates(channel_id, selector)
             .await?;
-        let mut candidates = Vec::with_capacity(rows.len());
-        for row in rows {
-            let delivery_id: i64 = row.get("id");
-            let stored_message: ContractNotificationMessage =
-                serde_json::from_value(row.get("message")).map_err(json_to_sqlx)?;
-            let Ok(event) = serde_json::from_value::<ContractEvent>(row.get("event")) else {
-                continue;
-            };
+        if selected.candidates.is_empty() {
+            return Ok(selected);
+        }
+        let delivery_ids = selected
+            .candidates
+            .iter()
+            .map(|candidate| candidate.candidate.delivery_id)
+            .collect::<Vec<_>>();
+        let mut transaction = self.pool.begin().await?;
+        let locked = self
+            .select_contract_delivery_rerender_candidates(
+                &mut transaction,
+                channel_id,
+                &ContractDeliveryRerenderSelector::DeliveryIds(delivery_ids),
+                true,
+            )
+            .await?;
+        for candidate in &locked.candidates {
+            let event = self.reconstruct_historical_matched_range(candidate).await?;
             let (issuer_history, corporation_history) = self
                 .contract_party_history(
                     event.contract.issuer_id,
@@ -5922,35 +6077,81 @@ impl ContractCollectionStore {
                 .await?;
             let regenerated = contract_notification_message(
                 &event,
-                historical_contract_primary_item(&event, &stored_message),
+                historical_contract_primary_item(&event, &candidate.stored_message),
                 &issuer_history,
                 &corporation_history,
                 false,
             );
-            let desired_message =
-                repaired_contract_message(&stored_message, &regenerated, event.kind);
-            sqlx::query("UPDATE contract_outbound_deliveries SET desired_message = $2, repair_status = 'pending', repair_revision = repair_revision + 1, repair_prepared_at = now(), repair_next_attempt_at = NULL, repair_failure_kind = NULL, repair_last_error = NULL, repair_failed_at = NULL, repair_failure_resolved_at = NULL WHERE id = $1")
-                .bind(delivery_id)
+            let desired_message = repaired_contract_message(
+                &candidate.stored_message,
+                &regenerated,
+                candidate.event.kind,
+            );
+            sqlx::query("UPDATE contract_outbound_deliveries SET event = $2, desired_message = $3, repair_status = 'pending', repair_revision = repair_revision + 1, repair_prepared_at = now(), repair_next_attempt_at = NULL, repair_failure_kind = NULL, repair_last_error = NULL, repair_failed_at = NULL, repair_failure_resolved_at = NULL WHERE id = $1")
+                .bind(candidate.candidate.delivery_id)
+                .bind(serde_json::to_value(event).map_err(json_to_sqlx)?)
                 .bind(serde_json::to_value(desired_message).map_err(json_to_sqlx)?)
                 .execute(&mut *transaction)
                 .await?;
             sqlx::query("INSERT INTO contract_delivery_audit (delivery_id, action, actor, occurred_at, detail) VALUES ($1, 'rerendered', $2, $3, 'operator queued historical contract format rerender')")
-                .bind(delivery_id)
+                .bind(candidate.candidate.delivery_id)
                 .bind(actor)
                 .bind(occurred_at)
                 .execute(&mut *transaction)
                 .await?;
-            candidates.push(ContractDeliveryRerenderCandidate {
-                delivery_id,
-                contract_id: row.get("contract_id"),
-                event_kind: contract_delivery_event_kind_from_str(
-                    &row.get::<String, _>("event_kind"),
-                )?,
-                discord_message_id: row.get("discord_message_id"),
-            });
         }
         transaction.commit().await?;
-        Ok(candidates)
+        Ok(ContractDeliveryRerenderSelection {
+            candidates: locked.candidates,
+            excluded: selected.excluded,
+        })
+    }
+
+    async fn reconstruct_historical_matched_range(
+        &self,
+        candidate: &ValidatedContractDeliveryRerenderCandidate,
+    ) -> Result<ContractEvent, sqlx::Error> {
+        let mut event = candidate.event.clone();
+        if event.embed_context.matched_range.is_some() {
+            return Ok(event);
+        }
+        let Some(range) = retained_direct_positive_range(&event, &candidate.subscription.filter)
+        else {
+            return Ok(event);
+        };
+        let reference_system_name = event
+            .context
+            .range_center_names
+            .get(&range.reference_system_id)
+            .cloned()
+            .or(self
+                .retained_range_center_name(range.reference_system_id)
+                .await?)
+            .map(|name| sanitize_contract_text(&name))
+            .filter(|name| !name.is_empty());
+        let Some(reference_system_name) = reference_system_name else {
+            return Ok(event);
+        };
+        event.embed_context.matched_range = contract_matched_range_for_embed(
+            MatchedContractRange {
+                light_years: range.light_years,
+                reference_system_id: range.reference_system_id,
+                reference_system_name,
+            },
+            &event.embed_context.location,
+        );
+        Ok(event)
+    }
+
+    async fn retained_range_center_name(
+        &self,
+        system_id: u32,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let key = format!("universe/systems/{system_id}/range-center-name");
+        Ok(self
+            .cache(&key)
+            .await?
+            .and_then(|cached| serde_json::from_value::<String>(cached.response).ok()))
     }
 
     pub async fn inspect_contract_delivery(
@@ -6419,7 +6620,7 @@ impl ContractCollectionStore {
         &self,
         attempted_at: DateTime<Utc>,
     ) -> Result<Vec<ContractMessageEdit>, sqlx::Error> {
-        sqlx::query("SELECT id, channel_id, discord_message_id, contract_id, event_kind, desired_message, repair_revision, repair_claim_token, repair_attempt_count FROM contract_outbound_deliveries WHERE status = 'sent' AND repair_status = 'pending' AND desired_message IS NOT NULL AND (repair_next_attempt_at IS NULL OR repair_next_attempt_at <= $1) AND (repair_lease_until IS NULL OR repair_lease_until <= $1) ORDER BY repair_prepared_at, id")
+        sqlx::query("SELECT id, channel_id, discord_message_id, contract_id, event_kind, desired_message, repair_revision, repair_claim_token, repair_attempt_count FROM contract_outbound_deliveries WHERE status = 'sent' AND repair_status = 'pending' AND desired_message IS NOT NULL AND (repair_next_attempt_at IS NULL OR repair_next_attempt_at <= $1) AND (repair_lease_until IS NULL OR repair_lease_until <= $1) AND NOT EXISTS (SELECT 1 FROM contract_outbound_deliveries AS deferred WHERE deferred.status = 'sent' AND deferred.repair_status = 'pending' AND deferred.repair_next_attempt_at > $1) ORDER BY repair_prepared_at, id")
             .bind(attempted_at)
             .fetch_all(&self.pool)
             .await?
@@ -7620,7 +7821,7 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
             }
         };
         let mut transaction = self.pool.begin().await?;
-        let resolved = sqlx::query_scalar::<_, i64>("UPDATE contract_resolution_cases SET state = $3, acceptance_provenance = $4, acceptance_response_metadata = $5, acceptance_evidence_at = CASE WHEN $4 IS NULL THEN NULL ELSE $6 END, notification_pending = NOT suppresses_nonfinancial_notification, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution' RETURNING contract_id")
+        let resolved = sqlx::query_scalar::<_, i64>("UPDATE contract_resolution_cases SET state = $3, acceptance_provenance = $4, acceptance_response_metadata = $5, acceptance_evidence_at = $6, notification_pending = NOT suppresses_nonfinancial_notification, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution' RETURNING contract_id")
             .bind(resolution.region_id)
             .bind(resolution.contract_id)
             .bind(state_name)
@@ -7638,6 +7839,7 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
                 .bind(serde_json::json!({
                     "last_public_observed_at": resolution.last_public_observed_at,
                     "absence_observed_at": resolution.absence_observed_at,
+                    "evidence_response_at": observed_at,
                     "provenance": provenance.map(ContractAcceptanceProvenance::as_str),
                 }))
                 .execute(&mut *transaction)
@@ -7771,7 +7973,14 @@ pub async fn execute_operator_delivery_cli(
         "rerender" => {
             reject_unknown_operator_delivery_options(
                 &flags,
-                &["--channel", "--limit", "--dry-run", "--queue", "--actor"],
+                &[
+                    "--channel",
+                    "--limit",
+                    "--delivery-ids",
+                    "--dry-run",
+                    "--queue",
+                    "--actor",
+                ],
             )?;
             let dry_run = flags.contains_key("--dry-run");
             let queue = flags.contains_key("--queue");
@@ -7779,24 +7988,42 @@ pub async fn execute_operator_delivery_cli(
                 return Err("rerender requires exactly one of --dry-run or --queue".to_string());
             }
             let channel_id = required_positive_operator_delivery_id(&flags, "--channel")? as u64;
-            let limit = required_operator_delivery_limit(&flags)?;
-            let candidates = if dry_run {
+            let selector = if flags.contains_key("--delivery-ids") {
+                if flags.contains_key("--limit") {
+                    return Err("--delivery-ids conflicts with --limit".to_string());
+                }
+                ContractDeliveryRerenderSelector::DeliveryIds(required_operator_delivery_ids(
+                    &flags,
+                    "--delivery-ids",
+                )?)
+            } else {
+                ContractDeliveryRerenderSelector::Limit(required_operator_delivery_limit(&flags)?)
+            };
+            let selection = if dry_run {
                 store
-                    .rerender_contract_delivery_candidates(channel_id, limit)
+                    .rerender_contract_delivery_candidates(channel_id, &selector)
                     .await
                     .map_err(|error| error.to_string())?
             } else {
                 store
-                    .queue_contract_delivery_rerenders(channel_id, limit, actor, now)
+                    .queue_contract_delivery_rerenders(channel_id, &selector, actor, now)
                     .await
                     .map_err(|error| error.to_string())?
             };
+            let excluded_count = selection.excluded.len();
+            let candidates = selection
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.candidate)
+                .collect::<Vec<_>>();
             Ok(OperatorDeliveryCliResult::Rerendered(
                 ContractDeliveryRerenderReport {
                     channel_id,
                     dry_run,
                     eligible_count: candidates.len(),
                     candidates,
+                    excluded_count,
+                    excluded: selection.excluded,
                 },
             ))
         }
@@ -7877,6 +8104,36 @@ fn required_operator_delivery_limit(flags: &BTreeMap<&str, Option<&str>>) -> Res
         ));
     }
     Ok(limit)
+}
+
+fn required_operator_delivery_ids(
+    flags: &BTreeMap<&str, Option<&str>>,
+    name: &str,
+) -> Result<Vec<i64>, String> {
+    let values = required_operator_delivery_option(flags, name)?
+        .split(',')
+        .map(str::trim)
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .map_err(|_| format!("{name} must be comma-separated positive integers"))
+                .and_then(|value| {
+                    (value > 0)
+                        .then_some(value)
+                        .ok_or_else(|| format!("{name} must be comma-separated positive integers"))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() || values.len() > CONTRACT_DELIVERY_RERENDER_MAX_LIMIT {
+        return Err(format!(
+            "{name} must contain between 1 and {CONTRACT_DELIVERY_RERENDER_MAX_LIMIT} IDs"
+        ));
+    }
+    let unique = values.iter().copied().collect::<BTreeSet<_>>();
+    if unique.len() != values.len() {
+        return Err(format!("{name} must not contain duplicate IDs"));
+    }
+    Ok(values)
 }
 
 fn contract_subscription_from_row(
@@ -9204,11 +9461,11 @@ impl ContractCollector {
         provenance: Option<ContractAcceptanceProvenance>,
         metadata: Option<&CacheMetadata>,
     ) -> Result<Option<ContractEvent>, ContractCollectionError> {
-        let acceptance_evidence = provenance.map(|provenance| ContractAcceptanceEvidence {
+        let acceptance_evidence = Some(ContractAcceptanceEvidence {
             last_public_observed_at: resolution.last_public_observed_at,
             absence_observed_at: resolution.absence_observed_at,
             evidence_response_at: observed_at,
-            provenance: Some(provenance),
+            provenance,
         });
         if self
             .store
@@ -10518,7 +10775,7 @@ impl ContractCollector {
                     contract_id = edit.contract_id,
                     "contract message repair remains pending after retryable Discord failure: {error}"
                 );
-                Ok(false)
+                Ok(true)
             }
         }
     }
@@ -11230,20 +11487,15 @@ fn terminal_resolution_event(resolution: &TerminalContractResolution) -> Option<
             resolution.acceptance_provenance?,
         ),
         ContractResolutionState::Expired | ContractResolutionState::ClosedOutcomeUnknown => {
-            let acceptance_evidence = match (
-                resolution.acceptance_evidence_at,
-                resolution.acceptance_provenance,
-            ) {
-                (Some(evidence_response_at), Some(ContractAcceptanceProvenance::NoContent)) => {
-                    Some(ContractAcceptanceEvidence {
+            let acceptance_evidence =
+                resolution
+                    .acceptance_evidence_at
+                    .map(|evidence_response_at| ContractAcceptanceEvidence {
                         last_public_observed_at: resolution.last_public_observed_at,
                         absence_observed_at: resolution.absence_observed_at,
                         evidence_response_at,
-                        provenance: Some(ContractAcceptanceProvenance::NoContent),
-                    })
-                }
-                _ => None,
-            };
+                        provenance: resolution.acceptance_provenance,
+                    });
             nonfinancial_terminal_event(
                 &AwaitingContractResolution {
                     region_id: resolution.region_id,
@@ -12050,7 +12302,7 @@ fn contract_notification_message(
         .unwrap_or_else(|| "Public contract".to_string());
     let title_location = contract_title_location(&event.embed_context.location);
     let title_isk = title_isk(event, primary_item);
-    let (title, _title_has_isk) = contract_embed_title(
+    let title = contract_embed_title(
         &primary_name,
         event.kind,
         title_isk.as_deref(),
@@ -12107,13 +12359,9 @@ fn contract_notification_message(
                 .acceptance_evidence
                 .as_ref()
                 .map(|evidence| evidence.evidence_response_at),
-            ContractEventKind::Expired => Some(event.contract.date_expired),
-            ContractEventKind::ClosedOutcomeUnknown => event
+            ContractEventKind::Expired | ContractEventKind::ClosedOutcomeUnknown => event
                 .acceptance_evidence
                 .as_ref()
-                .filter(|evidence| {
-                    evidence.provenance == Some(ContractAcceptanceProvenance::NoContent)
-                })
                 .map(|evidence| evidence.absence_observed_at),
         },
     };
@@ -12150,20 +12398,10 @@ fn contract_notification_message(
         event.kind,
         ContractEventKind::Expired | ContractEventKind::ClosedOutcomeUnknown
     ) {
-        if let Some(evidence) = event
-            .acceptance_evidence
-            .as_ref()
-            .filter(|evidence| evidence.provenance == Some(ContractAcceptanceProvenance::NoContent))
-        {
-            let (window_name, semantic_esi_result) = match event.kind {
-                ContractEventKind::ClosedOutcomeUnknown => (
-                    "Observed closure window",
-                    "Public listing absent before expiry boundary",
-                ),
-                ContractEventKind::Expired => (
-                    "Observed expiry window",
-                    "Public listing absent after expiry boundary",
-                ),
+        if let Some(evidence) = event.acceptance_evidence.as_ref() {
+            let window_name = match event.kind {
+                ContractEventKind::ClosedOutcomeUnknown => "Observed closure window",
+                ContractEventKind::Expired => "Observed expiry window",
                 _ => unreachable!("only nonfinancial terminal events reach this branch"),
             };
             message.fields.push(ContractEmbedField {
@@ -12180,11 +12418,20 @@ fn contract_notification_message(
                 ),
                 inline: false,
             });
-            message.fields.push(ContractEmbedField {
-                name: "ESI result".to_string(),
-                value: semantic_esi_result.to_string(),
-                inline: false,
-            });
+            if evidence.provenance == Some(ContractAcceptanceProvenance::NoContent) {
+                let semantic_esi_result = match event.kind {
+                    ContractEventKind::ClosedOutcomeUnknown => {
+                        "Public listing absent before expiry boundary"
+                    }
+                    ContractEventKind::Expired => "Public listing absent after expiry boundary",
+                    _ => unreachable!("only nonfinancial terminal events reach this branch"),
+                };
+                message.fields.push(ContractEmbedField {
+                    name: "ESI result".to_string(),
+                    value: semantic_esi_result.to_string(),
+                    inline: false,
+                });
+            }
         }
     }
     if has_history {
@@ -12328,6 +12575,106 @@ fn historical_contract_primary_item<'a>(
         })
 }
 
+enum RetainedRangeMatch {
+    Matched(Option<RetainedMatchedRange>),
+    Unmatched,
+    Unresolved,
+}
+
+struct RetainedMatchedRange {
+    light_years: f64,
+    reference_system_id: u32,
+}
+
+fn retained_direct_positive_range(
+    event: &ContractEvent,
+    filter: &ContractFilter,
+) -> Option<RetainedMatchedRange> {
+    let ContractFilterNode::And(nodes) = &filter.root else {
+        return None;
+    };
+    let mut matched_range: Option<RetainedMatchedRange> = None;
+    let mut has_direct_range = false;
+    for node in nodes {
+        let ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(ranges)) = node
+        else {
+            continue;
+        };
+        has_direct_range = true;
+        match retained_light_year_range_match(event, ranges) {
+            RetainedRangeMatch::Matched(Some(range)) => {
+                matched_range = match matched_range {
+                    Some(current)
+                        if range.light_years > current.light_years
+                            || (range.light_years == current.light_years
+                                && range.reference_system_id >= current.reference_system_id) =>
+                    {
+                        Some(current)
+                    }
+                    _ => Some(range),
+                };
+            }
+            RetainedRangeMatch::Matched(None) => {}
+            RetainedRangeMatch::Unmatched | RetainedRangeMatch::Unresolved => return None,
+        }
+    }
+    has_direct_range.then_some(matched_range).flatten()
+}
+
+fn retained_light_year_range_match(
+    event: &ContractEvent,
+    ranges: &[SystemRange],
+) -> RetainedRangeMatch {
+    let Some(event_position) = event
+        .context
+        .solar_system_position
+        .filter(|position| position.is_finite())
+    else {
+        return RetainedRangeMatch::Unresolved;
+    };
+    let mut matched = false;
+    let mut unresolved = false;
+    let mut matched_range: Option<RetainedMatchedRange> = None;
+    for range in ranges {
+        let Some(center_position) = event
+            .context
+            .range_center_positions
+            .get(&range.system_id)
+            .copied()
+            .filter(|position| position.is_finite())
+        else {
+            unresolved = true;
+            continue;
+        };
+        let light_years = event_position.distance_in_light_years(center_position);
+        if light_years > range.range {
+            continue;
+        }
+        matched = true;
+        let candidate = RetainedMatchedRange {
+            light_years,
+            reference_system_id: range.system_id,
+        };
+        matched_range = match matched_range {
+            Some(current)
+                if candidate.light_years > current.light_years
+                    || (candidate.light_years == current.light_years
+                        && candidate.reference_system_id >= current.reference_system_id) =>
+            {
+                Some(current)
+            }
+            _ => Some(candidate),
+        };
+    }
+    if matched {
+        RetainedRangeMatch::Matched(matched_range)
+    } else if unresolved {
+        RetainedRangeMatch::Unresolved
+    } else {
+        RetainedRangeMatch::Unmatched
+    }
+}
+
 fn proximity_out_of_range_contract_message(
     stored: &ContractNotificationMessage,
 ) -> ContractNotificationMessage {
@@ -12344,6 +12691,7 @@ fn proximity_out_of_range_contract_message(
 
 const MAX_EMBED_TITLE_CHARACTERS: usize = 256;
 const MAX_EMBED_DESCRIPTION_CHARACTERS: usize = 4096;
+const MAX_EMBED_AUTHOR_NAME_CHARACTERS: usize = 256;
 const MAX_EMBED_FIELD_NAME_CHARACTERS: usize = 256;
 const MAX_EMBED_FIELD_VALUE_CHARACTERS: usize = 1024;
 const MAX_EMBED_CHARACTERS: usize = 6000;
@@ -12358,7 +12706,7 @@ fn contract_embed_title(
     kind: ContractEventKind,
     title_isk: Option<&str>,
     location: &str,
-) -> (String, bool) {
+) -> String {
     let definitive_title = match kind {
         ContractEventKind::SaleConfirmed => {
             title_isk.map(|isk| format!("{primary_name} contract accepted • {isk}"))
@@ -12375,7 +12723,7 @@ fn contract_embed_title(
     if let Some(title) =
         definitive_title.filter(|title| title.chars().count() <= MAX_EMBED_TITLE_CHARACTERS)
     {
-        return (title, true);
+        return title;
     }
     let action = match kind {
         ContractEventKind::Listed => "listed",
@@ -12388,14 +12736,11 @@ fn contract_embed_title(
     if let Some(title) =
         with_isk.filter(|title| title.chars().count() <= MAX_EMBED_TITLE_CHARACTERS)
     {
-        return (title, true);
+        return title;
     }
-    (
-        bounded_text(
-            &format!("{primary_name} {action}{location}"),
-            MAX_EMBED_TITLE_CHARACTERS,
-        ),
-        false,
+    bounded_text(
+        &format!("{primary_name} {action}{location}"),
+        MAX_EMBED_TITLE_CHARACTERS,
     )
 }
 
@@ -12652,8 +12997,17 @@ fn bound_terminal_embed_message(message: &mut ContractNotificationMessage) {
         .retain(|field| !field.value.trim().is_empty());
     message.fields.truncate(MAX_TERMINAL_EMBED_FIELDS);
     while listing_content_lines(message) > MAX_TERMINAL_CONTENT_LINES {
-        if message.fields.pop().is_none() {
+        let Some(history) = message
+            .fields
+            .iter_mut()
+            .find(|field| field.name == "History")
+        else {
             break;
+        };
+        if history.value.contains('\n') {
+            history.value = history.value.replace('\n', " • ");
+        } else {
+            message.fields.retain(|field| field.name != "History");
         }
     }
 }
@@ -12664,6 +13018,10 @@ fn bound_embed_message(message: &mut ContractNotificationMessage) {
         .description
         .as_deref()
         .map(|description| bounded_text(description, MAX_EMBED_DESCRIPTION_CHARACTERS));
+    message.author = message
+        .author
+        .as_deref()
+        .map(|author| bounded_text(author, MAX_EMBED_AUTHOR_NAME_CHARACTERS));
     for field in &mut message.fields {
         field.name = bounded_text(&field.name, MAX_EMBED_FIELD_NAME_CHARACTERS);
         field.value = bounded_text(&field.value, MAX_EMBED_FIELD_VALUE_CHARACTERS);
@@ -12701,6 +13059,12 @@ fn embed_character_count(message: &ContractNotificationMessage) -> usize {
             .unwrap_or(0)
         + message
             .footer
+            .as_deref()
+            .map(str::chars)
+            .map(Iterator::count)
+            .unwrap_or(0)
+        + message
+            .author
             .as_deref()
             .map(str::chars)
             .map(Iterator::count)
@@ -13820,6 +14184,79 @@ mod embed_tests {
     }
 
     #[test]
+    fn terminal_no_content_embed_trims_history_before_proximity_alert() {
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 8, 18, 22, 1, 0)
+            .single()
+            .expect("fixed observation time");
+        let mut event = event(ContractEventKind::ClosedOutcomeUnknown);
+        event.acceptance_evidence = Some(ContractAcceptanceEvidence {
+            last_public_observed_at: observed_at - ChronoDuration::minutes(2),
+            absence_observed_at: observed_at - ChronoDuration::minutes(1),
+            evidence_response_at: observed_at,
+            provenance: Some(ContractAcceptanceProvenance::NoContent),
+        });
+        let history = ContractPartyHistory {
+            confirmed_sales: 4,
+            confirmed_purchases: 2,
+            unknown_closures: 1,
+            most_recent_confirmed: Some(MostRecentConfirmedContractEvent {
+                kind: ContractEventKind::SaleConfirmed,
+                observed_at: observed_at - ChronoDuration::hours(1),
+            }),
+        };
+
+        assert!(3 + 2 + 4 + 1 + 2 + 1 > MAX_TERMINAL_CONTENT_LINES);
+        let message = contract_notification_message(
+            &event,
+            Some(&event.offered_items[0]),
+            &history,
+            &history,
+            true,
+        );
+
+        let description = message.description.as_deref().expect("contract context");
+        assert_eq!(description.lines().count(), 3);
+        assert!(description.contains("contract:0//45"));
+        assert!(description.contains("**in:**"));
+        assert!(description.contains("**on:**"));
+        assert!(field(&message, "Listing time").is_some());
+        assert!(field(&message, "Observed closure window").is_some());
+        assert_eq!(
+            field(&message, "ESI result"),
+            Some("Public listing absent before expiry boundary")
+        );
+        assert!(field(&message, "History").is_some_and(|history| {
+            history.contains("Issuer: 4 sales")
+                && history.contains("Corp: 4 sales")
+                && !history.contains('\n')
+        }));
+        assert_eq!(field(&message, "Alert"), Some("Proximity-Unverified"));
+        assert!(message.fields.len() <= MAX_TERMINAL_EMBED_FIELDS);
+        assert!(listing_content_lines(&message) <= MAX_TERMINAL_CONTENT_LINES);
+        assert!(message.title.chars().count() <= MAX_EMBED_TITLE_CHARACTERS);
+        assert!(message
+            .description
+            .as_deref()
+            .is_none_or(
+                |description| description.chars().count() <= MAX_EMBED_DESCRIPTION_CHARACTERS
+            ));
+        assert!(message
+            .author
+            .as_deref()
+            .is_none_or(|author| author.chars().count() <= MAX_EMBED_AUTHOR_NAME_CHARACTERS));
+        assert!(message
+            .footer
+            .as_deref()
+            .is_none_or(|footer| footer.chars().count() <= 2048));
+        assert!(message.fields.iter().all(|field| {
+            field.name.chars().count() <= MAX_EMBED_FIELD_NAME_CHARACTERS
+                && field.value.chars().count() <= MAX_EMBED_FIELD_VALUE_CHARACTERS
+        }));
+        assert!(embed_character_count(&message) <= MAX_EMBED_CHARACTERS);
+    }
+
+    #[test]
     fn contract_history_uses_a_native_confirmation_date() {
         let confirmed_at = Utc
             .with_ymd_and_hms(2026, 8, 18, 12, 1, 0)
@@ -14225,7 +14662,7 @@ mod embed_tests {
                 })
                 .collect(),
             presentation_revision: CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
-            author: None,
+            author: Some("A".repeat(257)),
             thumbnail_url: None,
             footer: Some("F".repeat(2048)),
             timestamp: None,
@@ -14233,10 +14670,25 @@ mod embed_tests {
 
         bound_embed_message(&mut message);
 
+        assert_eq!(
+            message
+                .author
+                .as_deref()
+                .expect("bounded author")
+                .chars()
+                .count(),
+            256
+        );
         assert!(
             message.title.chars().count()
                 + message
                     .description
+                    .as_deref()
+                    .map(str::chars)
+                    .map(Iterator::count)
+                    .unwrap_or(0)
+                + message
+                    .author
                     .as_deref()
                     .map(str::chars)
                     .map(Iterator::count)

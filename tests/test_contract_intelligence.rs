@@ -6353,8 +6353,8 @@ async fn operator_location_evidence_reconciles_unverified_alerts_by_location_aft
     let edits = resolved_delivery.edits.lock().unwrap();
     assert_eq!(
         edits.len(),
-        3,
-        "both in-range and out-of-range alerts are corrected"
+        1,
+        "the first retryable edit stops the repair batch at its persisted boundary"
     );
     assert!(edits.iter().all(|edit| !edit
         .message
@@ -10920,9 +10920,9 @@ async fn retained_evidence_reconciles_each_terminal_lifecycle_without_recursive_
     assert!(reconciled.sent.lock().unwrap().is_empty());
     let intermediate_edits = reconciled.edits.lock().unwrap();
     let intermediate_edit_count = intermediate_edits.len();
-    assert_eq!(
-        intermediate_edit_count, 4,
-        "format repairs may refresh retained terminal presentation without resolving U"
+    assert!(
+        (1..=4).contains(&intermediate_edit_count),
+        "only stale retained terminal presentations need an intermediate U-preserving repair"
     );
     assert!(intermediate_edits.iter().all(|edit| {
         edit.message.presentation_revision == CONTRACT_NOTIFICATION_PRESENTATION_REVISION
@@ -10999,7 +10999,7 @@ async fn retained_evidence_reconciles_each_terminal_lifecycle_without_recursive_
     assert_eq!(
         reconciled_edits.len(),
         intermediate_edit_count + 4,
-        "each terminal first receives a presentation repair, then one authoritative edit"
+        "each terminal receives one authoritative edit after any needed presentation repair"
     );
     assert_eq!(
         reconciled.sent.lock().unwrap().len(),
@@ -12165,11 +12165,22 @@ async fn expired_and_unknown_terminal_outcomes_use_independent_actions_and_are_i
             .fields
             .iter()
             .all(|field| !matches!(field.name.as_str(), "Event" | "Delay")));
+        let expected_window = match message.event_kind {
+            ContractEventKind::Expired => "Observed expiry window",
+            ContractEventKind::ClosedOutcomeUnknown => "Observed closure window",
+            _ => unreachable!("only nonfinancial terminal events reach this assertion"),
+        };
         assert!(message
             .message
             .fields
             .iter()
-            .any(|field| field.name == "Evidence"));
+            .any(|field| field.name == expected_window));
+        assert!(message
+            .message
+            .fields
+            .iter()
+            .all(|field| field.name != "Evidence"));
+        assert!(message.message.timestamp.is_some());
     }
     drop(sent);
     assert_eq!(
@@ -14772,7 +14783,7 @@ async fn contract_migrations_apply_to_clean_and_already_current_databases() {
         .fetch_one(&validation_pool)
         .await
         .expect("read already-current migration ledger");
-    assert_eq!(current_migration_count, 24);
+    assert_eq!(current_migration_count, 25);
     assert_eq!(
         current_store
             .storage_counts()
@@ -17318,6 +17329,324 @@ fn cli_output(output: &std::process::Output) -> String {
     )
 }
 
+fn rerender_test_event(contract_id: i64, kind: ContractEventKind) -> ContractEvent {
+    let acceptance_evidence = match kind {
+        ContractEventKind::SaleConfirmed => Some(ContractAcceptanceEvidence {
+            last_public_observed_at: Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0).unwrap(),
+            absence_observed_at: Utc.with_ymd_and_hms(2026, 8, 14, 12, 5, 0).unwrap(),
+            evidence_response_at: Utc.with_ymd_and_hms(2026, 8, 14, 12, 6, 0).unwrap(),
+            provenance: Some(
+                killbot_rust::contract_intelligence::ContractAcceptanceProvenance::AcceptedByPlayer,
+            ),
+        }),
+        ContractEventKind::ClosedOutcomeUnknown => Some(ContractAcceptanceEvidence {
+            last_public_observed_at: Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0).unwrap(),
+            absence_observed_at: Utc.with_ymd_and_hms(2026, 8, 14, 12, 5, 0).unwrap(),
+            evidence_response_at: Utc.with_ymd_and_hms(2026, 8, 14, 12, 6, 0).unwrap(),
+            provenance: Some(
+                killbot_rust::contract_intelligence::ContractAcceptanceProvenance::NoContent,
+            ),
+        }),
+        _ => None,
+    };
+    ContractEvent {
+        region_id: 10_000_002,
+        kind,
+        contract: item_exchange_contract(contract_id),
+        offered_items: vec![offered_ship(contract_id)],
+        requested_items: vec![],
+        context: ContractObservationContext::default(),
+        acceptance_evidence,
+        embed_context: ContractEmbedContext {
+            item_names: BTreeMap::from([(587, "Rifter".to_string())]),
+            ..ContractEmbedContext::default()
+        },
+    }
+}
+
+#[tokio::test]
+async fn contract_delivery_rerender_skips_and_reports_malformed_rows_before_the_limit_for_dry_run_and_queue(
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "rerender-malformed",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist rerender subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed malformed rerender history");
+    let legacy_message = serde_json::json!({
+        "title": "Legacy Rifter listed",
+        "description": null,
+        "fields": []
+    });
+    let insert = "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'rerender-malformed', $1, 'listed', $2, $3, TRUE, 'everyone', 'sent', CONCAT('rerender-malformed-', $1), CONCAT('message-', $1)) RETURNING id";
+    let malformed_event_id = sqlx::query_scalar::<_, i64>(insert)
+        .bind(45_i64)
+        .bind(serde_json::json!({}))
+        .bind(&legacy_message)
+        .fetch_one(&pool)
+        .await
+        .expect("seed malformed retained event");
+    let malformed_message_id = sqlx::query_scalar::<_, i64>(insert)
+        .bind(46_i64)
+        .bind(
+            serde_json::to_value(rerender_test_event(46, ContractEventKind::Listed))
+                .expect("serialize retained event"),
+        )
+        .bind(serde_json::json!({"title": 7, "description": null, "fields": []}))
+        .fetch_one(&pool)
+        .await
+        .expect("seed malformed retained message");
+    let valid_id = sqlx::query_scalar::<_, i64>(insert)
+        .bind(47_i64)
+        .bind(
+            serde_json::to_value(rerender_test_event(47, ContractEventKind::Listed))
+                .expect("serialize retained event"),
+        )
+        .bind(&legacy_message)
+        .fetch_one(&pool)
+        .await
+        .expect("seed valid retained event after malformed rows");
+    pool.close().await;
+
+    let token = "rerender-malformed-test-token-not-for-argv";
+    let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
+    for mode in ["--dry-run", "--queue"] {
+        let output = run_contract_delivery_cli(
+            &database.url,
+            &digest,
+            Some(token),
+            &["rerender", "--channel", "77", "--limit", "1", mode],
+        );
+        assert!(output.status.success(), "{}", cli_output(&output));
+        let report: Value = serde_json::from_slice(&output.stdout).expect("rerender JSON result");
+        assert_eq!(report["eligible_count"], 1);
+        assert_eq!(report["candidates"][0]["delivery_id"], valid_id);
+        assert_eq!(report["excluded_count"], 2);
+        assert_eq!(
+            report["excluded"]
+                .as_array()
+                .expect("malformed retained rows are reported")
+                .iter()
+                .map(|row| row["delivery_id"].as_i64())
+                .collect::<Vec<_>>(),
+            vec![Some(malformed_event_id), Some(malformed_message_id)]
+        );
+    }
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect rerender queue after malformed rows");
+    let states: Vec<(i64, String, Option<Value>, i64)> = sqlx::query_as(
+        "SELECT id, repair_status, desired_message, (SELECT count(*) FROM contract_delivery_audit WHERE delivery_id = contract_outbound_deliveries.id AND action = 'rerendered') FROM contract_outbound_deliveries ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read rerender states");
+    assert_eq!(states.len(), 3);
+    assert_eq!(states[0], (malformed_event_id, "none".to_string(), None, 0));
+    assert_eq!(
+        states[1],
+        (malformed_message_id, "none".to_string(), None, 0)
+    );
+    assert_eq!(states[2].0, valid_id);
+    assert_eq!(states[2].1, "pending");
+    assert!(states[2].2.is_some());
+    assert_eq!(states[2].3, 1);
+    assert_eq!(
+        states[2]
+            .2
+            .as_ref()
+            .and_then(|message| message.get("presentation_revision"))
+            .and_then(Value::as_u64),
+        Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into())
+    );
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn contract_delivery_rerender_queues_exact_explicit_listing_sale_and_closed_canaries() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "rerender-canaries",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist canary rerender subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed rerender canaries");
+    let legacy_message = serde_json::json!({
+        "title": "Legacy Rifter contract",
+        "description": null,
+        "fields": []
+    });
+    let insert = "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'rerender-canaries', $1, $2, $3, $4, TRUE, 'everyone', 'sent', CONCAT('rerender-canary-', $1), CONCAT('canary-message-', $1)) RETURNING id";
+    let mut delivery_ids = Vec::new();
+    for (contract_id, kind, stored_event_kind) in [
+        (45_i64, ContractEventKind::Listed, "listed"),
+        (46, ContractEventKind::SaleConfirmed, "sale_confirmed"),
+        (
+            47,
+            ContractEventKind::ClosedOutcomeUnknown,
+            "closed_outcome_unknown",
+        ),
+        (48, ContractEventKind::Listed, "listed"),
+    ] {
+        delivery_ids.push(
+            sqlx::query_scalar::<_, i64>(insert)
+                .bind(contract_id)
+                .bind(stored_event_kind)
+                .bind(
+                    serde_json::to_value(rerender_test_event(contract_id, kind))
+                        .expect("serialize retained canary event"),
+                )
+                .bind(&legacy_message)
+                .fetch_one(&pool)
+                .await
+                .expect("seed retained rerender canary"),
+        );
+    }
+    pool.close().await;
+
+    let token = "rerender-canary-test-token-not-for-argv";
+    let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let selected = delivery_ids[..3]
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let dry_run = run_contract_delivery_cli(
+        &database.url,
+        &digest,
+        Some(token),
+        &[
+            "rerender",
+            "--channel",
+            "77",
+            "--delivery-ids",
+            &selected,
+            "--dry-run",
+        ],
+    );
+    assert!(dry_run.status.success(), "{}", cli_output(&dry_run));
+    let dry_run_report: Value =
+        serde_json::from_slice(&dry_run.stdout).expect("canary dry-run JSON result");
+    assert_eq!(dry_run_report["eligible_count"], 3);
+    assert_eq!(dry_run_report["excluded_count"], 0);
+    assert_eq!(
+        dry_run_report["candidates"]
+            .as_array()
+            .expect("exact dry-run canary candidates")
+            .iter()
+            .map(|candidate| candidate["delivery_id"].as_i64())
+            .collect::<Vec<_>>(),
+        delivery_ids[..3]
+            .iter()
+            .copied()
+            .map(Some)
+            .collect::<Vec<_>>()
+    );
+    let output = run_contract_delivery_cli(
+        &database.url,
+        &digest,
+        Some(token),
+        &[
+            "rerender",
+            "--channel",
+            "77",
+            "--delivery-ids",
+            &selected,
+            "--queue",
+        ],
+    );
+    assert!(output.status.success(), "{}", cli_output(&output));
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("canary rerender JSON result");
+    assert_eq!(report["eligible_count"], 3);
+    assert_eq!(report["excluded_count"], 0);
+    assert_eq!(
+        report["candidates"]
+            .as_array()
+            .expect("exact canary candidates")
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate["delivery_id"].as_i64(),
+                    candidate["event_kind"].as_str(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (Some(delivery_ids[0]), Some("listed")),
+            (Some(delivery_ids[1]), Some("sale_confirmed")),
+            (Some(delivery_ids[2]), Some("closed_outcome_unknown")),
+        ]
+    );
+
+    let conflicting_limit = run_contract_delivery_cli(
+        &database.url,
+        &digest,
+        Some(token),
+        &[
+            "rerender",
+            "--channel",
+            "77",
+            "--delivery-ids",
+            &selected,
+            "--limit",
+            "3",
+            "--queue",
+        ],
+    );
+    assert!(!conflicting_limit.status.success());
+    assert!(cli_output(&conflicting_limit).contains("--delivery-ids conflicts with --limit"));
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect exact canary queue state");
+    let states: Vec<(i64, String, Option<Value>, String, bool, String)> = sqlx::query_as(
+        "SELECT id, repair_status, desired_message, discord_message_id, ping, delivery_nonce FROM contract_outbound_deliveries ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read exact canary queue state");
+    assert!(states[..3].iter().all(|state| {
+        state.1 == "pending"
+            && state.2.is_some()
+            && state.3.starts_with("canary-message-")
+            && state.4
+            && state.5.starts_with("rerender-canary-")
+    }));
+    assert_eq!(states[3].0, delivery_ids[3]);
+    assert_eq!(states[3].1, "none");
+    assert_eq!(states[3].2, None);
+    pool.close().await;
+    database.destroy().await;
+}
+
 #[tokio::test]
 async fn contract_delivery_rerender_dry_run_is_channel_scoped_and_does_not_mutate_retained_history()
 {
@@ -17365,9 +17694,21 @@ async fn contract_delivery_rerender_dry_run_is_channel_scoped_and_does_not_mutat
         "title": "Legacy Rifter listed",
         "fields": []
     });
+    let eligible_event = serde_json::to_value(ContractEvent {
+        region_id: 10_000_002,
+        kind: ContractEventKind::Listed,
+        contract: item_exchange_contract(45),
+        offered_items: vec![offered_ship(1)],
+        requested_items: vec![],
+        context: ContractObservationContext::default(),
+        acceptance_evidence: None,
+        embed_context: ContractEmbedContext::default(),
+    })
+    .expect("serialize the retained target event");
     let eligible_id = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'rerender-target', 45, 'listed', '{}'::jsonb, $1, TRUE, 'everyone', 'sent', 'ci-rerender-target', 'retained-message') RETURNING id",
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'rerender-target', 45, 'listed', $1, $2, TRUE, 'everyone', 'sent', 'ci-rerender-target', 'retained-message') RETURNING id",
     )
+    .bind(&eligible_event)
     .bind(&obsolete_message)
     .fetch_one(&pool)
     .await
@@ -17559,6 +17900,12 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
         .expect("seed excluded rerender delivery");
     }
     sqlx::query(
+        "UPDATE contract_outbound_deliveries SET repair_next_attempt_at = NULL, repair_lease_until = TIMESTAMPTZ '2099-01-01T00:00:00Z' WHERE contract_id = 49",
+    )
+    .execute(&pool)
+    .await
+    .expect("keep the unrelated pending repair leased without creating a shared rate boundary");
+    sqlx::query(
         "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'rerender-retired', 51, 'listed', '{}'::jsonb, $1, FALSE, 'here', 'sent', 'ci-rerender-retired', 'retired-message')",
     )
     .bind(&obsolete_message)
@@ -17707,6 +18054,305 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
 }
 
 #[tokio::test]
+async fn contract_delivery_rerender_reconstructs_and_persists_legacy_matched_range_from_retained_context(
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut subscription = contract_subscription(
+        "rerender-legacy-range",
+        ContractItemDirection::Offered,
+        vec![],
+        vec![659],
+        ContractEventAction::Post,
+    );
+    let ContractFilterNode::And(nodes) = &mut subscription.filter.root else {
+        panic!("listed ship subscription has an AND root");
+    };
+    nodes.push(ContractFilterNode::Condition(
+        ContractFilterCondition::LyRangeFrom(vec![
+            config::SystemRange {
+                system_id: 30_002_086,
+                range: 8.0,
+            },
+            config::SystemRange {
+                system_id: 30_003_089,
+                range: 8.0,
+            },
+        ]),
+    ));
+    nodes.push(ContractFilterNode::Not(Box::new(
+        ContractFilterNode::Condition(ContractFilterCondition::Regions(vec![10_000_003])),
+    )));
+    store
+        .upsert_contract_subscription(&subscription)
+        .await
+        .expect("persist retained proximity subscription");
+
+    let legacy_event = ContractEvent {
+        region_id: 10_000_002,
+        kind: ContractEventKind::Listed,
+        contract: item_exchange_contract(45),
+        offered_items: vec![offered_ship(1)],
+        requested_items: vec![],
+        context: ContractObservationContext {
+            solar_system_id: Some(30_000_142),
+            solar_system_resolution: ContractContextResolution::Resolved,
+            solar_system_position: Some(position_at_light_years(0.0)),
+            solar_system_position_resolution: ContractContextResolution::Resolved,
+            range_center_positions: BTreeMap::from([
+                (30_002_086, position_at_light_years(1.0)),
+                (30_003_089, position_at_light_years(2.0)),
+            ]),
+            ..ContractObservationContext::default()
+        },
+        acceptance_evidence: None,
+        embed_context: ContractEmbedContext {
+            observed_at: None,
+            location: ContractLocationContext {
+                location_name: Some("Jita IV - Moon 4".to_string()),
+                location_kind: Some("station".to_string()),
+                solar_system_id: Some(30_000_142),
+                solar_system_name: Some("Jita".to_string()),
+                solar_system_position: Some(position_at_light_years(0.0)),
+                security_status: Some(0.9),
+                region_id: Some(10_000_002),
+                region_name: Some("The Forge".to_string()),
+            },
+            matched_range: None,
+            issuer_character_name: Some("Issuer".to_string()),
+            issuer_corporation_name: Some("Issuer Corp".to_string()),
+            issuer_alliance_id: None,
+            issuer_alliance_name: None,
+            item_names: BTreeMap::from([(587, "Rifter".to_string())]),
+        },
+    };
+    let mut legacy_event = serde_json::to_value(legacy_event).expect("serialize old event JSON");
+    legacy_event
+        .get_mut("context")
+        .and_then(Value::as_object_mut)
+        .expect("serialized context")
+        .remove("range_center_names");
+    assert!(
+        legacy_event
+            .pointer("/embed_context/matched_range")
+            .is_none(),
+        "pre-feature retained events omit the matched range"
+    );
+    assert!(
+        legacy_event
+            .pointer("/context/range_center_names")
+            .is_none(),
+        "pre-feature retained events omit range-center names"
+    );
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed legacy rerender delivery");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, response, updated_at) VALUES ($1, $2, now())",
+    )
+    .bind("universe/systems/30002086/range-center-name")
+    .bind(serde_json::json!("Turnur"))
+    .execute(&pool)
+    .await
+    .expect("seed retained range-center name cache");
+    let delivery_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'rerender-legacy-range', 45, 'listed', $1, $2, FALSE, 'here', 'sent', 'ci-rerender-legacy-range', '9001') RETURNING id",
+    )
+    .bind(&legacy_event)
+    .bind(serde_json::json!({"title":"Legacy Rifter listed","fields":[]}))
+    .fetch_one(&pool)
+    .await
+    .expect("seed legacy rerender delivery");
+    pool.close().await;
+
+    let token = "rerender-legacy-range-token-not-for-argv";
+    let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let queued = run_contract_delivery_cli(
+        &database.url,
+        &digest,
+        Some(token),
+        &["rerender", "--channel", "77", "--limit", "1", "--queue"],
+    );
+    assert!(queued.status.success(), "{}", cli_output(&queued));
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect legacy rerender result");
+    let (event, desired_message): (Value, Value) = sqlx::query_as(
+        "SELECT event, desired_message FROM contract_outbound_deliveries WHERE id = $1",
+    )
+    .bind(delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read queued legacy rerender");
+    let description = desired_message["description"]
+        .as_str()
+        .expect("rerendered message has a description");
+    let expected_range = "**range:** 1.0 LY from Turnur ([Supers](https://evemaps.dotlan.net/jump/Nyx,555/Turnur:Jita)|[FAX](https://evemaps.dotlan.net/jump/Lif,555/Turnur:Jita)|[Blops](https://evemaps.dotlan.net/jump/Sin,555/Turnur:Jita))";
+    let range_line = description
+        .lines()
+        .find(|line| line.starts_with("**range:**"))
+        .expect("rerendered message has a range line");
+    assert_eq!(range_line, expected_range);
+    assert!(!range_line.contains("30002086"));
+    assert!(!range_line.contains("30000142"));
+    assert_eq!(
+        event.pointer("/embed_context/matched_range/reference_system_name"),
+        Some(&Value::String("Turnur".to_string()))
+    );
+    assert_eq!(
+        event.pointer("/embed_context/matched_range/destination_system_name"),
+        Some(&Value::String("Jita".to_string()))
+    );
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn contract_delivery_rerender_does_not_reconstruct_a_range_from_a_failed_nested_or_branch() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let subscription = ContractSubscription {
+        guild_id: 42,
+        channel_id: 77,
+        id: "rerender-nested-range".to_string(),
+        description: "nested range branch".to_string(),
+        filter: ContractFilter {
+            root: ContractFilterNode::And(vec![
+                ContractFilterNode::Condition(ContractFilterCondition::EventKinds(vec![
+                    ContractEventKind::Listed,
+                ])),
+                ContractFilterNode::Or(vec![
+                    ContractFilterNode::And(vec![
+                        ContractFilterNode::Condition(ContractFilterCondition::Regions(vec![
+                            10_000_003,
+                        ])),
+                        ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                            config::SystemRange {
+                                system_id: 30_002_086,
+                                range: 8.0,
+                            },
+                        ])),
+                    ]),
+                    ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                        direction: ContractItemDirection::Offered,
+                        ids: vec![587],
+                    }),
+                ]),
+            ]),
+        },
+        event_actions: ContractEventActions {
+            listed: ContractEventAction::Post,
+            ..ContractEventActions::default()
+        },
+    };
+    store
+        .upsert_contract_subscription(&subscription)
+        .await
+        .expect("persist nested range subscription");
+    let legacy_event = ContractEvent {
+        region_id: 10_000_002,
+        kind: ContractEventKind::Listed,
+        contract: item_exchange_contract(46),
+        offered_items: vec![offered_ship(1)],
+        requested_items: vec![],
+        context: ContractObservationContext {
+            solar_system_id: Some(30_000_142),
+            solar_system_resolution: ContractContextResolution::Resolved,
+            solar_system_position: Some(position_at_light_years(0.0)),
+            solar_system_position_resolution: ContractContextResolution::Resolved,
+            range_center_positions: BTreeMap::from([(30_002_086, position_at_light_years(1.0))]),
+            ..ContractObservationContext::default()
+        },
+        acceptance_evidence: None,
+        embed_context: ContractEmbedContext {
+            location: ContractLocationContext {
+                location_name: Some("Jita IV - Moon 4".to_string()),
+                location_kind: Some("station".to_string()),
+                solar_system_id: Some(30_000_142),
+                solar_system_name: Some("Jita".to_string()),
+                solar_system_position: Some(position_at_light_years(0.0)),
+                security_status: Some(0.9),
+                region_id: Some(10_000_002),
+                region_name: Some("The Forge".to_string()),
+            },
+            item_names: BTreeMap::from([(587, "Rifter".to_string())]),
+            ..ContractEmbedContext::default()
+        },
+    };
+    let mut legacy_event = serde_json::to_value(legacy_event).expect("serialize old event JSON");
+    legacy_event
+        .get_mut("context")
+        .and_then(Value::as_object_mut)
+        .expect("serialized context")
+        .remove("range_center_names");
+    assert!(legacy_event
+        .pointer("/embed_context/matched_range")
+        .is_none());
+    assert!(legacy_event
+        .pointer("/context/range_center_names")
+        .is_none());
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed nested range rerender delivery");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, response, updated_at) VALUES ($1, $2, now())",
+    )
+    .bind("universe/systems/30002086/range-center-name")
+    .bind(serde_json::json!("Turnur"))
+    .execute(&pool)
+    .await
+    .expect("seed retained range-center name cache");
+    let delivery_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'rerender-nested-range', 46, 'listed', $1, $2, FALSE, 'here', 'sent', 'ci-rerender-nested-range', '9002') RETURNING id",
+    )
+    .bind(&legacy_event)
+    .bind(serde_json::json!({"title":"Legacy Rifter listed","fields":[]}))
+    .fetch_one(&pool)
+    .await
+    .expect("seed nested range rerender delivery");
+    pool.close().await;
+
+    let token = "rerender-nested-range-token-not-for-argv";
+    let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let queued = run_contract_delivery_cli(
+        &database.url,
+        &digest,
+        Some(token),
+        &["rerender", "--channel", "77", "--limit", "1", "--queue"],
+    );
+    assert!(queued.status.success(), "{}", cli_output(&queued));
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect nested range rerender result");
+    let (event, desired_message): (Value, Value) = sqlx::query_as(
+        "SELECT event, desired_message FROM contract_outbound_deliveries WHERE id = $1",
+    )
+    .bind(delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read queued nested range rerender");
+    assert!(event.pointer("/embed_context/matched_range").is_none());
+    assert!(!desired_message["description"]
+        .as_str()
+        .expect("rerendered message has a description")
+        .contains("**range:**"));
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn historical_rerender_batch_stops_after_a_permanent_edit_failure_and_leaves_later_repairs_durable(
 ) {
     let database = TemporaryDatabase::new().await;
@@ -17818,6 +18464,162 @@ async fn historical_rerender_batch_stops_after_a_permanent_edit_failure_and_leav
         Some("original-second")
     );
 
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn historical_rerender_batch_stops_at_a_retry_after_boundary_until_the_deadline() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "rerender-stop-on-retry-after",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist rerender retry boundary subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed rerender retry boundary batch");
+    let original = serde_json::json!({"title":"Legacy listing","fields":[]});
+    let first_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'rerender-stop-on-retry-after', 45, 'listed', '{}'::jsonb, $1, FALSE, 'here', 'sent', 'ci-rerender-retry-first', '9001') RETURNING id",
+    )
+    .bind(&original)
+    .fetch_one(&pool)
+    .await
+    .expect("seed first retained rerender");
+    let second_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'rerender-stop-on-retry-after', 46, 'listed', '{}'::jsonb, $1, FALSE, 'here', 'sent', 'ci-rerender-retry-second', '9002') RETURNING id",
+    )
+    .bind(&original)
+    .fetch_one(&pool)
+    .await
+    .expect("seed later retained rerender");
+    pool.close().await;
+    for (delivery_id, title) in [
+        (first_id, "First correction"),
+        (second_id, "Later correction"),
+    ] {
+        store
+            .prepare_delivery_repair(
+                delivery_id,
+                ContractNotificationMessage {
+                    title: title.to_string(),
+                    description: None,
+                    fields: vec![],
+                    presentation_revision: CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+                    author: None,
+                    thumbnail_url: None,
+                    footer: None,
+                    timestamp: None,
+                },
+            )
+            .await
+            .expect("queue durable historical repair");
+    }
+
+    let wire = ControlledHttpServer::start(
+        vec![
+            WireReply {
+                status: 429,
+                headers: vec![("Retry-After", "60")],
+                body: r#"{"retry_after":60.0,"global":false}"#,
+            },
+            WireReply {
+                status: 200,
+                headers: vec![],
+                body: "{}",
+            },
+            WireReply {
+                status: 200,
+                headers: vec![],
+                body: "{}",
+            },
+        ],
+        WireReply {
+            status: 500,
+            headers: vec![],
+            body: r#"{"code":0,"message":"unexpected rerender retry"}"#,
+        },
+    );
+    let delivery = Arc::new(DiscordContractDelivery::new_with_edit_api_base(
+        Arc::new(Http::new("controlled-rerender-retry-token")),
+        wire.base_url.trim_end_matches('/').to_string(),
+    ));
+    let attempted_at = Utc::now();
+    ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+        .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(attempted_at))))
+        .reconcile_proximity_notifications()
+        .await
+        .expect("persist the retryable rerender failure");
+
+    let requests = wire.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the retry-after boundary stops the historical rerender batch"
+    );
+    assert!(requests[0].starts_with("PATCH /channels/77/messages/9001 HTTP/1.1\r\n"));
+    let first = store
+        .inspect_contract_delivery(first_id)
+        .await
+        .expect("inspect retrying rerender")
+        .expect("first rerender remains recorded");
+    let retry_at = first
+        .next_repair_attempt_at
+        .expect("the 429 Retry-After becomes a durable future retry deadline");
+    assert!(retry_at >= attempted_at + chrono::Duration::seconds(59));
+    let second = store
+        .inspect_contract_delivery(second_id)
+        .await
+        .expect("inspect unattempted rerender")
+        .expect("later rerender remains durable");
+    assert_eq!(second.repair_attempt_count, 0);
+    assert_eq!(
+        second.repair_status,
+        killbot_rust::contract_intelligence::ContractRepairStatus::Pending
+    );
+    assert_eq!(second.next_repair_attempt_at, None);
+
+    ContractCollector::new(database.store().await, Arc::new(FailingContractEsi))
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+        .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(
+            retry_at - chrono::Duration::seconds(1),
+        ))))
+        .reconcile_proximity_notifications()
+        .await
+        .expect("a restarted rerender dispatcher honors the retry boundary");
+    assert_eq!(wire.requests.lock().unwrap().len(), 1);
+
+    ContractCollector::new(database.store().await, Arc::new(FailingContractEsi))
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery)
+        .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(retry_at))))
+        .reconcile_proximity_notifications()
+        .await
+        .expect("the rerender batch resumes at the retry deadline");
+    let requests = wire.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].starts_with("PATCH /channels/77/messages/9001 HTTP/1.1\r\n"));
+    assert!(requests[2].starts_with("PATCH /channels/77/messages/9002 HTTP/1.1\r\n"));
+    for delivery_id in [first_id, second_id] {
+        let inspection = store
+            .inspect_contract_delivery(delivery_id)
+            .await
+            .expect("inspect resumed rerender")
+            .expect("rerender remains recorded");
+        assert_eq!(
+            inspection.repair_status,
+            killbot_rust::contract_intelligence::ContractRepairStatus::None
+        );
+    }
+    wire.finish();
     database.destroy().await;
 }
 
@@ -25952,7 +26754,7 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         .fetch_one(&clean_pool)
         .await
         .expect("read clean migration ledger");
-    assert_eq!(clean_migration_count, 24);
+    assert_eq!(clean_migration_count, 25);
     let clean_pacing_column_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'esi_collection_limiter_state' AND column_name = 'next_request_at')",
     )
@@ -27467,11 +28269,7 @@ async fn no_content_closure_release_seam_is_non_pinging_and_uses_evidence_safe_t
             .iter()
             .find(|record| record.contract_id == prepared.contract_id)
             .expect("terminal delivery retains an observation window");
-        let native_timestamp = if prepared.contract_id == pre_expiry.contract_id {
-            record.absence_observed_at
-        } else {
-            contract.date_expired
-        };
+        let native_timestamp = record.absence_observed_at;
         let expected_fields = vec![
             (
                 "Listing time".to_string(),
@@ -27550,8 +28348,12 @@ async fn no_content_closure_release_seam_is_non_pinging_and_uses_evidence_safe_t
 }
 
 #[tokio::test]
-async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_new_notifications() {
+async fn acceptance_provenance_forward_migration_preserves_the_applied_ledger_and_quarantines_stale_replay(
+) {
     const ACCEPTANCE_PROVENANCE_MIGRATION: i64 = 20_260_819_000_000;
+    const ACCEPTANCE_PROVENANCE_FORWARD_MIGRATION: i64 = 20_260_819_000_002;
+    const APPLIED_ACCEPTANCE_PROVENANCE_CHECKSUM: &str =
+        "7af90d102e5348c7ef2a9fa6d38354c21ee3bfda2d90eca8db1947e2442a69dbd76a268df3b004afaf333f0c1b34cfb8";
     let database = TemporaryDatabase::unavailable().await;
     database.create().await;
     let pool = PgPoolOptions::new()
@@ -27592,7 +28394,7 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
         "offered_items": [offered_ship(1)],
         "requested_items": [],
     });
-    for contract_id in [44_i64, 45, 46] {
+    for contract_id in [44_i64, 45, 46, 48, 49] {
         let mut retained_contract = contract.clone();
         retained_contract.contract_id = contract_id;
         sqlx::query(
@@ -27609,6 +28411,22 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
         .await
         .expect("seed legacy accepted lifecycle state");
     }
+    let mut legitimate_pending_contract = contract.clone();
+    legitimate_pending_contract.contract_id = 50;
+    legitimate_pending_contract.issuer_id = 500;
+    legitimate_pending_contract.issuer_corporation_id = 600;
+    sqlx::query(
+        "INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state, notification_pending) VALUES ($1,$2,$3,$4,$5,$6,$6,'closed_outcome_unknown',TRUE)",
+    )
+    .bind(10_000_002_i64)
+    .bind(50_i64)
+    .bind(serde_json::to_value(legitimate_pending_contract).expect("serialize legitimate closure"))
+    .bind(&manifest)
+    .bind(last_public_observed_at)
+    .bind(absence_observed_at)
+    .execute(&pool)
+    .await
+    .expect("seed an already-closed lifecycle with legitimate pending work");
     for (contract_id, response) in [(44_i64, "204_no_content"), (46, "403_accepted_by_player")] {
         sqlx::query(
             "INSERT INTO contract_lifecycle_evidence (region_id, contract_id, evidence_kind, observed_at, detail) VALUES ($1,$2,'acceptance_confirmed',$3,$4)",
@@ -27630,7 +28448,22 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
     .await
     .expect("seed a retained contract observation");
     sqlx::query(
-        "INSERT INTO contract_subscriptions (guild_id, channel_id, subscription_id, description, filter, event_actions) VALUES (42,77,'legacy-no-content','legacy closure subscription','{}'::jsonb,'{}'::jsonb)",
+        "INSERT INTO contract_subscriptions (guild_id, channel_id, subscription_id, description, filter, event_actions) VALUES (42,77,'legacy-no-content','legacy closure subscription',$1,$2)",
+    )
+    .bind(
+        serde_json::to_value(ContractFilter {
+            root: ContractFilterNode::Condition(ContractFilterCondition::EventKinds(vec![
+                ContractEventKind::SaleConfirmed,
+                ContractEventKind::PurchaseConfirmed,
+                ContractEventKind::ClosedOutcomeUnknown,
+                ContractEventKind::Expired,
+            ])),
+        })
+        .expect("serialize retained terminal subscription filter"),
+    )
+    .bind(
+        serde_json::to_value(ContractEventActions::default())
+            .expect("serialize retained terminal event actions"),
     )
     .execute(&pool)
     .await
@@ -27661,10 +28494,29 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
         .expect("legacy event carries acceptance evidence")
         .remove("provenance");
     let legacy_message = serde_json::json!({
-        "title": "Rifter contract accepted • 1.5B ISK",
+        "title": "Rifter sale confirmed for 1.5B",
         "description": null,
         "fields": []
     });
+    let mut legitimate_pending_event = legacy_event.clone();
+    legitimate_pending_event["contract"]["contract_id"] = serde_json::json!(50_i64);
+    legitimate_pending_event["kind"] = serde_json::json!("closed_outcome_unknown");
+    legitimate_pending_event
+        .as_object_mut()
+        .expect("event is an object")
+        .remove("acceptance_evidence");
+    let legitimate_prepared_delivery_id: i64 = sqlx::query_scalar(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, delivery_nonce) VALUES (42,77,'legacy-no-content',50,'closed_outcome_unknown',$1,$2,TRUE,'prepared','legacy-nonce-50') RETURNING id",
+    )
+    .bind(legitimate_pending_event)
+    .bind(serde_json::json!({
+        "title": "Rifter contract closed • outcome unknown",
+        "description": null,
+        "fields": []
+    }))
+    .fetch_one(&pool)
+    .await
+    .expect("seed legitimate pending closure delivery");
     let mut delivery_ids = Vec::new();
     for contract_id in [44_i64, 45, 46] {
         let mut event = legacy_event.clone();
@@ -27681,6 +28533,27 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
             .expect("seed a retained pre-upgrade sent Discord identity"),
         );
     }
+    let mut prepared_event = legacy_event.clone();
+    prepared_event["contract"]["contract_id"] = serde_json::json!(48);
+    let prepared_delivery_id: i64 = sqlx::query_scalar(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, delivery_nonce, delivery_claim_token, delivery_claimed_at, delivery_lease_until) VALUES (42,77,'legacy-no-content',48,'sale_confirmed',$1,$2,TRUE,'prepared','legacy-nonce-48','legacy-delivery-claim','2026-08-18T12:01:00Z','2026-08-18T12:06:00Z') RETURNING id",
+    )
+    .bind(prepared_event)
+    .bind(&legacy_message)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a prepared pre-upgrade false acceptance delivery");
+    let mut stale_repair_event = legacy_event.clone();
+    stale_repair_event["contract"]["contract_id"] = serde_json::json!(49);
+    let pending_repair_delivery_id: i64 = sqlx::query_scalar(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, discord_message_id, delivery_nonce, desired_message, repair_status, repair_prepared_at, repair_next_attempt_at, repair_failure_kind, repair_last_error, repair_failed_at, repair_revision, repair_claim_token, repair_claimed_revision, repair_claimed_at, repair_lease_until) VALUES (42,77,'legacy-no-content',49,'sale_confirmed',$1,$2,TRUE,'sent','legacy-message-49','legacy-nonce-49',$2,'pending','2026-08-18T12:01:00Z','2026-08-18T12:06:00Z','transient','stale accepted-copy repair','2026-08-18T12:01:00Z',3,'legacy-repair-claim',3,'2026-08-18T12:01:00Z','2026-08-18T12:06:00Z') RETURNING id",
+    )
+    .bind(stale_repair_event)
+    .bind(&legacy_message)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a pending pre-upgrade false acceptance repair");
+    delivery_ids.push(pending_repair_delivery_id);
     let unrenderable_delivery_id: i64 = sqlx::query_scalar(
         "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, discord_message_id, delivery_nonce) VALUES (42,77,'legacy-no-content',47,'sale_confirmed','{}'::jsonb,$1,TRUE,'sent','legacy-message-47','legacy-nonce-47') RETURNING id",
     )
@@ -27688,6 +28561,27 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
     .fetch_one(&pool)
     .await
     .expect("seed a retained but unreconstructable legacy identity");
+
+    let applied_provenance_migrator = synthetic_migrator(
+        all_migrations
+            .migrations
+            .iter()
+            .filter(|migration| migration.version < ACCEPTANCE_PROVENANCE_FORWARD_MIGRATION)
+            .cloned()
+            .collect(),
+    );
+    applied_provenance_migrator
+        .run(&pool)
+        .await
+        .expect("apply the exact production provenance migration ledger");
+    let applied_checksum: String = sqlx::query_scalar(
+        "SELECT encode(checksum, 'hex') FROM _sqlx_migrations WHERE version = $1",
+    )
+    .bind(ACCEPTANCE_PROVENANCE_MIGRATION)
+    .fetch_one(&pool)
+    .await
+    .expect("read the applied provenance migration checksum");
+    assert_eq!(applied_checksum, APPLIED_ACCEPTANCE_PROVENANCE_CHECKSUM);
     pool.close().await;
 
     let store = database.store().await;
@@ -27736,6 +28630,30 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
                 absence_observed_at,
                 Some(evidence_response_at),
             ),
+            (
+                48,
+                ContractResolutionState::ClosedOutcomeUnknown,
+                None,
+                last_public_observed_at,
+                absence_observed_at,
+                Some(evidence_response_at),
+            ),
+            (
+                49,
+                ContractResolutionState::ClosedOutcomeUnknown,
+                None,
+                last_public_observed_at,
+                absence_observed_at,
+                Some(evidence_response_at),
+            ),
+            (
+                50,
+                ContractResolutionState::ClosedOutcomeUnknown,
+                None,
+                last_public_observed_at,
+                absence_observed_at,
+                Some(absence_observed_at),
+            ),
         ]
     );
     let (issuer_history, corporation_history) = store
@@ -27744,7 +28662,7 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
         .expect("exclude ambiguous legacy closures from confirmed history");
     assert_eq!(issuer_history.confirmed_sales, 1);
     assert_eq!(issuer_history.confirmed_purchases, 0);
-    assert_eq!(issuer_history.unknown_closures, 2);
+    assert_eq!(issuer_history.unknown_closures, 4);
     assert_eq!(corporation_history, issuer_history);
 
     let verification_pool = PgPoolOptions::new()
@@ -27760,7 +28678,14 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
     .expect("read migrated notification suppression");
     assert_eq!(
         notification_pending,
-        vec![(44, false), (45, false), (46, true)]
+        vec![
+            (44, false),
+            (45, false),
+            (46, true),
+            (48, false),
+            (49, false),
+            (50, true)
+        ]
     );
     let provenance_constraint_validated: bool = sqlx::query_scalar(
         "SELECT convalidated FROM pg_constraint WHERE conname = 'contract_resolution_cases_acceptance_provenance_check'",
@@ -27785,7 +28710,7 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
     .expect("retain existing lifecycle evidence");
     assert_eq!(lifecycle_evidence, 2);
     let upgraded_deliveries: Vec<(i64, String, Value, Value, Option<Value>, String, String, bool, String)> = sqlx::query_as(
-        "SELECT contract_id, event_kind, event, message, desired_message, repair_status, discord_message_id, ping, delivery_nonce FROM contract_outbound_deliveries ORDER BY contract_id",
+        "SELECT contract_id, event_kind, event, message, desired_message, repair_status, discord_message_id, ping, delivery_nonce FROM contract_outbound_deliveries WHERE status = 'sent' ORDER BY contract_id",
     )
     .fetch_all(&verification_pool)
     .await
@@ -27807,12 +28732,13 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
             ))
             .collect::<Vec<_>>(),
         vec![
-            (44, "closed_outcome_unknown", Some("closed_outcome_unknown"), true, true, true, "none", "legacy-message-44", true, "legacy-nonce-44"),
-            (45, "closed_outcome_unknown", Some("closed_outcome_unknown"), true, true, true, "none", "legacy-message-45", true, "legacy-nonce-45"),
+            (44, "closed_outcome_unknown", Some("closed_outcome_unknown"), false, true, true, "none", "legacy-message-44", true, "legacy-nonce-44"),
+            (45, "closed_outcome_unknown", Some("closed_outcome_unknown"), false, true, true, "none", "legacy-message-45", true, "legacy-nonce-45"),
             (46, "sale_confirmed", Some("sale_confirmed"), false, true, true, "none", "legacy-message-46", true, "legacy-nonce-46"),
             (47, "closed_outcome_unknown", Some("closed_outcome_unknown"), true, true, true, "none", "legacy-message-47", true, "legacy-nonce-47"),
+            (49, "closed_outcome_unknown", Some("closed_outcome_unknown"), false, true, true, "none", "legacy-message-49", true, "legacy-nonce-49"),
         ],
-        "migration rewrites false terminal event payloads but leaves every unedited message obsolete"
+        "migration retains terminal observation windows while leaving every unedited message obsolete"
     );
     assert_eq!(
         upgraded_deliveries[2]
@@ -27822,10 +28748,135 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
         Some("accepted_by_player"),
         "recoverable definitive evidence is backfilled into the retained event"
     );
+    let no_provenance_event = store
+        .delivery_event(delivery_ids[1])
+        .await
+        .expect("read the migrated no-provenance terminal event")
+        .expect("migrated no-provenance delivery remains durable");
+    assert_eq!(
+        no_provenance_event.acceptance_evidence,
+        Some(ContractAcceptanceEvidence {
+            last_public_observed_at,
+            absence_observed_at,
+            evidence_response_at,
+            provenance: None,
+        }),
+        "migration retains the exact terminal observation window without inventing provenance"
+    );
+    let prepared_quarantine: (String, Option<String>, bool, bool, bool, String) = sqlx::query_as(
+        "SELECT status, failure_kind, failure_resolved_at IS NOT NULL, ping, delivery_claim_token IS NULL, repair_status FROM contract_outbound_deliveries WHERE id = $1",
+    )
+    .bind(prepared_delivery_id)
+    .fetch_one(&verification_pool)
+    .await
+    .expect("read quarantined prepared false acceptance delivery");
+    assert_eq!(
+        prepared_quarantine,
+        (
+            "failed".to_string(),
+            Some("permanent".to_string()),
+            true,
+            false,
+            true,
+            "none".to_string(),
+        ),
+        "a reclassified prepared acceptance is resolved, cannot ping, and cannot replay stale accepted copy"
+    );
+    let legitimate_pending: (String, String, bool) = sqlx::query_as(
+        "SELECT status, event_kind, ping FROM contract_outbound_deliveries WHERE id = $1",
+    )
+    .bind(legitimate_prepared_delivery_id)
+    .fetch_one(&verification_pool)
+    .await
+    .expect("read untouched legitimate pending closure delivery");
+    assert_eq!(
+        legitimate_pending,
+        (
+            "prepared".to_string(),
+            "closed_outcome_unknown".to_string(),
+            true,
+        ),
+        "a non-acceptance pending closure remains eligible for its normal delivery lifecycle"
+    );
+    let pending_repair_reset: (String, String, bool, String, bool, bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT status, event_kind, desired_message IS NULL, repair_status, repair_prepared_at IS NULL, repair_next_attempt_at IS NULL, repair_failure_kind IS NULL, repair_last_error IS NULL, repair_claim_token IS NULL, repair_claimed_revision IS NULL, repair_claimed_at IS NULL, repair_lease_until IS NULL FROM contract_outbound_deliveries WHERE id = $1",
+    )
+    .bind(pending_repair_delivery_id)
+    .fetch_one(&verification_pool)
+    .await
+    .expect("read reset stale repair state");
+    assert_eq!(
+        pending_repair_reset,
+        (
+            "sent".to_string(),
+            "closed_outcome_unknown".to_string(),
+            true,
+            "none".to_string(),
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+        ),
+        "a migrated sent closure drops its stale accepted-copy repair and claim before rerender"
+    );
     verification_pool.close().await;
 
     let token = "legacy-provenance-rerender-token-not-for-argv";
     let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let prepared_delivery_id_value = prepared_delivery_id.to_string();
+    let inspected = run_contract_delivery_cli(
+        &database.url,
+        &digest,
+        Some(token),
+        &["inspect", "--id", &prepared_delivery_id_value],
+    );
+    assert!(inspected.status.success(), "{}", cli_output(&inspected));
+    let inspection: Value =
+        serde_json::from_slice(&inspected.stdout).expect("parse quarantined delivery inspection");
+    assert_eq!(inspection["status"].as_str(), Some("failed"));
+    assert_eq!(inspection["ping"].as_bool(), Some(false));
+    let requeue = run_contract_delivery_cli(
+        &database.url,
+        &digest,
+        Some(token),
+        &["requeue", "--id", &prepared_delivery_id_value],
+    );
+    assert!(!requeue.status.success(), "{}", cli_output(&requeue));
+    assert!(
+        cli_output(&requeue).contains("not an unresolved permanent failure"),
+        "the quarantine cannot be operator-requeued into a stale acceptance send"
+    );
+    assert!(
+        store
+            .delivery_failure(prepared_delivery_id)
+            .await
+            .expect("inspect quarantine failure visibility")
+            .is_none(),
+        "the resolved quarantine is not an operator-visible failure"
+    );
+    assert!(
+        store
+            .unresolved_delivery_failures()
+            .await
+            .expect("read unresolved delivery health inputs")
+            .iter()
+            .all(|failure| failure.delivery_id != prepared_delivery_id),
+        "the quarantine cannot make delivery health critically unresolved"
+    );
+    let health = HealthCycle::new(
+        store.clone(),
+        Arc::new(FixedHealthClock(StdMutex::new(Utc::now()))),
+    )
+    .run_once()
+    .await
+    .expect("evaluate resolved quarantine health");
+    assert!(health.checks.iter().any(|check| {
+        check.key == "permanent_delivery_failure" && check.status == HealthStatus::Healthy
+    }));
     let queued = run_contract_delivery_cli(
         &database.url,
         &digest,
@@ -27834,7 +28885,7 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
     );
     assert!(queued.status.success(), "{}", cli_output(&queued));
     let report: Value = serde_json::from_slice(&queued.stdout).expect("queued rerender report");
-    assert_eq!(report["eligible_count"], 3);
+    assert_eq!(report["eligible_count"], 4);
     assert_eq!(
         report["candidates"]
             .as_array()
@@ -27874,8 +28925,43 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
             (44, Some("Rifter contract closed • outcome unknown"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 1, "legacy-message-44", true, "legacy-nonce-44"),
             (45, Some("Rifter contract closed • outcome unknown"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 1, "legacy-message-45", true, "legacy-nonce-45"),
             (46, Some("Rifter contract accepted • 1.5B ISK"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 1, "legacy-message-46", true, "legacy-nonce-46"),
+            (49, Some("Rifter contract closed • outcome unknown"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 4, "legacy-message-49", true, "legacy-nonce-49"),
         ],
         "repairs reuse the original message identities and retain ping configuration without creating fresh deliveries"
+    );
+    let no_provenance_repair = queued_deliveries
+        .iter()
+        .find(|delivery| delivery.0 == 45)
+        .map(|delivery| &delivery.1)
+        .expect("queue a renderer-backed no-provenance closure repair");
+    assert_eq!(
+        no_provenance_repair["timestamp"].as_str(),
+        Some("2026-08-18T12:00:00Z")
+    );
+    let no_provenance_fields = no_provenance_repair["fields"]
+        .as_array()
+        .expect("serialized no-provenance closure fields");
+    assert_eq!(
+        Value::Array(no_provenance_fields[..2].to_vec()),
+        serde_json::json!([
+            {
+                "name": "Listing time",
+                "value": "<t:1786622400:F>\n<t:1786622400:R>",
+                "inline": false,
+            },
+            {
+                "name": "Observed closure window",
+                "value": "**after** <t:1787054100:F>\n<t:1787054100:R>\n**before** <t:1787054400:F>\n<t:1787054400:R>",
+                "inline": false,
+            },
+        ]),
+        "a no-provenance migration closure rerenders its exact observed window without semantic ESI copy"
+    );
+    assert!(
+        no_provenance_fields
+            .iter()
+            .all(|field| field["name"].as_str() != Some("ESI result")),
+        "only durable provenance may add semantic ESI copy"
     );
     let unrenderable: (Value, Option<Value>, String, i64, String, bool, String) = sqlx::query_as(
         "SELECT message, desired_message, repair_status, repair_revision, discord_message_id, ping, delivery_nonce FROM contract_outbound_deliveries WHERE id = $1",

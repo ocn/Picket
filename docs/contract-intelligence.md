@@ -4,7 +4,7 @@
 
 This feed observes unauthenticated public EVE item-exchange contracts in every public region. It does not use character, corporation, or alliance authorization. The issuer is public; an acceptor or counterparty is not, so neither is displayed or stored.
 
-The collector first records a complete regional baseline silently. A complete later observation can create a Listed event. When a contract is no longer public, it enters Awaiting Resolution and is not reported as a sale. A pre-expiry `204` from the public item endpoint confirms acceptance. `404` and other unavailable evidence do not confirm acceptance.
+The collector first records a complete regional baseline silently. A complete later observation can create a Listed event. When a contract is no longer public, it enters Awaiting Resolution and is not reported as a sale. A pre-expiry `204` from the public item endpoint produces Closed — Outcome Unknown; it does not confirm acceptance. `404` and other unavailable evidence do not confirm acceptance.
 
 | Event action | Public evidence |
 | --- | --- |
