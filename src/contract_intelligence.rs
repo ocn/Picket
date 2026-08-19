@@ -4,6 +4,9 @@ use crate::feed::{FeedHealthSnapshot, FeedHealthTelemetry};
 use crate::location_evidence::{
     lock_location, LocationEvidence, LocationEvidenceClass, LocationEvidenceService,
 };
+use crate::presentation::{
+    compact_location_description, CompactLocation, LocationOn, LocationRegion, LocationSystem,
+};
 use crate::structure_resolver::{
     ResolvedStructure, StructureResolver, StructureResolverError, StructureResolverFailureKind,
     StructureResolverRuntimeStatus,
@@ -815,6 +818,22 @@ impl PublicContract {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractAcceptanceProvenance {
+    AcceptedByPlayer,
+    NoContent,
+}
+
+impl ContractAcceptanceProvenance {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AcceptedByPlayer => "accepted_by_player",
+            Self::NoContent => "no_content",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PublicContractItem {
     pub record_id: i64,
@@ -967,14 +986,6 @@ impl ContractItemProbe {
             Self::AcceptedByPlayer(metadata) => metadata,
             Self::NotPublic(metadata) => metadata,
             Self::NotFound(metadata) => metadata,
-        }
-    }
-
-    fn acceptance_response_kind(&self) -> Option<&'static str> {
-        match self {
-            Self::NoContent(_) => Some("204_no_content"),
-            Self::AcceptedByPlayer(_) => Some("403_accepted_by_player"),
-            Self::Available(_) | Self::NotPublic(_) | Self::NotFound(_) => None,
         }
     }
 }
@@ -3285,6 +3296,7 @@ pub struct ContractResolutionRecord {
     pub last_public_observed_at: DateTime<Utc>,
     pub absence_observed_at: DateTime<Utc>,
     pub acceptance_evidence_at: Option<DateTime<Utc>>,
+    pub acceptance_provenance: Option<ContractAcceptanceProvenance>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3935,15 +3947,23 @@ pub struct ContractEmbedField {
     pub inline: bool,
 }
 
+pub const CONTRACT_NOTIFICATION_PRESENTATION_REVISION: u32 = 1;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContractNotificationMessage {
     pub title: String,
     pub description: Option<String>,
     pub fields: Vec<ContractEmbedField>,
+    #[serde(default)]
+    pub presentation_revision: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -4033,6 +4053,7 @@ pub struct ContractDeliveryFailure {
 
 pub const CONTRACT_DELIVERY_OPERATOR_ACTOR: &str = "discord:146451271497416704";
 pub const CONTRACT_DELIVERY_OPERATOR_TOKEN_MAX_BYTES: usize = 128;
+pub const CONTRACT_DELIVERY_RERENDER_MAX_LIMIT: usize = 100;
 
 pub struct ContractDeliveryOperatorCapability {
     actor: String,
@@ -4114,11 +4135,28 @@ pub struct ContractDeliveryInspection {
     pub audit: Vec<ContractDeliveryAudit>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContractDeliveryRerenderCandidate {
+    pub delivery_id: i64,
+    pub contract_id: i64,
+    pub event_kind: ContractEventKind,
+    pub discord_message_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContractDeliveryRerenderReport {
+    pub channel_id: u64,
+    pub dry_run: bool,
+    pub eligible_count: usize,
+    pub candidates: Vec<ContractDeliveryRerenderCandidate>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum OperatorDeliveryCliResult {
     Inspected(ContractDeliveryInspection),
     Requeued(ContractDeliveryInspection),
+    Rerendered(ContractDeliveryRerenderReport),
 }
 
 #[derive(Clone, Debug)]
@@ -5534,9 +5572,11 @@ impl ContractCollectionStore {
             let query = format!(
                 "SELECT \
                     count(*) FILTER (WHERE state = 'acceptance_confirmed' \
+                        AND acceptance_provenance = 'accepted_by_player' \
                         AND jsonb_array_length(COALESCE(manifest->'requested_items', '[]'::jsonb)) = 0 \
                         AND COALESCE((contract->>'price')::double precision, 0) > 0) AS confirmed_sales, \
                     count(*) FILTER (WHERE state = 'acceptance_confirmed' \
+                        AND acceptance_provenance = 'accepted_by_player' \
                         AND jsonb_array_length(COALESCE(manifest->'offered_items', '[]'::jsonb)) = 0 \
                         AND COALESCE((contract->>'reward')::double precision, 0) > 0) AS confirmed_purchases, \
                     count(*) FILTER (WHERE state = 'closed_outcome_unknown') AS unknown_closures \
@@ -5558,6 +5598,7 @@ impl ContractCollectionStore {
                  FROM contract_resolution_cases \
                  WHERE (contract->>'{identity_field}')::bigint = $1 \
                    AND state = 'acceptance_confirmed' \
+                   AND acceptance_provenance = 'accepted_by_player' \
                    AND acceptance_evidence_at >= now() - interval '90 days' \
                    AND ( \
                         (jsonb_array_length(COALESCE(manifest->'requested_items', '[]'::jsonb)) = 0 \
@@ -5603,7 +5644,7 @@ impl ContractCollectionStore {
     pub async fn contract_resolution_records(
         &self,
     ) -> Result<Vec<ContractResolutionRecord>, sqlx::Error> {
-        sqlx::query("SELECT region_id, contract_id, state, last_public_observed_at, absence_observed_at, acceptance_evidence_at FROM contract_resolution_cases ORDER BY region_id, contract_id")
+        sqlx::query("SELECT region_id, contract_id, state, last_public_observed_at, absence_observed_at, acceptance_evidence_at, acceptance_provenance FROM contract_resolution_cases ORDER BY region_id, contract_id")
             .fetch_all(&self.pool)
             .await?
             .into_iter()
@@ -5770,6 +5811,100 @@ impl ContractCollectionStore {
             .await?;
         transaction.commit().await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    async fn rerender_contract_delivery_candidates(
+        &self,
+        channel_id: u64,
+        limit: usize,
+    ) -> Result<Vec<ContractDeliveryRerenderCandidate>, sqlx::Error> {
+        sqlx::query("SELECT deliveries.id, deliveries.contract_id, deliveries.event_kind, deliveries.discord_message_id FROM contract_outbound_deliveries AS deliveries JOIN contract_subscriptions AS subscriptions ON subscriptions.guild_id = deliveries.guild_id AND subscriptions.channel_id = deliveries.channel_id AND subscriptions.subscription_id = deliveries.subscription_id WHERE deliveries.channel_id = $1 AND deliveries.status = 'sent' AND deliveries.discord_message_id IS NOT NULL AND subscriptions.deleted_at IS NULL AND deliveries.repair_status = 'none' AND COALESCE(deliveries.failure_kind, '') <> 'permanent' AND COALESCE(deliveries.repair_failure_kind, '') <> 'permanent' AND COALESCE((deliveries.message ->> 'presentation_revision')::INTEGER, 0) < $2 ORDER BY deliveries.id LIMIT $3")
+            .bind(channel_id as i64)
+            .bind(CONTRACT_NOTIFICATION_PRESENTATION_REVISION as i32)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(ContractDeliveryRerenderCandidate {
+                    delivery_id: row.get("id"),
+                    contract_id: row.get("contract_id"),
+                    event_kind: contract_delivery_event_kind_from_str(&row.get::<String, _>("event_kind"))?,
+                    discord_message_id: row.get("discord_message_id"),
+                })
+            })
+            .collect()
+    }
+
+    async fn queue_contract_delivery_rerenders(
+        &self,
+        channel_id: u64,
+        limit: usize,
+        actor: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<Vec<ContractDeliveryRerenderCandidate>, sqlx::Error> {
+        if actor != CONTRACT_DELIVERY_OPERATOR_ACTOR {
+            return Err(sqlx::Error::Protocol(
+                "delivery rerender actor is not authorized".to_string(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        let rows = sqlx::query("SELECT deliveries.id, deliveries.contract_id, deliveries.event_kind, deliveries.discord_message_id, deliveries.event, deliveries.message FROM contract_outbound_deliveries AS deliveries JOIN contract_subscriptions AS subscriptions ON subscriptions.guild_id = deliveries.guild_id AND subscriptions.channel_id = deliveries.channel_id AND subscriptions.subscription_id = deliveries.subscription_id WHERE deliveries.channel_id = $1 AND deliveries.status = 'sent' AND deliveries.discord_message_id IS NOT NULL AND subscriptions.deleted_at IS NULL AND deliveries.repair_status = 'none' AND COALESCE(deliveries.failure_kind, '') <> 'permanent' AND COALESCE(deliveries.repair_failure_kind, '') <> 'permanent' AND COALESCE((deliveries.message ->> 'presentation_revision')::INTEGER, 0) < $2 ORDER BY deliveries.id LIMIT $3 FOR UPDATE OF deliveries SKIP LOCKED")
+            .bind(channel_id as i64)
+            .bind(CONTRACT_NOTIFICATION_PRESENTATION_REVISION as i32)
+            .bind(limit as i64)
+            .fetch_all(&mut *transaction)
+            .await?;
+        let mut candidates = Vec::with_capacity(rows.len());
+        for row in rows {
+            let delivery_id: i64 = row.get("id");
+            let stored_message: ContractNotificationMessage =
+                serde_json::from_value(row.get("message")).map_err(json_to_sqlx)?;
+            let desired_message = match serde_json::from_value::<ContractEvent>(row.get("event")) {
+                Ok(event) => {
+                    let (issuer_history, corporation_history) = self
+                        .contract_party_history(
+                            event.contract.issuer_id,
+                            event.contract.issuer_corporation_id,
+                        )
+                        .await?;
+                    let regenerated = contract_notification_message(
+                        &event,
+                        historical_contract_primary_item(&event, &stored_message),
+                        &issuer_history,
+                        &corporation_history,
+                        false,
+                    );
+                    repaired_contract_message(&stored_message, &regenerated, event.kind)
+                }
+                Err(_) => {
+                    let mut fallback = stored_message;
+                    fallback.presentation_revision = CONTRACT_NOTIFICATION_PRESENTATION_REVISION;
+                    fallback
+                }
+            };
+            sqlx::query("UPDATE contract_outbound_deliveries SET desired_message = $2, repair_status = 'pending', repair_revision = repair_revision + 1, repair_prepared_at = now(), repair_next_attempt_at = NULL, repair_failure_kind = NULL, repair_last_error = NULL, repair_failed_at = NULL, repair_failure_resolved_at = NULL WHERE id = $1")
+                .bind(delivery_id)
+                .bind(serde_json::to_value(desired_message).map_err(json_to_sqlx)?)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("INSERT INTO contract_delivery_audit (delivery_id, action, actor, occurred_at, detail) VALUES ($1, 'rerendered', $2, $3, 'operator queued historical contract format rerender')")
+                .bind(delivery_id)
+                .bind(actor)
+                .bind(occurred_at)
+                .execute(&mut *transaction)
+                .await?;
+            candidates.push(ContractDeliveryRerenderCandidate {
+                delivery_id,
+                contract_id: row.get("contract_id"),
+                event_kind: contract_delivery_event_kind_from_str(
+                    &row.get::<String, _>("event_kind"),
+                )?,
+                discord_message_id: row.get("discord_message_id"),
+            });
+        }
+        transaction.commit().await?;
+        Ok(candidates)
     }
 
     pub async fn inspect_contract_delivery(
@@ -7252,7 +7387,7 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
     async fn pending_terminal_notifications(
         &self,
     ) -> Result<Vec<TerminalContractResolution>, sqlx::Error> {
-        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at, state FROM contract_resolution_cases WHERE state <> 'awaiting_resolution' AND notification_pending = TRUE ORDER BY region_id, contract_id")
+        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at, acceptance_provenance, state FROM contract_resolution_cases WHERE state <> 'awaiting_resolution' AND notification_pending = TRUE ORDER BY region_id, contract_id")
             .fetch_all(&self.pool)
             .await?
             .into_iter()
@@ -7265,6 +7400,9 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
                     last_public_observed_at: row.get("last_public_observed_at"),
                     absence_observed_at: row.get("absence_observed_at"),
                     acceptance_evidence_at: row.get("acceptance_evidence_at"),
+                    acceptance_provenance: contract_acceptance_provenance_from_optional_str(
+                        row.get::<Option<String>, _>("acceptance_provenance").as_deref(),
+                    )?,
                     state: contract_resolution_state_from_str(&row.get::<String, _>("state"))?,
                 })
             })
@@ -7275,7 +7413,7 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
         &self,
         region_id: i64,
     ) -> Result<Vec<TerminalContractResolution>, sqlx::Error> {
-        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at, state FROM contract_resolution_cases WHERE state <> 'awaiting_resolution' AND notification_pending = TRUE AND region_id = $1 ORDER BY contract_id")
+        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at, acceptance_provenance, state FROM contract_resolution_cases WHERE state <> 'awaiting_resolution' AND notification_pending = TRUE AND region_id = $1 ORDER BY contract_id")
             .bind(region_id)
             .fetch_all(&self.pool)
             .await?
@@ -7289,6 +7427,9 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
                     last_public_observed_at: row.get("last_public_observed_at"),
                     absence_observed_at: row.get("absence_observed_at"),
                     acceptance_evidence_at: row.get("acceptance_evidence_at"),
+                    acceptance_provenance: contract_acceptance_provenance_from_optional_str(
+                        row.get::<Option<String>, _>("acceptance_provenance").as_deref(),
+                    )?,
                     state: contract_resolution_state_from_str(&row.get::<String, _>("state"))?,
                 })
             })
@@ -7299,7 +7440,7 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
         &self,
         excluded_region_ids: &[i64],
     ) -> Result<Vec<TerminalContractResolution>, sqlx::Error> {
-        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at, state FROM contract_resolution_cases WHERE state <> 'awaiting_resolution' AND notification_pending = TRUE AND NOT (region_id = ANY($1)) ORDER BY region_id, contract_id")
+        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at, acceptance_provenance, state FROM contract_resolution_cases WHERE state <> 'awaiting_resolution' AND notification_pending = TRUE AND NOT (region_id = ANY($1)) ORDER BY region_id, contract_id")
             .bind(excluded_region_ids)
             .fetch_all(&self.pool)
             .await?
@@ -7313,6 +7454,9 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
                     last_public_observed_at: row.get("last_public_observed_at"),
                     absence_observed_at: row.get("absence_observed_at"),
                     acceptance_evidence_at: row.get("acceptance_evidence_at"),
+                    acceptance_provenance: contract_acceptance_provenance_from_optional_str(
+                        row.get::<Option<String>, _>("acceptance_provenance").as_deref(),
+                    )?,
                     state: contract_resolution_state_from_str(&row.get::<String, _>("state"))?,
                 })
             })
@@ -7369,11 +7513,10 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
         resolution: &AwaitingContractResolution,
         evidence_response_at: DateTime<Utc>,
         metadata: &CacheMetadata,
-        response_kind: &str,
         notification_pending: bool,
     ) -> Result<bool, sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
-        let confirmed = sqlx::query_scalar::<_, i64>("UPDATE contract_resolution_cases SET state = 'acceptance_confirmed', acceptance_evidence_at = $3, acceptance_response_metadata = $4, notification_pending = $5, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution' RETURNING contract_id")
+        let confirmed = sqlx::query_scalar::<_, i64>("UPDATE contract_resolution_cases SET state = 'acceptance_confirmed', acceptance_evidence_at = $3, acceptance_response_metadata = $4, acceptance_provenance = 'accepted_by_player', notification_pending = $5, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution' RETURNING contract_id")
             .bind(resolution.region_id)
             .bind(resolution.contract_id)
             .bind(evidence_response_at)
@@ -7390,7 +7533,8 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
                     "last_public_observed_at": resolution.last_public_observed_at,
                     "absence_observed_at": resolution.absence_observed_at,
                     "evidence_response_at": evidence_response_at,
-                    "response": response_kind,
+                    "provenance": ContractAcceptanceProvenance::AcceptedByPlayer.as_str(),
+                    "response": "403_accepted_by_player",
                 }))
                 .execute(&mut *transaction)
                 .await?;
@@ -7413,6 +7557,8 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
         resolution: &AwaitingContractResolution,
         state: ContractResolutionState,
         observed_at: DateTime<Utc>,
+        provenance: Option<ContractAcceptanceProvenance>,
+        metadata: Option<&CacheMetadata>,
     ) -> Result<bool, sqlx::Error> {
         let (state_name, evidence_kind) = match state {
             ContractResolutionState::Expired => ("expired", "expired"),
@@ -7428,10 +7574,12 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
             }
         };
         let mut transaction = self.pool.begin().await?;
-        let resolved = sqlx::query_scalar::<_, i64>("UPDATE contract_resolution_cases SET state = $3, notification_pending = NOT suppresses_nonfinancial_notification, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution' RETURNING contract_id")
+        let resolved = sqlx::query_scalar::<_, i64>("UPDATE contract_resolution_cases SET state = $3, acceptance_provenance = $4, acceptance_response_metadata = $5, notification_pending = NOT suppresses_nonfinancial_notification, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution' RETURNING contract_id")
             .bind(resolution.region_id)
             .bind(resolution.contract_id)
             .bind(state_name)
+            .bind(provenance.map(ContractAcceptanceProvenance::as_str))
+            .bind(metadata.map(serde_json::to_value).transpose().map_err(json_to_sqlx)?)
             .fetch_optional(&mut *transaction)
             .await?;
         if resolved.is_some() {
@@ -7443,6 +7591,7 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
                 .bind(serde_json::json!({
                     "last_public_observed_at": resolution.last_public_observed_at,
                     "absence_observed_at": resolution.absence_observed_at,
+                    "provenance": provenance.map(ContractAcceptanceProvenance::as_str),
                 }))
                 .execute(&mut *transaction)
                 .await?;
@@ -7549,52 +7698,90 @@ pub async fn execute_operator_delivery_cli(
     now: DateTime<Utc>,
 ) -> Result<OperatorDeliveryCliResult, String> {
     let (command, flags) = parse_operator_delivery_command(arguments)?;
-    reject_unknown_operator_delivery_options(&flags, &["--id", "--actor"])?;
     let actor = required_operator_delivery_option(&flags, "--actor")?;
     if actor != CONTRACT_DELIVERY_OPERATOR_ACTOR {
         return Err("delivery requeue actor is not authorized".to_string());
     }
-    let delivery_id = required_positive_operator_delivery_id(&flags, "--id")?;
     match command {
-        "inspect" => store
-            .inspect_contract_delivery(delivery_id)
-            .await
-            .map_err(|error| error.to_string())?
-            .map(OperatorDeliveryCliResult::Inspected)
-            .ok_or_else(|| format!("contract delivery {delivery_id} does not exist")),
-        "requeue" => store
-            .requeue_permanent_contract_delivery(delivery_id, actor, now)
-            .await
-            .map(OperatorDeliveryCliResult::Requeued)
-            .map_err(|error| error.to_string()),
-        _ => Err("contract-delivery command must be inspect or requeue".to_string()),
+        "inspect" | "requeue" => {
+            reject_unknown_operator_delivery_options(&flags, &["--id", "--actor"])?;
+            let delivery_id = required_positive_operator_delivery_id(&flags, "--id")?;
+            if command == "inspect" {
+                store
+                    .inspect_contract_delivery(delivery_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map(OperatorDeliveryCliResult::Inspected)
+                    .ok_or_else(|| format!("contract delivery {delivery_id} does not exist"))
+            } else {
+                store
+                    .requeue_permanent_contract_delivery(delivery_id, actor, now)
+                    .await
+                    .map(OperatorDeliveryCliResult::Requeued)
+                    .map_err(|error| error.to_string())
+            }
+        }
+        "rerender" => {
+            reject_unknown_operator_delivery_options(
+                &flags,
+                &["--channel", "--limit", "--dry-run", "--queue", "--actor"],
+            )?;
+            let dry_run = flags.contains_key("--dry-run");
+            let queue = flags.contains_key("--queue");
+            if dry_run == queue {
+                return Err("rerender requires exactly one of --dry-run or --queue".to_string());
+            }
+            let channel_id = required_positive_operator_delivery_id(&flags, "--channel")? as u64;
+            let limit = required_operator_delivery_limit(&flags)?;
+            let candidates = if dry_run {
+                store
+                    .rerender_contract_delivery_candidates(channel_id, limit)
+                    .await
+                    .map_err(|error| error.to_string())?
+            } else {
+                store
+                    .queue_contract_delivery_rerenders(channel_id, limit, actor, now)
+                    .await
+                    .map_err(|error| error.to_string())?
+            };
+            Ok(OperatorDeliveryCliResult::Rerendered(
+                ContractDeliveryRerenderReport {
+                    channel_id,
+                    dry_run,
+                    eligible_count: candidates.len(),
+                    candidates,
+                },
+            ))
+        }
+        _ => Err("contract-delivery command must be inspect, requeue, or rerender".to_string()),
     }
 }
 
 fn parse_operator_delivery_command<'a>(
     arguments: &'a [&'a str],
-) -> Result<(&'a str, BTreeMap<&'a str, &'a str>), String> {
+) -> Result<(&'a str, BTreeMap<&'a str, Option<&'a str>>), String> {
     let Some((command, values)) = arguments.split_first() else {
         return Err("contract-delivery command is required".to_string());
     };
     let mut flags = BTreeMap::new();
-    let mut values = values.iter();
+    let mut values = values.iter().peekable();
     while let Some(flag) = values.next() {
         if !flag.starts_with("--") || flags.contains_key(flag) {
             return Err(format!(
                 "invalid or duplicate contract-delivery option: {flag}"
             ));
         }
-        let value = values
-            .next()
-            .ok_or_else(|| format!("missing value for contract-delivery option: {flag}"))?;
-        flags.insert(*flag, *value);
+        let value = match values.peek() {
+            Some(value) if !value.starts_with("--") => values.next().copied(),
+            _ => None,
+        };
+        flags.insert(*flag, value);
     }
     Ok((command, flags))
 }
 
 fn reject_unknown_operator_delivery_options(
-    flags: &BTreeMap<&str, &str>,
+    flags: &BTreeMap<&str, Option<&str>>,
     allowed: &[&str],
 ) -> Result<(), String> {
     flags
@@ -7605,18 +7792,19 @@ fn reject_unknown_operator_delivery_options(
 }
 
 fn required_operator_delivery_option<'a>(
-    flags: &BTreeMap<&str, &'a str>,
+    flags: &BTreeMap<&str, Option<&'a str>>,
     name: &str,
 ) -> Result<&'a str, String> {
     flags
         .get(name)
         .copied()
+        .flatten()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("{name} is required"))
 }
 
 fn required_positive_operator_delivery_id(
-    flags: &BTreeMap<&str, &str>,
+    flags: &BTreeMap<&str, Option<&str>>,
     name: &str,
 ) -> Result<i64, String> {
     let value = required_operator_delivery_option(flags, name)?
@@ -7626,6 +7814,22 @@ fn required_positive_operator_delivery_id(
         return Err(format!("{name} must be a positive integer"));
     }
     Ok(value)
+}
+
+fn required_operator_delivery_limit(flags: &BTreeMap<&str, Option<&str>>) -> Result<usize, String> {
+    let limit = required_operator_delivery_option(flags, "--limit")?
+        .parse::<usize>()
+        .map_err(|_| {
+            format!(
+                "--limit must be an integer between 1 and {CONTRACT_DELIVERY_RERENDER_MAX_LIMIT}"
+            )
+        })?;
+    if !(1..=CONTRACT_DELIVERY_RERENDER_MAX_LIMIT).contains(&limit) {
+        return Err(format!(
+            "--limit must be an integer between 1 and {CONTRACT_DELIVERY_RERENDER_MAX_LIMIT}"
+        ));
+    }
+    Ok(limit)
 }
 
 fn contract_subscription_from_row(
@@ -7764,7 +7968,25 @@ fn contract_resolution_record_from_row(
         last_public_observed_at: row.get("last_public_observed_at"),
         absence_observed_at: row.get("absence_observed_at"),
         acceptance_evidence_at: row.get("acceptance_evidence_at"),
+        acceptance_provenance: contract_acceptance_provenance_from_optional_str(
+            row.get::<Option<String>, _>("acceptance_provenance")
+                .as_deref(),
+        )?,
     })
+}
+
+fn contract_acceptance_provenance_from_optional_str(
+    value: Option<&str>,
+) -> Result<Option<ContractAcceptanceProvenance>, sqlx::Error> {
+    value
+        .map(|value| match value {
+            "accepted_by_player" => Ok(ContractAcceptanceProvenance::AcceptedByPlayer),
+            "no_content" => Ok(ContractAcceptanceProvenance::NoContent),
+            value => Err(sqlx::Error::Protocol(format!(
+                "unknown contract acceptance provenance: {value}"
+            ))),
+        })
+        .transpose()
 }
 
 fn contract_resolution_state_from_str(value: &str) -> Result<ContractResolutionState, sqlx::Error> {
@@ -7934,6 +8156,7 @@ struct TerminalContractResolution {
     last_public_observed_at: DateTime<Utc>,
     absence_observed_at: DateTime<Utc>,
     acceptance_evidence_at: Option<DateTime<Utc>>,
+    acceptance_provenance: Option<ContractAcceptanceProvenance>,
     state: ContractResolutionState,
 }
 
@@ -8042,6 +8265,7 @@ pub struct ContractAcceptanceEvidence {
     pub last_public_observed_at: DateTime<Utc>,
     pub absence_observed_at: DateTime<Utc>,
     pub evidence_response_at: DateTime<Utc>,
+    pub provenance: ContractAcceptanceProvenance,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -8796,6 +9020,8 @@ impl ContractCollector {
                             resolution,
                             ContractResolutionState::Expired,
                             Utc::now(),
+                            None,
+                            None,
                         )
                         .await;
                 }
@@ -8853,6 +9079,8 @@ impl ContractCollector {
                             resolution,
                             ContractResolutionState::Expired,
                             Utc::now(),
+                            None,
+                            None,
                         )
                         .await;
                 }
@@ -8865,7 +9093,7 @@ impl ContractCollector {
                     .await?;
                 Ok(None)
             }
-            probe @ (ContractItemProbe::NoContent(_) | ContractItemProbe::AcceptedByPlayer(_)) => {
+            ContractItemProbe::AcceptedByPlayer(metadata) => {
                 let evidence_response_at = Utc::now();
                 if evidence_response_at >= resolution.contract.date_expired {
                     return self
@@ -8873,6 +9101,8 @@ impl ContractCollector {
                             resolution,
                             ContractResolutionState::Expired,
                             evidence_response_at,
+                            None,
+                            None,
                         )
                         .await;
                 }
@@ -8883,16 +9113,14 @@ impl ContractCollector {
                     resolution.last_public_observed_at,
                     resolution.absence_observed_at,
                     evidence_response_at,
+                    ContractAcceptanceProvenance::AcceptedByPlayer,
                 );
                 if self
                     .store
                     .confirm_acceptance(
                         resolution,
                         evidence_response_at,
-                        probe.metadata(),
-                        probe
-                            .acceptance_response_kind()
-                            .expect("acceptance probes have a response kind"),
+                        &metadata,
                         event.is_some(),
                     )
                     .await?
@@ -8902,6 +9130,22 @@ impl ContractCollector {
                     Ok(None)
                 }
             }
+            ContractItemProbe::NoContent(metadata) => {
+                let observed_at = Utc::now();
+                let state = if observed_at >= resolution.contract.date_expired {
+                    ContractResolutionState::Expired
+                } else {
+                    ContractResolutionState::ClosedOutcomeUnknown
+                };
+                self.resolve_nonfinancial_terminal(
+                    resolution,
+                    state,
+                    observed_at,
+                    Some(ContractAcceptanceProvenance::NoContent),
+                    Some(&metadata),
+                )
+                .await
+            }
             ContractItemProbe::NotPublic(_) | ContractItemProbe::NotFound(_) => {
                 let observed_at = Utc::now();
                 let state = if observed_at >= resolution.contract.date_expired {
@@ -8909,7 +9153,7 @@ impl ContractCollector {
                 } else {
                     ContractResolutionState::ClosedOutcomeUnknown
                 };
-                self.resolve_nonfinancial_terminal(resolution, state, observed_at)
+                self.resolve_nonfinancial_terminal(resolution, state, observed_at, None, None)
                     .await
             }
         }
@@ -8920,10 +9164,12 @@ impl ContractCollector {
         resolution: &AwaitingContractResolution,
         state: ContractResolutionState,
         observed_at: DateTime<Utc>,
+        provenance: Option<ContractAcceptanceProvenance>,
+        metadata: Option<&CacheMetadata>,
     ) -> Result<Option<ContractEvent>, ContractCollectionError> {
         if self
             .store
-            .resolve_nonfinancial_terminal(resolution, state, observed_at)
+            .resolve_nonfinancial_terminal(resolution, state, observed_at, provenance, metadata)
             .await?
             && !resolution.suppresses_nonfinancial_notification
         {
@@ -9924,6 +10170,9 @@ impl ContractCollector {
         ship_groups: &dyn ShipGroupResolver,
         resolving_proximity_unverified: bool,
     ) -> Result<NotificationResolution, ContractCollectionError> {
+        if event.kind == ContractEventKind::Listed && is_want_to_buy_listing(event) {
+            return Ok(NotificationResolution::Complete);
+        }
         let action = contract_event_action(subscription, &event.kind);
         if matches!(action, ContractEventAction::Ignore) && !resolving_proximity_unverified {
             return Ok(NotificationResolution::Complete);
@@ -10085,7 +10334,7 @@ impl ContractCollector {
             message: stored_message,
         } = preparation
         {
-            let desired_message = repaired_contract_message(&stored_message, &message);
+            let desired_message = repaired_contract_message(&stored_message, &message, event.kind);
             if desired_message != stored_message {
                 self.store
                     .prepare_delivery_repair(delivery_id, desired_message)
@@ -10818,6 +11067,12 @@ fn confirmed_contract_event_kind(
     None
 }
 
+fn is_want_to_buy_listing(event: &ContractEvent) -> bool {
+    event.offered_items.is_empty()
+        && !event.requested_items.is_empty()
+        && positive_isk(event.contract.reward)
+}
+
 fn acceptance_event(
     region_id: i64,
     contract: &PublicContract,
@@ -10825,6 +11080,7 @@ fn acceptance_event(
     last_public_observed_at: DateTime<Utc>,
     absence_observed_at: DateTime<Utc>,
     evidence_response_at: DateTime<Utc>,
+    provenance: ContractAcceptanceProvenance,
 ) -> Option<ContractEvent> {
     Some(ContractEvent {
         region_id,
@@ -10837,6 +11093,7 @@ fn acceptance_event(
             last_public_observed_at,
             absence_observed_at,
             evidence_response_at,
+            provenance,
         }),
         embed_context: ContractEmbedContext::default(),
     })
@@ -10873,6 +11130,7 @@ fn terminal_resolution_event(resolution: &TerminalContractResolution) -> Option<
             resolution.last_public_observed_at,
             resolution.absence_observed_at,
             resolution.acceptance_evidence_at?,
+            resolution.acceptance_provenance?,
         ),
         ContractResolutionState::Expired | ContractResolutionState::ClosedOutcomeUnknown => {
             nonfinancial_terminal_event(
@@ -11591,22 +11849,19 @@ fn contract_notification_message(
         .unwrap_or_else(|| "Public contract".to_string());
     let title_location = contract_title_location(&event.embed_context.location);
     let title_isk = title_isk(event, primary_item);
-    let (title, title_has_isk) = contract_embed_title(
+    let (title, _title_has_isk) = contract_embed_title(
         &primary_name,
         event.kind,
         title_isk.as_deref(),
         &title_location,
     );
-    let mut footer_parts = Vec::new();
-    if !title_has_isk {
-        if let Some(isk) = contract_isk_footer(event, primary_item) {
-            footer_parts.push(isk);
-        }
-    }
-    footer_parts.push(format!(
-        "Issued {}",
-        compact_timestamp(event.contract.date_issued)
-    ));
+    let has_history = has_party_history(issuer_history) || has_party_history(corporation_history);
+    let history_suffix = if has_history {
+        " • 90-day history"
+    } else {
+        ""
+    };
+    let footer = format!("Contract #{}{history_suffix}", event.contract.contract_id);
     let mut description = vec![contract_address(
         event.contract.contract_id,
         &primary_name,
@@ -11616,11 +11871,11 @@ fn contract_notification_message(
         )
         .as_str(),
     )];
-    if let Some(issuer) = compact_issuer(&event.embed_context) {
-        description.push(issuer);
-    }
-    if let Some(location) = precise_contract_location(&event.embed_context.location) {
-        description.push(format!("at: {location}"));
+    if let Some(location) = compact_contract_location_description(
+        &event.embed_context.location,
+        event.contract.start_location_id,
+    ) {
+        description.push(location);
     }
     let mut message = ContractNotificationMessage {
         title,
@@ -11629,42 +11884,60 @@ fn contract_notification_message(
             MAX_EMBED_DESCRIPTION_CHARACTERS,
         )),
         fields: Vec::new(),
+        presentation_revision: CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+        author: Some({
+            format!(
+                "Public Contract\n{}",
+                compact_issuer(&event.embed_context)
+                    .unwrap_or_else(|| "issuer: unavailable".to_string())
+            )
+        }),
         thumbnail_url: primary_item.map(|item| {
             format!(
                 "https://images.evetech.net/types/{}/icon?size=64",
                 item.type_id
             )
         }),
-        footer: Some(footer_parts.join(" • ")),
+        footer: Some(footer),
+        timestamp: match event.kind {
+            ContractEventKind::Listed => Some(event.contract.date_issued),
+            ContractEventKind::SaleConfirmed | ContractEventKind::PurchaseConfirmed => event
+                .acceptance_evidence
+                .as_ref()
+                .map(|evidence| evidence.evidence_response_at),
+            ContractEventKind::Expired | ContractEventKind::ClosedOutcomeUnknown => None,
+        },
     };
-    let mut timeline = vec![format!(
-        "Listed {}",
-        discord_absolute_relative_timestamp(event.contract.date_issued)
-    )];
-    if let Some(evidence) = &event.acceptance_evidence {
-        let label = match event.kind {
-            ContractEventKind::SaleConfirmed => Some("Sale"),
-            ContractEventKind::PurchaseConfirmed => Some("Purchase"),
-            _ => None,
-        };
-        if let Some(label) = label {
-            timeline.push(format!(
-                "{label} window: {} → {}",
-                discord_absolute_relative_timestamp(evidence.last_public_observed_at),
-                discord_absolute_relative_timestamp(evidence.absence_observed_at),
-            ));
-            timeline.push(format!(
-                "Acceptance confirmed: {}",
-                discord_absolute_relative_timestamp(evidence.evidence_response_at)
-            ));
+    if matches!(
+        event.kind,
+        ContractEventKind::SaleConfirmed | ContractEventKind::PurchaseConfirmed
+    ) {
+        message.fields.push(ContractEmbedField {
+            name: "Listing time".to_string(),
+            value: discord_absolute_timestamp(event.contract.date_issued),
+            inline: false,
+        });
+        if let Some(evidence) = &event.acceptance_evidence {
+            message.fields.push(ContractEmbedField {
+                name: "Observed acceptance window".to_string(),
+                value: format!(
+                    "**after** {}\n**before** {}",
+                    discord_absolute_timestamp(evidence.last_public_observed_at),
+                    discord_absolute_timestamp(evidence.absence_observed_at),
+                ),
+                inline: false,
+            });
+            message.fields.push(ContractEmbedField {
+                name: "ESI result".to_string(),
+                value: format!(
+                    "Contract accepted by another player\nESI confirmed {}",
+                    discord_relative_timestamp(evidence.evidence_response_at),
+                ),
+                inline: false,
+            });
         }
     }
-    message.fields.push(ContractEmbedField {
-        name: "Timeline".to_string(),
-        value: timeline.join("\n"),
-        inline: false,
-    });
-    if has_party_history(issuer_history) || has_party_history(corporation_history) {
+    if has_history {
         let mut history = Vec::new();
         if has_party_history(issuer_history) {
             history.push(format!("Issuer: {}", format_party_history(issuer_history)));
@@ -11688,21 +11961,12 @@ fn contract_notification_message(
             inline: false,
         });
     }
-    if let Some(evidence) = &event.acceptance_evidence {
-        message.fields.push(ContractEmbedField {
-            name: "Evidence".to_string(),
-            value: format!(
-                "Last publicly observed {}\nFirst observed absent {}\nAcceptance confirmed {}",
-                compact_timestamp(evidence.last_public_observed_at),
-                compact_timestamp(evidence.absence_observed_at),
-                compact_timestamp(evidence.evidence_response_at),
-            ),
-            inline: false,
-        });
-    } else if matches!(
-        event.kind,
-        ContractEventKind::Expired | ContractEventKind::ClosedOutcomeUnknown
-    ) {
+    if event.acceptance_evidence.is_none()
+        && matches!(
+            event.kind,
+            ContractEventKind::Expired | ContractEventKind::ClosedOutcomeUnknown
+        )
+    {
         message.fields.push(ContractEmbedField {
             name: "Evidence".to_string(),
             value: match event.kind {
@@ -11717,6 +11981,11 @@ fn contract_notification_message(
             inline: false,
         });
     }
+    if event.kind == ContractEventKind::Listed {
+        bound_listing_embed_message(&mut message);
+    } else {
+        bound_terminal_embed_message(&mut message);
+    }
     bound_embed_message(&mut message);
     message
 }
@@ -11724,14 +11993,65 @@ fn contract_notification_message(
 fn repaired_contract_message(
     stored: &ContractNotificationMessage,
     regenerated: &ContractNotificationMessage,
+    event_kind: ContractEventKind,
 ) -> ContractNotificationMessage {
-    ContractNotificationMessage {
-        title: regenerated.title.clone(),
-        description: regenerated.description.clone(),
-        thumbnail_url: regenerated.thumbnail_url.clone(),
-        fields: stored.fields.clone(),
-        footer: stored.footer.clone(),
+    let proximity = stored
+        .fields
+        .iter()
+        .find(|field| {
+            field.name == "Alert"
+                && matches!(
+                    field.value.as_str(),
+                    "Proximity-Unverified" | "Proximity-Verified: Out of Range"
+                )
+        })
+        .cloned();
+    let mut message = regenerated.clone();
+    if let Some(proximity) = proximity {
+        message.fields.retain(|field| field.name != "Alert");
+        message.fields.push(proximity);
     }
+    if event_kind == ContractEventKind::Listed {
+        bound_listing_embed_message(&mut message);
+    } else {
+        bound_terminal_embed_message(&mut message);
+    }
+    bound_embed_message(&mut message);
+    message
+}
+
+fn historical_contract_primary_item<'a>(
+    event: &'a ContractEvent,
+    stored: &ContractNotificationMessage,
+) -> Option<&'a PublicContractItem> {
+    let thumbnail_type_id = stored.thumbnail_url.as_deref().and_then(|thumbnail| {
+        thumbnail
+            .split("/types/")
+            .nth(1)
+            .and_then(|suffix| suffix.split('/').next())
+            .and_then(|type_id| type_id.parse::<i64>().ok())
+    });
+    thumbnail_type_id
+        .and_then(|type_id| {
+            contract_items_with_direction(event)
+                .find_map(|(_, item)| (item.type_id == type_id).then_some(item))
+        })
+        .or_else(|| match event.kind {
+            ContractEventKind::PurchaseConfirmed => event
+                .requested_items
+                .iter()
+                .find(|item| item.is_included)
+                .or_else(|| event.requested_items.first()),
+            ContractEventKind::Listed
+            | ContractEventKind::SaleConfirmed
+            | ContractEventKind::Expired
+            | ContractEventKind::ClosedOutcomeUnknown => event
+                .offered_items
+                .iter()
+                .find(|item| item.is_included)
+                .or_else(|| event.offered_items.first())
+                .or_else(|| event.requested_items.first()),
+        })
 }
 
 fn proximity_out_of_range_contract_message(
@@ -11754,6 +12074,10 @@ const MAX_EMBED_FIELD_NAME_CHARACTERS: usize = 256;
 const MAX_EMBED_FIELD_VALUE_CHARACTERS: usize = 1024;
 const MAX_EMBED_CHARACTERS: usize = 6000;
 const MAX_EMBED_FIELDS: usize = 25;
+const MAX_LISTING_EMBED_FIELDS: usize = 3;
+const MAX_LISTING_CONTENT_LINES: usize = 7;
+const MAX_TERMINAL_EMBED_FIELDS: usize = 5;
+const MAX_TERMINAL_CONTENT_LINES: usize = 12;
 
 fn contract_embed_title(
     primary_name: &str,
@@ -11761,12 +12085,30 @@ fn contract_embed_title(
     title_isk: Option<&str>,
     location: &str,
 ) -> (String, bool) {
+    let definitive_title = match kind {
+        ContractEventKind::SaleConfirmed => {
+            title_isk.map(|isk| format!("{primary_name} contract accepted • {isk}"))
+        }
+        ContractEventKind::PurchaseConfirmed => {
+            title_isk.map(|isk| format!("{primary_name} buy contract accepted • {isk}"))
+        }
+        ContractEventKind::Expired => Some(format!("{primary_name} contract expired")),
+        ContractEventKind::ClosedOutcomeUnknown => {
+            Some(format!("{primary_name} contract closed • outcome unknown"))
+        }
+        ContractEventKind::Listed => None,
+    };
+    if let Some(title) =
+        definitive_title.filter(|title| title.chars().count() <= MAX_EMBED_TITLE_CHARACTERS)
+    {
+        return (title, true);
+    }
     let action = match kind {
         ContractEventKind::Listed => "listed",
-        ContractEventKind::SaleConfirmed => "sale confirmed",
-        ContractEventKind::PurchaseConfirmed => "purchase confirmed",
-        ContractEventKind::Expired => "expired",
-        ContractEventKind::ClosedOutcomeUnknown => "closed (outcome unknown)",
+        ContractEventKind::SaleConfirmed => "contract accepted",
+        ContractEventKind::PurchaseConfirmed => "buy contract accepted",
+        ContractEventKind::Expired => "contract expired",
+        ContractEventKind::ClosedOutcomeUnknown => "contract closed • outcome unknown",
     };
     let with_isk = title_isk.map(|isk| format!("{primary_name} {action} for {isk}{location}"));
     if let Some(title) =
@@ -11793,16 +12135,7 @@ fn title_isk(event: &ContractEvent, primary_item: Option<&PublicContractItem>) -
         return None;
     }
     let value = contract_display_isk(event, primary_item)?;
-    positive_isk(value).then(|| format_compact_isk_short(value))
-}
-
-fn contract_isk_footer(
-    event: &ContractEvent,
-    primary_item: Option<&PublicContractItem>,
-) -> Option<String> {
-    contract_display_isk(event, primary_item)
-        .filter(|value| positive_isk(*value))
-        .map(|value| format!("Value: {}", format_compact_isk(value)))
+    positive_isk(value).then(|| format_compact_isk(value))
 }
 
 fn contract_display_isk(
@@ -11833,6 +12166,54 @@ fn contract_title_location(context: &ContractLocationContext) -> String {
         (None, Some(region)) => format!(" in {}", sanitize_contract_text(region)),
         (None, None) => String::new(),
     }
+}
+
+fn compact_contract_location_description(
+    context: &ContractLocationContext,
+    location_id: i64,
+) -> Option<String> {
+    let system_name = context
+        .solar_system_name
+        .as_deref()
+        .map(sanitize_contract_text)
+        .filter(|name| !name.is_empty());
+    let system = system_name
+        .as_deref()
+        .zip(
+            context
+                .solar_system_id
+                .and_then(|id| u32::try_from(id).ok()),
+        )
+        .map(|(name, id)| LocationSystem { name, id });
+    let region_name = context
+        .region_name
+        .as_deref()
+        .map(sanitize_contract_text)
+        .filter(|name| !name.is_empty());
+    let region = region_name
+        .as_deref()
+        .zip(context.region_id.and_then(|id| u32::try_from(id).ok()))
+        .map(|(name, id)| LocationRegion { name, id });
+    let location_name = context
+        .location_name
+        .as_deref()
+        .map(sanitize_contract_text)
+        .filter(|name| !name.is_empty());
+    let on = location_name
+        .as_deref()
+        .zip(u64::try_from(location_id).ok())
+        .map(|(name, id)| LocationOn {
+            name,
+            id,
+            suffix: None,
+        });
+    let description = compact_location_description(CompactLocation {
+        system,
+        region,
+        on,
+        range: None,
+    });
+    (!description.is_empty()).then_some(description)
 }
 
 fn contract_link_place(context: &ContractLocationContext, location_id: i64) -> String {
@@ -11882,40 +12263,6 @@ fn compact_issuer(context: &ContractEmbedContext) -> Option<String> {
         .map(|affiliation| format!("[{affiliation}] {character}"))
         .unwrap_or(character);
     Some(format!("issuer: {identity}"))
-}
-
-fn precise_contract_location(context: &ContractLocationContext) -> Option<String> {
-    if let Some(location) = context
-        .location_name
-        .as_deref()
-        .map(sanitize_contract_text)
-        .filter(|location| !location.is_empty())
-    {
-        return Some(location);
-    }
-    let mut parts = Vec::new();
-    if let Some(system) = context
-        .solar_system_name
-        .as_deref()
-        .map(sanitize_contract_text)
-        .filter(|system| !system.is_empty())
-    {
-        let security = context
-            .security_status
-            .filter(|value| value.is_finite())
-            .map(|value| format!(" ({value:.1})"))
-            .unwrap_or_default();
-        parts.push(format!("{system}{security}"));
-    }
-    if let Some(region) = context
-        .region_name
-        .as_deref()
-        .map(sanitize_contract_text)
-        .filter(|region| !region.is_empty())
-    {
-        parts.push(region);
-    }
-    (!parts.is_empty()).then(|| parts.join(" • "))
 }
 
 fn has_party_history(history: &ContractPartyHistory) -> bool {
@@ -11976,9 +12323,52 @@ fn compact_timestamp(value: DateTime<Utc>) -> String {
     value.format("%-d %b %Y %H:%MZ").to_string()
 }
 
-fn discord_absolute_relative_timestamp(value: DateTime<Utc>) -> String {
+fn discord_absolute_timestamp(value: DateTime<Utc>) -> String {
     let timestamp = value.timestamp();
-    format!("<t:{timestamp}:F> • <t:{timestamp}:R>")
+    format!("<t:{timestamp}:F>")
+}
+
+fn discord_relative_timestamp(value: DateTime<Utc>) -> String {
+    let timestamp = value.timestamp();
+    format!("<t:{timestamp}:R>")
+}
+
+fn bound_listing_embed_message(message: &mut ContractNotificationMessage) {
+    message
+        .fields
+        .retain(|field| !field.value.trim().is_empty());
+    message.fields.truncate(MAX_LISTING_EMBED_FIELDS);
+    while listing_content_lines(message) > MAX_LISTING_CONTENT_LINES {
+        if message.fields.pop().is_none() {
+            break;
+        }
+    }
+}
+
+fn listing_content_lines(message: &ContractNotificationMessage) -> usize {
+    message
+        .description
+        .as_deref()
+        .map(str::lines)
+        .map(Iterator::count)
+        .unwrap_or(0)
+        + message
+            .fields
+            .iter()
+            .map(|field| field.value.lines().count())
+            .sum::<usize>()
+}
+
+fn bound_terminal_embed_message(message: &mut ContractNotificationMessage) {
+    message
+        .fields
+        .retain(|field| !field.value.trim().is_empty());
+    message.fields.truncate(MAX_TERMINAL_EMBED_FIELDS);
+    while listing_content_lines(message) > MAX_TERMINAL_CONTENT_LINES {
+        if message.fields.pop().is_none() {
+            break;
+        }
+    }
 }
 
 fn bound_embed_message(message: &mut ContractNotificationMessage) {
@@ -12867,8 +13257,11 @@ mod embed_tests {
                 value: "contract:0//45".to_string(),
                 inline: false,
             }],
+            presentation_revision: CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+            author: None,
             thumbnail_url: Some("https://images.example.test/rifter.png".to_string()),
             footer: Some("corrected".to_string()),
+            timestamp: None,
         };
         let expected_embed = contract_notification_embed(&message).0;
         let delivery = DiscordContractDelivery::new_with_edit_api_base(
@@ -12925,8 +13318,11 @@ mod embed_tests {
                     title: "Rate limited correction".to_string(),
                     description: None,
                     fields: vec![],
+                    presentation_revision: CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+                    author: None,
                     thumbnail_url: None,
                     footer: None,
+                    timestamp: None,
                 }))
                 .await
                 .expect_err("the retry deadline is returned to the durable dispatcher");
@@ -12963,8 +13359,11 @@ mod embed_tests {
                 title: "Missing message correction".to_string(),
                 description: None,
                 fields: vec![],
+                presentation_revision: CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+                author: None,
                 thumbnail_url: None,
                 footer: None,
+                timestamp: None,
             }))
             .await
             .expect_err("an unknown Discord message is a permanent repair failure");
@@ -13004,8 +13403,11 @@ mod embed_tests {
                     title: "classification".to_string(),
                     description: None,
                     fields: vec![],
+                    presentation_revision: CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+                    author: None,
                     thumbnail_url: None,
                     footer: None,
+                    timestamp: None,
                 }))
                 .await
                 .expect_err("controlled Discord error");
@@ -13032,12 +13434,15 @@ mod embed_tests {
         let history = ContractPartyHistory::default();
         for (kind, expected) in [
             (ContractEventKind::Listed, "listed"),
-            (ContractEventKind::SaleConfirmed, "sold"),
-            (ContractEventKind::PurchaseConfirmed, "bought"),
-            (ContractEventKind::Expired, "expired"),
+            (ContractEventKind::SaleConfirmed, "contract accepted"),
+            (
+                ContractEventKind::PurchaseConfirmed,
+                "buy contract accepted",
+            ),
+            (ContractEventKind::Expired, "contract expired"),
             (
                 ContractEventKind::ClosedOutcomeUnknown,
-                "closed (outcome unknown)",
+                "contract closed • outcome unknown",
             ),
         ] {
             let message = contract_notification_message(
@@ -13058,7 +13463,7 @@ mod embed_tests {
     }
 
     #[test]
-    fn contract_timeline_contains_discord_absolute_and_relative_event_times() {
+    fn contract_acceptance_fields_use_separate_native_absolute_and_relative_times() {
         let listed_at = DateTime::parse_from_rfc3339("2026-08-17T19:43:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -13076,10 +13481,8 @@ mod embed_tests {
             &history,
             false,
         );
-        assert_eq!(
-            field(&listed_message, "Timeline"),
-            Some("Listed <t:1786995780:F> • <t:1786995780:R>")
-        );
+        assert_eq!(field(&listed_message, "Timeline"), None);
+        assert_eq!(listed_message.timestamp, Some(listed_at));
 
         let mut sold = event(ContractEventKind::SaleConfirmed);
         sold.contract.date_issued = listed_at;
@@ -13087,6 +13490,7 @@ mod embed_tests {
             last_public_observed_at: confirmed_at - ChronoDuration::minutes(2),
             absence_observed_at: confirmed_at - ChronoDuration::minutes(1),
             evidence_response_at: confirmed_at,
+            provenance: ContractAcceptanceProvenance::AcceptedByPlayer,
         });
         let sold_message = contract_notification_message(
             &sold,
@@ -13096,11 +13500,18 @@ mod embed_tests {
             false,
         );
         assert_eq!(
-            field(&sold_message, "Timeline"),
-            Some(
-                "Listed <t:1786995780:F> • <t:1786995780:R>\nSold <t:1787090460:F> • <t:1787090460:R>"
-            )
+            field(&sold_message, "Listing time"),
+            Some("<t:1786995780:F>")
         );
+        assert_eq!(
+            field(&sold_message, "Observed acceptance window"),
+            Some("**after** <t:1787090340:F>\n**before** <t:1787090400:F>")
+        );
+        assert_eq!(
+            field(&sold_message, "ESI result"),
+            Some("Contract accepted by another player\nESI confirmed <t:1787090460:R>")
+        );
+        assert_eq!(sold_message.timestamp, Some(confirmed_at));
 
         let mut purchased = event(ContractEventKind::PurchaseConfirmed);
         purchased.contract.date_issued = listed_at;
@@ -13113,11 +13524,10 @@ mod embed_tests {
             false,
         );
         assert_eq!(
-            field(&purchased_message, "Timeline"),
-            Some(
-                "Listed <t:1786995780:F> • <t:1786995780:R>\nPurchased <t:1787090460:F> • <t:1787090460:R>"
-            )
+            field(&purchased_message, "Listing time"),
+            Some("<t:1786995780:F>")
         );
+        assert_eq!(purchased_message.timestamp, Some(confirmed_at));
     }
 
     #[test]
@@ -13133,7 +13543,7 @@ mod embed_tests {
         assert_eq!(
             full.description.as_deref(),
             Some(
-                "`<url=\"contract:0//45\">Public contract - Jita</url>`\nissuer: [Issuer Alliance] Issuer Name\nat: Jita IV Moon 4 Caldari Navy Assembly Plant"
+                "`<url=\"contract:0//45\">Public contract - Jita</url>`\n**in:** [Jita](http://evemaps.dotlan.net/system/30000142) ([The Forge](http://evemaps.dotlan.net/region/10000002))\n**on:** [Jita IV Moon 4 Caldari Navy Assembly Plant](https://zkillboard.com/location/60003760/)"
             )
         );
 
@@ -13145,9 +13555,7 @@ mod embed_tests {
         let fallback = contract_notification_message(&fallback, None, &history, &history, false);
         assert_eq!(
             fallback.description.as_deref(),
-            Some(
-                "`<url=\"contract:0//45\">Public contract - Unknown location</url>`\nissuer: [Issuer Alliance] Issuer Name"
-            )
+            Some("`<url=\"contract:0//45\">Public contract - Unknown location</url>`")
         );
 
         let mut station_only = event(ContractEventKind::Listed);
@@ -13161,7 +13569,7 @@ mod embed_tests {
         assert_eq!(
             station_only.description.as_deref(),
             Some(
-                "`<url=\"contract:0//45\">Public contract - Jita IV Moon 4</url>`\nissuer: [Issuer Alliance] Issuer Name\nat: Jita IV Moon 4"
+                "`<url=\"contract:0//45\">Public contract - Jita IV Moon 4</url>`\n**on:** [Jita IV Moon 4](https://zkillboard.com/location/60003760/)"
             )
         );
 
@@ -13174,9 +13582,7 @@ mod embed_tests {
             contract_notification_message(&region_only, None, &history, &history, false);
         assert_eq!(
             region_only.description.as_deref(),
-            Some(
-                "`<url=\"contract:0//45\">Public contract - Unknown location</url>`\nissuer: [Issuer Alliance] Issuer Name"
-            )
+            Some("`<url=\"contract:0//45\">Public contract - Unknown location</url>`")
         );
 
         let mut raw_only = event(ContractEventKind::Listed);
@@ -13184,10 +13590,31 @@ mod embed_tests {
         let raw_only = contract_notification_message(&raw_only, None, &history, &history, false);
         assert_eq!(
             raw_only.description.as_deref(),
-            Some(
-                "`<url=\"contract:0//45\">Public contract - Unknown location</url>`\nissuer: [Issuer Alliance] Issuer Name"
-            )
+            Some("`<url=\"contract:0//45\">Public contract - Unknown location</url>`")
         );
+    }
+
+    #[test]
+    fn listing_omits_unresolved_player_structure_ids() {
+        let history = ContractPartyHistory::default();
+        let mut listed = event(ContractEventKind::Listed);
+        listed.contract.start_location_id = 1_035_466_617_946;
+        listed.embed_context.location = ContractLocationContext::default();
+
+        let message = contract_notification_message(
+            &listed,
+            Some(&listed.offered_items[0]),
+            &history,
+            &history,
+            false,
+        );
+        let description = message.description.expect("listing description");
+
+        assert_eq!(
+            description,
+            "`<url=\"contract:0//45\">Ragnarok - Player-owned structure</url>`"
+        );
+        assert!(!description.contains(&listed.contract.start_location_id.to_string()));
     }
 
     #[test]
@@ -13211,7 +13638,7 @@ mod embed_tests {
                 .iter()
                 .map(|field| field.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Timeline"]
+            Vec::<&str>::new()
         );
         let description = message.description.expect("compact contract description");
         assert!(description.contains("Ragnarok - Jita"));
@@ -13259,18 +13686,20 @@ mod embed_tests {
 
         assert_eq!(
             message.title,
-            "Ragnarok listed for 77.5B in Jita (The Forge)"
+            "Ragnarok listed for 77.5B ISK in Jita (The Forge)"
         );
         assert_eq!(
             message.description.as_deref(),
             Some(
-                "`<url=\"contract:0//45\">Ragnarok - Jita</url>`\nissuer: [Issuer Alliance] Issuer Name\nat: Jita IV Moon 4 Caldari Navy Assembly Plant"
+                "`<url=\"contract:0//45\">Ragnarok - Jita</url>`\n**in:** [Jita](http://evemaps.dotlan.net/system/30000142) ([The Forge](http://evemaps.dotlan.net/region/10000002))\n**on:** [Jita IV Moon 4 Caldari Navy Assembly Plant](https://zkillboard.com/location/60003760/)"
             )
         );
-        assert!(message
-            .footer
-            .as_deref()
-            .is_some_and(|footer| footer.starts_with("Issued ")));
+        assert_eq!(message.footer.as_deref(), Some("Contract #45"));
+        assert!(message.timestamp.is_some());
+        assert_eq!(
+            message.author.as_deref(),
+            Some("Public Contract\nissuer: [Issuer Alliance] Issuer Name")
+        );
         assert!(message.fields.iter().all(|field| {
             !matches!(
                 field.name.as_str(),
@@ -13306,6 +13735,7 @@ mod embed_tests {
             last_public_observed_at: Utc::now() - ChronoDuration::minutes(3),
             absence_observed_at: Utc::now() - ChronoDuration::minutes(2),
             evidence_response_at: Utc::now() - ChronoDuration::seconds(90),
+            provenance: ContractAcceptanceProvenance::AcceptedByPlayer,
         });
         event.embed_context.item_names.insert(
             19_720,
@@ -13339,21 +13769,28 @@ mod embed_tests {
         assert!(contract_link.starts_with("`<url=\"contract:0//45\">"));
         assert!(contract_link.ends_with(" - Jita</url>`"));
         assert!(!contract_link.contains("<url=\"bad\">"));
-        assert!(description.contains("issuer: Issuer-Name"));
+        assert!(!description.contains("issuer: Issuer-Name"));
         assert!(!description.contains("90000001"));
         assert!(!description.contains("98000001"));
         assert!(description.chars().count() <= MAX_EMBED_DESCRIPTION_CHARACTERS);
+        assert_eq!(
+            message.author.as_deref(),
+            Some("Public Contract\nissuer: Issuer-Name")
+        );
         assert!(field(&message, "History")
             .expect("history")
             .contains("4 sales"));
-        assert!(field(&message, "Evidence")
-            .expect("evidence")
-            .contains("204 "));
-        assert!(field(&message, "Delay").is_some_and(|delay| delay.ends_with(" after 204")));
+        assert_eq!(field(&message, "Evidence"), None);
+        assert_eq!(field(&message, "Delay"), None);
+        assert!(field(&message, "ESI result")
+            .expect("ESI result")
+            .contains("accepted by another player"));
         assert_eq!(field(&message, "Observed Affiliation"), None);
         assert_eq!(field(&message, "Contract Address"), None);
         let footer = message.footer.as_deref().expect("footer");
-        assert!(footer.starts_with("Value: 77.5B ISK • Issued "));
+        assert_eq!(footer, "Contract #45 • 90-day history");
+        assert!(message.fields.len() <= MAX_TERMINAL_EMBED_FIELDS);
+        assert!(listing_content_lines(&message) <= MAX_TERMINAL_CONTENT_LINES);
         assert!(embed_character_count(&message) <= MAX_EMBED_CHARACTERS);
     }
 
@@ -13386,6 +13823,7 @@ mod embed_tests {
             last_public_observed_at: Utc::now() - ChronoDuration::minutes(3),
             absence_observed_at: Utc::now() - ChronoDuration::minutes(2),
             evidence_response_at: Utc::now() - ChronoDuration::minutes(1),
+            provenance: ContractAcceptanceProvenance::AcceptedByPlayer,
         });
         let issuer_history = ContractPartyHistory {
             confirmed_sales: 4,
@@ -13475,8 +13913,11 @@ mod embed_tests {
                     inline: false,
                 })
                 .collect(),
+            presentation_revision: CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+            author: None,
             thumbnail_url: None,
             footer: Some("F".repeat(2048)),
+            timestamp: None,
         };
 
         bound_embed_message(&mut message);

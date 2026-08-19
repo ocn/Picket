@@ -15,6 +15,7 @@ pub mod feed;
 pub mod location_evidence;
 pub mod models;
 pub mod pipeline;
+pub mod presentation;
 pub mod processor;
 pub mod structure_resolver;
 
