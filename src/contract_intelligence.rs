@@ -5,7 +5,8 @@ use crate::location_evidence::{
     lock_location, LocationEvidence, LocationEvidenceClass, LocationEvidenceService,
 };
 use crate::presentation::{
-    compact_location_description, CompactLocation, LocationOn, LocationRegion, LocationSystem,
+    compact_location_description, CompactLocation, LocationOn, LocationRange, LocationRegion,
+    LocationSystem,
 };
 use crate::structure_resolver::{
     ResolvedStructure, StructureResolver, StructureResolverError, StructureResolverFailureKind,
@@ -1232,6 +1233,19 @@ pub trait PublicContractEsi: Send + Sync {
         ))
     }
 
+    /// The public ESI solar-system endpoint also provides the display name used by jump links.
+    /// The collector owns durable caching and limiter accounting for these lookups.
+    async fn solar_system_name(
+        &self,
+        _solar_system_id: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<String>, EsiError> {
+        Err(EsiError::retryable(
+            "solar-system name lookup is unavailable",
+            None,
+        ))
+    }
+
     async fn observed_contract_context(
         &self,
         _contract: &PublicContract,
@@ -1712,6 +1726,26 @@ impl PublicContractEsi for HttpPublicContractEsi {
                 )
             })?;
         Ok(EsiResponse::fresh(position, metadata))
+    }
+
+    async fn solar_system_name(
+        &self,
+        solar_system_id: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<String>, EsiError> {
+        #[derive(Deserialize)]
+        struct SolarSystem {
+            name: String,
+        }
+
+        let response = self
+            .get::<SolarSystem>(&format!("universe/systems/{solar_system_id}/"), etag)
+            .await?;
+        Ok(EsiResponse {
+            value: response.value.map(|system| system.name),
+            metadata: response.metadata,
+            not_modified: response.not_modified,
+        })
     }
 
     async fn observed_issuer_affiliation(
@@ -3806,6 +3840,8 @@ pub struct ContractObservationContext {
     pub location_evidence_class: Option<LocationEvidenceClass>,
     #[serde(default)]
     pub range_center_positions: BTreeMap<u32, SolarSystemPosition>,
+    #[serde(default)]
+    pub range_center_names: BTreeMap<u32, String>,
     pub security_status: Option<f64>,
     #[serde(default)]
     pub security_status_resolution: ContractContextResolution,
@@ -3834,6 +3870,8 @@ pub struct ContractEmbedContext {
     pub observed_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub location: ContractLocationContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_range: Option<ContractMatchedRange>,
     pub issuer_character_name: Option<String>,
     pub issuer_corporation_name: Option<String>,
     pub issuer_alliance_id: Option<i64>,
@@ -3878,6 +3916,10 @@ impl ContractEmbedContext {
             .region_name
             .clone()
             .or_else(|| source.location.region_name.clone());
+        self.matched_range = self
+            .matched_range
+            .clone()
+            .or_else(|| source.matched_range.clone());
         self.issuer_character_name = self
             .issuer_character_name
             .clone()
@@ -3895,6 +3937,15 @@ impl ContractEmbedContext {
             self.item_names.entry(*id).or_insert_with(|| name.clone());
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ContractMatchedRange {
+    pub light_years: f64,
+    pub reference_system_id: u32,
+    pub reference_system_name: String,
+    pub destination_system_id: u32,
+    pub destination_system_name: String,
 }
 
 impl ContractObservationContext {
@@ -5860,29 +5911,24 @@ impl ContractCollectionStore {
             let delivery_id: i64 = row.get("id");
             let stored_message: ContractNotificationMessage =
                 serde_json::from_value(row.get("message")).map_err(json_to_sqlx)?;
-            let desired_message = match serde_json::from_value::<ContractEvent>(row.get("event")) {
-                Ok(event) => {
-                    let (issuer_history, corporation_history) = self
-                        .contract_party_history(
-                            event.contract.issuer_id,
-                            event.contract.issuer_corporation_id,
-                        )
-                        .await?;
-                    let regenerated = contract_notification_message(
-                        &event,
-                        historical_contract_primary_item(&event, &stored_message),
-                        &issuer_history,
-                        &corporation_history,
-                        false,
-                    );
-                    repaired_contract_message(&stored_message, &regenerated, event.kind)
-                }
-                Err(_) => {
-                    let mut fallback = stored_message;
-                    fallback.presentation_revision = CONTRACT_NOTIFICATION_PRESENTATION_REVISION;
-                    fallback
-                }
+            let Ok(event) = serde_json::from_value::<ContractEvent>(row.get("event")) else {
+                continue;
             };
+            let (issuer_history, corporation_history) = self
+                .contract_party_history(
+                    event.contract.issuer_id,
+                    event.contract.issuer_corporation_id,
+                )
+                .await?;
+            let regenerated = contract_notification_message(
+                &event,
+                historical_contract_primary_item(&event, &stored_message),
+                &issuer_history,
+                &corporation_history,
+                false,
+            );
+            let desired_message =
+                repaired_contract_message(&stored_message, &regenerated, event.kind);
             sqlx::query("UPDATE contract_outbound_deliveries SET desired_message = $2, repair_status = 'pending', repair_revision = repair_revision + 1, repair_prepared_at = now(), repair_next_attempt_at = NULL, repair_failure_kind = NULL, repair_last_error = NULL, repair_failed_at = NULL, repair_failure_resolved_at = NULL WHERE id = $1")
                 .bind(delivery_id)
                 .bind(serde_json::to_value(desired_message).map_err(json_to_sqlx)?)
@@ -7574,12 +7620,13 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
             }
         };
         let mut transaction = self.pool.begin().await?;
-        let resolved = sqlx::query_scalar::<_, i64>("UPDATE contract_resolution_cases SET state = $3, acceptance_provenance = $4, acceptance_response_metadata = $5, notification_pending = NOT suppresses_nonfinancial_notification, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution' RETURNING contract_id")
+        let resolved = sqlx::query_scalar::<_, i64>("UPDATE contract_resolution_cases SET state = $3, acceptance_provenance = $4, acceptance_response_metadata = $5, acceptance_evidence_at = CASE WHEN $4 IS NULL THEN NULL ELSE $6 END, notification_pending = NOT suppresses_nonfinancial_notification, updated_at = now() WHERE region_id = $1 AND contract_id = $2 AND state = 'awaiting_resolution' RETURNING contract_id")
             .bind(resolution.region_id)
             .bind(resolution.contract_id)
             .bind(state_name)
             .bind(provenance.map(ContractAcceptanceProvenance::as_str))
             .bind(metadata.map(serde_json::to_value).transpose().map_err(json_to_sqlx)?)
+            .bind(observed_at)
             .fetch_optional(&mut *transaction)
             .await?;
         if resolved.is_some() {
@@ -8265,7 +8312,8 @@ pub struct ContractAcceptanceEvidence {
     pub last_public_observed_at: DateTime<Utc>,
     pub absence_observed_at: DateTime<Utc>,
     pub evidence_response_at: DateTime<Utc>,
-    pub provenance: ContractAcceptanceProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ContractAcceptanceProvenance>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -9095,17 +9143,6 @@ impl ContractCollector {
             }
             ContractItemProbe::AcceptedByPlayer(metadata) => {
                 let evidence_response_at = Utc::now();
-                if evidence_response_at >= resolution.contract.date_expired {
-                    return self
-                        .resolve_nonfinancial_terminal(
-                            resolution,
-                            ContractResolutionState::Expired,
-                            evidence_response_at,
-                            None,
-                            None,
-                        )
-                        .await;
-                }
                 let event = acceptance_event(
                     resolution.region_id,
                     &resolution.contract,
@@ -9167,13 +9204,23 @@ impl ContractCollector {
         provenance: Option<ContractAcceptanceProvenance>,
         metadata: Option<&CacheMetadata>,
     ) -> Result<Option<ContractEvent>, ContractCollectionError> {
+        let acceptance_evidence = provenance.map(|provenance| ContractAcceptanceEvidence {
+            last_public_observed_at: resolution.last_public_observed_at,
+            absence_observed_at: resolution.absence_observed_at,
+            evidence_response_at: observed_at,
+            provenance: Some(provenance),
+        });
         if self
             .store
             .resolve_nonfinancial_terminal(resolution, state, observed_at, provenance, metadata)
             .await?
             && !resolution.suppresses_nonfinancial_notification
         {
-            return Ok(nonfinancial_terminal_event(resolution, state));
+            return Ok(nonfinancial_terminal_event(
+                resolution,
+                state,
+                acceptance_evidence,
+            ));
         }
         Ok(None)
     }
@@ -10031,23 +10078,38 @@ impl ContractCollector {
             return Ok(());
         }
         for range in &requirements.ly_ranges {
-            if event
+            if !event
                 .context
                 .range_center_positions
                 .contains_key(&range.system_id)
             {
+                let Some(position) = self
+                    .cached_solar_system_position(event.contract.contract_id, range.system_id)
+                    .await?
+                else {
+                    continue;
+                };
+                event
+                    .context
+                    .range_center_positions
+                    .insert(range.system_id, position);
+            }
+            if event
+                .context
+                .range_center_names
+                .contains_key(&range.system_id)
+            {
                 continue;
             }
-            let Some(position) = self
-                .cached_solar_system_position(event.contract.contract_id, range.system_id)
+            if let Some(name) = self
+                .cached_solar_system_name(event.contract.contract_id, range.system_id)
                 .await?
-            else {
-                continue;
-            };
-            event
-                .context
-                .range_center_positions
-                .insert(range.system_id, position);
+            {
+                event
+                    .context
+                    .range_center_names
+                    .insert(range.system_id, name);
+            }
         }
         Ok(())
     }
@@ -10081,6 +10143,37 @@ impl ContractCollector {
         };
         let (position, _) = self.resolve_response(&key, cached, response).await?;
         Ok(position.is_finite().then_some(position))
+    }
+
+    async fn cached_solar_system_name(
+        &self,
+        contract_id: i64,
+        solar_system_id: u32,
+    ) -> Result<Option<String>, ContractCollectionError> {
+        let key = format!("universe/systems/{solar_system_id}/range-center-name");
+        let cached = self.store.cache(&key).await?;
+        if let Some((name, _)) = self.fresh_cached::<String>(&key, &cached)? {
+            return Ok((!name.trim().is_empty()).then_some(name));
+        }
+        if !self.context_request_allowed(contract_id).await? {
+            return Ok(None);
+        }
+        let etag = cached
+            .as_ref()
+            .and_then(|cached| cached.metadata.etag.clone());
+        let Some(response) = self
+            .record_context_esi_result(
+                contract_id,
+                self.esi
+                    .solar_system_name(solar_system_id, etag.as_deref())
+                    .await,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let (name, _) = self.resolve_response(&key, cached, response).await?;
+        Ok((!name.trim().is_empty()).then_some(name))
     }
 
     async fn context_request_allowed(
@@ -10253,7 +10346,10 @@ impl ContractCollector {
                 PrimaryDisplayItem::Deferred => return Ok(NotificationResolution::Deferred),
             }
         };
-        let event = self.enrich_event_for_embed(event, primary_item).await?;
+        let mut event = self.enrich_event_for_embed(event, primary_item).await?;
+        event.embed_context.matched_range = evaluator.matched_range().and_then(|range| {
+            contract_matched_range_for_embed(range, &event.embed_context.location)
+        });
         let (issuer_history, corporation_history) = self
             .store
             .contract_party_history(
@@ -10366,9 +10462,9 @@ impl ContractCollector {
             .pending_repairs(self.delivery_clock.now())
             .await?
         {
-            let retry = self.deliver_pending_repair(&pending, notifications).await?;
-            if retry {
-                self.deliver_pending_repair(&pending, notifications).await?;
+            let stop_batch = self.deliver_pending_repair(&pending, notifications).await?;
+            if stop_batch {
+                break;
             }
         }
         Ok(())
@@ -10406,7 +10502,7 @@ impl ContractCollector {
                     contract_id = edit.contract_id,
                     "contract message repair failed permanently: {error}"
                 );
-                Ok(false)
+                Ok(true)
             }
             Err(
                 error @ (ContractDeliveryError::Transient(_) | ContractDeliveryError::Ambiguous(_)),
@@ -11093,7 +11189,7 @@ fn acceptance_event(
             last_public_observed_at,
             absence_observed_at,
             evidence_response_at,
-            provenance,
+            provenance: Some(provenance),
         }),
         embed_context: ContractEmbedContext::default(),
     })
@@ -11102,6 +11198,7 @@ fn acceptance_event(
 fn nonfinancial_terminal_event(
     resolution: &AwaitingContractResolution,
     state: ContractResolutionState,
+    acceptance_evidence: Option<ContractAcceptanceEvidence>,
 ) -> Option<ContractEvent> {
     let kind = match state {
         ContractResolutionState::Expired => ContractEventKind::Expired,
@@ -11116,7 +11213,7 @@ fn nonfinancial_terminal_event(
         offered_items: resolution.manifest.offered_items.clone(),
         requested_items: resolution.manifest.requested_items.clone(),
         context: ContractObservationContext::default(),
-        acceptance_evidence: None,
+        acceptance_evidence,
         embed_context: ContractEmbedContext::default(),
     })
 }
@@ -11133,6 +11230,20 @@ fn terminal_resolution_event(resolution: &TerminalContractResolution) -> Option<
             resolution.acceptance_provenance?,
         ),
         ContractResolutionState::Expired | ContractResolutionState::ClosedOutcomeUnknown => {
+            let acceptance_evidence = match (
+                resolution.acceptance_evidence_at,
+                resolution.acceptance_provenance,
+            ) {
+                (Some(evidence_response_at), Some(ContractAcceptanceProvenance::NoContent)) => {
+                    Some(ContractAcceptanceEvidence {
+                        last_public_observed_at: resolution.last_public_observed_at,
+                        absence_observed_at: resolution.absence_observed_at,
+                        evidence_response_at,
+                        provenance: Some(ContractAcceptanceProvenance::NoContent),
+                    })
+                }
+                _ => None,
+            };
             nonfinancial_terminal_event(
                 &AwaitingContractResolution {
                     region_id: resolution.region_id,
@@ -11144,6 +11255,7 @@ fn terminal_resolution_event(resolution: &TerminalContractResolution) -> Option<
                     suppresses_nonfinancial_notification: false,
                 },
                 resolution.state,
+                acceptance_evidence,
             )
         }
         ContractResolutionState::AwaitingResolution => None,
@@ -11168,6 +11280,31 @@ struct ContractFilterEvaluator<'a> {
     group_cache: HashMap<i64, ShipGroupLookup>,
     matching_ship_items: HashSet<(ContractItemDirection, i64)>,
     matching_ship_items_deferred: bool,
+    matched_range: Option<MatchedContractRange>,
+}
+
+#[derive(Clone)]
+struct MatchedContractRange {
+    light_years: f64,
+    reference_system_id: u32,
+    reference_system_name: String,
+}
+
+fn prefer_nearer_contract_range(
+    current: Option<MatchedContractRange>,
+    candidate: Option<MatchedContractRange>,
+) -> Option<MatchedContractRange> {
+    match (current, candidate) {
+        (Some(current), Some(candidate))
+            if candidate.light_years < current.light_years
+                || (candidate.light_years == current.light_years
+                    && candidate.reference_system_id < current.reference_system_id) =>
+        {
+            Some(candidate)
+        }
+        (Some(current), _) => Some(current),
+        (None, candidate) => candidate,
+    }
 }
 
 impl<'a> ContractFilterEvaluator<'a> {
@@ -11178,13 +11315,19 @@ impl<'a> ContractFilterEvaluator<'a> {
             group_cache: HashMap::new(),
             matching_ship_items: HashSet::new(),
             matching_ship_items_deferred: false,
+            matched_range: None,
         }
     }
 
     async fn matches(&mut self, node: &ContractFilterNode) -> ContractFilterMatch {
         self.matching_ship_items.clear();
         self.matching_ship_items_deferred = false;
+        self.matched_range = None;
         evaluate_contract_filter_node(node.clone(), self, true).await
+    }
+
+    fn matched_range(&self) -> Option<MatchedContractRange> {
+        self.matched_range.clone()
     }
 
     async fn group_for_type(&mut self, type_id: i64) -> ShipGroupLookup {
@@ -11340,6 +11483,17 @@ fn plan_contract_filter_context<'borrow, 'event>(
                     }
                 }
                 let result = evaluate_contract_filter_condition(condition, evaluator, false).await;
+                if matches!(result, ContractFilterMatch::Matched)
+                    && matches!(condition, ContractFilterCondition::LyRangeFrom(_))
+                {
+                    return ContractFilterContextPlan {
+                        result,
+                        requirements: condition.context_requirements(),
+                        waits_for_non_context: false,
+                        confirmed_ship_items: HashSet::new(),
+                        potential_ship_items: HashSet::new(),
+                    };
+                }
                 if !matches!(
                     result,
                     ContractFilterMatch::Deferred | ContractFilterMatch::UnresolvedProximity
@@ -11520,6 +11674,7 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
             ContractFilterNode::And(nodes) => {
                 let initial_matches = evaluator.matching_ship_items.clone();
                 let initial_matches_deferred = evaluator.matching_ship_items_deferred;
+                let initial_range = evaluator.matched_range.clone();
                 let mut deferred = false;
                 let mut unresolved_proximity = false;
                 for node in nodes {
@@ -11534,6 +11689,7 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
                         ContractFilterMatch::Unmatched => {
                             evaluator.matching_ship_items = initial_matches;
                             evaluator.matching_ship_items_deferred = initial_matches_deferred;
+                            evaluator.matched_range = initial_range.clone();
                             return ContractFilterMatch::Unmatched;
                         }
                         ContractFilterMatch::Deferred => deferred = true,
@@ -11547,6 +11703,7 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
                     evaluator.matching_ship_items_deferred = initial_matches_deferred
                         || evaluator.matching_ship_items_deferred
                         || branch_may_add_ship_items;
+                    evaluator.matched_range = initial_range;
                     if deferred {
                         ContractFilterMatch::Deferred
                     } else {
@@ -11559,8 +11716,10 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
             ContractFilterNode::Or(nodes) => {
                 let initial_matches = evaluator.matching_ship_items.clone();
                 let initial_matches_deferred = evaluator.matching_ship_items_deferred;
+                let initial_range = evaluator.matched_range.clone();
                 let mut matching_ship_items = initial_matches.clone();
                 let mut matching_ship_items_deferred = initial_matches_deferred;
+                let mut matched_range = initial_range.clone();
                 let mut unresolved_ship_items = false;
                 let mut matched = false;
                 let mut deferred = false;
@@ -11568,6 +11727,7 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
                 for node in nodes {
                     evaluator.matching_ship_items = initial_matches.clone();
                     evaluator.matching_ship_items_deferred = initial_matches_deferred;
+                    evaluator.matched_range = initial_range.clone();
                     match evaluate_contract_filter_node(
                         node,
                         evaluator,
@@ -11580,6 +11740,10 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
                             matching_ship_items
                                 .extend(evaluator.matching_ship_items.iter().copied());
                             matching_ship_items_deferred |= evaluator.matching_ship_items_deferred;
+                            matched_range = prefer_nearer_contract_range(
+                                matched_range,
+                                evaluator.matched_range.clone(),
+                            );
                         }
                         ContractFilterMatch::Unmatched => {}
                         ContractFilterMatch::Deferred => {
@@ -11599,11 +11763,13 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
                 if matched {
                     evaluator.matching_ship_items = matching_ship_items;
                     evaluator.matching_ship_items_deferred = matching_ship_items_deferred;
+                    evaluator.matched_range = matched_range;
                     ContractFilterMatch::Matched
                 } else if deferred || unresolved_proximity {
                     evaluator.matching_ship_items = initial_matches;
                     evaluator.matching_ship_items_deferred =
                         matching_ship_items_deferred || unresolved_ship_items;
+                    evaluator.matched_range = initial_range;
                     if deferred {
                         ContractFilterMatch::Deferred
                     } else {
@@ -11612,18 +11778,22 @@ fn evaluate_contract_filter_node<'borrow, 'event>(
                 } else {
                     evaluator.matching_ship_items = initial_matches;
                     evaluator.matching_ship_items_deferred = initial_matches_deferred;
+                    evaluator.matched_range = initial_range;
                     ContractFilterMatch::Unmatched
                 }
             }
             ContractFilterNode::Not(node) => {
-                match evaluate_contract_filter_node(*node, evaluator, false).await {
+                let initial_range = evaluator.matched_range.clone();
+                let result = match evaluate_contract_filter_node(*node, evaluator, false).await {
                     ContractFilterMatch::Matched => ContractFilterMatch::Unmatched,
                     ContractFilterMatch::Unmatched => ContractFilterMatch::Matched,
                     ContractFilterMatch::Deferred => ContractFilterMatch::Deferred,
                     ContractFilterMatch::UnresolvedProximity => {
                         ContractFilterMatch::UnresolvedProximity
                     }
-                }
+                };
+                evaluator.matched_range = initial_range;
+                result
             }
         }
     })
@@ -11702,6 +11872,8 @@ async fn evaluate_contract_filter_condition(
                 return ContractFilterMatch::UnresolvedProximity;
             };
             let mut deferred = false;
+            let mut matched = false;
+            let mut matched_range: Option<MatchedContractRange> = None;
             for range in ranges {
                 let Some(center_position) = event
                     .context
@@ -11713,11 +11885,40 @@ async fn evaluate_contract_filter_condition(
                     deferred = true;
                     continue;
                 };
-                if event_position.distance_in_light_years(center_position) <= range.range {
-                    return ContractFilterMatch::Matched;
+                let light_years = event_position.distance_in_light_years(center_position);
+                if light_years <= range.range {
+                    matched = true;
+                    if let Some(reference_system_name) = event
+                        .context
+                        .range_center_names
+                        .get(&range.system_id)
+                        .map(|name| sanitize_contract_text(name))
+                        .filter(|name| !name.is_empty())
+                    {
+                        let candidate = MatchedContractRange {
+                            light_years,
+                            reference_system_id: range.system_id,
+                            reference_system_name,
+                        };
+                        if matched_range.as_ref().is_none_or(|current| {
+                            candidate.light_years < current.light_years
+                                || (candidate.light_years == current.light_years
+                                    && candidate.reference_system_id < current.reference_system_id)
+                        }) {
+                            matched_range = Some(candidate);
+                        }
+                    }
                 }
             }
-            if deferred {
+            if matched {
+                if let Some(matched_range) = matched_range {
+                    evaluator.matched_range = prefer_nearer_contract_range(
+                        evaluator.matched_range.clone(),
+                        Some(matched_range),
+                    );
+                }
+                ContractFilterMatch::Matched
+            } else if deferred {
                 ContractFilterMatch::UnresolvedProximity
             } else {
                 ContractFilterMatch::Unmatched
@@ -11874,6 +12075,7 @@ fn contract_notification_message(
     if let Some(location) = compact_contract_location_description(
         &event.embed_context.location,
         event.contract.start_location_id,
+        event.embed_context.matched_range.as_ref(),
     ) {
         description.push(location);
     }
@@ -11905,7 +12107,14 @@ fn contract_notification_message(
                 .acceptance_evidence
                 .as_ref()
                 .map(|evidence| evidence.evidence_response_at),
-            ContractEventKind::Expired | ContractEventKind::ClosedOutcomeUnknown => None,
+            ContractEventKind::Expired => Some(event.contract.date_expired),
+            ContractEventKind::ClosedOutcomeUnknown => event
+                .acceptance_evidence
+                .as_ref()
+                .filter(|evidence| {
+                    evidence.provenance == Some(ContractAcceptanceProvenance::NoContent)
+                })
+                .map(|evidence| evidence.absence_observed_at),
         },
     };
     if matches!(
@@ -11933,6 +12142,47 @@ fn contract_notification_message(
                     "Contract accepted by another player\nESI confirmed {}",
                     discord_relative_timestamp(evidence.evidence_response_at),
                 ),
+                inline: false,
+            });
+        }
+    }
+    if matches!(
+        event.kind,
+        ContractEventKind::Expired | ContractEventKind::ClosedOutcomeUnknown
+    ) {
+        if let Some(evidence) = event
+            .acceptance_evidence
+            .as_ref()
+            .filter(|evidence| evidence.provenance == Some(ContractAcceptanceProvenance::NoContent))
+        {
+            let (window_name, semantic_esi_result) = match event.kind {
+                ContractEventKind::ClosedOutcomeUnknown => (
+                    "Observed closure window",
+                    "Public listing absent before expiry boundary",
+                ),
+                ContractEventKind::Expired => (
+                    "Observed expiry window",
+                    "Public listing absent after expiry boundary",
+                ),
+                _ => unreachable!("only nonfinancial terminal events reach this branch"),
+            };
+            message.fields.push(ContractEmbedField {
+                name: "Listing time".to_string(),
+                value: discord_absolute_relative_timestamps(event.contract.date_issued),
+                inline: false,
+            });
+            message.fields.push(ContractEmbedField {
+                name: window_name.to_string(),
+                value: format!(
+                    "**after** {}\n**before** {}",
+                    discord_absolute_relative_timestamps(evidence.last_public_observed_at),
+                    discord_absolute_relative_timestamps(evidence.absence_observed_at),
+                ),
+                inline: false,
+            });
+            message.fields.push(ContractEmbedField {
+                name: "ESI result".to_string(),
+                value: semantic_esi_result.to_string(),
                 inline: false,
             });
         }
@@ -11971,7 +12221,10 @@ fn contract_notification_message(
             name: "Evidence".to_string(),
             value: match event.kind {
                 ContractEventKind::Expired => {
-                    format!("Expired {}", compact_timestamp(event.contract.date_expired))
+                    format!(
+                        "Expired {}",
+                        discord_absolute_timestamp(event.contract.date_expired)
+                    )
                 }
                 ContractEventKind::ClosedOutcomeUnknown => {
                     "No longer public; closure time unknown".to_string()
@@ -12018,6 +12271,27 @@ fn repaired_contract_message(
     }
     bound_embed_message(&mut message);
     message
+}
+
+fn contract_matched_range_for_embed(
+    range: MatchedContractRange,
+    location: &ContractLocationContext,
+) -> Option<ContractMatchedRange> {
+    let destination_system_id = location
+        .solar_system_id
+        .and_then(|id| u32::try_from(id).ok())?;
+    let destination_system_name = location
+        .solar_system_name
+        .as_deref()
+        .map(sanitize_contract_text)
+        .filter(|name| !name.is_empty())?;
+    Some(ContractMatchedRange {
+        light_years: range.light_years,
+        reference_system_id: range.reference_system_id,
+        reference_system_name: range.reference_system_name,
+        destination_system_id,
+        destination_system_name,
+    })
 }
 
 fn historical_contract_primary_item<'a>(
@@ -12171,6 +12445,7 @@ fn contract_title_location(context: &ContractLocationContext) -> String {
 fn compact_contract_location_description(
     context: &ContractLocationContext,
     location_id: i64,
+    matched_range: Option<&ContractMatchedRange>,
 ) -> Option<String> {
     let system_name = context
         .solar_system_name
@@ -12207,11 +12482,16 @@ fn compact_contract_location_description(
             id,
             suffix: None,
         });
+    let range = matched_range.map(|range| LocationRange {
+        light_years: range.light_years,
+        reference_system: &range.reference_system_name,
+        destination_system: &range.destination_system_name,
+    });
     let description = compact_location_description(CompactLocation {
         system,
         region,
         on,
-        range: None,
+        range,
     });
     (!description.is_empty()).then_some(description)
 }
@@ -12309,18 +12589,12 @@ fn format_party_history(history: &ContractPartyHistory) -> String {
         entries.push(format!("{} unknown", history.unknown_closures));
     }
     if let Some(latest) = &history.most_recent_confirmed {
-        let label = match latest.kind {
-            ContractEventKind::SaleConfirmed => "last sale",
-            ContractEventKind::PurchaseConfirmed => "last purchase",
-            _ => "last confirmed",
-        };
-        entries.push(format!("{label} {}", compact_timestamp(latest.observed_at)));
+        entries.push(format!(
+            "Latest confirmation {}",
+            discord_short_date_timestamp(latest.observed_at)
+        ));
     }
     entries.join(" • ")
-}
-
-fn compact_timestamp(value: DateTime<Utc>) -> String {
-    value.format("%-d %b %Y %H:%MZ").to_string()
 }
 
 fn discord_absolute_timestamp(value: DateTime<Utc>) -> String {
@@ -12331,6 +12605,19 @@ fn discord_absolute_timestamp(value: DateTime<Utc>) -> String {
 fn discord_relative_timestamp(value: DateTime<Utc>) -> String {
     let timestamp = value.timestamp();
     format!("<t:{timestamp}:R>")
+}
+
+fn discord_absolute_relative_timestamps(value: DateTime<Utc>) -> String {
+    format!(
+        "{}\n{}",
+        discord_absolute_timestamp(value),
+        discord_relative_timestamp(value)
+    )
+}
+
+fn discord_short_date_timestamp(value: DateTime<Utc>) -> String {
+    let timestamp = value.timestamp();
+    format!("<t:{timestamp}:d>")
 }
 
 fn bound_listing_embed_message(message: &mut ContractNotificationMessage) {
@@ -12940,6 +13227,7 @@ fn collection_recovery_gap(interval: Duration) -> ChronoDuration {
 #[cfg(test)]
 mod embed_tests {
     use crate::discord_bot::{contract_notification_embed, DiscordContractDelivery};
+    use chrono::TimeZone;
     use serenity::http::Http;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -13055,6 +13343,7 @@ mod embed_tests {
                     region_id: Some(10_000_002),
                     region_name: Some("The Forge".to_string()),
                 },
+                matched_range: None,
                 issuer_character_name: Some("Issuer Name".to_string()),
                 issuer_corporation_name: Some("Issuer Corp".to_string()),
                 issuer_alliance_id: Some(99_000_001),
@@ -13490,7 +13779,7 @@ mod embed_tests {
             last_public_observed_at: confirmed_at - ChronoDuration::minutes(2),
             absence_observed_at: confirmed_at - ChronoDuration::minutes(1),
             evidence_response_at: confirmed_at,
-            provenance: ContractAcceptanceProvenance::AcceptedByPlayer,
+            provenance: Some(ContractAcceptanceProvenance::AcceptedByPlayer),
         });
         let sold_message = contract_notification_message(
             &sold,
@@ -13528,6 +13817,28 @@ mod embed_tests {
             Some("<t:1786995780:F>")
         );
         assert_eq!(purchased_message.timestamp, Some(confirmed_at));
+    }
+
+    #[test]
+    fn contract_history_uses_a_native_confirmation_date() {
+        let confirmed_at = Utc
+            .with_ymd_and_hms(2026, 8, 18, 12, 1, 0)
+            .single()
+            .expect("fixed confirmation time");
+        let history = ContractPartyHistory {
+            confirmed_sales: 4,
+            confirmed_purchases: 2,
+            unknown_closures: 1,
+            most_recent_confirmed: Some(MostRecentConfirmedContractEvent {
+                kind: ContractEventKind::SaleConfirmed,
+                observed_at: confirmed_at,
+            }),
+        };
+
+        assert_eq!(
+            format_party_history(&history),
+            "4 sales • 2 purchases • 1 unknown • Latest confirmation <t:1787054460:d>"
+        );
     }
 
     #[test]
@@ -13735,7 +14046,7 @@ mod embed_tests {
             last_public_observed_at: Utc::now() - ChronoDuration::minutes(3),
             absence_observed_at: Utc::now() - ChronoDuration::minutes(2),
             evidence_response_at: Utc::now() - ChronoDuration::seconds(90),
-            provenance: ContractAcceptanceProvenance::AcceptedByPlayer,
+            provenance: Some(ContractAcceptanceProvenance::AcceptedByPlayer),
         });
         event.embed_context.item_names.insert(
             19_720,
@@ -13823,7 +14134,7 @@ mod embed_tests {
             last_public_observed_at: Utc::now() - ChronoDuration::minutes(3),
             absence_observed_at: Utc::now() - ChronoDuration::minutes(2),
             evidence_response_at: Utc::now() - ChronoDuration::minutes(1),
-            provenance: ContractAcceptanceProvenance::AcceptedByPlayer,
+            provenance: Some(ContractAcceptanceProvenance::AcceptedByPlayer),
         });
         let issuer_history = ContractPartyHistory {
             confirmed_sales: 4,

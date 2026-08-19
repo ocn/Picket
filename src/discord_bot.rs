@@ -398,8 +398,8 @@ impl DiscordContractDelivery {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_with_edit_api_base(http: Arc<Http>, edit_api_base: String) -> Self {
+    #[doc(hidden)]
+    pub fn new_with_edit_api_base(http: Arc<Http>, edit_api_base: String) -> Self {
         Self {
             http,
             edit_client: contract_repair_http_client(),
