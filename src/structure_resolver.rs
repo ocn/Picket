@@ -639,6 +639,7 @@ impl StructureResolverRuntimeStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedStructure {
     pub structure_id: i64,
+    pub name: Option<String>,
     pub solar_system_id: i64,
     pub observed_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
@@ -921,6 +922,7 @@ impl ScopeClaim {
 
 #[derive(Deserialize)]
 struct StructureResponse {
+    name: Option<String>,
     solar_system_id: i64,
 }
 
@@ -1298,6 +1300,7 @@ impl AuthenticatedStructureResolver {
                     };
                     Ok(ResolvedStructure {
                         structure_id,
+                        name: cached.name,
                         solar_system_id: cached.solar_system_id,
                         observed_at: response_received_at,
                         expires_at: Some(expires_at),
@@ -1331,6 +1334,7 @@ impl AuthenticatedStructureResolver {
                     }
                     Ok(ResolvedStructure {
                         structure_id,
+                        name: body.name.filter(|name| !name.trim().is_empty()),
                         solar_system_id: body.solar_system_id,
                         observed_at: response_received_at,
                         expires_at,

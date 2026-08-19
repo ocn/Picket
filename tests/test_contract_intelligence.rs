@@ -291,6 +291,7 @@ async fn structure_resolver_refreshes_a_signed_token_and_authorizes_only_the_str
         .resolve_structure(1_024_000_001)
         .await
         .expect("signed resolver token authorizes the structure request");
+    assert_eq!(result.name.as_deref(), Some("Test Citadel"));
     assert_eq!(result.solar_system_id, 30_002_086);
     let requests = structure_server.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 1);
@@ -1670,6 +1671,7 @@ async fn structure_401_limiter_boundary_defers_refresh_and_never_reuses_error_re
             .record_structure_resolution_success(
                 &killbot_rust::structure_resolver::ResolvedStructure {
                     structure_id: contract.start_location_id,
+                    name: None,
                     solar_system_id: 30_002_086,
                     observed_at: now - chrono::Duration::hours(1),
                     expires_at: Some(now),
@@ -1999,6 +2001,7 @@ async fn no_store_structure_responses_discard_representations_but_honor_limiter_
             .record_structure_resolution_success(
                 &killbot_rust::structure_resolver::ResolvedStructure {
                     structure_id: contract.start_location_id,
+                    name: None,
                     solar_system_id: 30_002_086,
                     observed_at: now - chrono::Duration::hours(1),
                     expires_at: Some(now),
@@ -2590,7 +2593,9 @@ async fn matching_region_subscription_resolves_structure_location_for_the_embed(
         .message
         .description
         .as_deref()
-        .is_some_and(|description| description.contains("Turnur")));
+        .is_some_and(|description| {
+            description.contains("Turnur") && description.contains("Summit's Beacon")
+        }));
     drop(sent);
 
     database.destroy().await;
@@ -3184,6 +3189,7 @@ async fn structure_resolution_admission_is_leased_and_stale_completion_cannot_re
         .record_structure_resolution_success(
             &killbot_rust::structure_resolver::ResolvedStructure {
                 structure_id,
+                name: None,
                 solar_system_id: 30_002_086,
                 observed_at: now,
                 expires_at: Some(now + chrono::Duration::hours(1)),
@@ -3362,6 +3368,7 @@ async fn stale_structure_success_cannot_create_evidence_or_mutate_a_new_generati
         .record_structure_resolution_success_with_evidence(
             &killbot_rust::structure_resolver::ResolvedStructure {
                 structure_id,
+                name: None,
                 solar_system_id: 30_002_086,
                 observed_at: now,
                 expires_at: Some(now + chrono::Duration::hours(1)),
@@ -3456,6 +3463,7 @@ async fn runtime_rotation_fences_all_inflight_structure_completion_effects() {
         .record_structure_resolution_success_with_evidence(
             &killbot_rust::structure_resolver::ResolvedStructure {
                 structure_id,
+                name: None,
                 solar_system_id: 30_002_086,
                 observed_at: now,
                 expires_at: Some(now + chrono::Duration::hours(1)),
@@ -3571,6 +3579,7 @@ async fn resolver_success_locks_location_before_state_and_serializes_public_evid
         .expect("hold resolver-state barrier");
     let resolved = killbot_rust::structure_resolver::ResolvedStructure {
         structure_id,
+        name: None,
         solar_system_id: 30_002_086,
         observed_at: now,
         expires_at: Some(now + chrono::Duration::hours(1)),
@@ -4441,6 +4450,7 @@ async fn assert_stale_collector_failure_cannot_overwrite_a_newer_ready_runtime(
         .record_structure_resolution_success(
             &killbot_rust::structure_resolver::ResolvedStructure {
                 structure_id,
+                name: None,
                 solar_system_id: 30_002_086,
                 observed_at: newer_now,
                 expires_at: Some(newer_now + chrono::Duration::hours(1)),
@@ -4592,6 +4602,7 @@ impl StructureResolver for SuccessfulStructureResolver {
         let observed_at = Utc::now();
         Ok(killbot_rust::structure_resolver::ResolvedStructure {
             structure_id,
+            name: Some("Summit's Beacon".to_string()),
             solar_system_id: self.solar_system_id,
             observed_at,
             expires_at: Some(observed_at + chrono::Duration::hours(1)),
