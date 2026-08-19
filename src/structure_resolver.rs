@@ -14,7 +14,11 @@ use crate::contract_intelligence::{cache_metadata_at, esi_limiter_deadline_at, C
 
 pub const STRUCTURE_RESOLVER_SCOPE: &str = "esi-universe.read_structures.v1";
 const EVE_SSO_AUTHORIZATION_URL: &str = "https://login.eveonline.com/v2/oauth/authorize/";
-const EVE_SSO_ISSUERS: &[&str] = &["https://login.eveonline.com/", "login.eveonline.com"];
+const EVE_SSO_ISSUERS: &[&str] = &[
+    "https://login.eveonline.com",
+    "https://login.eveonline.com/",
+    "login.eveonline.com",
+];
 const EVE_SSO_METADATA_URL: &str =
     "https://login.eveonline.com/.well-known/oauth-authorization-server";
 const EVE_ESI_BASE_URL: &str = "https://esi.evetech.net/latest/";

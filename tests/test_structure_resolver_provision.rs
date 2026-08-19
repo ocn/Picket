@@ -37,7 +37,7 @@ fn signed_access_token(scopes: &[&str]) -> String {
                 "EVE Online".to_string(),
             ],
             exp: 4_102_444_800,
-            iss: "https://login.eveonline.com/".to_string(),
+            iss: "https://login.eveonline.com".to_string(),
             scp: scopes.iter().map(|scope| (*scope).to_string()).collect(),
             sub: "CHARACTER:EVE:90000001".to_string(),
         },
