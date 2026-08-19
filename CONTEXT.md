@@ -99,3 +99,29 @@ _Avoid_: Contract URL, Discord link
 **Observation History**:
 Retained contract observations used initially for embed enrichment and later for querying or analysis.
 _Avoid_: Sales history
+
+## Release and communication
+
+**Deployment**:
+A change to the version running in production.
+_Avoid_: Release
+
+**GitHub Release**:
+The tagged public record of a deployable version, with technical release notes.
+_Avoid_: Deployment, announcement
+
+**Release Announcement**:
+A user-focused message that explains a release's practical effect and links to its GitHub Release.
+_Avoid_: Release notes
+
+**Release Window**:
+A recurring four-week checkpoint for drafting and publishing a release when the Changelog contains user-visible changes. A window may be recorded as skipped.
+_Avoid_: Release date
+
+**Changelog**:
+The human-authored factual source accumulated under Unreleased and converted into a versioned section for a GitHub Release.
+_Avoid_: Git log, generated release notes
+
+**Operator**:
+The recipient configured to receive a health incident.
+_Avoid_: Guild Administrator
