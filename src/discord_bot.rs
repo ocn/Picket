@@ -11,6 +11,10 @@ use crate::contract_intelligence::{
 };
 use crate::esi::Celestial;
 use crate::models::{Attacker, ZkData};
+use crate::presentation::{
+    compact_location_description, CompactLocation, LocationOn, LocationRange, LocationRegion,
+    LocationSystem,
+};
 use crate::processor::{AttackerKey, Color, NamedFilterResult};
 use chrono::{DateTime, FixedOffset, Utc};
 use serde_json::Value;
@@ -590,6 +594,9 @@ pub fn contract_notification_embed(message: &ContractNotificationMessage) -> Cre
     if let Some(description) = &message.description {
         embed.description(description);
     }
+    if let Some(author) = &message.author {
+        embed.author(|builder| builder.name(author));
+    }
     if let Some(thumbnail_url) = &message.thumbnail_url {
         embed.thumbnail(thumbnail_url);
     }
@@ -598,6 +605,9 @@ pub fn contract_notification_embed(message: &ContractNotificationMessage) -> Cre
     }
     for field in &message.fields {
         embed.field(&field.name, &field.value, field.inline);
+    }
+    if let Some(timestamp) = message.timestamp {
+        embed.timestamp(timestamp.to_rfc3339());
     }
     embed
 }
@@ -1409,33 +1419,6 @@ fn str_corp_zk(id: u64) -> String {
 fn str_alliance_zk(id: u64) -> String {
     format!("https://zkillboard.com/alliance/{}/", id)
 }
-fn str_system_dotlan(id: u32) -> String {
-    format!("http://evemaps.dotlan.net/system/{}", id)
-}
-fn str_region_dotlan(id: u32) -> String {
-    format!("http://evemaps.dotlan.net/region/{}", id)
-}
-fn str_location(id: u64) -> String {
-    format!("https://zkillboard.com/location/{}/", id)
-}
-
-enum DotlanJumpType {
-    Super,
-    Fax,
-    Blops,
-}
-fn str_jump_dotlan(from: &str, to: &str, with: DotlanJumpType) -> String {
-    let with = match with {
-        DotlanJumpType::Super => "Nyx",
-        DotlanJumpType::Fax => "Lif",
-        DotlanJumpType::Blops => "Sin",
-    };
-    format!(
-        "https://evemaps.dotlan.net/jump/{},555/{}:{}",
-        with, from, to
-    )
-}
-
 // Returns: ID, count
 fn most_common_ship_type(attackers: &[Attacker]) -> Option<(u64, u64)> {
     attackers
@@ -1696,58 +1679,31 @@ pub async fn build_killmail_embed(
     };
 
     // --- Location Details ---
-    let location_line = format!(
-        "**in:** [{}]({}) ([{}]({}))",
-        system_name,
-        str_system_dotlan(system_id),
-        region_name,
-        str_region_dotlan(region_id)
-    );
-
-    let celestial_line = if let Some(celestial) = get_closest_celestial(app_state, zk_data).await {
+    let celestial = get_closest_celestial(app_state, zk_data).await;
+    let celestial_distance = celestial.as_ref().map(|celestial| {
         let distance_km = celestial.distance / 1000.0;
-        let distance_str = if distance_km > 1_500_000.0 {
+        if distance_km > 1_500_000.0 {
             format!("{:.1} AU", distance_km / 149_597_870.7)
         } else {
             format!("{:.1} km", distance_km)
-        };
-        format!(
-            "**on:** [{}]({}), {} away",
-            celestial.item_name,
-            str_location(celestial.item_id),
-            distance_str
-        )
-    } else {
-        String::new()
-    };
+        }
+    });
 
-    let range_line = if let Some(matched_system_range) = &filter_result.light_year_range {
+    let range = if let Some(matched_system_range) = &filter_result.light_year_range {
         if matched_system_range.range > 0.0 {
             let matched_base_system_name = get_system(app_state, matched_system_range.system_id)
                 .await
                 .map_or_else(|| "Unknown System".to_string(), |s| s.name);
-            format!(
-                "**range:** {:.1} LY from {} ([Supers]({})|[FAX]({})|[Blops]({}))",
-                matched_system_range.range,
-                matched_base_system_name,
-                str_jump_dotlan(
-                    &matched_base_system_name,
-                    system_name,
-                    DotlanJumpType::Super
-                ),
-                str_jump_dotlan(&matched_base_system_name, system_name, DotlanJumpType::Fax),
-                str_jump_dotlan(
-                    &matched_base_system_name,
-                    system_name,
-                    DotlanJumpType::Blops
-                )
-            )
+            Some((matched_system_range.range, matched_base_system_name))
         } else {
-            String::new()
+            None
         }
     } else {
-        String::new()
+        None
     };
+    let celestial_suffix = celestial_distance
+        .as_deref()
+        .map(|distance| format!("{distance} away"));
 
     // --- Attackers Field with Fleet Composition ---
     let overall_fleet_comp = fleet_comp.format_overall(app_state).await;
@@ -1804,15 +1760,28 @@ pub async fn build_killmail_embed(
         Color::Red => Colour::RED,
     });
 
-    // Location fields
-    let mut location_content = location_line;
-    if !celestial_line.is_empty() {
-        location_content.push_str(&format!("\n{}", celestial_line));
-    }
-    if !range_line.is_empty() {
-        location_content.push_str(&format!("\n{}", range_line));
-    }
-    embed.description(location_content);
+    embed.description(compact_location_description(CompactLocation {
+        system: Some(LocationSystem {
+            name: system_name,
+            id: system_id,
+        }),
+        region: Some(LocationRegion {
+            name: region_name,
+            id: region_id,
+        }),
+        on: celestial.as_ref().map(|celestial| LocationOn {
+            name: &celestial.item_name,
+            id: celestial.item_id,
+            suffix: celestial_suffix.as_deref(),
+        }),
+        range: range
+            .as_ref()
+            .map(|(light_years, reference_system)| LocationRange {
+                light_years: *light_years,
+                reference_system,
+                destination_system: system_name,
+            }),
+    }));
 
     // Attackers field
     embed.field(
@@ -2262,8 +2231,12 @@ mod tests {
                 value: "contract:0//45".to_string(),
                 inline: false,
             }],
+            presentation_revision:
+                crate::contract_intelligence::CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+            author: None,
             thumbnail_url: None,
             footer: None,
+            timestamp: None,
         });
 
         assert_eq!(embed.0["title"].as_str(), Some("Public contract listed"));
@@ -2282,8 +2255,12 @@ mod tests {
             title: "@everyone cannot notify anyone".to_string(),
             description: None,
             fields: vec![],
+            presentation_revision:
+                crate::contract_intelligence::CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+            author: None,
             thumbnail_url: None,
             footer: None,
+            timestamp: None,
         };
         let delivery = PreparedContractDelivery {
             delivery_id: 1,
