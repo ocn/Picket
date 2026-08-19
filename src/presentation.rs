@@ -60,7 +60,7 @@ pub fn compact_location_description(location: CompactLocation<'_>) -> String {
     }
     if let Some(range) = location
         .range
-        .filter(|range| range.light_years.is_finite() && range.light_years > 0.0)
+        .filter(|range| range.light_years.is_finite() && range.light_years >= 0.0)
     {
         lines.push(format!(
             "**range:** {:.1} LY from {} ([Supers](https://evemaps.dotlan.net/jump/Nyx,555/{}:{})|[FAX](https://evemaps.dotlan.net/jump/Lif,555/{}:{})|[Blops](https://evemaps.dotlan.net/jump/Sin,555/{}:{}))",

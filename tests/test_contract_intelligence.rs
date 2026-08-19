@@ -8,22 +8,22 @@ use killbot_rust::contract_intelligence::{
     execute_operator_delivery_cli, new_contract_store_handle,
     proximity_reconciliation_interval_from, spawn_contract_collection_loop_with_notifications,
     spawn_proximity_reconciliation_loop_with_esi, AppStateContractPingLimiter, CacheMetadata,
-    CollectionOutcome, ContractCollectionStore, ContractCollector, ContractContextLimiter,
-    ContractContextRequirements, ContractContextResolution, ContractContextValue, ContractDelivery,
-    ContractDeliveryClock, ContractDeliveryError, ContractEmbedContext, ContractEvent,
-    ContractEventAction, ContractEventActions, ContractEventKind, ContractFilter,
-    ContractFilterCondition, ContractFilterNode, ContractItemDirection, ContractItemProbe,
-    ContractLocationContext, ContractMessageEdit, ContractNotificationMessage,
-    ContractObservationContext, ContractPingLimiter, ContractPingType, ContractRequestPacer,
-    ContractResolutionState, ContractSubscription, DeliveryFailureKind, DeliveryRecord,
-    DeliveryStatus, EsiError, EsiResponse, HealthCheck, HealthClock, HealthCycle,
+    CollectionOutcome, ContractAcceptanceEvidence, ContractCollectionStore, ContractCollector,
+    ContractContextLimiter, ContractContextRequirements, ContractContextResolution,
+    ContractContextValue, ContractDelivery, ContractDeliveryClock, ContractDeliveryError,
+    ContractEmbedContext, ContractEvent, ContractEventAction, ContractEventActions,
+    ContractEventKind, ContractFilter, ContractFilterCondition, ContractFilterNode,
+    ContractItemDirection, ContractItemProbe, ContractLocationContext, ContractMessageEdit,
+    ContractNotificationMessage, ContractObservationContext, ContractPingLimiter, ContractPingType,
+    ContractRequestPacer, ContractResolutionState, ContractSubscription, DeliveryFailureKind,
+    DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HealthCheck, HealthClock, HealthCycle,
     HealthDiscordPublisher, HealthPublishError, HealthRuntimeConfig, HealthStatus, HealthWatchdog,
     HealthWatchdogConfig, HealthWatchdogRunner, HttpPublicContractEsi, PreparedContractDelivery,
     PublicContract, PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
     SolarSystemPosition, StructureResolutionAdmission, CONTRACT_DELIVERY_OPERATOR_ACTOR,
     CONTRACT_DELIVERY_OPERATOR_TOKEN_MAX_BYTES, CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
 };
-use killbot_rust::discord_bot::contract_notification_embed;
+use killbot_rust::discord_bot::{contract_notification_embed, DiscordContractDelivery};
 use killbot_rust::esi::EsiClient;
 use killbot_rust::feed::{FeedError, FeedHealthProvider, FeedHealthTelemetry, KillmailFeed};
 use killbot_rust::location_evidence::{
@@ -39,6 +39,7 @@ use killbot_rust::structure_resolver::{
 use moka::future::Cache;
 use serde::Serialize;
 use serde_json::Value;
+use serenity::http::Http;
 use sha2::{Digest, Sha256, Sha384};
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::postgres::PgPoolOptions;
@@ -8309,6 +8310,17 @@ impl PublicContractEsi for PositionEsi {
             .map(|position| EsiResponse::fresh(position, CacheMetadata::cached_for_seconds(60)))
             .ok_or_else(|| EsiError::retryable("position unavailable", None))
     }
+
+    async fn solar_system_name(
+        &self,
+        solar_system_id: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<String>, EsiError> {
+        (solar_system_id == 30_002_086)
+            .then(|| "Turnur".to_string())
+            .map(|name| EsiResponse::fresh(name, CacheMetadata::cached_for_seconds(60)))
+            .ok_or_else(|| EsiError::retryable("system name unavailable", None))
+    }
 }
 
 #[async_trait]
@@ -12675,6 +12687,120 @@ async fn light_year_ranges_match_either_center_include_the_boundary_and_cache_ce
         1
     );
     drop(position_calls);
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn contract_range_match_renders_the_shared_linked_range_line_with_its_reference_and_destination(
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let baseline = item_exchange_contract(44);
+    let listed = item_exchange_contract(45);
+    let items = HashMap::from([
+        (
+            44,
+            Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+        ),
+        (
+            45,
+            Ok(EsiResponse::fresh(vec![offered_ship(2)], expiring_cache())),
+        ),
+    ]);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(vec![baseline.clone()], items.clone())),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish a silent range-render baseline");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "range-render".to_string(),
+            description: "render matched proximity range".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                    config::SystemRange {
+                        system_id: 30_002_086,
+                        range: 8.0,
+                    },
+                ])),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist range-render subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed the destination location");
+    sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,now()) ON CONFLICT (region_id, contract_id) DO UPDATE SET context = EXCLUDED.context, observed_at = EXCLUDED.observed_at")
+        .bind(10_000_002_i64)
+        .bind(listed.contract_id)
+        .bind(serde_json::to_value(ContractEmbedContext {
+            location: ContractLocationContext {
+                solar_system_id: Some(30_000_045),
+                solar_system_name: Some("Jita".to_string()),
+                region_id: Some(10_000_002),
+                region_name: Some("The Forge".to_string()),
+                ..ContractLocationContext::default()
+            },
+            ..ContractEmbedContext::default()
+        }).expect("serialize destination location"))
+        .execute(&pool)
+        .await
+        .expect("retain the destination location for range rendering");
+    pool.close().await;
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(PositionEsi {
+            inner: regional_esi(vec![baseline, listed.clone()], items),
+            contexts: HashMap::from([(
+                listed.contract_id,
+                ContractObservationContext {
+                    solar_system_id: Some(30_000_045),
+                    range_center_names: BTreeMap::from([(30_002_086, "Turnur".to_string())]),
+                    ..ContractObservationContext::default()
+                },
+            )]),
+            positions: HashMap::from([
+                (30_000_045, position_at_light_years(0.0)),
+                (30_002_086, position_at_light_years(0.0)),
+            ]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+    .collect_cycle()
+    .await
+    .expect("match and render the in-range listing");
+
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let description = sent[0]
+        .message
+        .description
+        .as_deref()
+        .expect("contract notification has a compact description");
+    assert!(
+        description.contains(
+            "**range:** 0.0 LY from Turnur ([Supers](https://evemaps.dotlan.net/jump/Nyx,555/Turnur:Jita)|[FAX](https://evemaps.dotlan.net/jump/Lif,555/Turnur:Jita)|[Blops](https://evemaps.dotlan.net/jump/Sin,555/Turnur:Jita))"
+        ),
+        "unexpected compact contract description: {description}; fields: {:?}",
+        sent[0].message.fields
+    );
+    drop(sent);
+
     database.destroy().await;
 }
 
@@ -17364,6 +17490,7 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
                 region_id: Some(10_000_002),
                 region_name: Some("The Forge".to_string()),
             },
+            matched_range: None,
             issuer_character_name: Some("Issuer".to_string()),
             issuer_corporation_name: Some("Issuer Corp".to_string()),
             issuer_alliance_id: None,
@@ -17372,7 +17499,7 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
         },
     };
     let eligible_id = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'rerender-queue-target', 45, 'listed', $1, $2, TRUE, 'everyone', 'sent', 'ci-rerender-eligible', 'retained-message') RETURNING id",
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'rerender-queue-target', 45, 'listed', $1, $2, TRUE, 'everyone', 'sent', 'ci-rerender-eligible', '9001') RETURNING id",
     )
     .bind(serde_json::to_value(historical_event).expect("serialize retained historical event"))
     .bind(&obsolete_message)
@@ -17510,7 +17637,7 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
     );
     assert_eq!(queued_state.2, "pending");
     assert_eq!(queued_state.3, 1);
-    assert_eq!(queued_state.4, "retained-message");
+    assert_eq!(queued_state.4, "9001");
     assert!(queued_state.5);
     assert_eq!(queued_state.6, "everyone");
     assert_eq!(queued_state.7, "ci-rerender-eligible");
@@ -17528,11 +17655,22 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
     );
     pool.close().await;
 
-    let delivery = Arc::new(ScriptedRepairDelivery {
-        sent: StdMutex::new(Vec::new()),
-        edits: StdMutex::new(Vec::new()),
-        edit_outcomes: StdMutex::new(vec![Ok(())]),
-    });
+    let wire = ControlledHttpServer::start(
+        vec![WireReply {
+            status: 200,
+            headers: vec![],
+            body: "{}",
+        }],
+        WireReply {
+            status: 500,
+            headers: vec![],
+            body: r#"{"code":0,"message":"unexpected rerender retry"}"#,
+        },
+    );
+    let delivery = Arc::new(DiscordContractDelivery::new_with_edit_api_base(
+        Arc::new(Http::new("controlled-rerender-token")),
+        wire.base_url.trim_end_matches('/').to_string(),
+    ));
     assert!(
         ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
             .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone(),)
@@ -17541,19 +17679,21 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
             .is_err(),
         "the controlled collector failure still dispatches durable repairs"
     );
-    assert!(
-        delivery.sent.lock().unwrap().is_empty(),
-        "historical rerendering cannot create a replacement post"
-    );
-    let edits = delivery.edits.lock().unwrap();
-    assert_eq!(edits.len(), 1);
-    assert_eq!(edits[0].delivery_id, eligible_id);
-    assert_eq!(edits[0].discord_message_id, "retained-message");
+    let requests = wire.requests.lock().unwrap().clone();
     assert_eq!(
-        edits[0].message.presentation_revision,
-        CONTRACT_NOTIFICATION_PRESENTATION_REVISION
+        requests.len(),
+        1,
+        "the rerender dispatch never posts a replacement"
     );
-    drop(edits);
+    let request = &requests[0];
+    assert!(request.starts_with("PATCH /channels/77/messages/9001 HTTP/1.1\r\n"));
+    assert!(!request.starts_with("POST "));
+    let body = request
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| serde_json::from_str::<Value>(body).expect("rerender PATCH JSON"))
+        .expect("rerender PATCH body");
+    assert_eq!(body["allowed_mentions"]["parse"], serde_json::json!([]));
+    assert_eq!(body["embeds"].as_array().map(Vec::len), Some(1));
 
     let record = store
         .delivery_record(eligible_id)
@@ -17561,10 +17701,123 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
         .expect("read dispatched rerender record")
         .expect("queued rerender remains retained");
     assert_eq!(record.status, DeliveryStatus::Sent);
+    assert_eq!(record.discord_message_id.as_deref(), Some("9001"));
+    wire.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn historical_rerender_batch_stops_after_a_permanent_edit_failure_and_leaves_later_repairs_durable(
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "rerender-stop-on-permanent",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist rerender stop subscription");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed rerender repair batch");
+    let original = serde_json::json!({"title":"Legacy listing","fields":[]});
+    let first_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'rerender-stop-on-permanent', 45, 'listed', '{}'::jsonb, $1, FALSE, 'here', 'sent', 'ci-rerender-stop-first', 'original-first') RETURNING id",
+    )
+    .bind(&original)
+    .fetch_one(&pool)
+    .await
+    .expect("seed first retained rerender");
+    let second_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, ping_type, status, delivery_nonce, discord_message_id) VALUES (42, 77, 'rerender-stop-on-permanent', 46, 'listed', '{}'::jsonb, $1, FALSE, 'here', 'sent', 'ci-rerender-stop-second', 'original-second') RETURNING id",
+    )
+    .bind(&original)
+    .fetch_one(&pool)
+    .await
+    .expect("seed later retained rerender");
+    pool.close().await;
+    for (delivery_id, title) in [
+        (first_id, "First correction"),
+        (second_id, "Later correction"),
+    ] {
+        store
+            .prepare_delivery_repair(
+                delivery_id,
+                ContractNotificationMessage {
+                    title: title.to_string(),
+                    description: None,
+                    fields: vec![],
+                    presentation_revision: CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+                    author: None,
+                    thumbnail_url: None,
+                    footer: None,
+                    timestamp: None,
+                },
+            )
+            .await
+            .expect("queue durable historical repair");
+    }
+
+    let delivery = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![Err(ContractDeliveryError::permanent_delivery(
+            "Discord HTTP 404, JSON code 10008",
+        ))]),
+    });
+    ContractCollector::new(store.clone(), Arc::new(FailingContractEsi))
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
+        .reconcile_proximity_notifications()
+        .await
+        .expect("run one durable repair dispatch batch");
+
+    let edits = delivery.edits.lock().unwrap();
     assert_eq!(
-        record.discord_message_id.as_deref(),
-        Some("retained-message")
+        edits.len(),
+        1,
+        "a permanent edit failure stops this rerender batch"
     );
+    assert_eq!(edits[0].delivery_id, first_id);
+    drop(edits);
+    assert!(delivery.sent.lock().unwrap().is_empty());
+    let first = store
+        .inspect_contract_delivery(first_id)
+        .await
+        .expect("inspect permanent rerender")
+        .expect("first rerender remains recorded");
+    assert_eq!(first.status, DeliveryStatus::Failed);
+    assert_eq!(
+        first.repair_failure_kind,
+        Some(DeliveryFailureKind::Permanent)
+    );
+    let second = store
+        .inspect_contract_delivery(second_id)
+        .await
+        .expect("inspect unattempted rerender")
+        .expect("later rerender remains durable");
+    assert_eq!(second.status, DeliveryStatus::Sent);
+    assert_eq!(
+        second.repair_status,
+        killbot_rust::contract_intelligence::ContractRepairStatus::Pending
+    );
+    assert_eq!(
+        second
+            .desired_message
+            .as_ref()
+            .map(|message| message.title.as_str()),
+        Some("Later correction")
+    );
+    assert_eq!(
+        second.discord_message_id.as_deref(),
+        Some("original-second")
+    );
+
     database.destroy().await;
 }
 
@@ -17907,6 +18160,52 @@ async fn contract_repair_waits_for_a_persisted_platform_retry_deadline() {
         .expect("inspect retry deadline")
         .expect("delivery remains durable");
     assert_eq!(inspection.next_repair_attempt_at, Some(retry_at));
+
+    let before_retry = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![Ok(())]),
+    });
+    assert!(
+        ContractCollector::new(database.store().await, Arc::new(FailingContractEsi))
+            .with_notifications(
+                Arc::new(StaticShipGroups(HashMap::new())),
+                before_retry.clone(),
+            )
+            .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(
+                retry_at - chrono::Duration::seconds(1),
+            ))))
+            .collect_cycle()
+            .await
+            .is_err(),
+        "a restarted collector observes the durable retry deadline before editing"
+    );
+    assert!(before_retry.edits.lock().unwrap().is_empty());
+    assert!(before_retry.sent.lock().unwrap().is_empty());
+
+    let after_retry = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![Ok(())]),
+    });
+    assert!(
+        ContractCollector::new(database.store().await, Arc::new(FailingContractEsi))
+            .with_notifications(
+                Arc::new(StaticShipGroups(HashMap::new())),
+                after_retry.clone(),
+            )
+            .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(retry_at))))
+            .collect_cycle()
+            .await
+            .is_err(),
+        "the restarted collector performs the PATCH-equivalent durable edit at the deadline"
+    );
+    assert!(after_retry.sent.lock().unwrap().is_empty());
+    assert_eq!(after_retry.edits.lock().unwrap().len(), 1);
+    assert_eq!(
+        after_retry.edits.lock().unwrap()[0].discord_message_id,
+        "original-retry-message"
+    );
 
     database.destroy().await;
 }
@@ -26445,7 +26744,7 @@ async fn http_esi_classifies_only_exact_public_contract_forbidden_bodies() {
 }
 
 #[tokio::test]
-async fn accepted_player_evidence_confirms_only_before_contract_expiry() {
+async fn accepted_player_evidence_confirms_even_after_contract_expiry() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let mut expired_contract = item_exchange_contract(44);
@@ -26514,11 +26813,14 @@ async fn accepted_player_evidence_confirms_only_before_contract_expiry() {
             .map(|event| (event.contract.contract_id, event.kind))
             .collect::<Vec<_>>(),
         vec![
-            (expired_contract.contract_id, ContractEventKind::Expired),
+            (
+                expired_contract.contract_id,
+                ContractEventKind::SaleConfirmed
+            ),
             (fresh_contract.contract_id, ContractEventKind::SaleConfirmed),
         ]
     );
-    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+    assert_eq!(delivery.sent.lock().unwrap().len(), 2);
     assert_eq!(
         store
             .contract_resolution_records()
@@ -26530,7 +26832,7 @@ async fn accepted_player_evidence_confirms_only_before_contract_expiry() {
         vec![
             (
                 expired_contract.contract_id,
-                ContractResolutionState::Expired
+                ContractResolutionState::AcceptanceConfirmed
             ),
             (
                 fresh_contract.contract_id,
@@ -27082,10 +27384,15 @@ async fn no_content_closure_release_seam_is_non_pinging_and_uses_evidence_safe_t
             ContractEventKind::Expired,
         ]
     );
-    assert!(resolution
-        .events
-        .iter()
-        .all(|event| event.acceptance_evidence.is_none()));
+    assert!(resolution.events.iter().all(|event| {
+        matches!(
+            event
+                .acceptance_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.provenance),
+            Some(killbot_rust::contract_intelligence::ContractAcceptanceProvenance::NoContent)
+        )
+    }));
     assert_eq!(
         store
             .contract_resolution_records()
@@ -27132,18 +27439,102 @@ async fn no_content_closure_release_seam_is_non_pinging_and_uses_evidence_safe_t
     .await
     .expect("serialize the retained terminal notifications after restart");
 
+    let records = store
+        .contract_resolution_records()
+        .await
+        .expect("read durable no-content observation windows for serialized embeds");
     let sent = delivery.sent.lock().unwrap();
     assert_eq!(sent.len(), 2);
     assert!(sent.iter().all(|prepared| !prepared.ping));
     for prepared in sent.iter() {
-        let expected = match prepared.contract_id {
-            id if id == pre_expiry.contract_id => "Rifter contract closed • outcome unknown",
-            id if id == post_expiry.contract_id => "Rifter contract expired",
-            id => panic!("unexpected no-content contract delivery {id}"),
+        let (contract, expected_title, window_name, semantic_esi_result) =
+            match prepared.contract_id {
+                id if id == pre_expiry.contract_id => (
+                    &pre_expiry,
+                    "Rifter contract closed • outcome unknown",
+                    "Observed closure window",
+                    "Public listing absent before expiry boundary",
+                ),
+                id if id == post_expiry.contract_id => (
+                    &post_expiry,
+                    "Rifter contract expired",
+                    "Observed expiry window",
+                    "Public listing absent after expiry boundary",
+                ),
+                id => panic!("unexpected no-content contract delivery {id}"),
+            };
+        let record = records
+            .iter()
+            .find(|record| record.contract_id == prepared.contract_id)
+            .expect("terminal delivery retains an observation window");
+        let native_timestamp = if prepared.contract_id == pre_expiry.contract_id {
+            record.absence_observed_at
+        } else {
+            contract.date_expired
         };
-        assert_eq!(prepared.message.title, expected);
+        let expected_fields = vec![
+            (
+                "Listing time".to_string(),
+                format!(
+                    "<t:{}:F>\n<t:{}:R>",
+                    contract.date_issued.timestamp(),
+                    contract.date_issued.timestamp(),
+                ),
+                false,
+            ),
+            (
+                window_name.to_string(),
+                format!(
+                    "**after** <t:{}:F>\n<t:{}:R>\n**before** <t:{}:F>\n<t:{}:R>",
+                    record.last_public_observed_at.timestamp(),
+                    record.last_public_observed_at.timestamp(),
+                    record.absence_observed_at.timestamp(),
+                    record.absence_observed_at.timestamp(),
+                ),
+                false,
+            ),
+            (
+                "ESI result".to_string(),
+                semantic_esi_result.to_string(),
+                false,
+            ),
+        ];
+        let actual_fields = prepared
+            .message
+            .fields
+            .iter()
+            .take(3)
+            .map(|field| (field.name.clone(), field.value.clone(), field.inline))
+            .collect::<Vec<_>>();
+        assert_eq!(actual_fields, expected_fields);
+        assert_eq!(prepared.message.timestamp, Some(native_timestamp));
+        assert!(prepared.message.fields.len() <= 5);
+        let content_lines = prepared
+            .message
+            .description
+            .as_deref()
+            .map(|value| value.lines().count())
+            .unwrap_or_default()
+            + prepared
+                .message
+                .fields
+                .iter()
+                .map(|field| field.value.lines().count())
+                .sum::<usize>();
+        assert!(content_lines <= 12);
+        assert_eq!(prepared.message.title, expected_title);
         let embed = contract_notification_embed(&prepared.message);
-        assert_eq!(embed.0["title"].as_str(), Some(expected));
+        assert_eq!(embed.0["title"].as_str(), Some(expected_title));
+        assert_eq!(
+            embed.0["timestamp"]
+                .as_str()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc)),
+            Some(native_timestamp)
+        );
+        let rendered = serde_json::to_string(&embed.0).expect("serialize terminal embed");
+        assert!(!rendered.contains("accepted by another player"));
+        assert!(!rendered.contains("exact transfer"));
     }
     drop(sent);
 
@@ -27244,12 +27635,59 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
     .execute(&pool)
     .await
     .expect("seed the retained delivery subscription");
-    let delivery_id: i64 = sqlx::query_scalar(
-        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, discord_message_id, delivery_nonce) VALUES (42,77,'legacy-no-content',44,'sale_confirmed','{}'::jsonb,'{}'::jsonb,TRUE,'sent','legacy-message-44','legacy-nonce-44') RETURNING id",
+    let mut legacy_event = serde_json::to_value(ContractEvent {
+        region_id: 10_000_002,
+        kind: ContractEventKind::SaleConfirmed,
+        contract: contract.clone(),
+        offered_items: vec![offered_ship(1)],
+        requested_items: vec![],
+        context: ContractObservationContext::default(),
+        acceptance_evidence: Some(ContractAcceptanceEvidence {
+            last_public_observed_at,
+            absence_observed_at,
+            evidence_response_at,
+            provenance: Some(
+                killbot_rust::contract_intelligence::ContractAcceptanceProvenance::AcceptedByPlayer,
+            ),
+        }),
+        embed_context: ContractEmbedContext {
+            item_names: BTreeMap::from([(587, "Rifter".to_string())]),
+            ..ContractEmbedContext::default()
+        },
+    })
+    .expect("serialize pre-upgrade terminal event");
+    legacy_event["acceptance_evidence"]
+        .as_object_mut()
+        .expect("legacy event carries acceptance evidence")
+        .remove("provenance");
+    let legacy_message = serde_json::json!({
+        "title": "Rifter contract accepted • 1.5B ISK",
+        "description": null,
+        "fields": []
+    });
+    let mut delivery_ids = Vec::new();
+    for contract_id in [44_i64, 45, 46] {
+        let mut event = legacy_event.clone();
+        event["contract"]["contract_id"] = serde_json::json!(contract_id);
+        delivery_ids.push(
+            sqlx::query_scalar::<_, i64>(
+                "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, discord_message_id, delivery_nonce) VALUES (42,77,'legacy-no-content',$1,'sale_confirmed',$2,$3,TRUE,'sent',CONCAT('legacy-message-', $1),CONCAT('legacy-nonce-', $1)) RETURNING id",
+            )
+            .bind(contract_id)
+            .bind(event)
+            .bind(&legacy_message)
+            .fetch_one(&pool)
+            .await
+            .expect("seed a retained pre-upgrade sent Discord identity"),
+        );
+    }
+    let unrenderable_delivery_id: i64 = sqlx::query_scalar(
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, discord_message_id, delivery_nonce) VALUES (42,77,'legacy-no-content',47,'sale_confirmed','{}'::jsonb,$1,TRUE,'sent','legacy-message-47','legacy-nonce-47') RETURNING id",
     )
+    .bind(&legacy_message)
     .fetch_one(&pool)
     .await
-    .expect("seed the retained sent Discord identity");
+    .expect("seed a retained but unreconstructable legacy identity");
     pool.close().await;
 
     let store = database.store().await;
@@ -27324,6 +27762,13 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
         notification_pending,
         vec![(44, false), (45, false), (46, true)]
     );
+    let provenance_constraint_validated: bool = sqlx::query_scalar(
+        "SELECT convalidated FROM pg_constraint WHERE conname = 'contract_resolution_cases_acceptance_provenance_check'",
+    )
+    .fetch_one(&verification_pool)
+    .await
+    .expect("validate the durable acceptance provenance constraint after backfill");
+    assert!(provenance_constraint_validated);
     let observations: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM regional_observations WHERE region_id = 10000002 AND observed_at = $1",
     )
@@ -27339,22 +27784,114 @@ async fn acceptance_provenance_migration_reclassifies_legacy_closures_without_ne
     .await
     .expect("retain existing lifecycle evidence");
     assert_eq!(lifecycle_evidence, 2);
-    let delivery_identity: (String, bool, String) = sqlx::query_as(
-        "SELECT discord_message_id, ping, delivery_nonce FROM contract_outbound_deliveries WHERE id = $1",
+    let upgraded_deliveries: Vec<(i64, String, Value, Value, Option<Value>, String, String, bool, String)> = sqlx::query_as(
+        "SELECT contract_id, event_kind, event, message, desired_message, repair_status, discord_message_id, ping, delivery_nonce FROM contract_outbound_deliveries ORDER BY contract_id",
     )
-    .bind(delivery_id)
-    .fetch_one(&verification_pool)
+    .fetch_all(&verification_pool)
     .await
-    .expect("retain the original sent Discord identity");
+    .expect("read upgraded pre-upgrade terminal deliveries");
     assert_eq!(
-        delivery_identity,
-        (
-            "legacy-message-44".to_string(),
-            true,
-            "legacy-nonce-44".to_string()
-        )
+        upgraded_deliveries
+            .iter()
+            .map(|delivery| (
+                delivery.0,
+                delivery.1.as_str(),
+                delivery.2["kind"].as_str(),
+                delivery.2.get("acceptance_evidence").is_none(),
+                delivery.3.get("presentation_revision").is_none(),
+                delivery.4.is_none(),
+                delivery.5.as_str(),
+                delivery.6.as_str(),
+                delivery.7,
+                delivery.8.as_str(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (44, "closed_outcome_unknown", Some("closed_outcome_unknown"), true, true, true, "none", "legacy-message-44", true, "legacy-nonce-44"),
+            (45, "closed_outcome_unknown", Some("closed_outcome_unknown"), true, true, true, "none", "legacy-message-45", true, "legacy-nonce-45"),
+            (46, "sale_confirmed", Some("sale_confirmed"), false, true, true, "none", "legacy-message-46", true, "legacy-nonce-46"),
+            (47, "closed_outcome_unknown", Some("closed_outcome_unknown"), true, true, true, "none", "legacy-message-47", true, "legacy-nonce-47"),
+        ],
+        "migration rewrites false terminal event payloads but leaves every unedited message obsolete"
+    );
+    assert_eq!(
+        upgraded_deliveries[2]
+            .2
+            .pointer("/acceptance_evidence/provenance")
+            .and_then(Value::as_str),
+        Some("accepted_by_player"),
+        "recoverable definitive evidence is backfilled into the retained event"
     );
     verification_pool.close().await;
+
+    let token = "legacy-provenance-rerender-token-not-for-argv";
+    let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let queued = run_contract_delivery_cli(
+        &database.url,
+        &digest,
+        Some(token),
+        &["rerender", "--channel", "77", "--limit", "10", "--queue"],
+    );
+    assert!(queued.status.success(), "{}", cli_output(&queued));
+    let report: Value = serde_json::from_slice(&queued.stdout).expect("queued rerender report");
+    assert_eq!(report["eligible_count"], 3);
+    assert_eq!(
+        report["candidates"]
+            .as_array()
+            .expect("rerender candidates")
+            .iter()
+            .map(|candidate| candidate["delivery_id"].as_i64())
+            .collect::<Vec<_>>(),
+        delivery_ids.iter().copied().map(Some).collect::<Vec<_>>()
+    );
+
+    let queued_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("verify durable same-message corrections");
+    let queued_deliveries: Vec<(i64, Value, String, i64, String, bool, String)> = sqlx::query_as(
+        "SELECT contract_id, desired_message, repair_status, repair_revision, discord_message_id, ping, delivery_nonce FROM contract_outbound_deliveries WHERE desired_message IS NOT NULL ORDER BY contract_id",
+    )
+    .fetch_all(&queued_pool)
+    .await
+    .expect("read queued legacy corrections");
+    assert_eq!(
+        queued_deliveries
+            .iter()
+            .map(|delivery| (
+                delivery.0,
+                delivery.1["title"].as_str(),
+                delivery.1["presentation_revision"].as_u64(),
+                delivery.2.as_str(),
+                delivery.3,
+                delivery.4.as_str(),
+                delivery.5,
+                delivery.6.as_str(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (44, Some("Rifter contract closed • outcome unknown"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 1, "legacy-message-44", true, "legacy-nonce-44"),
+            (45, Some("Rifter contract closed • outcome unknown"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 1, "legacy-message-45", true, "legacy-nonce-45"),
+            (46, Some("Rifter contract accepted • 1.5B ISK"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 1, "legacy-message-46", true, "legacy-nonce-46"),
+        ],
+        "repairs reuse the original message identities and retain ping configuration without creating fresh deliveries"
+    );
+    let unrenderable: (Value, Option<Value>, String, i64, String, bool, String) = sqlx::query_as(
+        "SELECT message, desired_message, repair_status, repair_revision, discord_message_id, ping, delivery_nonce FROM contract_outbound_deliveries WHERE id = $1",
+    )
+    .bind(unrenderable_delivery_id)
+    .fetch_one(&queued_pool)
+    .await
+    .expect("read the unreconstructable legacy identity after rerender queueing");
+    assert_eq!(unrenderable.0.get("presentation_revision"), None);
+    assert_eq!(unrenderable.1, None);
+    assert_eq!(unrenderable.2, "none");
+    assert_eq!(unrenderable.3, 0);
+    assert_eq!(unrenderable.4, "legacy-message-47");
+    assert!(unrenderable.5);
+    assert_eq!(unrenderable.6, "legacy-nonce-47");
+    queued_pool.close().await;
     database.destroy().await;
 }
 
