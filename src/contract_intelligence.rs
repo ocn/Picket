@@ -4563,6 +4563,7 @@ impl ContractCollectionStore {
             (etag, Some(solar_system_id), Some(observed_at)) if solar_system_id > 0 => {
                 Some(ResolvedStructure {
                     structure_id,
+                    name: None,
                     solar_system_id,
                     observed_at,
                     expires_at: cache_expires_at,
@@ -10107,6 +10108,13 @@ impl ContractCollector {
                 event.context.solar_system_resolution = ContractContextResolution::Resolved;
                 event.context.location_evidence_id = Some(evidence.id);
                 event.context.location_evidence_class = Some(evidence.evidence_class);
+                if let Some(name) = resolved.name {
+                    event.embed_context.location.solar_system_id = Some(evidence.solar_system_id);
+                    event.embed_context.location.region_id = Some(event.region_id);
+                    event.embed_context.location.location_name = Some(name);
+                    event.embed_context.location.location_kind =
+                        Some("Player-owned structure".to_string());
+                }
             }
             Ok(resolved) => {
                 if !resolved.representation_cacheable {
