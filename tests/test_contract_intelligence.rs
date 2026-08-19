@@ -20985,6 +20985,9 @@ async fn contract_notifications_render_only_filter_matched_ship_items() {
     let store = database.store().await;
     let baseline = item_exchange_contract(44);
     let mut listed = item_exchange_contract(45);
+    listed.date_issued = DateTime::parse_from_rfc3339("2026-08-17T19:43:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
     listed.reward = 2_500_000_000.0;
     let offered_ship = PublicContractItem {
         record_id: 1,
@@ -21140,6 +21143,15 @@ async fn contract_notifications_render_only_filter_matched_ship_items() {
         .find(|delivery| delivery.subscription_id == "requested-branch")
         .expect("requested-item delivery");
     assert_eq!(requested.message.title, "Ragnarok listed for 2.5B");
+    assert_eq!(
+        requested
+            .message
+            .fields
+            .iter()
+            .find(|field| field.name == "Timeline")
+            .map(|field| field.value.as_str()),
+        Some("Listed <t:1786995780:F> • <t:1786995780:R>")
+    );
     assert!(requested
         .message
         .description

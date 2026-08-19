@@ -11637,6 +11637,33 @@ fn contract_notification_message(
         }),
         footer: Some(footer_parts.join(" • ")),
     };
+    let mut timeline = vec![format!(
+        "Listed {}",
+        discord_absolute_relative_timestamp(event.contract.date_issued)
+    )];
+    if let Some(evidence) = &event.acceptance_evidence {
+        let label = match event.kind {
+            ContractEventKind::SaleConfirmed => Some("Sale"),
+            ContractEventKind::PurchaseConfirmed => Some("Purchase"),
+            _ => None,
+        };
+        if let Some(label) = label {
+            timeline.push(format!(
+                "{label} window: {} → {}",
+                discord_absolute_relative_timestamp(evidence.last_public_observed_at),
+                discord_absolute_relative_timestamp(evidence.absence_observed_at),
+            ));
+            timeline.push(format!(
+                "Acceptance confirmed: {}",
+                discord_absolute_relative_timestamp(evidence.evidence_response_at)
+            ));
+        }
+    }
+    message.fields.push(ContractEmbedField {
+        name: "Timeline".to_string(),
+        value: timeline.join("\n"),
+        inline: false,
+    });
     if has_party_history(issuer_history) || has_party_history(corporation_history) {
         let mut history = Vec::new();
         if has_party_history(issuer_history) {
@@ -11665,20 +11692,12 @@ fn contract_notification_message(
         message.fields.push(ContractEmbedField {
             name: "Evidence".to_string(),
             value: format!(
-                "Public {}\nAbsent {}\n204 {}",
+                "Last publicly observed {}\nFirst observed absent {}\nAcceptance confirmed {}",
                 compact_timestamp(evidence.last_public_observed_at),
                 compact_timestamp(evidence.absence_observed_at),
                 compact_timestamp(evidence.evidence_response_at),
             ),
             inline: false,
-        });
-        let latency_seconds = (Utc::now() - evidence.evidence_response_at)
-            .num_seconds()
-            .max(0);
-        message.fields.push(ContractEmbedField {
-            name: "Delay".to_string(),
-            value: format!("{} after 204", compact_duration(latency_seconds)),
-            inline: true,
         });
     } else if matches!(
         event.kind,
@@ -11744,8 +11763,8 @@ fn contract_embed_title(
 ) -> (String, bool) {
     let action = match kind {
         ContractEventKind::Listed => "listed",
-        ContractEventKind::SaleConfirmed => "sold",
-        ContractEventKind::PurchaseConfirmed => "bought",
+        ContractEventKind::SaleConfirmed => "sale confirmed",
+        ContractEventKind::PurchaseConfirmed => "purchase confirmed",
         ContractEventKind::Expired => "expired",
         ContractEventKind::ClosedOutcomeUnknown => "closed (outcome unknown)",
     };
@@ -11957,16 +11976,9 @@ fn compact_timestamp(value: DateTime<Utc>) -> String {
     value.format("%-d %b %Y %H:%MZ").to_string()
 }
 
-fn compact_duration(seconds: i64) -> String {
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 60 * 60 {
-        format!("{}m", seconds / 60)
-    } else if seconds < 60 * 60 * 24 {
-        format!("{}h", seconds / (60 * 60))
-    } else {
-        format!("{}d", seconds / (60 * 60 * 24))
-    }
+fn discord_absolute_relative_timestamp(value: DateTime<Utc>) -> String {
+    let timestamp = value.timestamp();
+    format!("<t:{timestamp}:F> • <t:{timestamp}:R>")
 }
 
 fn bound_embed_message(message: &mut ContractNotificationMessage) {
@@ -13046,6 +13058,69 @@ mod embed_tests {
     }
 
     #[test]
+    fn contract_timeline_contains_discord_absolute_and_relative_event_times() {
+        let listed_at = DateTime::parse_from_rfc3339("2026-08-17T19:43:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let confirmed_at = DateTime::parse_from_rfc3339("2026-08-18T22:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let history = ContractPartyHistory::default();
+
+        let mut listed = event(ContractEventKind::Listed);
+        listed.contract.date_issued = listed_at;
+        let listed_message = contract_notification_message(
+            &listed,
+            Some(&listed.offered_items[0]),
+            &history,
+            &history,
+            false,
+        );
+        assert_eq!(
+            field(&listed_message, "Timeline"),
+            Some("Listed <t:1786995780:F> • <t:1786995780:R>")
+        );
+
+        let mut sold = event(ContractEventKind::SaleConfirmed);
+        sold.contract.date_issued = listed_at;
+        sold.acceptance_evidence = Some(ContractAcceptanceEvidence {
+            last_public_observed_at: confirmed_at - ChronoDuration::minutes(2),
+            absence_observed_at: confirmed_at - ChronoDuration::minutes(1),
+            evidence_response_at: confirmed_at,
+        });
+        let sold_message = contract_notification_message(
+            &sold,
+            Some(&sold.offered_items[0]),
+            &history,
+            &history,
+            false,
+        );
+        assert_eq!(
+            field(&sold_message, "Timeline"),
+            Some(
+                "Listed <t:1786995780:F> • <t:1786995780:R>\nSold <t:1787090460:F> • <t:1787090460:R>"
+            )
+        );
+
+        let mut purchased = event(ContractEventKind::PurchaseConfirmed);
+        purchased.contract.date_issued = listed_at;
+        purchased.acceptance_evidence = sold.acceptance_evidence;
+        let purchased_message = contract_notification_message(
+            &purchased,
+            Some(&purchased.requested_items[0]),
+            &history,
+            &history,
+            false,
+        );
+        assert_eq!(
+            field(&purchased_message, "Timeline"),
+            Some(
+                "Listed <t:1786995780:F> • <t:1786995780:R>\nPurchased <t:1787090460:F> • <t:1787090460:R>"
+            )
+        );
+    }
+
+    #[test]
     fn location_degrades_without_dropping_known_facts() {
         let history = ContractPartyHistory::default();
         let full = contract_notification_message(
@@ -13130,7 +13205,14 @@ mod embed_tests {
             message.thumbnail_url.as_deref(),
             Some("https://images.evetech.net/types/19720/icon?size=64")
         );
-        assert!(message.fields.is_empty());
+        assert_eq!(
+            message
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Timeline"]
+        );
         let description = message.description.expect("compact contract description");
         assert!(description.contains("Ragnarok - Jita"));
         assert!(!description.contains("Rifter"));
