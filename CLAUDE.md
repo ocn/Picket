@@ -131,3 +131,17 @@ EVE_CLIENT_SECRET      # Required for /sync_standings SSO flow
 Setup:
 - Copy `docs/env.sample` to `.env` for base Discord vars.
 - Add `EVE_CLIENT_ID` and `EVE_CLIENT_SECRET` manually if using standings sync features.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs use Local Markdown under `.scratch/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Canonical Matt Pocock triage labels are used unchanged. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository using root `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
