@@ -4529,13 +4529,13 @@ impl ContractCollectionStore {
             transaction.commit().await?;
             return Ok(StructureResolutionAdmission::WaitUntil(global_deadline));
         }
-        sqlx::query("INSERT INTO structure_resolution_state (structure_id, credential_revision, next_attempt_at, updated_at) VALUES ($1, $2, $3, $3) ON CONFLICT (structure_id) DO UPDATE SET credential_revision = EXCLUDED.credential_revision, etag = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.etag END, solar_system_id = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.solar_system_id END, observed_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.observed_at END, cache_expires_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.cache_expires_at END, next_attempt_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN EXCLUDED.next_attempt_at ELSE structure_resolution_state.next_attempt_at END, lease_expires_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.lease_expires_at END, first_denied_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.first_denied_at END, last_denied_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.last_denied_at END, denied_attempts = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN 0 ELSE structure_resolution_state.denied_attempts END, parked_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.parked_at END, transient_failures = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN 0 ELSE structure_resolution_state.transient_failures END, last_error = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.last_error END, last_failure_kind = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.last_failure_kind END, updated_at = EXCLUDED.updated_at")
+        sqlx::query("INSERT INTO structure_resolution_state (structure_id, credential_revision, next_attempt_at, updated_at) VALUES ($1, $2, $3, $3) ON CONFLICT (structure_id) DO UPDATE SET credential_revision = EXCLUDED.credential_revision, etag = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.etag END, structure_name = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.structure_name END, solar_system_id = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.solar_system_id END, observed_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.observed_at END, cache_expires_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.cache_expires_at END, next_attempt_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN EXCLUDED.next_attempt_at ELSE structure_resolution_state.next_attempt_at END, lease_expires_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.lease_expires_at END, first_denied_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.first_denied_at END, last_denied_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.last_denied_at END, denied_attempts = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN 0 ELSE structure_resolution_state.denied_attempts END, parked_at = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.parked_at END, transient_failures = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN 0 ELSE structure_resolution_state.transient_failures END, last_error = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.last_error END, last_failure_kind = CASE WHEN structure_resolution_state.credential_revision <> EXCLUDED.credential_revision THEN NULL ELSE structure_resolution_state.last_failure_kind END, updated_at = EXCLUDED.updated_at")
             .bind(structure_id)
             .bind(credential_revision)
             .bind(now)
             .execute(&mut *transaction)
             .await?;
-        let state = sqlx::query("SELECT etag, solar_system_id, observed_at, cache_expires_at, next_attempt_at, first_denied_at, parked_at, lease_expires_at FROM structure_resolution_state WHERE structure_id = $1 FOR UPDATE")
+        let state = sqlx::query("SELECT etag, structure_name, solar_system_id, observed_at, cache_expires_at, next_attempt_at, first_denied_at, parked_at, lease_expires_at FROM structure_resolution_state WHERE structure_id = $1 FOR UPDATE")
             .bind(structure_id)
             .fetch_one(&mut *transaction)
             .await?;
@@ -4563,7 +4563,7 @@ impl ContractCollectionStore {
             (etag, Some(solar_system_id), Some(observed_at)) if solar_system_id > 0 => {
                 Some(ResolvedStructure {
                     structure_id,
-                    name: None,
+                    name: state.get("structure_name"),
                     solar_system_id,
                     observed_at,
                     expires_at: cache_expires_at,
@@ -4691,7 +4691,7 @@ impl ContractCollectionStore {
             transaction.commit().await?;
             return Ok(false);
         }
-        let update = sqlx::query("UPDATE structure_resolution_state SET etag = NULL, solar_system_id = NULL, observed_at = NULL, cache_expires_at = NULL WHERE structure_id = $1 AND credential_revision = $2 AND attempt_generation = $3")
+        let update = sqlx::query("UPDATE structure_resolution_state SET etag = NULL, structure_name = NULL, solar_system_id = NULL, observed_at = NULL, cache_expires_at = NULL WHERE structure_id = $1 AND credential_revision = $2 AND attempt_generation = $3")
             .bind(structure_id)
             .bind(credential_revision)
             .bind(generation)
@@ -4752,8 +4752,9 @@ impl ContractCollectionStore {
             return Ok(false);
         }
         let cache_expires_at = resolved.expires_at.unwrap_or(now);
-        let completion = sqlx::query("UPDATE structure_resolution_state SET etag = $1, solar_system_id = $2, observed_at = $3, cache_expires_at = $4, next_attempt_at = $4, first_denied_at = NULL, last_denied_at = NULL, denied_attempts = 0, parked_at = NULL, transient_failures = 0, last_error = NULL, last_failure_kind = NULL, last_success_at = $5, lease_expires_at = NULL, updated_at = $5 WHERE structure_id = $6 AND credential_revision = $7 AND attempt_generation = $8")
+        let completion = sqlx::query("UPDATE structure_resolution_state SET etag = $1, structure_name = $2, solar_system_id = $3, observed_at = $4, cache_expires_at = $5, next_attempt_at = $5, first_denied_at = NULL, last_denied_at = NULL, denied_attempts = 0, parked_at = NULL, transient_failures = 0, last_error = NULL, last_failure_kind = NULL, last_success_at = $6, lease_expires_at = NULL, updated_at = $6 WHERE structure_id = $7 AND credential_revision = $8 AND attempt_generation = $9")
             .bind(&resolved.etag)
+            .bind(&resolved.name)
             .bind(resolved.solar_system_id)
             .bind(resolved.observed_at)
             .bind(cache_expires_at)
