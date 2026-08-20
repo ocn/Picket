@@ -18017,12 +18017,25 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
             .await
             .expect("persist rerender fixture subscription");
     }
-
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&database.url)
         .await
         .expect("connect to seed rerender queue fixtures");
+    sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,now())")
+        .bind(10_000_002_i64)
+        .bind(45_i64)
+        .bind(serde_json::to_value(ContractEmbedContext {
+            location: ContractLocationContext {
+                region_id: Some(10_000_002),
+                region_name: Some("The Forge".to_string()),
+                ..ContractLocationContext::default()
+            },
+            ..ContractEmbedContext::default()
+        }).expect("serialize retained region snapshot"))
+        .execute(&pool)
+        .await
+        .expect("persist the observation-time region for historical rerender");
     let obsolete_message = serde_json::json!({
         "title": "Legacy Rifter listed",
         "description": "legacy location",
@@ -18038,16 +18051,7 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
         acceptance_evidence: None,
         embed_context: ContractEmbedContext {
             observed_at: None,
-            location: ContractLocationContext {
-                location_name: Some("Jita IV - Moon 4".to_string()),
-                location_kind: Some("station".to_string()),
-                solar_system_id: Some(30_000_142),
-                solar_system_name: Some("Jita".to_string()),
-                solar_system_position: None,
-                security_status: Some(0.9),
-                region_id: Some(10_000_002),
-                region_name: Some("The Forge".to_string()),
-            },
+            location: ContractLocationContext::default(),
             matched_range: None,
             issuer_character_name: Some("Issuer".to_string()),
             issuer_corporation_name: Some("Issuer Corp".to_string()),
@@ -18191,6 +18195,13 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
         .and_then(|message| message.get("description"))
         .and_then(Value::as_str)
         .is_some_and(|description| description.contains("contract:0//45")));
+    assert!(queued_state
+        .1
+        .as_ref()
+        .and_then(|message| message.get("description"))
+        .and_then(Value::as_str)
+        .is_some_and(|description| description.contains("The Forge")
+            && description.contains("/region/10000002")));
     assert_eq!(
         queued_state
             .1

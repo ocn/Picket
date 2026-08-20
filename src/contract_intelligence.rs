@@ -4035,7 +4035,7 @@ pub struct ContractEmbedField {
     pub inline: bool,
 }
 
-pub const CONTRACT_NOTIFICATION_PRESENTATION_REVISION: u32 = 2;
+pub const CONTRACT_NOTIFICATION_PRESENTATION_REVISION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContractNotificationMessage {
@@ -6157,6 +6157,13 @@ impl ContractCollectionStore {
         candidate: &ValidatedContractDeliveryRerenderCandidate,
     ) -> Result<ContractEvent, sqlx::Error> {
         let mut event = candidate.event.clone();
+        if let Some(snapshot) = self
+            .observed_embed_context(event.region_id, event.contract.contract_id)
+            .await?
+        {
+            event.embed_context.merge_missing_from(&snapshot);
+        }
+        event.embed_context.location.region_id = Some(event.region_id);
         if event.embed_context.matched_range.is_some() {
             return Ok(event);
         }
