@@ -1070,6 +1070,19 @@ impl std::error::Error for EsiError {}
 #[async_trait]
 pub trait PublicContractEsi: Send + Sync {
     async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError>;
+    fn supports_region_name_lookup(&self) -> bool {
+        false
+    }
+    async fn region_name(
+        &self,
+        _region_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Option<String>>, EsiError> {
+        Ok(EsiResponse::fresh(
+            None,
+            CacheMetadata::cached_for_seconds(0),
+        ))
+    }
     async fn public_contracts_page(
         &self,
         region_id: i64,
@@ -1595,6 +1608,30 @@ impl HttpPublicContractEsi {
 impl PublicContractEsi for HttpPublicContractEsi {
     async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
         self.get("universe/regions/", etag).await
+    }
+
+    fn supports_region_name_lookup(&self) -> bool {
+        true
+    }
+
+    async fn region_name(
+        &self,
+        region_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Option<String>>, EsiError> {
+        #[derive(Deserialize)]
+        struct Region {
+            name: String,
+        }
+
+        let response = self
+            .get::<Region>(&format!("universe/regions/{region_id}/"), etag)
+            .await?;
+        Ok(EsiResponse {
+            value: response.value.map(|region| Some(region.name)),
+            metadata: response.metadata,
+            not_modified: response.not_modified,
+        })
     }
 
     async fn public_contracts_page(
@@ -9987,6 +10024,8 @@ impl ContractCollector {
         {
             return Ok(());
         }
+        self.ensure_region_context(event.contract.contract_id, event.region_id, &mut context)
+            .await?;
         context.observed_at = context.observed_at.or(Some(self.delivery_clock.now()));
         self.store
             .save_observed_embed_context(event.region_id, event.contract.contract_id, &context)
@@ -10480,6 +10519,56 @@ impl ContractCollector {
         };
         let (name, _) = self.resolve_response(&key, cached, response).await?;
         Ok((!name.trim().is_empty()).then_some(name))
+    }
+
+    async fn cached_region_name(
+        &self,
+        contract_id: i64,
+        region_id: i64,
+    ) -> Result<Option<String>, ContractCollectionError> {
+        if !self.esi.supports_region_name_lookup() {
+            return Ok(None);
+        }
+        let key = format!("universe/regions/{region_id}/contract-region-name");
+        let cached = self.store.cache(&key).await?;
+        if let Some((name, _)) = self.fresh_cached::<Option<String>>(&key, &cached)? {
+            return Ok(name.filter(|name| !name.trim().is_empty()));
+        }
+        if !self.context_request_allowed(contract_id).await? {
+            return Ok(None);
+        }
+        let etag = cached
+            .as_ref()
+            .and_then(|cached| cached.metadata.etag.clone());
+        let Some(response) = self
+            .record_context_esi_result(
+                contract_id,
+                self.esi.region_name(region_id, etag.as_deref()).await,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let (name, _) = self.resolve_response(&key, cached, response).await?;
+        Ok(name.filter(|name| !name.trim().is_empty()))
+    }
+
+    async fn ensure_region_context(
+        &self,
+        contract_id: i64,
+        region_id: i64,
+        context: &mut ContractEmbedContext,
+    ) -> Result<(), ContractCollectionError> {
+        context.location.region_id = Some(region_id);
+        if context
+            .location
+            .region_name
+            .as_deref()
+            .is_none_or(|name| name.trim().is_empty())
+        {
+            context.location.region_name = self.cached_region_name(contract_id, region_id).await?;
+        }
+        Ok(())
     }
 
     async fn context_request_allowed(
@@ -10993,6 +11082,7 @@ impl ContractCollector {
                 }
             }
         }
+        enriched.embed_context.location.region_id = Some(event.region_id);
         Ok(enriched)
     }
 
@@ -11005,12 +11095,23 @@ impl ContractCollector {
         let evidence_now = self.delivery_clock.now();
         let mut consumed = 0;
         for observed in observed {
-            if self
+            if let Some(mut context) = self
                 .store
                 .observed_embed_context(region_id, observed.contract.contract_id)
                 .await?
-                .is_some()
             {
+                let prior_location = context.location.clone();
+                self.ensure_region_context(observed.contract.contract_id, region_id, &mut context)
+                    .await?;
+                if context.location != prior_location {
+                    self.store
+                        .save_observed_embed_context(
+                            region_id,
+                            observed.contract.contract_id,
+                            &context,
+                        )
+                        .await?;
+                }
                 self.store
                     .resolve_collection_failures(
                         Some(region_id),
@@ -11053,7 +11154,13 @@ impl ContractCollector {
                 .await?
             {
                 Some(response) => {
-                    let context = response.value.unwrap_or_default();
+                    let mut context = response.value.unwrap_or_default();
+                    self.ensure_region_context(
+                        observed.contract.contract_id,
+                        region_id,
+                        &mut context,
+                    )
+                    .await?;
                     let mut retain_snapshot = true;
                     if let Some(solar_system_id) = context.location.solar_system_id {
                         let station_id = (context.location.location_kind.as_deref()
@@ -12854,11 +12961,7 @@ fn compact_contract_location_description(
                 .and_then(|id| u32::try_from(id).ok()),
         )
         .map(|(name, id)| LocationSystem { name, id });
-    let region_name = context
-        .region_name
-        .as_deref()
-        .map(sanitize_contract_text)
-        .filter(|name| !name.is_empty());
+    let region_name = contract_region_display_name(context);
     let region = region_name
         .as_deref()
         .zip(context.region_id.and_then(|id| u32::try_from(id).ok()))
@@ -12894,11 +12997,36 @@ fn contract_link_place(context: &ContractLocationContext, location_id: i64) -> S
     context
         .solar_system_name
         .as_deref()
-        .or(context.location_name.as_deref())
-        .or(context.region_name.as_deref())
         .map(sanitize_contract_text)
         .filter(|place| !place.is_empty())
+        .or_else(|| {
+            context
+                .location_name
+                .as_deref()
+                .map(sanitize_contract_text)
+                .filter(|place| !place.is_empty())
+        })
+        .or_else(|| {
+            context
+                .region_name
+                .as_deref()
+                .map(sanitize_contract_text)
+                .filter(|place| !place.is_empty())
+        })
         .unwrap_or_else(|| unresolved_contract_location(location_id).to_string())
+}
+
+fn contract_region_display_name(context: &ContractLocationContext) -> Option<String> {
+    context
+        .region_name
+        .as_deref()
+        .map(sanitize_contract_text)
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            context
+                .region_id
+                .map(|region_id| format!("Region {region_id}"))
+        })
 }
 
 fn unresolved_contract_location(location_id: i64) -> &'static str {
@@ -14379,7 +14507,9 @@ mod embed_tests {
             contract_notification_message(&region_only, None, &history, &history, false);
         assert_eq!(
             region_only.description.as_deref(),
-            Some("`<url=\"contract:0//45\">Public contract - Unknown location</url>`")
+            Some(
+                "`<url=\"contract:0//45\">Public contract - Unknown location</url>`\n**in:** [Region 10000002](http://evemaps.dotlan.net/region/10000002)"
+            )
         );
 
         let mut raw_only = event(ContractEventKind::Listed);

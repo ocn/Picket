@@ -2504,6 +2504,26 @@ async fn public_contract_discovery_never_carries_structure_resolver_authorizatio
 }
 
 #[tokio::test]
+async fn public_region_name_lookup_never_carries_structure_resolver_authorization() {
+    let server = SequenceHttpServer::start(vec![WireReply {
+        status: 200,
+        headers: vec![],
+        body: r#"{"name":"The Forge"}"#,
+    }]);
+    let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+        .expect("public ESI client");
+    let region = esi
+        .region_name(10_000_002, None)
+        .await
+        .expect("public region name");
+    assert_eq!(region.value, Some(Some("The Forge".to_string())));
+    let request = server.requests.lock().unwrap()[0].to_ascii_lowercase();
+    assert!(request.contains("/universe/regions/10000002/"));
+    assert!(!request.contains("authorization:"));
+    server.finish();
+}
+
+#[tokio::test]
 async fn matching_region_subscription_resolves_structure_location_for_the_embed() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
@@ -15895,14 +15915,15 @@ async fn snapshot_backfill_cap_counts_missing_contexts_and_terminal_delivery_use
             .collect::<Vec<_>>()
     );
     for contract in &contracts {
-        assert!(
-            store
-                .observed_embed_context(10_000_002, contract.contract_id)
-                .await
-                .expect("read backfilled observation context")
-                .is_some(),
-            "contract {} was not backfilled",
-            contract.contract_id
+        let snapshot = store
+            .observed_embed_context(10_000_002, contract.contract_id)
+            .await
+            .expect("read backfilled observation context")
+            .unwrap_or_else(|| panic!("contract {} was not backfilled", contract.contract_id));
+        assert_eq!(
+            snapshot.location.region_id,
+            Some(10_000_002),
+            "the regional observation is the minimum durable location evidence"
         );
     }
 
@@ -15958,6 +15979,15 @@ async fn snapshot_backfill_cap_counts_missing_contexts_and_terminal_delivery_use
     assert_eq!(
         embed["author"]["name"].as_str(),
         Some(expected_author.as_str())
+    );
+    assert!(
+        sent[0]
+            .message
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("Region 10000002")
+                && description.contains("/region/10000002")),
+        "the terminal embed must retain at least its observed region"
     );
     let serialized_embed = serde_json::to_string(&embed).expect("serialize terminal embed");
     assert!(!serialized_embed.contains(&last_contract.issuer_id.to_string()));
@@ -16045,6 +16075,15 @@ async fn terminal_only_subscription_uses_the_persisted_observation_time_context(
         },
         contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
             ContractEmbedContext {
+                location: killbot_rust::contract_intelligence::ContractLocationContext {
+                    location_name: Some("Observed Private Keepstar".to_string()),
+                    location_kind: Some("Structure".to_string()),
+                    solar_system_id: Some(30_000_044),
+                    solar_system_name: Some("Uitra".to_string()),
+                    region_id: Some(10_000_002),
+                    region_name: Some("The Forge".to_string()),
+                    ..Default::default()
+                },
                 issuer_character_name: Some("Observed Issuer".to_string()),
                 issuer_corporation_name: Some("Observed Corporation".to_string()),
                 issuer_alliance_id: Some(99_000_111),
@@ -16059,6 +16098,15 @@ async fn terminal_only_subscription_uses_the_persisted_observation_time_context(
         .collect_cycle()
         .await
         .expect("snapshot the silent baseline contract");
+    let observation_snapshot = store
+        .observed_embed_context(10_000_002, contract.contract_id)
+        .await
+        .expect("read observation-time context")
+        .expect("persist observation-time context");
+    assert_eq!(
+        observation_snapshot.location.location_name.as_deref(),
+        Some("Observed Private Keepstar")
+    );
     let mut terminal_subscription = confirmed_ship_subscription(
         "terminal-only-sale",
         ContractEventKind::SaleConfirmed,
@@ -16109,6 +16157,17 @@ async fn terminal_only_subscription_uses_the_persisted_observation_time_context(
     assert_eq!(
         embed["author"]["name"].as_str(),
         Some("Public Contract\nissuer: [Observed Alliance] Observed Issuer")
+    );
+    assert!(
+        sent[0]
+            .message
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("Uitra")
+                && description.contains("The Forge")
+                && description.contains("Observed Private Keepstar")),
+        "the accepted embed must retain the most-specific observation-time location: {:?}",
+        sent[0].message.description
     );
     let serialized_embed = serde_json::to_string(&embed).expect("serialize terminal embed");
     for raw_id in ["90000001", "98000001", "99000111"] {
