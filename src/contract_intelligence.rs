@@ -4035,7 +4035,7 @@ pub struct ContractEmbedField {
     pub inline: bool,
 }
 
-pub const CONTRACT_NOTIFICATION_PRESENTATION_REVISION: u32 = 1;
+pub const CONTRACT_NOTIFICATION_PRESENTATION_REVISION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContractNotificationMessage {
