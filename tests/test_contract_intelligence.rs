@@ -15960,6 +15960,10 @@ async fn snapshot_backfill_cap_counts_missing_contexts_and_terminal_delivery_use
     };
 
     ContractCollector::new(store.clone(), Arc::new(resolver))
+        .with_region_names(Arc::new(HashMap::from([(
+            10_000_002,
+            "The Forge".to_string(),
+        )])))
         .with_notifications(
             Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
             delivery.clone(),
@@ -15985,10 +15989,15 @@ async fn snapshot_backfill_cap_counts_missing_contexts_and_terminal_delivery_use
             .message
             .description
             .as_deref()
-            .is_some_and(|description| description.contains("Region 10000002")
+            .is_some_and(|description| description.contains("The Forge")
                 && description.contains("/region/10000002")),
-        "the terminal embed must retain at least its observed region"
+        "the terminal embed must use the shared human-readable region style"
     );
+    assert!(!sent[0]
+        .message
+        .description
+        .as_deref()
+        .is_some_and(|description| description.contains("Region 10000002")));
     let serialized_embed = serde_json::to_string(&embed).expect("serialize terminal embed");
     assert!(!serialized_embed.contains(&last_contract.issuer_id.to_string()));
     assert!(!serialized_embed.contains(&last_contract.issuer_corporation_id.to_string()));
@@ -18028,7 +18037,7 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
         .bind(serde_json::to_value(ContractEmbedContext {
             location: ContractLocationContext {
                 region_id: Some(10_000_002),
-                region_name: Some("The Forge".to_string()),
+                region_name: None,
                 ..ContractLocationContext::default()
             },
             ..ContractEmbedContext::default()
@@ -18202,6 +18211,12 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
         .and_then(Value::as_str)
         .is_some_and(|description| description.contains("The Forge")
             && description.contains("/region/10000002")));
+    assert!(!queued_state
+        .1
+        .as_ref()
+        .and_then(|message| message.get("description"))
+        .and_then(Value::as_str)
+        .is_some_and(|description| description.contains("Region 10000002")));
     assert_eq!(
         queued_state
             .1
