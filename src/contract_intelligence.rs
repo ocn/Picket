@@ -1,4 +1,4 @@
-use crate::config::SystemRange;
+use crate::config::{System, SystemRange};
 use crate::discord_bot::SHIP_GROUP_PRIORITY;
 use crate::feed::{FeedHealthSnapshot, FeedHealthTelemetry};
 use crate::location_evidence::{
@@ -43,6 +43,48 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 const HEALTH_MIGRATION_VERSIONS: &[i64] = &[20260817000001, 20260817000004];
 const CONTRACT_COLLECTOR_USER_AGENT: &str = "killbot-rust Global Public Contract Intelligence";
 const MAX_EMBED_CONTEXT_ENRICHMENTS_PER_CYCLE: usize = 8;
+
+fn contract_region_names_from_systems(
+    systems: &HashMap<u32, System>,
+) -> Result<HashMap<i64, String>, String> {
+    let mut region_names = HashMap::new();
+    for system in systems.values() {
+        let region_id = i64::from(system.region_id);
+        let region_name = system.region.trim();
+        if region_id <= 0 || region_name.is_empty() {
+            continue;
+        }
+        if let Some(existing) = region_names.get(&region_id) {
+            if existing != region_name {
+                return Err(format!(
+                    "systems catalog has conflicting names for region {region_id}"
+                ));
+            }
+        } else {
+            region_names.insert(region_id, region_name.to_string());
+        }
+    }
+    if region_names.is_empty() {
+        return Err("systems catalog contains no region names".to_string());
+    }
+    Ok(region_names)
+}
+
+fn configured_contract_region_names() -> Result<HashMap<i64, String>, String> {
+    crate::config::load_systems()
+        .map_err(|error| format!("cannot load contract region names from systems.json: {error}"))
+        .and_then(|systems| contract_region_names_from_systems(&systems))
+}
+
+fn runtime_contract_region_names() -> Arc<HashMap<i64, String>> {
+    match configured_contract_region_names() {
+        Ok(region_names) => Arc::new(region_names),
+        Err(error) => {
+            warn!("contract region-name catalog unavailable; public ESI fallback remains active: {error}");
+            Arc::new(HashMap::new())
+        }
+    }
+}
 const MAX_TERMINAL_RESOLUTION_PROBES_PER_COMPLETED_REGION: usize = 8;
 const RESOLUTION_PROBE_RETRY_BASE_SECONDS: i64 = 30;
 const RESOLUTION_PROBE_RETRY_MAX_SECONDS: i64 = 15 * 60;
@@ -4035,7 +4077,7 @@ pub struct ContractEmbedField {
     pub inline: bool,
 }
 
-pub const CONTRACT_NOTIFICATION_PRESENTATION_REVISION: u32 = 3;
+pub const CONTRACT_NOTIFICATION_PRESENTATION_REVISION: u32 = 4;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContractNotificationMessage {
@@ -6086,6 +6128,7 @@ impl ContractCollectionStore {
         selector: &ContractDeliveryRerenderSelector,
         actor: &str,
         occurred_at: DateTime<Utc>,
+        region_names: &HashMap<i64, String>,
     ) -> Result<ContractDeliveryRerenderSelection, sqlx::Error> {
         if actor != CONTRACT_DELIVERY_OPERATOR_ACTOR {
             return Err(sqlx::Error::Protocol(
@@ -6113,7 +6156,9 @@ impl ContractCollectionStore {
             )
             .await?;
         for candidate in &locked.candidates {
-            let event = self.reconstruct_historical_matched_range(candidate).await?;
+            let event = self
+                .reconstruct_historical_matched_range(candidate, region_names)
+                .await?;
             let (issuer_history, corporation_history) = self
                 .contract_party_history(
                     event.contract.issuer_id,
@@ -6155,6 +6200,7 @@ impl ContractCollectionStore {
     async fn reconstruct_historical_matched_range(
         &self,
         candidate: &ValidatedContractDeliveryRerenderCandidate,
+        region_names: &HashMap<i64, String>,
     ) -> Result<ContractEvent, sqlx::Error> {
         let mut event = candidate.event.clone();
         if let Some(snapshot) = self
@@ -6164,6 +6210,32 @@ impl ContractCollectionStore {
             event.embed_context.merge_missing_from(&snapshot);
         }
         event.embed_context.location.region_id = Some(event.region_id);
+        if event
+            .embed_context
+            .location
+            .region_name
+            .as_deref()
+            .is_none_or(|name| name.trim().is_empty())
+        {
+            event.embed_context.location.region_name =
+                if let Some(region_name) = region_names.get(&event.region_id).cloned() {
+                    Some(region_name)
+                } else {
+                    self.retained_region_name(event.region_id).await?
+                };
+        }
+        if event
+            .embed_context
+            .location
+            .region_name
+            .as_deref()
+            .is_none_or(|name| name.trim().is_empty())
+        {
+            return Err(sqlx::Error::Protocol(format!(
+                "human-readable region name is unavailable for region {}",
+                event.region_id
+            )));
+        }
         if event.embed_context.matched_range.is_some() {
             return Ok(event);
         }
@@ -6204,6 +6276,16 @@ impl ContractCollectionStore {
             .cache(&key)
             .await?
             .and_then(|cached| serde_json::from_value::<String>(cached.response).ok()))
+    }
+
+    async fn retained_region_name(&self, region_id: i64) -> Result<Option<String>, sqlx::Error> {
+        let key = format!("universe/regions/{region_id}/contract-region-name");
+        Ok(self
+            .cache(&key)
+            .await?
+            .and_then(|cached| serde_json::from_value::<Option<String>>(cached.response).ok())
+            .flatten()
+            .filter(|name| !name.trim().is_empty()))
     }
 
     pub async fn inspect_contract_delivery(
@@ -7975,7 +8057,26 @@ pub async fn run_operator_delivery_cli_from_process_args(arguments: &[String]) -
         return Some(2);
     }
     let values = [values, vec!["--actor", actor.actor.as_str()]].concat();
-    match execute_operator_delivery_cli(&store, &values, Utc::now()).await {
+    let region_names = if values.first().copied() == Some("rerender") && values.contains(&"--queue")
+    {
+        match configured_contract_region_names() {
+            Ok(region_names) => region_names,
+            Err(error) => {
+                eprintln!("contract-delivery rerender cannot resolve region names: {error}");
+                return Some(2);
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+    match execute_operator_delivery_cli_with_region_names(
+        &store,
+        &values,
+        Utc::now(),
+        &region_names,
+    )
+    .await
+    {
         Ok(result) => match serde_json::to_string(&result) {
             Ok(output) => {
                 println!("{output}");
@@ -7997,6 +8098,15 @@ pub async fn execute_operator_delivery_cli(
     store: &ContractCollectionStore,
     arguments: &[&str],
     now: DateTime<Utc>,
+) -> Result<OperatorDeliveryCliResult, String> {
+    execute_operator_delivery_cli_with_region_names(store, arguments, now, &HashMap::new()).await
+}
+
+async fn execute_operator_delivery_cli_with_region_names(
+    store: &ContractCollectionStore,
+    arguments: &[&str],
+    now: DateTime<Utc>,
+    region_names: &HashMap<i64, String>,
 ) -> Result<OperatorDeliveryCliResult, String> {
     let (command, flags) = parse_operator_delivery_command(arguments)?;
     let actor = required_operator_delivery_option(&flags, "--actor")?;
@@ -8058,7 +8168,13 @@ pub async fn execute_operator_delivery_cli(
                     .map_err(|error| error.to_string())?
             } else {
                 store
-                    .queue_contract_delivery_rerenders(channel_id, &selector, actor, now)
+                    .queue_contract_delivery_rerenders(
+                        channel_id,
+                        &selector,
+                        actor,
+                        now,
+                        region_names,
+                    )
                     .await
                     .map_err(|error| error.to_string())?
             };
@@ -8636,6 +8752,7 @@ pub struct CollectionReport {
 pub struct ContractCollector {
     store: ContractCollectionStore,
     esi: Arc<dyn PublicContractEsi>,
+    region_names: Arc<HashMap<i64, String>>,
     structure_resolver: Option<Arc<dyn StructureResolver>>,
     notifications: Option<ContractNotifications>,
     delivery_clock: Arc<dyn ContractDeliveryClock>,
@@ -8726,6 +8843,7 @@ impl ContractCollector {
         Self {
             store,
             esi,
+            region_names: Arc::new(HashMap::new()),
             structure_resolver: None,
             notifications: None,
             delivery_clock: Arc::new(SystemContractDeliveryClock),
@@ -8749,6 +8867,11 @@ impl ContractCollector {
 
     pub fn with_structure_resolver(mut self, resolver: Arc<dyn StructureResolver>) -> Self {
         self.structure_resolver = Some(resolver);
+        self
+    }
+
+    pub fn with_region_names(mut self, region_names: Arc<HashMap<i64, String>>) -> Self {
+        self.region_names = region_names;
         self
     }
 
@@ -10573,7 +10696,12 @@ impl ContractCollector {
             .as_deref()
             .is_none_or(|name| name.trim().is_empty())
         {
-            context.location.region_name = self.cached_region_name(contract_id, region_id).await?;
+            context.location.region_name =
+                if let Some(region_name) = self.region_names.get(&region_id).cloned() {
+                    Some(region_name)
+                } else {
+                    self.cached_region_name(contract_id, region_id).await?
+                };
         }
         Ok(())
     }
@@ -11089,7 +11217,12 @@ impl ContractCollector {
                 }
             }
         }
-        enriched.embed_context.location.region_id = Some(event.region_id);
+        self.ensure_region_context(
+            event.contract.contract_id,
+            event.region_id,
+            &mut enriched.embed_context,
+        )
+        .await?;
         Ok(enriched)
     }
 
@@ -13029,11 +13162,6 @@ fn contract_region_display_name(context: &ContractLocationContext) -> Option<Str
         .as_deref()
         .map(sanitize_contract_text)
         .filter(|name| !name.is_empty())
-        .or_else(|| {
-            context
-                .region_id
-                .map(|region_id| format!("Region {region_id}"))
-        })
 }
 
 fn unresolved_contract_location(location_id: i64) -> &'static str {
@@ -13461,6 +13589,7 @@ async fn run_proximity_reconciliation_loop(
     ping_limiter: Arc<dyn ContractPingLimiter>,
     structure_resolver: Option<Arc<dyn StructureResolver>>,
 ) {
+    let region_names = runtime_contract_region_names();
     let mut cadence = tokio::time::interval_at(tokio::time::Instant::now(), interval);
     cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -13468,6 +13597,7 @@ async fn run_proximity_reconciliation_loop(
         match ContractCollectionStore::connect(&database_url).await {
             Ok(store) => {
                 let collector = ContractCollector::new(store, esi.clone())
+                    .with_region_names(region_names.clone())
                     .with_notifications_and_ping_limiter(
                         ship_groups.clone(),
                         delivery.clone(),
@@ -13595,6 +13725,7 @@ async fn run_contract_collection_loop_with_notifications_and_region_concurrency(
     structure_resolver_runtime: Option<StructureResolverRuntimeStatus>,
     max_concurrent_regions: usize,
 ) {
+    let region_names = runtime_contract_region_names();
     let notifications = ContractNotifications {
         ship_groups,
         delivery,
@@ -13625,6 +13756,7 @@ async fn run_contract_collection_loop_with_notifications_and_region_concurrency(
                     }
                 }
                 let collector = ContractCollector::new((*store).clone(), esi.clone())
+                    .with_region_names(region_names.clone())
                     .with_notifications_and_ping_limiter(
                         notifications.ship_groups.clone(),
                         notifications.delivery.clone(),
@@ -13682,6 +13814,7 @@ async fn run_contract_collection_loop_inner(
     esi_timeout: Duration,
     notifications: Option<ContractNotifications>,
 ) {
+    let region_names = runtime_contract_region_names();
     let esi = loop {
         match HttpPublicContractEsi::new(esi_timeout) {
             Ok(esi) => break Arc::new(esi),
@@ -13697,6 +13830,7 @@ async fn run_contract_collection_loop_inner(
         match ContractCollectionStore::connect(&database_url).await {
             Ok(store) => {
                 let mut collector = ContractCollector::new(store, esi.clone())
+                    .with_region_names(region_names.clone())
                     .with_max_concurrent_regions(DEFAULT_CONTRACT_REGIONAL_CONCURRENCY);
                 if let Some(notifications) = &notifications {
                     collector = collector.with_notifications(
@@ -14514,9 +14648,7 @@ mod embed_tests {
             contract_notification_message(&region_only, None, &history, &history, false);
         assert_eq!(
             region_only.description.as_deref(),
-            Some(
-                "`<url=\"contract:0//45\">Public contract - Unknown location</url>`\n**in:** [Region 10000002](http://evemaps.dotlan.net/region/10000002)"
-            )
+            Some("`<url=\"contract:0//45\">Public contract - Unknown location</url>`")
         );
 
         let mut raw_only = event(ContractEventKind::Listed);
