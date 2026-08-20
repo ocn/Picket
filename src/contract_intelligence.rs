@@ -6129,6 +6129,7 @@ impl ContractCollectionStore {
         actor: &str,
         occurred_at: DateTime<Utc>,
         region_names: &HashMap<i64, String>,
+        region_name_esi: Option<&dyn PublicContractEsi>,
     ) -> Result<ContractDeliveryRerenderSelection, sqlx::Error> {
         if actor != CONTRACT_DELIVERY_OPERATOR_ACTOR {
             return Err(sqlx::Error::Protocol(
@@ -6140,6 +6141,63 @@ impl ContractCollectionStore {
             .await?;
         if selected.candidates.is_empty() {
             return Ok(selected);
+        }
+        let mut resolved_region_names = region_names.clone();
+        for candidate in &selected.candidates {
+            let region_id = candidate.event.region_id;
+            if resolved_region_names
+                .get(&region_id)
+                .is_some_and(|name| !name.trim().is_empty())
+            {
+                continue;
+            }
+            if let Some(name) = candidate
+                .event
+                .embed_context
+                .location
+                .region_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                resolved_region_names.insert(region_id, name.to_string());
+                continue;
+            }
+            if let Some(name) = self
+                .observed_embed_context(region_id, candidate.event.contract.contract_id)
+                .await?
+                .and_then(|context| context.location.region_name)
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+            {
+                resolved_region_names.insert(region_id, name);
+                continue;
+            }
+            if let Some(name) = self.retained_region_name(region_id).await? {
+                resolved_region_names.insert(region_id, name);
+                continue;
+            }
+            let Some(esi) = region_name_esi.filter(|esi| esi.supports_region_name_lookup()) else {
+                return Err(sqlx::Error::Protocol(format!(
+                    "human-readable region name is unavailable for region {region_id}"
+                )));
+            };
+            let response = esi.region_name(region_id, None).await.map_err(|error| {
+                sqlx::Error::Protocol(format!(
+                    "public region name lookup failed for region {region_id}: {error}"
+                ))
+            })?;
+            let Some(name) = response
+                .value
+                .flatten()
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+            else {
+                return Err(sqlx::Error::Protocol(format!(
+                    "public region name lookup returned no name for region {region_id}"
+                )));
+            };
+            resolved_region_names.insert(region_id, name);
         }
         let delivery_ids = selected
             .candidates
@@ -6157,7 +6215,7 @@ impl ContractCollectionStore {
             .await?;
         for candidate in &locked.candidates {
             let event = self
-                .reconstruct_historical_matched_range(candidate, region_names)
+                .reconstruct_historical_matched_range(candidate, &resolved_region_names)
                 .await?;
             let (issuer_history, corporation_history) = self
                 .contract_party_history(
@@ -8069,11 +8127,27 @@ pub async fn run_operator_delivery_cli_from_process_args(arguments: &[String]) -
     } else {
         HashMap::new()
     };
-    match execute_operator_delivery_cli_with_region_names(
+    let region_name_esi = if values.first().copied() == Some("rerender")
+        && values.contains(&"--queue")
+    {
+        match HttpPublicContractEsi::new(Duration::from_secs(15)) {
+            Ok(esi) => Some(esi),
+            Err(error) => {
+                eprintln!("contract-delivery rerender cannot create public ESI client: {error}");
+                return Some(2);
+            }
+        }
+    } else {
+        None
+    };
+    match execute_operator_delivery_cli_with_region_name_lookup(
         &store,
         &values,
         Utc::now(),
         &region_names,
+        region_name_esi
+            .as_ref()
+            .map(|esi| esi as &dyn PublicContractEsi),
     )
     .await
     {
@@ -8099,14 +8173,23 @@ pub async fn execute_operator_delivery_cli(
     arguments: &[&str],
     now: DateTime<Utc>,
 ) -> Result<OperatorDeliveryCliResult, String> {
-    execute_operator_delivery_cli_with_region_names(store, arguments, now, &HashMap::new()).await
+    execute_operator_delivery_cli_with_region_name_lookup(
+        store,
+        arguments,
+        now,
+        &HashMap::new(),
+        None,
+    )
+    .await
 }
 
-async fn execute_operator_delivery_cli_with_region_names(
+#[doc(hidden)]
+pub async fn execute_operator_delivery_cli_with_region_name_lookup(
     store: &ContractCollectionStore,
     arguments: &[&str],
     now: DateTime<Utc>,
     region_names: &HashMap<i64, String>,
+    region_name_esi: Option<&dyn PublicContractEsi>,
 ) -> Result<OperatorDeliveryCliResult, String> {
     let (command, flags) = parse_operator_delivery_command(arguments)?;
     let actor = required_operator_delivery_option(&flags, "--actor")?;
@@ -8174,6 +8257,7 @@ async fn execute_operator_delivery_cli_with_region_names(
                         actor,
                         now,
                         region_names,
+                        region_name_esi,
                     )
                     .await
                     .map_err(|error| error.to_string())?

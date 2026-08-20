@@ -5,8 +5,9 @@ use killbot_rust::commands::health::{render_health_response, HEALTH_OPERATOR_ID}
 use killbot_rust::config::{self, AppConfig, AppState};
 use killbot_rust::contract_intelligence::{
     available_contract_store, collection_retry_delay, contract_regional_concurrency_from,
-    execute_operator_delivery_cli, new_contract_store_handle,
-    proximity_reconciliation_interval_from, spawn_contract_collection_loop_with_notifications,
+    execute_operator_delivery_cli, execute_operator_delivery_cli_with_region_name_lookup,
+    new_contract_store_handle, proximity_reconciliation_interval_from,
+    spawn_contract_collection_loop_with_notifications,
     spawn_proximity_reconciliation_loop_with_esi, AppStateContractPingLimiter, CacheMetadata,
     CollectionOutcome, ContractAcceptanceEvidence, ContractCollectionStore, ContractCollector,
     ContractContextLimiter, ContractContextRequirements, ContractContextResolution,
@@ -18032,11 +18033,11 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
         .await
         .expect("connect to seed rerender queue fixtures");
     sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,now())")
-        .bind(10_000_002_i64)
+        .bind(10_000_009_i64)
         .bind(45_i64)
         .bind(serde_json::to_value(ContractEmbedContext {
             location: ContractLocationContext {
-                region_id: Some(10_000_002),
+                region_id: Some(10_000_009),
                 region_name: None,
                 ..ContractLocationContext::default()
             },
@@ -18051,7 +18052,7 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
         "fields": []
     });
     let historical_event = ContractEvent {
-        region_id: 10_000_002,
+        region_id: 10_000_009,
         kind: ContractEventKind::Listed,
         contract: item_exchange_contract(45),
         offered_items: vec![offered_ship(1)],
@@ -18157,18 +18158,43 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
     .expect("seed other-channel retained delivery");
     pool.close().await;
 
-    let token = "contract-rerender-queue-test-token-not-for-argv";
-    let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
-    let queued = run_contract_delivery_cli(
-        &database.url,
-        &digest,
-        Some(token),
+    let region_wire = SequenceHttpServer::start(vec![WireReply {
+        status: 200,
+        headers: vec![],
+        body: r#"{"name":"Insmother"}"#,
+    }]);
+    let region_esi =
+        HttpPublicContractEsi::with_base_url(&region_wire.base_url, Duration::from_secs(1))
+            .expect("public region-name ESI client");
+    let queued = execute_operator_delivery_cli_with_region_name_lookup(
+        &store,
         &["rerender", "--channel", "77", "--limit", "10", "--queue"],
-    );
-    assert!(queued.status.success(), "{}", cli_output(&queued));
-    assert!(!cli_output(&queued).contains(token));
-    let report: Value =
-        serde_json::from_slice(&queued.stdout).expect("queued rerender JSON result");
+        Utc::now(),
+        &HashMap::new(),
+        Some(&region_esi),
+    )
+    .await
+    .expect_err("operator actor remains mandatory");
+    assert!(queued.contains("--actor"));
+    let queued = execute_operator_delivery_cli_with_region_name_lookup(
+        &store,
+        &[
+            "rerender",
+            "--channel",
+            "77",
+            "--limit",
+            "10",
+            "--queue",
+            "--actor",
+            CONTRACT_DELIVERY_OPERATOR_ACTOR,
+        ],
+        Utc::now(),
+        &HashMap::new(),
+        Some(&region_esi),
+    )
+    .await
+    .expect("queue rerender after public region-name preflight");
+    let report = serde_json::to_value(queued).expect("queued rerender JSON result");
     assert_eq!(report["result"], "rerendered");
     assert_eq!(report["channel_id"], 77);
     assert_eq!(report["dry_run"], false);
@@ -18209,14 +18235,17 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
         .as_ref()
         .and_then(|message| message.get("description"))
         .and_then(Value::as_str)
-        .is_some_and(|description| description.contains("The Forge")
-            && description.contains("/region/10000002")));
+        .is_some_and(|description| description.contains("Insmother")
+            && description.contains("/region/10000009")));
     assert!(!queued_state
         .1
         .as_ref()
         .and_then(|message| message.get("description"))
         .and_then(Value::as_str)
-        .is_some_and(|description| description.contains("Region 10000002")));
+        .is_some_and(|description| description.contains("Region 10000009")));
+    let region_request = region_wire.requests.lock().unwrap()[0].to_ascii_lowercase();
+    assert!(region_request.contains("/universe/regions/10000009/"));
+    assert!(!region_request.contains("authorization:"));
     assert_eq!(
         queued_state
             .1
@@ -18293,6 +18322,7 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
     assert_eq!(record.status, DeliveryStatus::Sent);
     assert_eq!(record.discord_message_id.as_deref(), Some("9001"));
     wire.finish();
+    region_wire.finish();
     database.destroy().await;
 }
 
