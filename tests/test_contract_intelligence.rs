@@ -1,3 +1,5 @@
+mod common;
+
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -38,7 +40,7 @@ use killbot_rust::structure_resolver::{
     StructureResolverConfig, StructureResolverError, StructureResolverRuntimeStatus,
 };
 use moka::future::Cache;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serenity::http::Http;
 use sha2::{Digest, Sha256, Sha384};
@@ -60,6 +62,8 @@ use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::{mpsc, oneshot, Barrier, Mutex, Notify, Semaphore};
 use url::Url;
+
+use common::load_text_fixture;
 
 static DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const ESI_PUBLIC_CONTRACT_SUMMARY_FIXTURE: &str =
@@ -4899,70 +4903,126 @@ impl ControlledHttpServer {
     }
 }
 
-struct GatedPublicEnrichmentHttpServer {
+#[derive(Clone, Deserialize)]
+struct PublicEnrichmentWireFixtures {
+    regions: Value,
+    listing: Value,
+    items: Value,
+    station: Value,
+    solar_system: Value,
+    constellation: Value,
+    region: Value,
+    missing_region: Value,
+    observed_affiliation: Value,
+    names: Value,
+    names_without_item: Value,
+    unexpected: Value,
+}
+
+impl PublicEnrichmentWireFixtures {
+    fn listing_page(&self, listing_count: usize) -> String {
+        Value::Array(
+            (45..45 + i64::try_from(listing_count).expect("listing count fits in i64"))
+                .map(|contract_id| {
+                    let mut listing = self.listing.clone();
+                    listing["contract_id"] = Value::from(contract_id);
+                    listing
+                })
+                .collect(),
+        )
+        .to_string()
+    }
+}
+
+struct GatedObservedLocationEnrichmentHttpServer {
     base_url: String,
     requests: Arc<StdMutex<Vec<String>>>,
     station_started: Arc<Notify>,
-    affiliation_started: Arc<Notify>,
+    observed_affiliation_started: Arc<Notify>,
     names_started: Arc<Notify>,
     station_release: std_mpsc::Sender<()>,
+    _names_release: std_mpsc::Sender<()>,
+    region_name_available: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
 }
 
-impl GatedPublicEnrichmentHttpServer {
+impl GatedObservedLocationEnrichmentHttpServer {
     fn start() -> Self {
-        Self::start_with_options(true, true, true)
+        Self::start_with_options(true, true, true, false)
     }
 
     fn start_without_region_name() -> Self {
-        Self::start_with_options(false, true, true)
+        Self::start_with_options(false, true, true, false)
+    }
+
+    fn start_with_delayed_region_name() -> Self {
+        Self::start_with_options(false, true, false, false)
     }
 
     fn start_without_item_name() -> Self {
-        Self::start_with_options(true, false, true)
+        Self::start_with_options(true, false, true, false)
     }
 
     fn start_ungated() -> Self {
-        Self::start_with_options(true, true, false)
+        Self::start_with_options(true, true, false, false)
+    }
+
+    fn start_with_gated_optional_names() -> Self {
+        Self::start_with_options(true, true, false, true)
     }
 
     fn start_with_more_listings_than_the_snapshot_cap() -> Self {
-        Self::start_with_listing_count(true, true, false, 9)
+        Self::start_with_listing_count(true, true, false, false, 9)
     }
 
     fn start_with_options(
         region_name_available: bool,
         item_name_available: bool,
         gate_station: bool,
+        gate_names: bool,
     ) -> Self {
-        Self::start_with_listing_count(region_name_available, item_name_available, gate_station, 1)
+        Self::start_with_listing_count(
+            region_name_available,
+            item_name_available,
+            gate_station,
+            gate_names,
+            1,
+        )
     }
 
     fn start_with_listing_count(
         region_name_available: bool,
         item_name_available: bool,
         gate_station: bool,
+        gate_names: bool,
         listing_count: usize,
     ) -> Self {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").expect("bind gated public-enrichment HTTP listener");
+        let fixtures: PublicEnrichmentWireFixtures =
+            serde_json::from_str(&load_text_fixture("contracts/public-enrichment-wire.json"))
+                .expect("parse public Progressive Enrichment wire fixtures");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind gated Observed Location enrichment HTTP listener");
         listener
             .set_nonblocking(true)
-            .expect("make gated public-enrichment listener nonblocking");
+            .expect("make gated Observed Location enrichment listener nonblocking");
         let address = listener
             .local_addr()
-            .expect("gated public-enrichment listener address");
+            .expect("gated Observed Location enrichment listener address");
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let recorded_requests = requests.clone();
         let station_started = Arc::new(Notify::new());
         let server_station_started = station_started.clone();
-        let affiliation_started = Arc::new(Notify::new());
-        let server_affiliation_started = affiliation_started.clone();
+        let observed_affiliation_started = Arc::new(Notify::new());
+        let server_observed_affiliation_started = observed_affiliation_started.clone();
         let names_started = Arc::new(Notify::new());
         let server_names_started = names_started.clone();
         let (station_release, station_release_receiver) = std_mpsc::channel();
         let server_station_release = Arc::new(StdMutex::new(station_release_receiver));
+        let (names_release, names_release_receiver) = std_mpsc::channel::<()>();
+        let server_names_release = Arc::new(StdMutex::new(names_release_receiver));
+        let region_name_available = Arc::new(AtomicBool::new(region_name_available));
+        let server_region_name_available = region_name_available.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let page_requests = Arc::new(AtomicU64::new(0));
@@ -4975,89 +5035,81 @@ impl GatedPublicEnrichmentHttpServer {
                         std::thread::sleep(Duration::from_millis(5));
                         continue;
                     }
-                    Err(error) => panic!("accept gated public-enrichment request: {error}"),
+                    Err(error) => {
+                        panic!("accept gated Observed Location enrichment request: {error}")
+                    }
                 };
                 let requests = recorded_requests.clone();
                 let station_started = server_station_started.clone();
-                let affiliation_started = server_affiliation_started.clone();
+                let observed_affiliation_started = server_observed_affiliation_started.clone();
                 let names_started = server_names_started.clone();
                 let station_release = server_station_release.clone();
+                let names_release = server_names_release.clone();
+                let region_name_available = server_region_name_available.clone();
                 let page_requests = server_page_requests.clone();
+                let fixtures = fixtures.clone();
                 std::thread::spawn(move || {
                     stream
                         .set_nonblocking(false)
-                        .expect("make gated public-enrichment connection blocking");
+                        .expect("make gated Observed Location enrichment connection blocking");
                     let mut request = [0_u8; 4096];
                     let length = stream
                         .read(&mut request)
-                        .expect("read gated public-enrichment request");
+                        .expect("read gated Observed Location enrichment request");
                     let request = String::from_utf8_lossy(&request[..length]).into_owned();
                     requests.lock().unwrap().push(request.clone());
-                    let (body, waits_for_station) = if request
-                        .starts_with("GET /universe/regions/ HTTP/")
-                    {
-                        ("[10000002]".to_string(), false)
-                    } else if request.starts_with("GET /contracts/public/10000002/?page=1 ") {
-                        let body = if page_requests.fetch_add(1, Ordering::Relaxed) == 0 {
-                            "[]".to_string()
+                    let (body, waits_for_station, waits_for_names) =
+                        if request.starts_with("GET /universe/regions/ HTTP/") {
+                            (fixtures.regions.to_string(), false, false)
+                        } else if request.starts_with("GET /contracts/public/10000002/?page=1 ") {
+                            let body = if page_requests.fetch_add(1, Ordering::Relaxed) == 0 {
+                                "[]".to_string()
+                            } else {
+                                fixtures.listing_page(listing_count)
+                            };
+                            (body, false, false)
+                        } else if request.starts_with("GET /contracts/public/items/") {
+                            (fixtures.items.to_string(), false, false)
+                        } else if request.starts_with("GET /universe/stations/60003760/") {
+                            station_started.notify_one();
+                            (fixtures.station.to_string(), gate_station, false)
+                        } else if request.starts_with("GET /universe/systems/30000142/") {
+                            (fixtures.solar_system.to_string(), false, false)
+                        } else if request.starts_with("GET /universe/constellations/20000020/") {
+                            (fixtures.constellation.to_string(), false, false)
+                        } else if request.starts_with("GET /universe/regions/10000002/") {
+                            if region_name_available.load(Ordering::Relaxed) {
+                                (fixtures.region.to_string(), false, false)
+                            } else {
+                                (fixtures.missing_region.to_string(), false, false)
+                            }
+                        } else if request.starts_with("POST /characters/affiliation/") {
+                            observed_affiliation_started.notify_one();
+                            (fixtures.observed_affiliation.to_string(), false, false)
+                        } else if request.starts_with("POST /universe/names/") {
+                            names_started.notify_one();
+                            let body = if item_name_available {
+                                fixtures.names.to_string()
+                            } else {
+                                fixtures.names_without_item.to_string()
+                            };
+                            (body, false, gate_names)
                         } else {
-                            format!(
-                                "[{}]",
-                                (45..45 + i64::try_from(listing_count).expect("listing count fits in i64"))
-                                    .map(|contract_id| format!(
-                                        r#"{{"collateral":0.0,"contract_id":{contract_id},"date_expired":"2026-08-14T12:00:00Z","date_issued":"2026-08-13T12:00:00Z","days_to_complete":0,"end_location_id":60003760,"for_corporation":false,"issuer_corporation_id":98000001,"issuer_id":90000001,"price":1500000000.0,"reward":0.0,"start_location_id":60003760,"type":"item_exchange","volume":115000.0}}"#
-                                    ))
-                                    .collect::<Vec<_>>()
-                                    .join(",")
-                            )
+                            (fixtures.unexpected.to_string(), false, false)
                         };
-                        (body, false)
-                    } else if request.starts_with("GET /contracts/public/items/") {
-                        (
-                            r#"[{"is_included":true,"quantity":1,"record_id":1,"type_id":587}]"#
-                                .to_string(),
-                            false,
-                        )
-                    } else if request.starts_with("GET /universe/stations/60003760/") {
-                        station_started.notify_one();
-                        (
-                            r#"{"name":"Jita IV - Moon 4 - Caldari Navy Assembly Plant","system_id":30000142}"#
-                                .to_string(),
-                            gate_station,
-                        )
-                    } else if request.starts_with("GET /universe/systems/30000142/") {
-                        (
-                            r#"{"constellation_id":20000020,"name":"Jita","position":{"x":0.0,"y":0.0,"z":0.0},"security_status":0.9}"#.to_string(),
-                            false,
-                        )
-                    } else if request.starts_with("GET /universe/constellations/20000020/") {
-                        (r#"{"region_id":10000002}"#.to_string(), false)
-                    } else if request.starts_with("GET /universe/regions/10000002/") {
-                        if region_name_available {
-                            (r#"{"name":"The Forge"}"#.to_string(), false)
-                        } else {
-                            (r#"{}"#.to_string(), false)
-                        }
-                    } else if request.starts_with("POST /characters/affiliation/") {
-                        affiliation_started.notify_one();
-                        (r#"[{"alliance_id":99000111}]"#.to_string(), false)
-                    } else if request.starts_with("POST /universe/names/") {
-                        names_started.notify_one();
-                        let body = if item_name_available {
-                            r#"[{"id":587,"name":"Rifter"},{"id":90000001,"name":"Issuer"},{"id":98000001,"name":"Issuer Corp"},{"id":99000111,"name":"Issuer Alliance"}]"#.to_string()
-                        } else {
-                            r#"[{"id":90000001,"name":"Issuer"},{"id":98000001,"name":"Issuer Corp"},{"id":99000111,"name":"Issuer Alliance"}]"#.to_string()
-                        };
-                        (body, false)
-                    } else {
-                        (r#"{"error":"unexpected request"}"#.to_string(), false)
-                    };
                     if waits_for_station {
                         station_release
                             .lock()
                             .unwrap()
                             .recv()
-                            .expect("release gated public-enrichment station response");
+                            .expect("release gated Observed Location station response");
+                    }
+                    if waits_for_names {
+                        names_release
+                            .lock()
+                            .unwrap()
+                            .recv()
+                            .expect("release gated optional name response");
                     }
                     let response = format!(
                         "HTTP/1.1 200 test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: max-age=0\r\nX-Pages: 1\r\nConnection: close\r\n\r\n{}",
@@ -5066,7 +5118,7 @@ impl GatedPublicEnrichmentHttpServer {
                     );
                     stream
                         .write_all(response.as_bytes())
-                        .expect("write gated public-enrichment response");
+                        .expect("write gated Observed Location enrichment response");
                 });
             }
         });
@@ -5074,9 +5126,11 @@ impl GatedPublicEnrichmentHttpServer {
             base_url: format!("http://{address}/"),
             requests,
             station_started,
-            affiliation_started,
+            observed_affiliation_started,
             names_started,
             station_release,
+            _names_release: names_release,
+            region_name_available,
             stop,
             handle,
         }
@@ -5085,7 +5139,11 @@ impl GatedPublicEnrichmentHttpServer {
     fn release_station(&self) {
         self.station_release
             .send(())
-            .expect("release gated public-enrichment station response");
+            .expect("release gated Observed Location station response");
+    }
+
+    fn make_region_name_available(&self) {
+        self.region_name_available.store(true, Ordering::Relaxed);
     }
 
     fn finish(self) {
@@ -9883,7 +9941,7 @@ fn requested_ship(record_id: i64) -> PublicContractItem {
 async fn public_contract_listing_embed_uses_the_compact_killfeed_shell_at_the_collector_seam() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
-    let server = GatedPublicEnrichmentHttpServer::start_ungated();
+    let server = GatedObservedLocationEnrichmentHttpServer::start_ungated();
     let esi = Arc::new(
         HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
             .expect("construct controlled public ESI client"),
@@ -9966,7 +10024,8 @@ async fn public_contract_listing_embed_uses_the_compact_killfeed_shell_at_the_co
 async fn public_listing_beyond_the_snapshot_cap_still_waits_for_enrichment() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
-    let server = GatedPublicEnrichmentHttpServer::start_with_more_listings_than_the_snapshot_cap();
+    let server =
+        GatedObservedLocationEnrichmentHttpServer::start_with_more_listings_than_the_snapshot_cap();
     let esi = Arc::new(
         HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(2))
             .expect("construct controlled public ESI client"),
@@ -10049,10 +10108,11 @@ async fn public_listing_beyond_the_snapshot_cap_still_waits_for_enrichment() {
 }
 
 #[tokio::test]
-async fn public_station_listing_waits_for_concurrent_enrichment_before_discord_delivery() {
+async fn public_station_listing_waits_for_concurrent_observed_location_enrichment_before_discord_delivery(
+) {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
-    let server = GatedPublicEnrichmentHttpServer::start();
+    let server = GatedObservedLocationEnrichmentHttpServer::start();
     let esi = Arc::new(
         HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(2))
             .expect("construct gated public ESI client"),
@@ -10084,10 +10144,10 @@ async fn public_station_listing_waits_for_concurrent_enrichment_before_discord_d
 
     tokio::time::timeout(Duration::from_secs(2), server.station_started.notified())
         .await
-        .expect("the first public location step starts");
-    let affiliation_started = tokio::time::timeout(
+        .expect("the first Observed Location step starts");
+    let observed_affiliation_started = tokio::time::timeout(
         Duration::from_millis(500),
-        server.affiliation_started.notified(),
+        server.observed_affiliation_started.notified(),
     )
     .await;
     let names_started =
@@ -10111,12 +10171,12 @@ async fn public_station_listing_waits_for_concurrent_enrichment_before_discord_d
         .expect("finish enriched public-station collection");
 
     assert!(
-        affiliation_started.is_ok(),
-        "issuer affiliation resolution starts while the first location step is held"
+        observed_affiliation_started.is_ok(),
+        "Observed Affiliation resolution starts while the first Observed Location step is held"
     );
     assert!(
         names_started.is_ok(),
-        "issuer and item-name resolution starts while the first location step is held"
+        "issuer and item-name resolution starts while the first Observed Location step is held"
     );
     let sent = delivery.sent.lock().unwrap();
     assert_eq!(sent.len(), 1);
@@ -10141,19 +10201,46 @@ async fn public_station_listing_waits_for_concurrent_enrichment_before_discord_d
         .await
         .expect("read retained enrichment evidence")
         .expect("retain enrichment evidence before delivery");
+    assert!(retained.observed_at.is_some());
     assert_eq!(retained.issuer_alliance_id, Some(99_000_111));
     assert_eq!(retained.issuer_character_name.as_deref(), Some("Issuer"));
+    assert_eq!(
+        retained.issuer_corporation_name.as_deref(),
+        Some("Issuer Corp")
+    );
+    assert_eq!(
+        retained.issuer_alliance_name.as_deref(),
+        Some("Issuer Alliance")
+    );
     assert_eq!(
         retained.location.location_name.as_deref(),
         Some("Jita IV - Moon 4 - Caldari Navy Assembly Plant")
     );
     assert_eq!(retained.location.solar_system_name.as_deref(), Some("Jita"));
     assert_eq!(retained.location.region_name.as_deref(), Some("The Forge"));
+    let verification_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect retained public contract identifiers");
+    let persisted_contract: PublicContract = serde_json::from_value(
+        sqlx::query_scalar::<_, Value>(
+            "SELECT facts FROM public_contract_facts WHERE contract_id = $1",
+        )
+        .bind(45_i64)
+        .fetch_one(&verification_pool)
+        .await
+        .expect("read retained public contract identifiers"),
+    )
+    .expect("deserialize retained public contract identifiers");
+    verification_pool.close().await;
+    assert_eq!(persisted_contract.issuer_id, 90_000_001);
+    assert_eq!(persisted_contract.issuer_corporation_id, 98_000_001);
     let evidence = LocationEvidenceService::new(&store)
         .resolve(60_003_760, Utc::now())
         .await
-        .expect("read retained public location evidence")
-        .expect("retain public station provenance");
+        .expect("read retained Observed Location evidence")
+        .expect("retain Observed Location station provenance");
     assert_eq!(evidence.evidence_class, LocationEvidenceClass::PublicNpc);
     assert_eq!(evidence.station_id, Some(60_003_760));
     assert_eq!(evidence.solar_system_id, 30_000_142);
@@ -10187,10 +10274,10 @@ async fn public_station_listing_waits_for_concurrent_enrichment_before_discord_d
 }
 
 #[tokio::test]
-async fn public_listing_defers_when_no_human_readable_region_can_be_retained() {
+async fn public_listing_defers_when_observed_location_has_no_human_readable_region() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
-    let server = GatedPublicEnrichmentHttpServer::start_without_region_name();
+    let server = GatedObservedLocationEnrichmentHttpServer::start_without_region_name();
     let esi = Arc::new(
         HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(2))
             .expect("construct regionless public ESI client"),
@@ -10221,7 +10308,7 @@ async fn public_listing_defers_when_no_human_readable_region_can_be_retained() {
     let cycle = tokio::spawn(async move { collector.collect_cycle().await });
     tokio::time::timeout(Duration::from_secs(2), server.station_started.notified())
         .await
-        .expect("the public station lookup starts");
+        .expect("the Observed Location station lookup starts");
     server.release_station();
     cycle
         .await
@@ -10240,10 +10327,155 @@ async fn public_listing_defers_when_no_human_readable_region_can_be_retained() {
 }
 
 #[tokio::test]
+async fn deferred_listing_retries_observed_location_when_the_retained_snapshot_lacks_a_region() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let server = GatedObservedLocationEnrichmentHttpServer::start_with_delayed_region_name();
+    let esi = Arc::new(
+        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(2))
+            .expect("construct delayed-region public ESI client"),
+    );
+
+    ContractCollector::new(store.clone(), esi.clone())
+        .collect_cycle()
+        .await
+        .expect("establish the silent public-contract baseline");
+    let subscription = contract_subscription(
+        "retry-observed-location-region",
+        ContractItemDirection::Offered,
+        vec![587],
+        vec![],
+        ContractEventAction::Post,
+    );
+    store
+        .upsert_contract_subscription(&subscription)
+        .await
+        .expect("persist the Observed Location retry subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let collector = ContractCollector::new(store.clone(), esi).with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    );
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("retain the regionless Observed Location snapshot and defer delivery");
+    assert!(delivery.sent.lock().unwrap().is_empty());
+    let partial_snapshot = store
+        .observed_embed_context(10_000_002, 45)
+        .await
+        .expect("read the retained partial Observed Location snapshot")
+        .expect("retain the partial Observed Location snapshot");
+    assert_eq!(
+        partial_snapshot.location.location_name.as_deref(),
+        Some("Jita IV - Moon 4 - Caldari Navy Assembly Plant")
+    );
+    assert_eq!(
+        partial_snapshot.location.solar_system_name.as_deref(),
+        Some("Jita")
+    );
+    assert_eq!(partial_snapshot.location.region_id, Some(10_000_002));
+    assert!(partial_snapshot.location.region_name.is_none());
+
+    server.make_region_name_available();
+    collector
+        .collect_cycle()
+        .await
+        .expect("retry the deferred listing after the Observed Location region is available");
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+    assert_eq!(
+        store
+            .observed_embed_context(10_000_002, 45)
+            .await
+            .expect("read the retried Observed Location snapshot")
+            .expect("retain the retried Observed Location snapshot")
+            .location
+            .region_name
+            .as_deref(),
+        Some("The Forge")
+    );
+
+    server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn public_listing_omits_held_optional_names_at_the_injected_enrichment_deadline() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let server = GatedObservedLocationEnrichmentHttpServer::start_with_gated_optional_names();
+    let esi = Arc::new(
+        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(2))
+            .expect("construct deadline-controlled public ESI client")
+            .with_optional_enrichment_budget(Duration::from_millis(200)),
+    );
+
+    ContractCollector::new(store.clone(), esi.clone())
+        .collect_cycle()
+        .await
+        .expect("establish the silent public-contract baseline");
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "deadline-omits-optional-names",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the deadline test subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let collector = ContractCollector::new(store.clone(), esi).with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    );
+    let mut cycle = tokio::spawn(async move { collector.collect_cycle().await });
+
+    tokio::time::timeout(Duration::from_secs(2), server.names_started.notified())
+        .await
+        .expect("the optional name request starts and is held");
+    let cycle_result = tokio::time::timeout(Duration::from_secs(2), &mut cycle).await;
+    if cycle_result.is_err() {
+        cycle.abort();
+        let _ = cycle.await;
+    }
+    cycle_result
+        .expect("the injected enrichment deadline expires without waiting for optional names")
+        .expect("join the deadline-bound collection")
+        .expect("complete the deadline-bound collection");
+
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].message.title.starts_with("Public contract listed"));
+    assert!(!serde_json::to_string(&sent[0].message)
+        .expect("serialize deadline-bound delivery")
+        .contains("Unknown"));
+    drop(sent);
+    let retained = store
+        .observed_embed_context(10_000_002, 45)
+        .await
+        .expect("read the deadline-bound retained context")
+        .expect("retain the deadline-bound Observed Location context");
+    assert_eq!(retained.location.region_name.as_deref(), Some("The Forge"));
+    assert!(retained.item_names.is_empty());
+    assert!(retained.issuer_character_name.is_none());
+
+    server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn public_listing_omits_an_unresolved_item_name_instead_of_rendering_unknown() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
-    let server = GatedPublicEnrichmentHttpServer::start_without_item_name();
+    let server = GatedObservedLocationEnrichmentHttpServer::start_without_item_name();
     let esi = Arc::new(
         HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(2))
             .expect("construct item-name-limited public ESI client"),
