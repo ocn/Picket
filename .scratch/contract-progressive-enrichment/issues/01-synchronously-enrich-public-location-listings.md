@@ -4,7 +4,7 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] A production-shaped Contract Collector test is written red first and proves a matched public-station listing is not prepared before its synchronous enrichment barrier completes.
 - [ ] Independent Issuer affiliation/name, item-name, and first-step location requests can make progress concurrently while dependent station-to-system-to-region lookups remain correctly ordered.
