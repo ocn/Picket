@@ -1,12 +1,16 @@
 # Contract Intelligence
 
-This context describes the bot's observation and reporting of publicly visible EVE Online item-exchange contracts across all regions. It excludes authenticated character-, corporation-, and alliance-specific contract monitoring.
+This context describes the bot's observation and reporting of publicly visible EVE Online item-exchange contracts across all configured regions. One operator-managed character authorization may resolve accessible player structures, but the system does not request private character or corporation contract history.
 
 ## Language
 
 **Global Public Contract Intelligence**:
 Observation and analysis of public item-exchange contracts across all EVE regions, based solely on data available without contract-owner or contract-acceptor authorization.
 _Avoid_: Private contract monitoring, corporation contract monitoring
+
+**Structure Authorization**:
+The operator-managed character authorization used only to resolve player structures that character may access. It does not expose private contract-party history and does not imply that every public contract location can be resolved.
+_Avoid_: Contract authorization, universal structure access
 
 **Public Contract**:
 An item-exchange contract that EVE exposes to all players and through the public contract API while it remains publicly available.
@@ -29,12 +33,24 @@ ISK the issuer requires from the accepting party in exchange for Offered Items.
 _Avoid_: Reward, offered price
 
 **Issuer**:
-The character that created a public contract; this is the only contract party identified by the global public data.
+The character that created a contract. Global public contract data always identifies the Issuer by character ID.
 _Avoid_: Seller, buyer, party
 
+**Acceptor**:
+The character or corporation that accepted a contract. Global public contract data does not identify the Acceptor, and this system does not request private party contract history, so unavailable Acceptor identity is omitted from embeds.
+_Avoid_: Purchaser, buyer, contractor
+
 **Observed Location**:
-The most precise publicly resolvable place associated with a contract, degrading from station or structure name to solar system, region, and raw location ID as necessary.
+The most precise evidenced place associated with a contract, degrading from structure or station to solar system and then human-readable region. Raw location and region IDs are retained internally but are not user-facing location labels.
 _Avoid_: Exact location
+
+**Last-Verified Location**:
+A previously authenticated structure-to-system or system-to-region mapping whose verification has expired. It remains usable with its verification time stated and must not be represented as currently revalidated.
+_Avoid_: Current location, stale location, inferred location
+
+**Progressive Enrichment**:
+Synchronous pre-delivery collection and presentation of the most specific supported facts available for an event while omitting unavailable optional facts. Once posted, an event is not dynamically rerendered when later evidence becomes available.
+_Avoid_: Complete embed, best-effort guess
 
 **Observed Affiliation**:
 The issuer's corporation and, when resolvable, alliance at observation time; it is not evidence of affiliation when the contract later disappears.
@@ -99,6 +115,14 @@ _Avoid_: Contract URL, Discord link
 **Observation History**:
 Retained contract observations used initially for embed enrichment and later for querying or analysis.
 _Avoid_: Sales history
+
+**Historical Enrichment Repair**:
+An operator-initiated, bounded, non-pinging in-place migration of existing retained Discord deliveries to a newer presentation format or fuller retained evidence. It preserves original message identity, never recreates a deleted or retired alert, and is not a normal-operation retry path.
+_Avoid_: Repost, historical replay
+
+**Retained Enrichment Evidence**:
+Identity or location facts preserved with their source and observation time after collection. Previously verified location evidence remains part of contract history after structure access changes and is retained until an explicit retention policy replaces indefinite storage.
+_Avoid_: Authorization token, live lookup result
 
 ## Release and communication
 
