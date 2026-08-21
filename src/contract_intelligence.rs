@@ -1172,6 +1172,23 @@ pub trait PublicContractEsi: Send + Sync {
         self.observed_contract_embed_context(contract, items).await
     }
 
+    /// Creates the deadline shared by all optional presentation enrichment in one attempt.
+    fn observed_embed_enrichment_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + OPTIONAL_EMBED_ENRICHMENT_BUDGET
+    }
+
+    /// Uses a caller-owned deadline so snapshot and notification enrichment cannot renew it.
+    async fn observed_contract_embed_context_limited_until(
+        &self,
+        contract: &PublicContract,
+        items: &[PublicContractItem],
+        limiter: &dyn ContractContextLimiter,
+        _deadline: tokio::time::Instant,
+    ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
+        self.observed_contract_embed_context_limited(contract, items, limiter)
+            .await
+    }
+
     async fn observed_contract_solar_system(
         &self,
         contract: &PublicContract,
@@ -1702,6 +1719,9 @@ impl HttpPublicContractEsi {
         limiter: &dyn ContractContextLimiter,
         deadline: tokio::time::Instant,
     ) -> Option<EsiResponse<T>> {
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
         match tokio::time::timeout_at(
             deadline,
             self.cached_context_get::<T>(cache_key, path, limiter),
@@ -1728,6 +1748,9 @@ impl HttpPublicContractEsi {
         limiter: &dyn ContractContextLimiter,
         deadline: tokio::time::Instant,
     ) -> Option<EsiResponse<T>> {
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
         match tokio::time::timeout_at(
             deadline,
             self.cached_context_post::<T, B>(cache_key, path, body, limiter),
@@ -1906,8 +1929,8 @@ impl HttpPublicContractEsi {
         contract: &PublicContract,
         items: &[PublicContractItem],
         limiter: &dyn ContractContextLimiter,
+        deadline: tokio::time::Instant,
     ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
-        let deadline = tokio::time::Instant::now() + self.optional_enrichment_budget;
         let mut names = BTreeSet::new();
         names.insert(contract.issuer_id);
         names.insert(contract.issuer_corporation_id);
@@ -1949,6 +1972,13 @@ impl HttpPublicContractEsi {
             metadata = merge_cache_metadata(&metadata, alliance_metadata);
             context.issuer_alliance_name = names.get(&alliance_id).cloned();
         }
+        if context.issuer_character_name.is_some()
+            || context.issuer_corporation_name.is_some()
+            || context.issuer_alliance_id.is_some()
+            || context.issuer_alliance_name.is_some()
+        {
+            context.issuer_identity_provenance = Some(IssuerIdentityProvenance::PublicEsi);
+        }
         Ok(EsiResponse::fresh(context, metadata))
     }
 }
@@ -1961,6 +1991,10 @@ impl PublicContractEsi for HttpPublicContractEsi {
 
     fn supports_region_name_lookup(&self) -> bool {
         true
+    }
+
+    fn observed_embed_enrichment_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.optional_enrichment_budget
     }
 
     async fn region_name(
@@ -2199,7 +2233,12 @@ impl PublicContractEsi for HttpPublicContractEsi {
     ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
         if limiter.permits_parallel_enrichment() {
             return self
-                .observed_contract_embed_context_parallel(contract, items, limiter)
+                .observed_contract_embed_context_parallel(
+                    contract,
+                    items,
+                    limiter,
+                    self.observed_embed_enrichment_deadline(),
+                )
                 .await;
         }
         let mut context = ContractEmbedContext {
@@ -2327,7 +2366,30 @@ impl PublicContractEsi for HttpPublicContractEsi {
                 }
             }
         }
+        if context.issuer_character_name.is_some()
+            || context.issuer_corporation_name.is_some()
+            || context.issuer_alliance_id.is_some()
+            || context.issuer_alliance_name.is_some()
+        {
+            context.issuer_identity_provenance = Some(IssuerIdentityProvenance::PublicEsi);
+        }
         Ok(EsiResponse::fresh(context, metadata))
+    }
+
+    async fn observed_contract_embed_context_limited_until(
+        &self,
+        contract: &PublicContract,
+        items: &[PublicContractItem],
+        limiter: &dyn ContractContextLimiter,
+        deadline: tokio::time::Instant,
+    ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
+        if limiter.permits_parallel_enrichment() {
+            return self
+                .observed_contract_embed_context_parallel(contract, items, limiter, deadline)
+                .await;
+        }
+        self.observed_contract_embed_context_limited(contract, items, limiter)
+            .await
     }
 }
 
@@ -4225,6 +4287,13 @@ pub struct ContractLocationContext {
     pub region_name: Option<String>,
 }
 
+/// Public ESI supplied the human-readable issuer identity fields in the embed context.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssuerIdentityProvenance {
+    PublicEsi,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContractEmbedContext {
@@ -4237,6 +4306,8 @@ pub struct ContractEmbedContext {
     pub issuer_corporation_name: Option<String>,
     pub issuer_alliance_id: Option<i64>,
     pub issuer_alliance_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_identity_provenance: Option<IssuerIdentityProvenance>,
     #[serde(default)]
     pub item_names: BTreeMap<i64, String>,
 }
@@ -4294,6 +4365,9 @@ impl ContractEmbedContext {
             .issuer_alliance_name
             .clone()
             .or_else(|| source.issuer_alliance_name.clone());
+        self.issuer_identity_provenance = self
+            .issuer_identity_provenance
+            .or(source.issuer_identity_provenance);
         for (id, name) in &source.item_names {
             self.item_names.entry(*id).or_insert_with(|| name.clone());
         }
@@ -9311,11 +9385,13 @@ impl ContractCollector {
         remaining_embed_context_enrichments: usize,
     ) -> Result<CompletedRegionalPostprocessing, ContractCollectionError> {
         let observed_contracts = recorded.observed_contracts;
+        let mut attempted_embed_enrichment_deadlines = HashMap::new();
         let consumed = self
             .snapshot_observed_contracts(
                 region_id,
                 &recorded.observed,
                 remaining_embed_context_enrichments,
+                &mut attempted_embed_enrichment_deadlines,
             )
             .await?;
         let mut events = recorded
@@ -9333,7 +9409,8 @@ impl ContractCollector {
             })
             .collect::<Vec<_>>();
         if !events.is_empty() {
-            self.notify_fresh_events(&events).await?;
+            self.notify_fresh_events_with_deadlines(&events, &attempted_embed_enrichment_deadlines)
+                .await?;
         }
         let resolution_batch = self
             .resolve_awaiting_resolutions_for_region(region_id)
@@ -10042,8 +10119,15 @@ impl ContractCollector {
                     &ship_groups,
                 )
                 .await?;
+            let mut embed_enrichment_deadline = None;
             match self
-                .notify_subscription(&deferred.subscription, &event, &ship_groups, false)
+                .notify_subscription(
+                    &deferred.subscription,
+                    &event,
+                    &ship_groups,
+                    false,
+                    &mut embed_enrichment_deadline,
+                )
                 .await?
             {
                 NotificationResolution::Complete if !deferred.proximity_unverified => {
@@ -10120,8 +10204,15 @@ impl ContractCollector {
                         ship_groups,
                     )
                     .await?;
+                let mut embed_enrichment_deadline = None;
                 match self
-                    .notify_subscription(&deferred.subscription, &event, ship_groups, true)
+                    .notify_subscription(
+                        &deferred.subscription,
+                        &event,
+                        ship_groups,
+                        true,
+                        &mut embed_enrichment_deadline,
+                    )
                     .await?
                 {
                     NotificationResolution::ProximityResolved => {}
@@ -10139,12 +10230,26 @@ impl ContractCollector {
         &self,
         events: &[ContractEvent],
     ) -> Result<(), ContractCollectionError> {
+        self.notify_fresh_events_with_deadlines(events, &HashMap::new())
+            .await
+    }
+
+    async fn notify_fresh_events_with_deadlines(
+        &self,
+        events: &[ContractEvent],
+        attempted_embed_enrichment_deadlines: &HashMap<i64, tokio::time::Instant>,
+    ) -> Result<(), ContractCollectionError> {
         let Some(notifications) = &self.notifications else {
             return Ok(());
         };
         let ship_groups = CycleShipGroupResolver::new(&*notifications.ship_groups);
-        self.notify_events(events, notifications, &ship_groups)
-            .await
+        self.notify_events_with_deadlines(
+            events,
+            notifications,
+            &ship_groups,
+            attempted_embed_enrichment_deadlines,
+        )
+        .await
     }
 
     async fn notify_events(
@@ -10153,14 +10258,39 @@ impl ContractCollector {
         notifications: &ContractNotifications,
         ship_groups: &dyn ShipGroupResolver,
     ) -> Result<(), ContractCollectionError> {
+        self.notify_events_with_deadlines(events, notifications, ship_groups, &HashMap::new())
+            .await
+    }
+
+    async fn notify_events_with_deadlines(
+        &self,
+        events: &[ContractEvent],
+        notifications: &ContractNotifications,
+        ship_groups: &dyn ShipGroupResolver,
+        attempted_embed_enrichment_deadlines: &HashMap<i64, tokio::time::Instant>,
+    ) -> Result<(), ContractCollectionError> {
         let subscriptions = self.store.all_contract_subscriptions().await?;
         for event in events {
+            let mut embed_enrichment_deadline = attempted_embed_enrichment_deadlines
+                .get(&event.contract.contract_id)
+                .copied();
             let event = self
-                .event_with_observed_context(event, &subscriptions, ship_groups)
+                .event_with_observed_context_before_enrichment_deadline(
+                    event,
+                    &subscriptions,
+                    ship_groups,
+                    embed_enrichment_deadline,
+                )
                 .await?;
             for subscription in &subscriptions {
                 match self
-                    .notify_subscription(subscription, &event, ship_groups, false)
+                    .notify_subscription(
+                        subscription,
+                        &event,
+                        ship_groups,
+                        false,
+                        &mut embed_enrichment_deadline,
+                    )
                     .await?
                 {
                     NotificationResolution::Complete => {}
@@ -10177,6 +10307,32 @@ impl ContractCollector {
         }
         self.deliver_prepared_notifications(notifications).await?;
         Ok(())
+    }
+
+    async fn event_with_observed_context_before_enrichment_deadline(
+        &self,
+        event: &ContractEvent,
+        subscriptions: &[ContractSubscription],
+        ship_groups: &dyn ShipGroupResolver,
+        enrichment_deadline: Option<tokio::time::Instant>,
+    ) -> Result<ContractEvent, ContractCollectionError> {
+        let Some(deadline) = enrichment_deadline else {
+            return self
+                .event_with_observed_context(event, subscriptions, ship_groups)
+                .await;
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(event.clone());
+        }
+        match tokio::time::timeout_at(
+            deadline,
+            self.event_with_observed_context(event, subscriptions, ship_groups),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Ok(event.clone()),
+        }
     }
 
     async fn event_with_observed_context(
@@ -11147,6 +11303,7 @@ impl ContractCollector {
         event: &ContractEvent,
         ship_groups: &dyn ShipGroupResolver,
         resolving_proximity_unverified: bool,
+        embed_enrichment_deadline: &mut Option<tokio::time::Instant>,
     ) -> Result<NotificationResolution, ContractCollectionError> {
         let mut refreshed = event.clone();
         for refresh in 0..=MAX_PROXIMITY_EVIDENCE_REFRESHES {
@@ -11156,6 +11313,7 @@ impl ContractCollector {
                     &refreshed,
                     ship_groups,
                     resolving_proximity_unverified,
+                    embed_enrichment_deadline,
                 )
                 .await?
             {
@@ -11163,10 +11321,11 @@ impl ContractCollector {
                     if refresh < MAX_PROXIMITY_EVIDENCE_REFRESHES =>
                 {
                     refreshed = self
-                        .event_with_observed_context(
+                        .event_with_observed_context_before_enrichment_deadline(
                             &refreshed,
                             std::slice::from_ref(subscription),
                             ship_groups,
+                            *embed_enrichment_deadline,
                         )
                         .await?;
                 }
@@ -11185,6 +11344,7 @@ impl ContractCollector {
         event: &ContractEvent,
         ship_groups: &dyn ShipGroupResolver,
         resolving_proximity_unverified: bool,
+        embed_enrichment_deadline: &mut Option<tokio::time::Instant>,
     ) -> Result<NotificationResolution, ContractCollectionError> {
         if event.kind == ContractEventKind::Listed && is_want_to_buy_listing(event) {
             return Ok(NotificationResolution::Complete);
@@ -11269,7 +11429,10 @@ impl ContractCollector {
                 PrimaryDisplayItem::Deferred => return Ok(NotificationResolution::Deferred),
             }
         };
-        let Some(mut event) = self.enrich_event_for_embed(event, primary_item).await? else {
+        let Some(mut event) = self
+            .enrich_event_for_embed(event, primary_item, embed_enrichment_deadline)
+            .await?
+        else {
             return Ok(NotificationResolution::Deferred);
         };
         event.embed_context.matched_range = evaluator.matched_range().and_then(|range| {
@@ -11508,6 +11671,7 @@ impl ContractCollector {
         &self,
         event: &ContractEvent,
         primary_item: Option<&PublicContractItem>,
+        embed_enrichment_deadline: &mut Option<tokio::time::Instant>,
     ) -> Result<Option<ContractEvent>, ContractCollectionError> {
         let mut enriched = event.clone();
         let snapshot = self
@@ -11598,11 +11762,18 @@ impl ContractCollector {
                 store: self.store.clone(),
                 request_pacer: self.request_pacer.clone(),
             };
+            let deadline = embed_enrichment_deadline
+                .get_or_insert_with(|| self.esi.observed_embed_enrichment_deadline());
             match self
                 .record_context_esi_result(
                     event.contract.contract_id,
                     self.esi
-                        .observed_contract_embed_context_limited(&event.contract, &items, &limiter)
+                        .observed_contract_embed_context_limited_until(
+                            &event.contract,
+                            &items,
+                            &limiter,
+                            *deadline,
+                        )
                         .await,
                 )
                 .await?
@@ -11656,6 +11827,7 @@ impl ContractCollector {
         region_id: i64,
         observed: &[ObservedContract],
         remaining: usize,
+        attempted_embed_enrichment_deadlines: &mut HashMap<i64, tokio::time::Instant>,
     ) -> Result<usize, ContractCollectionError> {
         let evidence_now = self.delivery_clock.now();
         let mut consumed = 0;
@@ -11713,14 +11885,18 @@ impl ContractCollector {
                 store: self.store.clone(),
                 request_pacer: self.request_pacer.clone(),
             };
+            let deadline = *attempted_embed_enrichment_deadlines
+                .entry(observed.contract.contract_id)
+                .or_insert_with(|| self.esi.observed_embed_enrichment_deadline());
             match self
                 .record_context_esi_result(
                     observed.contract.contract_id,
                     self.esi
-                        .observed_contract_embed_context_limited(
+                        .observed_contract_embed_context_limited_until(
                             &observed.contract,
                             &items,
                             &limiter,
+                            deadline,
                         )
                         .await,
                 )

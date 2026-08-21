@@ -21,10 +21,11 @@ use killbot_rust::contract_intelligence::{
     ContractRequestPacer, ContractResolutionState, ContractSubscription, DeliveryFailureKind,
     DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HealthCheck, HealthClock, HealthCycle,
     HealthDiscordPublisher, HealthPublishError, HealthRuntimeConfig, HealthStatus, HealthWatchdog,
-    HealthWatchdogConfig, HealthWatchdogRunner, HttpPublicContractEsi, PreparedContractDelivery,
-    PublicContract, PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver,
-    SolarSystemPosition, StructureResolutionAdmission, CONTRACT_DELIVERY_OPERATOR_ACTOR,
-    CONTRACT_DELIVERY_OPERATOR_TOKEN_MAX_BYTES, CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+    HealthWatchdogConfig, HealthWatchdogRunner, HttpPublicContractEsi, IssuerIdentityProvenance,
+    PreparedContractDelivery, PublicContract, PublicContractEsi, PublicContractItem,
+    ShipGroupLookup, ShipGroupResolver, SolarSystemPosition, StructureResolutionAdmission,
+    CONTRACT_DELIVERY_OPERATOR_ACTOR, CONTRACT_DELIVERY_OPERATOR_TOKEN_MAX_BYTES,
+    CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
 };
 use killbot_rust::discord_bot::{contract_notification_embed, DiscordContractDelivery};
 use killbot_rust::esi::EsiClient;
@@ -10213,6 +10214,10 @@ async fn public_station_listing_waits_for_concurrent_observed_location_enrichmen
         Some("Issuer Alliance")
     );
     assert_eq!(
+        retained.issuer_identity_provenance,
+        Some(IssuerIdentityProvenance::PublicEsi)
+    );
+    assert_eq!(
         retained.location.location_name.as_deref(),
         Some("Jita IV - Moon 4 - Caldari Navy Assembly Plant")
     );
@@ -10223,19 +10228,45 @@ async fn public_station_listing_waits_for_concurrent_observed_location_enrichmen
         .connect(&database.url)
         .await
         .expect("connect to inspect retained public contract identifiers");
-    let persisted_contract: PublicContract = serde_json::from_value(
+    let persisted_event: ContractEvent = serde_json::from_value(
         sqlx::query_scalar::<_, Value>(
-            "SELECT facts FROM public_contract_facts WHERE contract_id = $1",
+            "SELECT event FROM contract_outbound_deliveries WHERE contract_id = $1 ORDER BY id DESC LIMIT 1",
         )
         .bind(45_i64)
         .fetch_one(&verification_pool)
         .await
-        .expect("read retained public contract identifiers"),
+        .expect("read the serialized delivered public-contract event"),
     )
-    .expect("deserialize retained public contract identifiers");
+    .expect("deserialize the serialized delivered public-contract event");
     verification_pool.close().await;
-    assert_eq!(persisted_contract.issuer_id, 90_000_001);
-    assert_eq!(persisted_contract.issuer_corporation_id, 98_000_001);
+    assert_eq!(persisted_event.contract.issuer_id, 90_000_001);
+    assert_eq!(persisted_event.contract.issuer_corporation_id, 98_000_001);
+    assert!(persisted_event.embed_context.observed_at.is_some());
+    assert_eq!(
+        persisted_event
+            .embed_context
+            .issuer_character_name
+            .as_deref(),
+        Some("Issuer")
+    );
+    assert_eq!(
+        persisted_event
+            .embed_context
+            .issuer_corporation_name
+            .as_deref(),
+        Some("Issuer Corp")
+    );
+    assert_eq!(
+        persisted_event
+            .embed_context
+            .issuer_alliance_name
+            .as_deref(),
+        Some("Issuer Alliance")
+    );
+    assert_eq!(
+        persisted_event.embed_context.issuer_identity_provenance,
+        Some(IssuerIdentityProvenance::PublicEsi)
+    );
     let evidence = LocationEvidenceService::new(&store)
         .resolve(60_003_760, Utc::now())
         .await
@@ -10469,6 +10500,78 @@ async fn public_listing_omits_held_optional_names_at_the_injected_enrichment_dea
 
     server.finish();
     database.destroy().await;
+}
+
+#[tokio::test]
+async fn public_listing_uses_one_optional_enrichment_deadline_across_snapshot_and_notification() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let server = GatedObservedLocationEnrichmentHttpServer::start();
+    let esi = Arc::new(
+        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(2))
+            .expect("construct shared-deadline public ESI client")
+            .with_optional_enrichment_budget(Duration::from_millis(200)),
+    );
+
+    ContractCollector::new(store.clone(), esi.clone())
+        .collect_cycle()
+        .await
+        .expect("establish the silent public-contract baseline");
+    store
+        .upsert_contract_subscription(&contract_subscription(
+            "shared-observed-location-deadline",
+            ContractItemDirection::Offered,
+            vec![587],
+            vec![],
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the shared-deadline subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let collector = ContractCollector::new(store.clone(), esi).with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    );
+    let mut cycle = tokio::spawn(async move { collector.collect_cycle().await });
+
+    tokio::time::timeout(Duration::from_secs(2), server.station_started.notified())
+        .await
+        .expect("the snapshot Observed Location request starts and is held");
+    let completed_within_one_budget =
+        match tokio::time::timeout(Duration::from_secs(2), &mut cycle).await {
+            Ok(Ok(Ok(_))) => true,
+            Ok(Ok(Err(_))) | Ok(Err(_)) => false,
+            Err(_) => {
+                cycle.abort();
+                let _ = cycle.await;
+                false
+            }
+        };
+
+    let station_requests = server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.starts_with("GET /universe/stations/60003760/"))
+        .count();
+    server.release_station();
+    server.release_station();
+    server.finish();
+    database.destroy().await;
+
+    assert_eq!(
+        station_requests, 1,
+        "notification must reuse the snapshot's exhausted Observed Location deadline"
+    );
+    assert!(
+        completed_within_one_budget,
+        "the single optional-enrichment deadline ends the presentation attempt"
+    );
+    assert!(delivery.sent.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -18781,6 +18884,7 @@ async fn contract_delivery_rerender_queue_uses_the_existing_repair_dispatcher_wi
             issuer_corporation_name: Some("Issuer Corp".to_string()),
             issuer_alliance_id: None,
             issuer_alliance_name: None,
+            issuer_identity_provenance: None,
             item_names: BTreeMap::from([(587, "Rifter".to_string())]),
         },
     };
@@ -19110,6 +19214,7 @@ async fn contract_delivery_rerender_reconstructs_and_persists_legacy_matched_ran
             issuer_corporation_name: Some("Issuer Corp".to_string()),
             issuer_alliance_id: None,
             issuer_alliance_name: None,
+            issuer_identity_provenance: None,
             item_names: BTreeMap::from([(587, "Rifter".to_string())]),
         },
     };
