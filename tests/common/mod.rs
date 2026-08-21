@@ -35,6 +35,13 @@ pub fn load_fixture(name: &str) -> ZkData {
         .unwrap_or_else(|e| panic!("Failed to parse fixture {}: {}", path, e))
 }
 
+/// Load a text fixture from the resources directory.
+pub fn load_text_fixture(name: &str) -> String {
+    let path = format!("resources/{name}");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("Failed to read fixture {path}: {error}"))
+}
+
 /// Create an AppState with the given subscriptions
 pub async fn create_app_state_with_subscriptions(
     subscriptions: Vec<Subscription>,

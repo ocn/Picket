@@ -1350,6 +1350,7 @@ pub struct HttpPublicContractEsi {
     client: Client,
     base_url: String,
     context_cache: Mutex<HashMap<String, CachedResponse>>,
+    optional_enrichment_budget: Duration,
 }
 
 impl HttpPublicContractEsi {
@@ -1368,7 +1369,15 @@ impl HttpPublicContractEsi {
                 .build()?,
             base_url: base_url.into(),
             context_cache: Mutex::new(HashMap::new()),
+            optional_enrichment_budget: OPTIONAL_EMBED_ENRICHMENT_BUDGET,
         })
+    }
+
+    /// Sets the wall-clock budget for optional public-contract presentation enrichment.
+    /// The production constructor retains the thirty-second default.
+    pub fn with_optional_enrichment_budget(mut self, budget: Duration) -> Self {
+        self.optional_enrichment_budget = budget;
+        self
     }
 
     async fn get<T: DeserializeOwned>(
@@ -1701,7 +1710,10 @@ impl HttpPublicContractEsi {
         {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
-                warn!("optional public contract enrichment request failed: {error}");
+                warn!(
+                    error = %error,
+                    "optional public contract enrichment request failed before the enrichment deadline"
+                );
                 None
             }
             Err(_) => None,
@@ -1724,14 +1736,17 @@ impl HttpPublicContractEsi {
         {
             Ok(Ok(response)) => Some(response),
             Ok(Err(error)) => {
-                warn!("optional public contract enrichment request failed: {error}");
+                warn!(
+                    error = %error,
+                    "optional public contract enrichment request failed before the enrichment deadline"
+                );
                 None
             }
             Err(_) => None,
         }
     }
 
-    async fn public_location_context_before_deadline(
+    async fn observed_location_context_before_deadline(
         &self,
         location_id: i64,
         limiter: &dyn ContractContextLimiter,
@@ -1822,7 +1837,7 @@ impl HttpPublicContractEsi {
         (context, metadata)
     }
 
-    async fn issuer_affiliation_before_deadline(
+    async fn observed_affiliation_before_deadline(
         &self,
         issuer_id: i64,
         limiter: &dyn ContractContextLimiter,
@@ -1892,19 +1907,19 @@ impl HttpPublicContractEsi {
         items: &[PublicContractItem],
         limiter: &dyn ContractContextLimiter,
     ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
-        let deadline = tokio::time::Instant::now() + OPTIONAL_EMBED_ENRICHMENT_BUDGET;
+        let deadline = tokio::time::Instant::now() + self.optional_enrichment_budget;
         let mut names = BTreeSet::new();
         names.insert(contract.issuer_id);
         names.insert(contract.issuer_corporation_id);
         names.extend(items.iter().map(|item| item.type_id));
         let names = names.into_iter().collect::<Vec<_>>();
         let (location, affiliation, names) = tokio::join!(
-            self.public_location_context_before_deadline(
+            self.observed_location_context_before_deadline(
                 contract.start_location_id,
                 limiter,
                 deadline,
             ),
-            self.issuer_affiliation_before_deadline(contract.issuer_id, limiter, deadline),
+            self.observed_affiliation_before_deadline(contract.issuer_id, limiter, deadline),
             self.public_names_before_deadline(names, limiter, deadline),
         );
         let (location, location_metadata) = location;
@@ -11557,9 +11572,17 @@ impl ContractCollector {
                 .location_name
                 .as_deref()
                 .is_none_or(|name| name.trim().is_empty());
+        let required_region_missing = self.esi.supports_region_name_lookup()
+            && enriched
+                .embed_context
+                .location
+                .region_name
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty());
         let needs_live_enrichment = (snapshot.is_none()
             && (event.kind == ContractEventKind::Listed || primary_name_missing))
-            || incomplete_station_listing;
+            || incomplete_station_listing
+            || required_region_missing;
         if needs_live_enrichment
             && self
                 .context_request_allowed(event.contract.contract_id)
@@ -11645,24 +11668,32 @@ impl ContractCollector {
                 let prior_location = context.location.clone();
                 self.ensure_region_context_from_retained_sources(region_id, &mut context)
                     .await?;
-                if context.location != prior_location {
+                let required_region_missing = self.esi.supports_region_name_lookup()
+                    && context
+                        .location
+                        .region_name
+                        .as_deref()
+                        .is_none_or(|name| name.trim().is_empty());
+                if !required_region_missing {
+                    if context.location != prior_location {
+                        self.store
+                            .save_observed_embed_context(
+                                region_id,
+                                observed.contract.contract_id,
+                                &context,
+                            )
+                            .await?;
+                    }
                     self.store
-                        .save_observed_embed_context(
-                            region_id,
-                            observed.contract.contract_id,
-                            &context,
+                        .resolve_collection_failures(
+                            Some(region_id),
+                            Some(observed.contract.contract_id),
+                            Some(&embed_context_resource_key(observed.contract.contract_id)),
+                            "embed_context_enrichment",
                         )
                         .await?;
+                    continue;
                 }
-                self.store
-                    .resolve_collection_failures(
-                        Some(region_id),
-                        Some(observed.contract.contract_id),
-                        Some(&embed_context_resource_key(observed.contract.contract_id)),
-                        "embed_context_enrichment",
-                    )
-                    .await?;
-                continue;
             }
             if consumed >= remaining {
                 break;

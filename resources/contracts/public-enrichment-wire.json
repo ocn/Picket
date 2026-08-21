@@ -1,0 +1,38 @@
+{
+  "regions": [10000002],
+  "listing": {
+    "collateral": 0.0,
+    "contract_id": 45,
+    "date_expired": "2026-08-14T12:00:00Z",
+    "date_issued": "2026-08-13T12:00:00Z",
+    "days_to_complete": 0,
+    "end_location_id": 60003760,
+    "for_corporation": false,
+    "issuer_corporation_id": 98000001,
+    "issuer_id": 90000001,
+    "price": 1500000000.0,
+    "reward": 0.0,
+    "start_location_id": 60003760,
+    "type": "item_exchange",
+    "volume": 115000.0
+  },
+  "items": [{"is_included": true, "quantity": 1, "record_id": 1, "type_id": 587}],
+  "station": {"name": "Jita IV - Moon 4 - Caldari Navy Assembly Plant", "system_id": 30000142},
+  "solar_system": {"constellation_id": 20000020, "name": "Jita", "position": {"x": 0.0, "y": 0.0, "z": 0.0}, "security_status": 0.9},
+  "constellation": {"region_id": 10000002},
+  "region": {"name": "The Forge"},
+  "missing_region": {},
+  "observed_affiliation": [{"alliance_id": 99000111}],
+  "names": [
+    {"id": 587, "name": "Rifter"},
+    {"id": 90000001, "name": "Issuer"},
+    {"id": 98000001, "name": "Issuer Corp"},
+    {"id": 99000111, "name": "Issuer Alliance"}
+  ],
+  "names_without_item": [
+    {"id": 90000001, "name": "Issuer"},
+    {"id": 98000001, "name": "Issuer Corp"},
+    {"id": 99000111, "name": "Issuer Alliance"}
+  ],
+  "unexpected": {"error": "unexpected request"}
+}
