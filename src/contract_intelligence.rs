@@ -43,6 +43,7 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 const HEALTH_MIGRATION_VERSIONS: &[i64] = &[20260817000001, 20260817000004];
 const CONTRACT_COLLECTOR_USER_AGENT: &str = "killbot-rust Global Public Contract Intelligence";
 const MAX_EMBED_CONTEXT_ENRICHMENTS_PER_CYCLE: usize = 8;
+const OPTIONAL_EMBED_ENRICHMENT_BUDGET: Duration = Duration::from_secs(30);
 
 fn contract_region_names_from_systems(
     systems: &HashMap<u32, System>,
@@ -1316,6 +1317,9 @@ pub trait PublicContractEsi: Send + Sync {
 #[async_trait]
 pub trait ContractContextLimiter: Send + Sync {
     async fn request_allowed(&self) -> Result<bool, EsiError>;
+    fn permits_parallel_enrichment(&self) -> bool {
+        false
+    }
     async fn wait_for_request_admission(&self) -> Result<(), EsiError> {
         if self.request_allowed().await? {
             Ok(())
@@ -1646,6 +1650,294 @@ impl HttpPublicContractEsi {
     }
 }
 
+#[derive(Deserialize)]
+struct PublicEmbedStation {
+    name: String,
+    system_id: i64,
+}
+
+#[derive(Deserialize)]
+struct PublicEmbedSolarSystem {
+    name: String,
+    security_status: f64,
+    constellation_id: i64,
+    position: Option<SolarSystemPosition>,
+}
+
+#[derive(Deserialize)]
+struct PublicEmbedConstellation {
+    region_id: i64,
+}
+
+#[derive(Deserialize)]
+struct PublicEmbedRegion {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct PublicEmbedAffiliation {
+    alliance_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct PublicEmbedName {
+    id: i64,
+    name: String,
+}
+
+impl HttpPublicContractEsi {
+    async fn optional_context_get<T: DeserializeOwned>(
+        &self,
+        cache_key: &str,
+        path: &str,
+        limiter: &dyn ContractContextLimiter,
+        deadline: tokio::time::Instant,
+    ) -> Option<EsiResponse<T>> {
+        match tokio::time::timeout_at(
+            deadline,
+            self.cached_context_get::<T>(cache_key, path, limiter),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                warn!("optional public contract enrichment request failed: {error}");
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    async fn optional_context_post<T: DeserializeOwned, B: Serialize>(
+        &self,
+        cache_key: &str,
+        path: &str,
+        body: &B,
+        limiter: &dyn ContractContextLimiter,
+        deadline: tokio::time::Instant,
+    ) -> Option<EsiResponse<T>> {
+        match tokio::time::timeout_at(
+            deadline,
+            self.cached_context_post::<T, B>(cache_key, path, body, limiter),
+        )
+        .await
+        {
+            Ok(Ok(response)) => Some(response),
+            Ok(Err(error)) => {
+                warn!("optional public contract enrichment request failed: {error}");
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    async fn public_location_context_before_deadline(
+        &self,
+        location_id: i64,
+        limiter: &dyn ContractContextLimiter,
+        deadline: tokio::time::Instant,
+    ) -> (ContractLocationContext, CacheMetadata) {
+        let mut context = ContractLocationContext::default();
+        let mut metadata = CacheMetadata::cached_for_seconds(0);
+        let Ok(location_id) = u32::try_from(location_id) else {
+            return (context, metadata);
+        };
+        if (30_000_000..33_000_000).contains(&location_id) {
+            context.solar_system_id = Some(i64::from(location_id));
+        } else {
+            let Some(response) = self
+                .optional_context_get::<PublicEmbedStation>(
+                    &format!("universe/stations/{location_id}"),
+                    &format!("universe/stations/{location_id}/"),
+                    limiter,
+                    deadline,
+                )
+                .await
+            else {
+                return (context, metadata);
+            };
+            metadata = merge_cache_metadata(&metadata, response.metadata);
+            let Some(station) = response.value else {
+                return (context, metadata);
+            };
+            context.location_name = Some(station.name);
+            context.location_kind = Some("Station".to_string());
+            context.solar_system_id = Some(station.system_id);
+        }
+        let Some(system_id) = context.solar_system_id else {
+            return (context, metadata);
+        };
+        let Some(response) = self
+            .optional_context_get::<PublicEmbedSolarSystem>(
+                &format!("universe/systems/{system_id}"),
+                &format!("universe/systems/{system_id}/"),
+                limiter,
+                deadline,
+            )
+            .await
+        else {
+            return (context, metadata);
+        };
+        metadata = merge_cache_metadata(&metadata, response.metadata);
+        let Some(system) = response.value else {
+            return (context, metadata);
+        };
+        context.solar_system_name = Some(system.name);
+        context.security_status = system
+            .security_status
+            .is_finite()
+            .then_some(system.security_status);
+        context.solar_system_position = system.position.filter(|position| position.is_finite());
+        let Some(response) = self
+            .optional_context_get::<PublicEmbedConstellation>(
+                &format!("universe/constellations/{}", system.constellation_id),
+                &format!("universe/constellations/{}/", system.constellation_id),
+                limiter,
+                deadline,
+            )
+            .await
+        else {
+            return (context, metadata);
+        };
+        metadata = merge_cache_metadata(&metadata, response.metadata);
+        let Some(constellation) = response.value else {
+            return (context, metadata);
+        };
+        context.region_id = Some(constellation.region_id);
+        let Some(response) = self
+            .optional_context_get::<PublicEmbedRegion>(
+                &format!("universe/regions/{}", constellation.region_id),
+                &format!("universe/regions/{}/", constellation.region_id),
+                limiter,
+                deadline,
+            )
+            .await
+        else {
+            return (context, metadata);
+        };
+        metadata = merge_cache_metadata(&metadata, response.metadata);
+        if let Some(region) = response.value {
+            context.region_name = Some(region.name);
+        }
+        (context, metadata)
+    }
+
+    async fn issuer_affiliation_before_deadline(
+        &self,
+        issuer_id: i64,
+        limiter: &dyn ContractContextLimiter,
+        deadline: tokio::time::Instant,
+    ) -> (Option<i64>, CacheMetadata) {
+        let Some(response) = self
+            .optional_context_post::<Vec<PublicEmbedAffiliation>, _>(
+                &format!("characters/affiliation/{issuer_id}"),
+                "characters/affiliation/",
+                &vec![issuer_id],
+                limiter,
+                deadline,
+            )
+            .await
+        else {
+            return (None, CacheMetadata::cached_for_seconds(0));
+        };
+        let alliance_id = response
+            .value
+            .and_then(|affiliations| affiliations.into_iter().next())
+            .and_then(|affiliation| affiliation.alliance_id);
+        (alliance_id, response.metadata)
+    }
+
+    async fn public_names_before_deadline(
+        &self,
+        ids: Vec<i64>,
+        limiter: &dyn ContractContextLimiter,
+        deadline: tokio::time::Instant,
+    ) -> (BTreeMap<i64, String>, CacheMetadata) {
+        if ids.is_empty() {
+            return (BTreeMap::new(), CacheMetadata::cached_for_seconds(0));
+        }
+        let key = format!(
+            "universe/names/{}",
+            ids.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let Some(response) = self
+            .optional_context_post::<Vec<PublicEmbedName>, _>(
+                &key,
+                "universe/names/",
+                &ids,
+                limiter,
+                deadline,
+            )
+            .await
+        else {
+            return (BTreeMap::new(), CacheMetadata::cached_for_seconds(0));
+        };
+        (
+            response
+                .value
+                .unwrap_or_default()
+                .into_iter()
+                .map(|name| (name.id, name.name))
+                .collect(),
+            response.metadata,
+        )
+    }
+
+    async fn observed_contract_embed_context_parallel(
+        &self,
+        contract: &PublicContract,
+        items: &[PublicContractItem],
+        limiter: &dyn ContractContextLimiter,
+    ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
+        let deadline = tokio::time::Instant::now() + OPTIONAL_EMBED_ENRICHMENT_BUDGET;
+        let mut names = BTreeSet::new();
+        names.insert(contract.issuer_id);
+        names.insert(contract.issuer_corporation_id);
+        names.extend(items.iter().map(|item| item.type_id));
+        let names = names.into_iter().collect::<Vec<_>>();
+        let (location, affiliation, names) = tokio::join!(
+            self.public_location_context_before_deadline(
+                contract.start_location_id,
+                limiter,
+                deadline,
+            ),
+            self.issuer_affiliation_before_deadline(contract.issuer_id, limiter, deadline),
+            self.public_names_before_deadline(names, limiter, deadline),
+        );
+        let (location, location_metadata) = location;
+        let (issuer_alliance_id, affiliation_metadata) = affiliation;
+        let (resolved_names, names_metadata) = names;
+        let mut metadata = merge_cache_metadata(&location_metadata, affiliation_metadata);
+        metadata = merge_cache_metadata(&metadata, names_metadata);
+        let mut context = ContractEmbedContext {
+            observed_at: Some(Utc::now()),
+            location,
+            issuer_alliance_id,
+            ..ContractEmbedContext::default()
+        };
+        for (id, name) in resolved_names {
+            if id == contract.issuer_id {
+                context.issuer_character_name = Some(name);
+            } else if id == contract.issuer_corporation_id {
+                context.issuer_corporation_name = Some(name);
+            } else {
+                context.item_names.insert(id, name);
+            }
+        }
+        if let Some(alliance_id) = context.issuer_alliance_id {
+            let (names, alliance_metadata) = self
+                .public_names_before_deadline(vec![alliance_id], limiter, deadline)
+                .await;
+            metadata = merge_cache_metadata(&metadata, alliance_metadata);
+            context.issuer_alliance_name = names.get(&alliance_id).cloned();
+        }
+        Ok(EsiResponse::fresh(context, metadata))
+    }
+}
+
 #[async_trait]
 impl PublicContractEsi for HttpPublicContractEsi {
     async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
@@ -1890,36 +2182,11 @@ impl PublicContractEsi for HttpPublicContractEsi {
         items: &[PublicContractItem],
         limiter: &dyn ContractContextLimiter,
     ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
-        #[derive(Deserialize)]
-        struct Station {
-            name: String,
-            system_id: i64,
+        if limiter.permits_parallel_enrichment() {
+            return self
+                .observed_contract_embed_context_parallel(contract, items, limiter)
+                .await;
         }
-        #[derive(Deserialize)]
-        struct SolarSystem {
-            name: String,
-            security_status: f64,
-            constellation_id: i64,
-            position: Option<SolarSystemPosition>,
-        }
-        #[derive(Deserialize)]
-        struct Constellation {
-            region_id: i64,
-        }
-        #[derive(Deserialize)]
-        struct Region {
-            name: String,
-        }
-        #[derive(Deserialize)]
-        struct Affiliation {
-            alliance_id: Option<i64>,
-        }
-        #[derive(Deserialize)]
-        struct Name {
-            id: i64,
-            name: String,
-        }
-
         let mut context = ContractEmbedContext {
             observed_at: Some(Utc::now()),
             ..ContractEmbedContext::default()
@@ -1930,7 +2197,7 @@ impl PublicContractEsi for HttpPublicContractEsi {
             if (30_000_000..33_000_000).contains(&system_id) {
                 context.location.solar_system_id = Some(i64::from(system_id));
             } else if let Some(response) = self
-                .cached_context_get::<Station>(
+                .cached_context_get::<PublicEmbedStation>(
                     &format!("universe/stations/{system_id}"),
                     &format!("universe/stations/{system_id}/"),
                     limiter,
@@ -1947,7 +2214,7 @@ impl PublicContractEsi for HttpPublicContractEsi {
         }
         if let Some(system_id) = context.location.solar_system_id {
             if let Some(response) = self
-                .cached_context_get::<SolarSystem>(
+                .cached_context_get::<PublicEmbedSolarSystem>(
                     &format!("universe/systems/{system_id}"),
                     &format!("universe/systems/{system_id}/"),
                     limiter,
@@ -1964,7 +2231,7 @@ impl PublicContractEsi for HttpPublicContractEsi {
                     context.location.solar_system_position =
                         system.position.filter(|position| position.is_finite());
                     if let Some(response) = self
-                        .cached_context_get::<Constellation>(
+                        .cached_context_get::<PublicEmbedConstellation>(
                             &format!("universe/constellations/{}", system.constellation_id),
                             &format!("universe/constellations/{}/", system.constellation_id),
                             limiter,
@@ -1975,7 +2242,7 @@ impl PublicContractEsi for HttpPublicContractEsi {
                         if let Some(constellation) = response.value {
                             context.location.region_id = Some(constellation.region_id);
                             if let Some(response) = self
-                                .cached_context_get::<Region>(
+                                .cached_context_get::<PublicEmbedRegion>(
                                     &format!("universe/regions/{}", constellation.region_id),
                                     &format!("universe/regions/{}/", constellation.region_id),
                                     limiter,
@@ -1994,7 +2261,7 @@ impl PublicContractEsi for HttpPublicContractEsi {
         }
         let affiliation_ids = vec![contract.issuer_id];
         let affiliation = self
-            .cached_context_post::<Vec<Affiliation>, _>(
+            .cached_context_post::<Vec<PublicEmbedAffiliation>, _>(
                 &format!("characters/affiliation/{}", contract.issuer_id),
                 "characters/affiliation/",
                 &affiliation_ids,
@@ -2025,7 +2292,7 @@ impl PublicContractEsi for HttpPublicContractEsi {
                     .join(",")
             );
             let response = self
-                .cached_context_post::<Vec<Name>, _>(
+                .cached_context_post::<Vec<PublicEmbedName>, _>(
                     &names_key,
                     "universe/names/",
                     &name_ids,
@@ -8910,6 +9177,10 @@ impl ContractContextLimiter for PersistedContractContextLimiter {
             .map_err(|error| EsiError::retryable(error.to_string(), None))
     }
 
+    fn permits_parallel_enrichment(&self) -> bool {
+        true
+    }
+
     async fn wait_for_request_admission(&self) -> Result<(), EsiError> {
         wait_for_esi_request_admission(&self.store, &*self.request_pacer).await
     }
@@ -10790,6 +11061,29 @@ impl ContractCollector {
         Ok(())
     }
 
+    /// Completes the required region presentation fact from sources that are already
+    /// retained locally. Live public lookups belong to the bounded enrichment barrier.
+    async fn ensure_region_context_from_retained_sources(
+        &self,
+        region_id: i64,
+        context: &mut ContractEmbedContext,
+    ) -> Result<(), ContractCollectionError> {
+        context.location.region_id = Some(region_id);
+        if context
+            .location
+            .region_name
+            .as_deref()
+            .is_none_or(|name| name.trim().is_empty())
+        {
+            context.location.region_name = self
+                .region_names
+                .get(&region_id)
+                .cloned()
+                .or(self.store.retained_region_name(region_id).await?);
+        }
+        Ok(())
+    }
+
     async fn context_request_allowed(
         &self,
         contract_id: i64,
@@ -10960,7 +11254,9 @@ impl ContractCollector {
                 PrimaryDisplayItem::Deferred => return Ok(NotificationResolution::Deferred),
             }
         };
-        let mut event = self.enrich_event_for_embed(event, primary_item).await?;
+        let Some(mut event) = self.enrich_event_for_embed(event, primary_item).await? else {
+            return Ok(NotificationResolution::Deferred);
+        };
         event.embed_context.matched_range = evaluator.matched_range().and_then(|range| {
             contract_matched_range_for_embed(range, &event.embed_context.location)
         });
@@ -11197,13 +11493,13 @@ impl ContractCollector {
         &self,
         event: &ContractEvent,
         primary_item: Option<&PublicContractItem>,
-    ) -> Result<ContractEvent, ContractCollectionError> {
+    ) -> Result<Option<ContractEvent>, ContractCollectionError> {
         let mut enriched = event.clone();
-        if let Some(snapshot) = self
+        let snapshot = self
             .store
             .observed_embed_context(event.region_id, event.contract.contract_id)
-            .await?
-        {
+            .await?;
+        if let Some(snapshot) = snapshot.as_ref() {
             enriched.embed_context.merge_missing_from(&snapshot);
         }
         let authoritative_location_changed = enriched.context.location_evidence_id.is_some()
@@ -11251,7 +11547,20 @@ impl ContractCollector {
                 .item_names
                 .contains_key(&item.type_id)
         });
-        if primary_name_missing
+        let incomplete_station_listing = event.kind == ContractEventKind::Listed
+            && u32::try_from(event.contract.start_location_id)
+                .ok()
+                .is_some_and(|location_id| !(30_000_000..33_000_000).contains(&location_id))
+            && enriched
+                .embed_context
+                .location
+                .location_name
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty());
+        let needs_live_enrichment = (snapshot.is_none()
+            && (event.kind == ContractEventKind::Listed || primary_name_missing))
+            || incomplete_station_listing;
+        if needs_live_enrichment
             && self
                 .context_request_allowed(event.contract.contract_id)
                 .await?
@@ -11301,13 +11610,22 @@ impl ContractCollector {
                 }
             }
         }
-        self.ensure_region_context(
-            event.contract.contract_id,
+        self.ensure_region_context_from_retained_sources(
             event.region_id,
             &mut enriched.embed_context,
         )
         .await?;
-        Ok(enriched)
+        if self.esi.supports_region_name_lookup()
+            && enriched
+                .embed_context
+                .location
+                .region_name
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty())
+        {
+            return Ok(None);
+        }
+        Ok(Some(enriched))
     }
 
     async fn snapshot_observed_contracts(
@@ -11325,7 +11643,7 @@ impl ContractCollector {
                 .await?
             {
                 let prior_location = context.location.clone();
-                self.ensure_region_context(observed.contract.contract_id, region_id, &mut context)
+                self.ensure_region_context_from_retained_sources(region_id, &mut context)
                     .await?;
                 if context.location != prior_location {
                     self.store
@@ -11379,12 +11697,8 @@ impl ContractCollector {
             {
                 Some(response) => {
                     let mut context = response.value.unwrap_or_default();
-                    self.ensure_region_context(
-                        observed.contract.contract_id,
-                        region_id,
-                        &mut context,
-                    )
-                    .await?;
+                    self.ensure_region_context_from_retained_sources(region_id, &mut context)
+                        .await?;
                     let mut retain_snapshot = true;
                     if let Some(solar_system_id) = context.location.solar_system_id {
                         let station_id = (context.location.location_kind.as_deref()
@@ -12678,7 +12992,7 @@ fn contract_notification_message(
     let primary_name = primary_item
         .and_then(|item| event.embed_context.item_names.get(&item.type_id))
         .map(|name| sanitize_contract_text(name))
-        .or_else(|| primary_item.map(|_| "Unknown ship".to_string()))
+        .or_else(|| primary_item.map(|_| "Public contract".to_string()))
         .unwrap_or_else(|| "Public contract".to_string());
     let title_location = contract_title_location(&event.embed_context.location);
     let title_isk = title_isk(event, primary_item);
@@ -12719,13 +13033,11 @@ fn contract_notification_message(
         )),
         fields: Vec::new(),
         presentation_revision: CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
-        author: Some({
-            format!(
-                "Public Contract\n{}",
-                compact_issuer(&event.embed_context)
-                    .unwrap_or_else(|| "issuer: unavailable".to_string())
-            )
-        }),
+        author: Some(
+            compact_issuer(&event.embed_context)
+                .map(|issuer| format!("Public Contract\n{issuer}"))
+                .unwrap_or_else(|| "Public Contract".to_string()),
+        ),
         thumbnail_url: primary_item.map(|item| {
             format!(
                 "https://images.evetech.net/types/{}/icon?size=64",
