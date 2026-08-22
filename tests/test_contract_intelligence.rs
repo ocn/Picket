@@ -10751,13 +10751,14 @@ async fn historical_rerender_without_a_thumbnail_keeps_the_live_multiship_primar
         .await
         .expect("connect to remove the retained thumbnail");
     sqlx::query(
-        "UPDATE contract_outbound_deliveries SET message = $2, discord_message_id = '9001' WHERE id = $1",
+        "UPDATE contract_outbound_deliveries SET message = $2, discord_message_id = $3 WHERE id = $1",
     )
-        .bind(live.delivery_id)
-        .bind(
-            serde_json::to_value(retained_without_thumbnail)
-                .expect("serialize retained thumbnail-less message"),
-        )
+    .bind(live.delivery_id)
+    .bind(
+        serde_json::to_value(retained_without_thumbnail)
+            .expect("serialize retained thumbnail-less message"),
+    )
+    .bind(rerender_test_discord_message_id(1))
         .execute(&pool)
         .await
         .expect("retain the generic revision-four historical message");
@@ -32408,11 +32409,12 @@ async fn acceptance_provenance_forward_migration_preserves_the_applied_ledger_an
         event["contract"]["contract_id"] = serde_json::json!(contract_id);
         delivery_ids.push(
             sqlx::query_scalar::<_, i64>(
-                "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, discord_message_id, delivery_nonce) VALUES (42,77,'legacy-no-content',$1,'sale_confirmed',$2,$3,TRUE,'sent',CONCAT('900', $1),CONCAT('legacy-nonce-', $1)) RETURNING id",
+                "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, discord_message_id, delivery_nonce) VALUES (42,77,'legacy-no-content',$1,'sale_confirmed',$2,$3,TRUE,'sent',$4,CONCAT('legacy-nonce-', $1)) RETURNING id",
             )
             .bind(contract_id)
             .bind(event)
             .bind(&legacy_message)
+            .bind(rerender_test_discord_message_id(contract_id as u64))
             .fetch_one(&pool)
             .await
             .expect("seed a retained pre-upgrade sent Discord identity"),
@@ -32431,18 +32433,20 @@ async fn acceptance_provenance_forward_migration_preserves_the_applied_ledger_an
     let mut stale_repair_event = legacy_event.clone();
     stale_repair_event["contract"]["contract_id"] = serde_json::json!(49);
     let pending_repair_delivery_id: i64 = sqlx::query_scalar(
-        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, discord_message_id, delivery_nonce, desired_message, repair_status, repair_prepared_at, repair_next_attempt_at, repair_failure_kind, repair_last_error, repair_failed_at, repair_revision, repair_claim_token, repair_claimed_revision, repair_claimed_at, repair_lease_until) VALUES (42,77,'legacy-no-content',49,'sale_confirmed',$1,$2,TRUE,'sent','90049','legacy-nonce-49',$2,'pending','2026-08-18T12:01:00Z','2026-08-18T12:06:00Z','transient','stale accepted-copy repair','2026-08-18T12:01:00Z',3,'legacy-repair-claim',3,'2026-08-18T12:01:00Z','2026-08-18T12:06:00Z') RETURNING id",
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, discord_message_id, delivery_nonce, desired_message, repair_status, repair_prepared_at, repair_next_attempt_at, repair_failure_kind, repair_last_error, repair_failed_at, repair_revision, repair_claim_token, repair_claimed_revision, repair_claimed_at, repair_lease_until) VALUES (42,77,'legacy-no-content',49,'sale_confirmed',$1,$2,TRUE,'sent',$3,'legacy-nonce-49',$2,'pending','2026-08-18T12:01:00Z','2026-08-18T12:06:00Z','transient','stale accepted-copy repair','2026-08-18T12:01:00Z',3,'legacy-repair-claim',3,'2026-08-18T12:01:00Z','2026-08-18T12:06:00Z') RETURNING id",
     )
     .bind(stale_repair_event)
     .bind(&legacy_message)
+    .bind(rerender_test_discord_message_id(49))
     .fetch_one(&pool)
     .await
     .expect("seed a pending pre-upgrade false acceptance repair");
     delivery_ids.push(pending_repair_delivery_id);
     let unrenderable_delivery_id: i64 = sqlx::query_scalar(
-        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, discord_message_id, delivery_nonce) VALUES (42,77,'legacy-no-content',47,'sale_confirmed','{}'::jsonb,$1,TRUE,'sent','90047','legacy-nonce-47') RETURNING id",
+        "INSERT INTO contract_outbound_deliveries (guild_id, channel_id, subscription_id, contract_id, event_kind, event, message, ping, status, discord_message_id, delivery_nonce) VALUES (42,77,'legacy-no-content',47,'sale_confirmed','{}'::jsonb,$1,TRUE,'sent',$2,'legacy-nonce-47') RETURNING id",
     )
     .bind(&legacy_message)
+    .bind(rerender_test_discord_message_id(47))
     .fetch_one(&pool)
     .await
     .expect("seed a retained but unreconstructable legacy identity");
@@ -32611,17 +32615,17 @@ async fn acceptance_provenance_forward_migration_preserves_the_applied_ledger_an
                 delivery.3.get("presentation_revision").is_none(),
                 delivery.4.is_none(),
                 delivery.5.as_str(),
-                delivery.6.as_str(),
+                delivery.6.clone(),
                 delivery.7,
                 delivery.8.as_str(),
             ))
             .collect::<Vec<_>>(),
         vec![
-            (44, "closed_outcome_unknown", Some("closed_outcome_unknown"), false, true, true, "none", "90044", true, "legacy-nonce-44"),
-            (45, "closed_outcome_unknown", Some("closed_outcome_unknown"), false, true, true, "none", "90045", true, "legacy-nonce-45"),
-            (46, "sale_confirmed", Some("sale_confirmed"), false, true, true, "none", "90046", true, "legacy-nonce-46"),
-            (47, "closed_outcome_unknown", Some("closed_outcome_unknown"), true, true, true, "none", "90047", true, "legacy-nonce-47"),
-            (49, "closed_outcome_unknown", Some("closed_outcome_unknown"), false, true, true, "none", "90049", true, "legacy-nonce-49"),
+            (44, "closed_outcome_unknown", Some("closed_outcome_unknown"), false, true, true, "none", rerender_test_discord_message_id(44), true, "legacy-nonce-44"),
+            (45, "closed_outcome_unknown", Some("closed_outcome_unknown"), false, true, true, "none", rerender_test_discord_message_id(45), true, "legacy-nonce-45"),
+            (46, "sale_confirmed", Some("sale_confirmed"), false, true, true, "none", rerender_test_discord_message_id(46), true, "legacy-nonce-46"),
+            (47, "closed_outcome_unknown", Some("closed_outcome_unknown"), true, true, true, "none", rerender_test_discord_message_id(47), true, "legacy-nonce-47"),
+            (49, "closed_outcome_unknown", Some("closed_outcome_unknown"), false, true, true, "none", rerender_test_discord_message_id(49), true, "legacy-nonce-49"),
         ],
         "migration retains terminal observation windows while leaving every unedited message obsolete"
     );
@@ -32801,16 +32805,16 @@ async fn acceptance_provenance_forward_migration_preserves_the_applied_ledger_an
                 delivery.1["presentation_revision"].as_u64(),
                 delivery.2.as_str(),
                 delivery.3,
-                delivery.4.as_str(),
+                delivery.4.clone(),
                 delivery.5,
                 delivery.6.as_str(),
             ))
             .collect::<Vec<_>>(),
         vec![
-            (44, Some("Rifter contract closed • outcome unknown"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 1, "90044", true, "legacy-nonce-44"),
-            (45, Some("Rifter contract closed • outcome unknown"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 1, "90045", true, "legacy-nonce-45"),
-            (46, Some("Rifter contract accepted • 1.5B ISK"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 1, "90046", true, "legacy-nonce-46"),
-            (49, Some("Rifter contract closed • outcome unknown"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 4, "90049", true, "legacy-nonce-49"),
+            (44, Some("Rifter contract closed • outcome unknown"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 1, rerender_test_discord_message_id(44), true, "legacy-nonce-44"),
+            (45, Some("Rifter contract closed • outcome unknown"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 1, rerender_test_discord_message_id(45), true, "legacy-nonce-45"),
+            (46, Some("Rifter contract accepted • 1.5B ISK"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 1, rerender_test_discord_message_id(46), true, "legacy-nonce-46"),
+            (49, Some("Rifter contract closed • outcome unknown"), Some(CONTRACT_NOTIFICATION_PRESENTATION_REVISION.into()), "pending", 4, rerender_test_discord_message_id(49), true, "legacy-nonce-49"),
         ],
         "repairs reuse the original message identities and retain ping configuration without creating fresh deliveries"
     );
@@ -32859,7 +32863,7 @@ async fn acceptance_provenance_forward_migration_preserves_the_applied_ledger_an
     assert_eq!(unrenderable.1, None);
     assert_eq!(unrenderable.2, "none");
     assert_eq!(unrenderable.3, 0);
-    assert_eq!(unrenderable.4, "90047");
+    assert_eq!(unrenderable.4, rerender_test_discord_message_id(47));
     assert!(unrenderable.5);
     assert_eq!(unrenderable.6, "legacy-nonce-47");
     queued_pool.close().await;
