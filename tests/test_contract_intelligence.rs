@@ -2662,6 +2662,139 @@ async fn matching_region_subscription_resolves_structure_location_for_the_embed(
 }
 
 #[tokio::test]
+async fn deferred_listing_keeps_observation_time_structure_after_failed_revalidation() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let structure_id = 1_024_000_000_101;
+    let region_id = 10_000_042;
+    let mut contract = item_exchange_contract(101);
+    contract.start_location_id = structure_id;
+    contract.end_location_id = Some(structure_id);
+    let expired = LocationEvidenceService::new(&store)
+        .record_access_qualified(
+            structure_id,
+            30_002_086,
+            Some(region_id),
+            "character:90000001",
+            now - chrono::Duration::hours(2),
+            now - chrono::Duration::hours(1),
+            now,
+        )
+        .await
+        .expect("retain an expired authenticated structure fact");
+    let subscription = ContractSubscription {
+        guild_id: 42,
+        channel_id: 77,
+        id: "deferred-observation-structure".to_string(),
+        description: "preserve observation-time structure precision".to_string(),
+        filter: ContractFilter {
+            root: ContractFilterNode::Condition(ContractFilterCondition::Regions(vec![region_id])),
+        },
+        event_actions: ContractEventActions {
+            listed: ContractEventAction::Post,
+            ..ContractEventActions::default()
+        },
+    };
+    store
+        .upsert_contract_subscription(&subscription)
+        .await
+        .expect("persist the deferred listing subscription");
+    let snapshot = ContractEmbedContext {
+        observed_at: Some(now - chrono::Duration::hours(2)),
+        location: ContractLocationContext {
+            location_name: Some("Observation Keepstar".to_string()),
+            location_kind: Some("Player-owned structure".to_string()),
+            solar_system_id: Some(30_002_086),
+            solar_system_name: Some("Turnur".to_string()),
+            region_id: Some(region_id),
+            region_name: Some("Metropolis".to_string()),
+            ..ContractLocationContext::default()
+        },
+        ..ContractEmbedContext::default()
+    };
+    let deferred = ContractEvent {
+        region_id,
+        kind: ContractEventKind::Listed,
+        contract: contract.clone(),
+        offered_items: vec![offered_ship(1)],
+        requested_items: Vec::new(),
+        context: ContractObservationContext {
+            solar_system_id: Some(30_002_086),
+            solar_system_resolution: ContractContextResolution::Resolved,
+            location_evidence_id: Some(expired.id),
+            location_evidence_class: Some(LocationEvidenceClass::AccessQualified),
+            ..ContractObservationContext::default()
+        },
+        acceptance_evidence: None,
+        embed_context: ContractEmbedContext::default(),
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed durable deferred observation state");
+    sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,$4)")
+        .bind(region_id)
+        .bind(contract.contract_id)
+        .bind(serde_json::to_value(snapshot).expect("serialize observation-time snapshot"))
+        .bind(now - chrono::Duration::hours(2))
+        .execute(&pool)
+        .await
+        .expect("seed the retained observation-time structure snapshot");
+    sqlx::query("INSERT INTO contract_deferred_subscription_matches (guild_id, channel_id, subscription_id, contract_id, event_kind, event, proximity_unverified) VALUES ($1,$2,$3,$4,'listed',$5,FALSE)")
+        .bind(subscription.guild_id as i64)
+        .bind(subscription.channel_id as i64)
+        .bind(&subscription.id)
+        .bind(contract.contract_id)
+        .bind(serde_json::to_value(deferred).expect("serialize deferred listed event"))
+        .execute(&pool)
+        .await
+        .expect("seed the deferred access-qualified listing");
+    pool.close().await;
+    initialize_resolver_runtime(&store, "test-credential-v1", now).await;
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let resolver = Arc::new(FailingStructureResolver::access_denied());
+
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![],
+            pages: HashMap::new(),
+            items: HashMap::new(),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    )
+    .with_structure_resolver(resolver.clone())
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+    .collect_cycle()
+    .await
+    .expect("failed current revalidation keeps the stronger observation-time location");
+
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let description = sent[0]
+        .message
+        .description
+        .as_deref()
+        .expect("render the retained observation-time structure");
+    assert!(description.contains("Observation Keepstar"));
+    assert!(description.contains("**in:** [Turnur]"));
+    assert!(description.contains("([Metropolis]"));
+    assert!(!description.contains("**location verified:**"));
+    drop(sent);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn collector_renders_expired_current_structure_as_last_verified_location() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
