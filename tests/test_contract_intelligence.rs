@@ -19638,6 +19638,177 @@ async fn terminal_light_year_range_uses_the_observation_snapshot_after_restart()
 }
 
 #[tokio::test]
+async fn terminal_same_system_evidence_supersession_clears_stale_facts_preserving_position() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let location_id = 60_003_760_i64;
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 18, 12, 0, 0).unwrap();
+    let observation_position = position_at_light_years(0.0);
+    let mut contract = item_exchange_contract(44);
+    contract.start_location_id = location_id;
+    contract.end_location_id = Some(location_id);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(
+            vec![contract.clone()],
+            HashMap::from([(
+                contract.contract_id,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        )),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the terminal baseline before observation supersession");
+    let older = LocationEvidenceService::new(&store)
+        .record_access_qualified(
+            location_id,
+            30_000_044,
+            Some(10_000_002),
+            "character:90000001",
+            observed_at,
+            observed_at + chrono::Duration::hours(1),
+            observed_at,
+        )
+        .await
+        .expect("record the older same-system structure evidence");
+    let selected = LocationEvidenceService::new(&store)
+        .record_public_npc(
+            location_id,
+            Some(location_id),
+            30_000_044,
+            Some(10_000_003),
+            observed_at + chrono::Duration::minutes(1),
+            observed_at + chrono::Duration::minutes(1),
+        )
+        .await
+        .expect("record newer same-system public evidence");
+    assert_ne!(selected.id, older.id);
+    assert_eq!(selected.region_id, Some(10_000_003));
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to retain stale same-system terminal facts");
+    sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,$4) ON CONFLICT (region_id, contract_id) DO UPDATE SET context = EXCLUDED.context, observed_at = EXCLUDED.observed_at")
+        .bind(10_000_002_i64)
+        .bind(contract.contract_id)
+        .bind(serde_json::to_value(ContractEmbedContext {
+            observed_at: Some(observed_at),
+            location: ContractLocationContext {
+                location_name: Some("Stale Keepstar".to_string()),
+                location_kind: Some("Player-owned structure".to_string()),
+                last_verified_at: Some(observed_at),
+                solar_system_id: Some(30_000_044),
+                solar_system_name: Some("Stale System".to_string()),
+                solar_system_position: Some(observation_position),
+                security_status: Some(0.1),
+                region_id: Some(10_000_002),
+                region_name: Some("Stale Region".to_string()),
+            },
+            ..ContractEmbedContext::default()
+        })
+        .expect("serialize stale same-system terminal facts"))
+        .bind(observed_at)
+        .execute(&pool)
+        .await
+        .expect("retain stale same-system terminal facts");
+    pool.close().await;
+    let mut subscription = confirmed_ship_subscription(
+        "terminal-same-system-supersession",
+        ContractEventKind::SaleConfirmed,
+        ContractItemDirection::Offered,
+        ContractEventAction::Post,
+    );
+    subscription.filter.root = ContractFilterNode::And(vec![
+        subscription.filter.root,
+        ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+            config::SystemRange {
+                system_id: 30_002_086,
+                range: 8.0,
+            },
+        ])),
+    ]);
+    store
+        .upsert_contract_subscription(&subscription)
+        .await
+        .expect("persist the terminal range subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let restarted_esi = Arc::new(PositionedResolutionEsi {
+        inner: ResolutionEsi {
+            inner: regional_esi(vec![], HashMap::new()),
+            probes: StdMutex::new(vec![Ok(ContractItemProbe::AcceptedByPlayer(
+                expiring_cache(),
+            ))]),
+            probe_calls: StdMutex::new(Vec::new()),
+        },
+        positions: HashMap::from([(30_002_086, position_at_light_years(0.0))]),
+        position_calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), restarted_esi.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+            delivery.clone(),
+        )
+        .collect_cycle()
+        .await
+        .expect("reconcile newer same-system terminal evidence");
+
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect the delivered terminal event");
+    let delivered: ContractEvent = serde_json::from_value(
+        sqlx::query_scalar::<_, Value>(
+            "SELECT event FROM contract_outbound_deliveries WHERE contract_id = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(contract.contract_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the delivered terminal event"),
+    )
+    .expect("deserialize the delivered terminal event");
+    pool.close().await;
+    assert_eq!(delivered.context.location_evidence_id, Some(selected.id));
+    assert_eq!(
+        delivered.context.location_evidence_class,
+        Some(LocationEvidenceClass::PublicNpc)
+    );
+    assert!(delivered.context.location_evidence_replaced);
+    assert_eq!(delivered.context.solar_system_id, Some(30_000_044));
+    assert_eq!(
+        delivered.context.solar_system_position,
+        Some(observation_position)
+    );
+    assert_eq!(
+        delivered.embed_context.location.solar_system_position,
+        Some(observation_position)
+    );
+    assert_eq!(
+        delivered.embed_context.location.solar_system_id,
+        Some(30_000_044)
+    );
+    assert_eq!(delivered.embed_context.location.region_id, Some(10_000_002));
+    assert!(delivered.embed_context.location.location_name.is_none());
+    assert!(delivered.embed_context.location.location_kind.is_none());
+    assert!(delivered.embed_context.location.last_verified_at.is_none());
+    assert!(delivered.embed_context.location.solar_system_name.is_none());
+    assert!(delivered.embed_context.location.security_status.is_none());
+    assert!(delivered.embed_context.location.region_name.is_none());
+    assert_eq!(
+        restarted_esi.position_calls.lock().unwrap().as_slice(),
+        &[30_002_086],
+        "same-system supersession keeps only the observed event position"
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn terminal_light_year_range_reuses_location_resolved_at_observation_time() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;

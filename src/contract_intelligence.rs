@@ -4284,6 +4284,8 @@ pub struct ContractObservationContext {
     #[serde(default)]
     pub location_evidence_class: Option<LocationEvidenceClass>,
     #[serde(default)]
+    pub location_evidence_replaced: bool,
+    #[serde(default)]
     pub range_center_positions: BTreeMap<u32, SolarSystemPosition>,
     #[serde(default)]
     pub range_center_names: BTreeMap<u32, String>,
@@ -10919,8 +10921,25 @@ impl ContractCollector {
                     .resolve(event.contract.start_location_id, evidence_now)
                     .await?
                 {
-                    if event.context.solar_system_id != Some(evidence.solar_system_id) {
+                    let retained_position = (event.context.location_evidence_id
+                        != Some(evidence.id)
+                        && event.context.solar_system_id == Some(evidence.solar_system_id))
+                    .then(|| {
+                        event
+                            .context
+                            .solar_system_position
+                            .filter(|position| position.is_finite())
+                    })
+                    .flatten();
+                    if event.context.location_evidence_id != Some(evidence.id) {
+                        event.context.location_evidence_replaced = true;
                         clear_location_evidence_context(&mut event);
+                        if let Some(position) = retained_position {
+                            event.context.solar_system_position = Some(position);
+                            event.context.solar_system_position_resolution =
+                                ContractContextResolution::Resolved;
+                            event.embed_context.location.solar_system_position = Some(position);
+                        }
                     }
                     event.context.solar_system_id = Some(evidence.solar_system_id);
                     event.context.solar_system_resolution = ContractContextResolution::Resolved;
@@ -12210,13 +12229,17 @@ impl ContractCollector {
         if enriched.context.location_evidence_id.is_some() && !selected_last_verified {
             enriched.embed_context.location.last_verified_at = None;
         }
-        let authoritative_location_changed = enriched.context.location_evidence_id.is_some()
-            && enriched.context.solar_system_id.is_some()
-            && enriched.embed_context.location.solar_system_id != enriched.context.solar_system_id;
+        let authoritative_location_changed = enriched.context.location_evidence_replaced
+            || (enriched.context.location_evidence_id.is_some()
+                && enriched.context.solar_system_id.is_some()
+                && enriched.embed_context.location.solar_system_id
+                    != enriched.context.solar_system_id);
         if authoritative_location_changed {
             enriched.embed_context.location.location_name = None;
             enriched.embed_context.location.location_kind = None;
+            enriched.embed_context.location.last_verified_at = None;
             enriched.embed_context.location.solar_system_name = None;
+            enriched.embed_context.location.security_status = None;
             enriched.embed_context.location.region_id = None;
             enriched.embed_context.location.region_name = None;
         }
