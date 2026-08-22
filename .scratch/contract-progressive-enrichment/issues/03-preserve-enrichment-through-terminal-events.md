@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — Synchronously enrich public-location listings; 02 — Enrich player-structure listings.
 
-**Status:** ready-for-agent
+**Status:** claimed-by-ticket_03_impl; awaiting Sol review
 
 - [ ] Collector-level red tests cover Sale Confirmed, Purchase Confirmed, Expired, and Closed — Outcome Unknown through the same pre-delivery enrichment boundary.
 - [ ] Terminal events retain observation-time Issuer, Observed Affiliation, structure, solar-system, region, and evidence provenance across disappearance and restart.
