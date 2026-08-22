@@ -10371,6 +10371,10 @@ impl ContractCollector {
                             || event.context.solar_system_id != Some(evidence.solar_system_id)
                     })
                 });
+        let retained_observation_context = (matches!(event.kind, ContractEventKind::Listed)
+            && retained_evidence_requires_public_refresh
+            && selected_evidence.is_none())
+        .then(|| (event.context.clone(), event.embed_context.location.clone()));
         if matches!(event.kind, ContractEventKind::Listed)
             && (retained_evidence_requires_public_refresh || authoritative_evidence_changed)
         {
@@ -10544,6 +10548,13 @@ impl ContractCollector {
         {
             self.resolve_structure_location_evidence(&mut event, evidence_now)
                 .await?;
+        }
+
+        if event.context.solar_system_id.is_none() {
+            if let Some((context, location)) = retained_observation_context {
+                event.context = context;
+                event.embed_context.location = location;
+            }
         }
 
         if (requirements.solar_system || requirements.security_status)
