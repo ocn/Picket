@@ -5,9 +5,9 @@ use crate::config::{
     PingType, SimpleFilter, StandingSource, Subscription, System,
 };
 use crate::contract_intelligence::{
-    ContractDelivery, ContractDeliveryError, ContractMessageEdit, ContractNotificationMessage,
-    HealthDiscordPublisher, HealthPublishError, PreparedContractDelivery, ShipGroupLookup,
-    ShipGroupResolver,
+    parse_contract_discord_message_id, ContractDelivery, ContractDeliveryError,
+    ContractMessageEdit, ContractNotificationMessage, HealthDiscordPublisher, HealthPublishError,
+    PreparedContractDelivery, ShipGroupLookup, ShipGroupResolver,
 };
 use crate::esi::Celestial;
 use crate::models::{Attacker, ZkData};
@@ -424,12 +424,8 @@ impl ContractDelivery for DiscordContractDelivery {
     }
 
     async fn edit(&self, edit: ContractMessageEdit) -> Result<(), ContractDeliveryError> {
-        let message_id = edit.discord_message_id.parse::<u64>().map_err(|error| {
-            ContractDeliveryError::permanent(format!(
-                "invalid Discord message ID {}: {error}",
-                edit.discord_message_id
-            ))
-        })?;
+        let message_id = parse_contract_discord_message_id(&edit.discord_message_id)
+            .map_err(ContractDeliveryError::permanent)?;
         let payload = serde_json::json!({
             "embeds": [contract_notification_embed(&edit.message).0],
             "allowed_mentions": { "parse": [] },
