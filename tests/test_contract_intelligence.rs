@@ -19576,6 +19576,14 @@ async fn terminal_light_year_range_uses_the_observation_snapshot_after_restart()
     .collect_cycle()
     .await
     .expect("persist the observation-time solar-system position");
+    assert!(
+        LocationEvidenceService::new(&store)
+            .current_public_npc(contract.start_location_id, Utc::now())
+            .await
+            .expect("inspect public snapshot evidence")
+            .is_some(),
+        "the terminal restart must keep its observation position even when current PublicNpc evidence exists"
+    );
 
     let mut subscription = confirmed_ship_subscription(
         "terminal-near-turnur",
