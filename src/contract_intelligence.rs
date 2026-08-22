@@ -6466,6 +6466,7 @@ impl ContractCollectionStore {
         lock_for_queue: bool,
     ) -> Result<ContractDeliveryRerenderSelection, sqlx::Error> {
         const RERENDER_SELECTION_PAGE_SIZE: i64 = 64;
+        const RERENDER_SELECTION_MAX_SCANNED_ROWS: usize = 4096;
         const RERENDER_DELIVERY_COLUMNS: &str = "SELECT deliveries.id, deliveries.contract_id, deliveries.event_kind, deliveries.status, deliveries.discord_message_id, deliveries.repair_status, deliveries.failure_kind, deliveries.repair_failure_kind, deliveries.event, deliveries.message, subscriptions.guild_id AS retained_subscription_guild_id, subscriptions.channel_id AS retained_subscription_channel_id, subscriptions.subscription_id AS retained_subscription_id, subscriptions.description AS retained_subscription_description, subscriptions.filter AS retained_subscription_filter, subscriptions.event_actions AS retained_subscription_event_actions, subscriptions.deleted_at AS retained_subscription_deleted_at FROM contract_outbound_deliveries AS deliveries LEFT JOIN contract_subscriptions AS subscriptions ON subscriptions.guild_id = deliveries.guild_id AND subscriptions.channel_id = deliveries.channel_id AND subscriptions.subscription_id = deliveries.subscription_id";
         const OUTDATED_PRESENTATION: &str = "(CASE WHEN jsonb_typeof(deliveries.message -> 'presentation_revision') = 'number' AND length(deliveries.message ->> 'presentation_revision') <= 9 AND (deliveries.message ->> 'presentation_revision') ~ '^[0-9]+$' THEN (deliveries.message ->> 'presentation_revision')::INTEGER ELSE 0 END) < $2";
         let lock_clause = if lock_for_queue {
@@ -6477,8 +6478,18 @@ impl ContractCollectionStore {
         let mut selected_ids = BTreeSet::new();
         match selector {
             ContractDeliveryRerenderSelector::Limit(limit) => {
+                let scan_limit = limit
+                    .saturating_mul(RERENDER_SELECTION_PAGE_SIZE as usize)
+                    .clamp(
+                        RERENDER_SELECTION_PAGE_SIZE as usize,
+                        RERENDER_SELECTION_MAX_SCANNED_ROWS,
+                    );
                 let mut after_delivery_id = 0_i64;
-                while selection.candidates.len() < *limit {
+                let mut scanned_rows = 0_usize;
+                while selection.candidates.len() < *limit && scanned_rows < scan_limit {
+                    let page_size = (scan_limit - scanned_rows)
+                        .min(RERENDER_SELECTION_PAGE_SIZE as usize)
+                        as i64;
                     let query = format!(
                         "{RERENDER_DELIVERY_COLUMNS} WHERE deliveries.channel_id = $1 AND {OUTDATED_PRESENTATION} AND deliveries.id > $3 ORDER BY deliveries.id LIMIT $4{lock_clause}"
                     );
@@ -6486,13 +6497,14 @@ impl ContractCollectionStore {
                         .bind(channel_id as i64)
                         .bind(CONTRACT_NOTIFICATION_PRESENTATION_REVISION as i32)
                         .bind(after_delivery_id)
-                        .bind(RERENDER_SELECTION_PAGE_SIZE)
+                        .bind(page_size)
                         .fetch_all(&mut **transaction)
                         .await?;
                     let Some(last_row) = rows.last() else {
                         break;
                     };
                     after_delivery_id = last_row.get("id");
+                    scanned_rows += rows.len();
                     for row in rows {
                         match contract_delivery_rerender_row_from_row(row)? {
                             ContractDeliveryRerenderRow::Candidate(candidate) => {
@@ -6505,6 +6517,21 @@ impl ContractCollectionStore {
                                 selection.excluded.push(exclusion);
                             }
                         }
+                    }
+                }
+                if selection.candidates.len() < *limit && scanned_rows == scan_limit {
+                    let more_outdated_rows: bool = sqlx::query_scalar(&format!(
+                        "SELECT EXISTS(SELECT 1 FROM contract_outbound_deliveries AS deliveries WHERE deliveries.channel_id = $1 AND {OUTDATED_PRESENTATION} AND deliveries.id > $3)"
+                    ))
+                    .bind(channel_id as i64)
+                    .bind(CONTRACT_NOTIFICATION_PRESENTATION_REVISION as i32)
+                    .bind(after_delivery_id)
+                    .fetch_one(&mut **transaction)
+                    .await?;
+                    if more_outdated_rows {
+                        return Err(sqlx::Error::Protocol(format!(
+                            "rerender scan limit reached after examining {scan_limit} outdated deliveries for channel {channel_id}; rerun with --delivery-ids for explicit retained delivery IDs"
+                        )));
                     }
                 }
             }
@@ -6799,7 +6826,9 @@ impl ContractCollectionStore {
                 if retained.location_kind.is_none() {
                     retained.location_kind = location.location_kind;
                 }
-                if retained.last_verified_at.is_none() {
+                if location.location_name.is_some() {
+                    retained.last_verified_at = None;
+                } else if retained.last_verified_at.is_none() {
                     retained.last_verified_at = location.last_verified_at;
                 }
                 if retained.solar_system_id.is_none() {
@@ -9005,6 +9034,21 @@ fn contract_delivery_rerender_row_from_row(
             reason: reason.to_string(),
         })
     };
+    let repair_status: String = row.get("repair_status");
+    let repair_failure_kind: Option<String> = row.get("repair_failure_kind");
+    let failure_kind: Option<String> = row.get("failure_kind");
+    if repair_status == "permanent"
+        || repair_failure_kind.as_deref() == Some("permanent")
+        || failure_kind.as_deref() == Some("permanent")
+    {
+        return Ok(excluded("permanent_failure"));
+    }
+    if row
+        .get::<Option<DateTime<Utc>>, _>("retained_subscription_deleted_at")
+        .is_some()
+    {
+        return Ok(excluded("retired_subscription"));
+    }
     match row.get::<String, _>("status").as_str() {
         "sent" => {}
         "prepared" => return Ok(excluded("prepared_delivery")),
@@ -9015,21 +9059,6 @@ fn contract_delivery_rerender_row_from_row(
     };
     if parse_contract_discord_message_id(&discord_message_id).is_err() {
         return Ok(excluded("invalid_discord_message_identity"));
-    }
-    if row
-        .get::<Option<DateTime<Utc>>, _>("retained_subscription_deleted_at")
-        .is_some()
-    {
-        return Ok(excluded("retired_subscription"));
-    }
-    let repair_status: String = row.get("repair_status");
-    let repair_failure_kind: Option<String> = row.get("repair_failure_kind");
-    let failure_kind: Option<String> = row.get("failure_kind");
-    if repair_status == "permanent"
-        || repair_failure_kind.as_deref() == Some("permanent")
-        || failure_kind.as_deref() == Some("permanent")
-    {
-        return Ok(excluded("permanent_failure"));
     }
     if repair_status != "none" {
         return Ok(excluded("active_repair"));
