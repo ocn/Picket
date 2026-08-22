@@ -8,6 +8,7 @@ use killbot_rust::config::{self, AppConfig, AppState};
 use killbot_rust::contract_intelligence::{
     available_contract_store, collection_retry_delay, contract_regional_concurrency_from,
     execute_operator_delivery_cli, execute_operator_delivery_cli_with_region_name_lookup,
+    execute_operator_delivery_cli_with_region_name_lookup_and_ship_groups,
     new_contract_store_handle, proximity_reconciliation_interval_from,
     spawn_contract_collection_loop_with_notifications,
     spawn_proximity_reconciliation_loop_with_esi, AppStateContractPingLimiter, CacheMetadata,
@@ -10511,6 +10512,152 @@ async fn contract_subscription_filters_share_listing_presentation_at_the_collect
 }
 
 #[tokio::test]
+async fn contract_subscription_filters_keep_canonical_multiship_presentation_at_the_collector_seam()
+{
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let baseline = item_exchange_contract(44);
+    let listed = item_exchange_contract(45);
+    let ragnarok = PublicContractItem {
+        type_id: 19_720,
+        ..offered_ship(2)
+    };
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(
+            vec![baseline.clone()],
+            HashMap::from([(
+                baseline.contract_id,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        )),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent canonical multiship baseline");
+    let snapshot_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to retain canonical multiship names");
+    sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,now())")
+        .bind(10_000_002_i64)
+        .bind(listed.contract_id)
+        .bind(serde_json::to_value(ContractEmbedContext {
+            item_names: BTreeMap::from([
+                (587, "Rifter".to_string()),
+                (19_720, "Ragnarok".to_string()),
+            ]),
+            ..ContractEmbedContext::default()
+        }).expect("serialize canonical multiship names"))
+        .execute(&snapshot_pool)
+        .await
+        .expect("retain canonical multiship names");
+    snapshot_pool.close().await;
+    for (id, root) in [
+        (
+            "region",
+            ContractFilterNode::Condition(ContractFilterCondition::Regions(vec![10_000_002])),
+        ),
+        (
+            "issuer",
+            ContractFilterNode::Condition(ContractFilterCondition::IssuerCharacters(vec![
+                90_000_001,
+            ])),
+        ),
+        (
+            "rifter-only-item",
+            ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                direction: ContractItemDirection::Offered,
+                ids: vec![587],
+            }),
+        ),
+        (
+            "proximity",
+            ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                config::SystemRange {
+                    system_id: 30_000_142,
+                    range: 1.0,
+                },
+            ])),
+        ),
+    ] {
+        store
+            .upsert_contract_subscription(&ContractSubscription {
+                guild_id: 42,
+                channel_id: 77,
+                id: id.to_string(),
+                description: format!("{id} canonical multiship subscription"),
+                filter: ContractFilter { root },
+                event_actions: ContractEventActions {
+                    listed: ContractEventAction::Post,
+                    ..ContractEventActions::default()
+                },
+            })
+            .await
+            .expect("persist canonical multiship subscription");
+    }
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store,
+        Arc::new(PositionEsi {
+            inner: regional_esi(
+                vec![baseline, listed.clone()],
+                HashMap::from([
+                    (
+                        44,
+                        Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                    ),
+                    (
+                        listed.contract_id,
+                        Ok(EsiResponse::fresh(
+                            vec![offered_ship(1), ragnarok],
+                            expiring_cache(),
+                        )),
+                    ),
+                ]),
+            ),
+            contexts: HashMap::from([(
+                listed.contract_id,
+                ContractObservationContext {
+                    solar_system_id: Some(30_000_142),
+                    solar_system_position: Some(position_at_light_years(0.0)),
+                    ..ContractObservationContext::default()
+                },
+            )]),
+            positions: HashMap::from([(30_000_142, position_at_light_years(0.0))]),
+            position_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659), (19_720, 30)]))),
+        delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("collect canonical multiship subscriptions");
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 4);
+    for id in ["region", "issuer", "rifter-only-item", "proximity"] {
+        let notification = sent
+            .iter()
+            .find(|notification| notification.subscription_id == id)
+            .expect("each independent filter stays eligible");
+        assert_eq!(notification.message.title, "Ragnarok listed for 1.5B ISK");
+        assert_eq!(
+            notification.message.thumbnail_url.as_deref(),
+            Some("https://images.evetech.net/types/19720/icon?size=64")
+        );
+        assert!(!notification.ping);
+    }
+    drop(sent);
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn historical_rerender_without_a_thumbnail_keeps_the_live_multiship_primary() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
@@ -10592,6 +10739,10 @@ async fn historical_rerender_without_a_thumbnail_keeps_the_live_multiship_primar
         Some("https://images.evetech.net/types/19720/icon?size=64")
     );
     let mut retained_without_thumbnail = live.message.clone();
+    retained_without_thumbnail.title = "Public contract listed for 1.5B ISK".to_string();
+    retained_without_thumbnail.description =
+        Some("`<url=\"contract:0//45\">Public contract - Jita</url>`".to_string());
+    retained_without_thumbnail.fields.clear();
     retained_without_thumbnail.thumbnail_url = None;
     retained_without_thumbnail.presentation_revision = 4;
     let pool = PgPoolOptions::new()
@@ -10607,26 +10758,56 @@ async fn historical_rerender_without_a_thumbnail_keeps_the_live_multiship_primar
         )
         .execute(&pool)
         .await
-        .expect("retain the no-thumbnail historical message");
+        .expect("retain the generic revision-four historical message");
     pool.close().await;
-    execute_operator_delivery_cli_with_region_name_lookup(
+    let delivery_id = live.delivery_id.to_string();
+    let rerender_arguments = [
+        "rerender",
+        "--channel",
+        "77",
+        "--delivery-ids",
+        delivery_id.as_str(),
+        "--queue",
+        "--actor",
+        CONTRACT_DELIVERY_OPERATOR_ACTOR,
+    ];
+    let missing_group_error =
+        execute_operator_delivery_cli_with_region_name_lookup_and_ship_groups(
+            &store,
+            &rerender_arguments,
+            Utc::now(),
+            &HashMap::from([(10_000_002, "The Forge".to_string())]),
+            None,
+            &StaticShipGroups(HashMap::from([(587, 659)])),
+        )
+        .await
+        .expect_err("reject a rerender whose canonical item lacks a cached group");
+    assert!(missing_group_error.contains("lacks cached ship group for type 19720"));
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect the rejected rerender");
+    let rejected_state: (String, Option<Value>) = sqlx::query_as(
+        "SELECT repair_status, desired_message FROM contract_outbound_deliveries WHERE id = $1",
+    )
+    .bind(live.delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read the atomically rejected rerender");
+    assert_eq!(rejected_state.0, "none");
+    assert!(rejected_state.1.is_none());
+    pool.close().await;
+    execute_operator_delivery_cli_with_region_name_lookup_and_ship_groups(
         &store,
-        &[
-            "rerender",
-            "--channel",
-            "77",
-            "--delivery-ids",
-            &live.delivery_id.to_string(),
-            "--queue",
-            "--actor",
-            CONTRACT_DELIVERY_OPERATOR_ACTOR,
-        ],
+        &rerender_arguments,
         Utc::now(),
         &HashMap::from([(10_000_002, "The Forge".to_string())]),
         None,
+        &StaticShipGroups(HashMap::from([(587, 659), (19_720, 30)])),
     )
     .await
-    .expect("queue the thumbnail-less historical rerender");
+    .expect("queue the generic revision-four historical rerender");
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&database.url)

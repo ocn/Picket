@@ -4928,6 +4928,27 @@ pub enum ShipGroupLookup {
     TemporarilyUnavailable,
 }
 
+struct CachedShipGroupResolver {
+    groups: HashMap<u32, u32>,
+}
+
+impl CachedShipGroupResolver {
+    fn new(groups: HashMap<u32, u32>) -> Self {
+        Self { groups }
+    }
+}
+
+#[async_trait]
+impl ShipGroupResolver for CachedShipGroupResolver {
+    async fn group_for_type(&self, type_id: i64) -> ShipGroupLookup {
+        let group = u32::try_from(type_id)
+            .ok()
+            .and_then(|type_id| self.groups.get(&type_id).copied())
+            .map(i64::from);
+        ShipGroupLookup::Resolved(group)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CachedResponse {
     response: Value,
@@ -6536,6 +6557,7 @@ impl ContractCollectionStore {
         occurred_at: DateTime<Utc>,
         region_names: &HashMap<i64, String>,
         region_name_esi: Option<&dyn PublicContractEsi>,
+        ship_groups: &dyn ShipGroupResolver,
     ) -> Result<ContractDeliveryRerenderSelection, sqlx::Error> {
         if actor != CONTRACT_DELIVERY_OPERATOR_ACTOR {
             return Err(sqlx::Error::Protocol(
@@ -6631,7 +6653,7 @@ impl ContractCollectionStore {
                 .await?;
             let regenerated = contract_notification_message(
                 &event,
-                historical_contract_primary_item(&event, &candidate.stored_message),
+                historical_contract_primary_item(&event, ship_groups).await?,
                 &issuer_history,
                 &corporation_history,
                 false,
@@ -8597,6 +8619,45 @@ pub async fn execute_operator_delivery_cli_with_region_name_lookup(
     region_names: &HashMap<i64, String>,
     region_name_esi: Option<&dyn PublicContractEsi>,
 ) -> Result<OperatorDeliveryCliResult, String> {
+    execute_operator_delivery_cli_with_region_name_lookup_inner(
+        store,
+        arguments,
+        now,
+        region_names,
+        region_name_esi,
+        None,
+    )
+    .await
+}
+
+#[doc(hidden)]
+pub async fn execute_operator_delivery_cli_with_region_name_lookup_and_ship_groups(
+    store: &ContractCollectionStore,
+    arguments: &[&str],
+    now: DateTime<Utc>,
+    region_names: &HashMap<i64, String>,
+    region_name_esi: Option<&dyn PublicContractEsi>,
+    ship_groups: &dyn ShipGroupResolver,
+) -> Result<OperatorDeliveryCliResult, String> {
+    execute_operator_delivery_cli_with_region_name_lookup_inner(
+        store,
+        arguments,
+        now,
+        region_names,
+        region_name_esi,
+        Some(ship_groups),
+    )
+    .await
+}
+
+async fn execute_operator_delivery_cli_with_region_name_lookup_inner(
+    store: &ContractCollectionStore,
+    arguments: &[&str],
+    now: DateTime<Utc>,
+    region_names: &HashMap<i64, String>,
+    region_name_esi: Option<&dyn PublicContractEsi>,
+    supplied_ship_groups: Option<&dyn ShipGroupResolver>,
+) -> Result<OperatorDeliveryCliResult, String> {
     let (command, flags) = parse_operator_delivery_command(arguments)?;
     let actor = required_operator_delivery_option(&flags, "--actor")?;
     if actor != CONTRACT_DELIVERY_OPERATOR_ACTOR {
@@ -8655,7 +8716,7 @@ pub async fn execute_operator_delivery_cli_with_region_name_lookup(
                     .rerender_contract_delivery_candidates(channel_id, &selector)
                     .await
                     .map_err(|error| error.to_string())?
-            } else {
+            } else if let Some(ship_groups) = supplied_ship_groups {
                 store
                     .queue_contract_delivery_rerenders(
                         channel_id,
@@ -8664,6 +8725,24 @@ pub async fn execute_operator_delivery_cli_with_region_name_lookup(
                         now,
                         region_names,
                         region_name_esi,
+                        ship_groups,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+            } else {
+                let ship_groups =
+                    CachedShipGroupResolver::new(crate::config::load_ships().map_err(|error| {
+                        format!("load cached ship groups for rerender: {error}")
+                    })?);
+                store
+                    .queue_contract_delivery_rerenders(
+                        channel_id,
+                        &selector,
+                        actor,
+                        now,
+                        region_names,
+                        region_name_esi,
+                        &ship_groups,
                     )
                     .await
                     .map_err(|error| error.to_string())?
@@ -12628,27 +12707,11 @@ impl<'a> ContractFilterEvaluator<'a> {
         &mut self,
         required_direction: Option<ContractItemDirection>,
     ) -> PrimaryDisplayItem<'a> {
-        let matching_ship_items = self
-            .matching_ship_items
-            .iter()
-            .copied()
-            .filter(|(direction, _)| {
-                required_direction.is_none_or(|required| *direction == required)
-            })
-            .collect::<HashSet<_>>();
-        if !matching_ship_items.is_empty() {
-            return self.primary_display_item_for(&matching_ship_items).await;
-        }
-        if !self.matching_ship_items.is_empty() {
-            return PrimaryDisplayItem::Resolved {
-                item: None,
-                strategic_priority: usize::MAX,
-            };
-        }
-        let fallback_ship_items = contract_presentation_items(self.event, required_direction)
+        let presentation_ship_items = contract_presentation_items(self.event, required_direction)
             .map(|(direction, item)| (direction, item.record_id))
             .collect::<HashSet<_>>();
-        self.primary_display_item_for(&fallback_ship_items).await
+        self.primary_display_item_for(&presentation_ship_items)
+            .await
     }
 
     async fn primary_display_item_for(
@@ -12658,7 +12721,7 @@ impl<'a> ContractFilterEvaluator<'a> {
         if self.matching_ship_items_deferred {
             return PrimaryDisplayItem::Deferred;
         }
-        let mut primary: Option<(&PublicContractItem, usize)> = None;
+        let mut resolved_items = Vec::new();
         for (direction, item) in contract_items_with_direction(self.event) {
             if !matching_ship_items.contains(&(direction, item.record_id)) {
                 continue;
@@ -12670,14 +12733,9 @@ impl<'a> ContractFilterEvaluator<'a> {
                 ShipGroupLookup::Resolved(None) => continue,
                 ShipGroupLookup::TemporarilyUnavailable => return PrimaryDisplayItem::Deferred,
             };
-            let candidate = (item, priority);
-            if primary.as_ref().is_none_or(|(current, current_priority)| {
-                (candidate.1, candidate.0.type_id, candidate.0.record_id)
-                    < (*current_priority, current.type_id, current.record_id)
-            }) {
-                primary = Some(candidate);
-            }
+            resolved_items.push((item, priority));
         }
+        let primary = canonical_contract_primary_item(resolved_items);
         PrimaryDisplayItem::Resolved {
             item: primary.map(|(item, _)| item),
             strategic_priority: primary.map(|(_, priority)| priority).unwrap_or(usize::MAX),
@@ -13607,42 +13665,39 @@ fn contract_matched_range_for_embed(
     })
 }
 
-fn historical_contract_primary_item<'a>(
+fn canonical_contract_primary_item<'a>(
+    candidates: impl IntoIterator<Item = (&'a PublicContractItem, usize)>,
+) -> Option<(&'a PublicContractItem, usize)> {
+    candidates
+        .into_iter()
+        .min_by_key(|(item, priority)| (*priority, item.type_id, item.record_id))
+}
+
+async fn historical_contract_primary_item<'a>(
     event: &'a ContractEvent,
-    stored: &ContractNotificationMessage,
-) -> Option<&'a PublicContractItem> {
-    let candidates =
-        contract_presentation_items(event, contract_presentation_direction(event.kind))
-            .map(|(_, item)| item)
-            .collect::<Vec<_>>();
-    let thumbnail_type_id = stored.thumbnail_url.as_deref().and_then(|thumbnail| {
-        thumbnail
-            .split("/types/")
-            .nth(1)
-            .and_then(|suffix| suffix.split('/').next())
-            .and_then(|type_id| type_id.parse::<i64>().ok())
-    });
-    thumbnail_type_id
-        .and_then(|type_id| {
-            candidates
-                .iter()
-                .copied()
-                .find(|item| item.type_id == type_id)
-        })
-        .or_else(|| {
-            candidates.iter().copied().find(|item| {
-                event
-                    .embed_context
-                    .item_names
-                    .get(&item.type_id)
-                    .map(|name| sanitize_contract_text(name))
-                    .is_some_and(|name| {
-                        stored.title == name || stored.title.starts_with(&format!("{name} "))
-                    })
-            })
-        })
-        .or_else(|| candidates.iter().copied().find(|item| item.is_included))
-        .or_else(|| candidates.first().copied())
+    ship_groups: &dyn ShipGroupResolver,
+) -> Result<Option<&'a PublicContractItem>, sqlx::Error> {
+    let mut resolved_items = Vec::new();
+    for (_, item) in contract_presentation_items(event, contract_presentation_direction(event.kind))
+    {
+        let group_id = match ship_groups.group_for_type(item.type_id).await {
+            ShipGroupLookup::Resolved(Some(group_id)) => group_id,
+            ShipGroupLookup::Resolved(None) => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "historical contract presentation lacks cached ship group for type {}",
+                    item.type_id
+                )));
+            }
+            ShipGroupLookup::TemporarilyUnavailable => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "historical contract presentation ship group is unavailable for type {}",
+                    item.type_id
+                )));
+            }
+        };
+        resolved_items.push((item, strategic_ship_group_priority(group_id)));
+    }
+    Ok(canonical_contract_primary_item(resolved_items).map(|(item, _)| item))
 }
 
 enum RetainedRangeMatch {
