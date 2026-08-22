@@ -11487,12 +11487,7 @@ impl ContractCollector {
             ContractFilterMatch::Deferred => return Ok(NotificationResolution::Deferred),
             ContractFilterMatch::UnresolvedProximity => true,
         };
-        let required_direction = match event.kind {
-            ContractEventKind::Listed => None,
-            ContractEventKind::SaleConfirmed => Some(ContractItemDirection::Offered),
-            ContractEventKind::PurchaseConfirmed => Some(ContractItemDirection::Requested),
-            ContractEventKind::Expired | ContractEventKind::ClosedOutcomeUnknown => None,
-        };
+        let required_direction = contract_presentation_direction(event.kind);
         let (primary_item, strategic_priority) = if proximity_unverified {
             let mut selection_evaluator = ContractFilterEvaluator::new(event, ship_groups);
             let selection = plan_contract_filter_context(
@@ -11501,25 +11496,20 @@ impl ContractCollector {
                 true,
             )
             .await;
-            if selection.waits_for_non_context
-                || required_direction.is_some_and(|direction| {
-                    !selection
-                        .all_ship_items()
-                        .iter()
-                        .any(|(item_direction, _)| *item_direction == direction)
-                })
-            {
+            if selection.waits_for_non_context {
                 return Ok(NotificationResolution::Deferred);
             }
-            let matching_ship_items = selection.all_ship_items();
             match selection_evaluator
-                .primary_display_item_for(&matching_ship_items)
+                .primary_display_item(required_direction)
                 .await
             {
                 PrimaryDisplayItem::Resolved {
                     item,
                     strategic_priority,
-                } => (item, strategic_priority),
+                } if required_direction.is_none() || item.is_some() => (item, strategic_priority),
+                PrimaryDisplayItem::Resolved { .. } => {
+                    return Ok(NotificationResolution::Complete);
+                }
                 PrimaryDisplayItem::Deferred => return Ok(NotificationResolution::Deferred),
             }
         } else {
@@ -12655,10 +12645,7 @@ impl<'a> ContractFilterEvaluator<'a> {
                 strategic_priority: usize::MAX,
             };
         }
-        let fallback_ship_items = contract_items_with_direction(self.event)
-            .filter(|(direction, _)| {
-                required_direction.is_none_or(|required| *direction == required)
-            })
+        let fallback_ship_items = contract_presentation_items(self.event, required_direction)
             .map(|(direction, item)| (direction, item.record_id))
             .collect::<HashSet<_>>();
         self.primary_display_item_for(&fallback_ship_items).await
@@ -13321,6 +13308,25 @@ fn items_for_direction(
     }
 }
 
+fn contract_presentation_direction(kind: ContractEventKind) -> Option<ContractItemDirection> {
+    match kind {
+        ContractEventKind::SaleConfirmed => Some(ContractItemDirection::Offered),
+        ContractEventKind::PurchaseConfirmed => Some(ContractItemDirection::Requested),
+        ContractEventKind::Listed
+        | ContractEventKind::Expired
+        | ContractEventKind::ClosedOutcomeUnknown => None,
+    }
+}
+
+fn contract_presentation_items(
+    event: &ContractEvent,
+    required_direction: Option<ContractItemDirection>,
+) -> impl Iterator<Item = (ContractItemDirection, &PublicContractItem)> {
+    contract_items_with_direction(event).filter(move |(direction, _)| {
+        required_direction.is_none_or(|required| *direction == required)
+    })
+}
+
 fn contract_items_with_direction(
     event: &ContractEvent,
 ) -> impl Iterator<Item = (ContractItemDirection, &PublicContractItem)> {
@@ -13605,6 +13611,10 @@ fn historical_contract_primary_item<'a>(
     event: &'a ContractEvent,
     stored: &ContractNotificationMessage,
 ) -> Option<&'a PublicContractItem> {
+    let candidates =
+        contract_presentation_items(event, contract_presentation_direction(event.kind))
+            .map(|(_, item)| item)
+            .collect::<Vec<_>>();
     let thumbnail_type_id = stored.thumbnail_url.as_deref().and_then(|thumbnail| {
         thumbnail
             .split("/types/")
@@ -13614,25 +13624,25 @@ fn historical_contract_primary_item<'a>(
     });
     thumbnail_type_id
         .and_then(|type_id| {
-            contract_items_with_direction(event)
-                .find_map(|(_, item)| (item.type_id == type_id).then_some(item))
-        })
-        .or_else(|| match event.kind {
-            ContractEventKind::PurchaseConfirmed => event
-                .requested_items
+            candidates
                 .iter()
-                .find(|item| item.is_included)
-                .or_else(|| event.requested_items.first()),
-            ContractEventKind::Listed
-            | ContractEventKind::SaleConfirmed
-            | ContractEventKind::Expired
-            | ContractEventKind::ClosedOutcomeUnknown => event
-                .offered_items
-                .iter()
-                .find(|item| item.is_included)
-                .or_else(|| event.offered_items.first())
-                .or_else(|| event.requested_items.first()),
+                .copied()
+                .find(|item| item.type_id == type_id)
         })
+        .or_else(|| {
+            candidates.iter().copied().find(|item| {
+                event
+                    .embed_context
+                    .item_names
+                    .get(&item.type_id)
+                    .map(|name| sanitize_contract_text(name))
+                    .is_some_and(|name| {
+                        stored.title == name || stored.title.starts_with(&format!("{name} "))
+                    })
+            })
+        })
+        .or_else(|| candidates.iter().copied().find(|item| item.is_included))
+        .or_else(|| candidates.first().copied())
 }
 
 enum RetainedRangeMatch {
