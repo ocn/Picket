@@ -4,7 +4,7 @@
 
 **Blocked by:** 03 — Preserve enrichment through terminal events.
 
-**Status:** claimed
+**Status:** resolved
 
 - [ ] A table-driven collector test is written red first and sends equivalent evidence through region, identity, item, and proximity-oriented Contract Subscriptions.
 - [ ] Equivalent events across feeds produce the same Issuer information, Observed Location precedence, compact `in/on/range` grammar, and presentation revision.
