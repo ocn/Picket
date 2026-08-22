@@ -2587,6 +2587,144 @@ async fn matching_region_subscription_resolves_structure_location_for_the_embed(
 
     ContractCollector::new(
         store.clone(),
+        Arc::new(SnapshottingEsi {
+            inner: FakeEsi {
+                regions: vec![region_id],
+                pages: HashMap::from([(
+                    (region_id, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+                ContractEmbedContext {
+                    observed_at: Some(Utc::now() - chrono::Duration::hours(2)),
+                    location: ContractLocationContext {
+                        location_name: Some("Old Anchorage".to_string()),
+                        location_kind: Some("Player-owned structure".to_string()),
+                        last_verified_at: Some(Utc::now() - chrono::Duration::hours(2)),
+                        solar_system_id: Some(30_002_086),
+                        solar_system_name: Some("Turnur".to_string()),
+                        region_id: Some(region_id),
+                        region_name: Some("Metropolis".to_string()),
+                        ..ContractLocationContext::default()
+                    },
+                    ..ContractEmbedContext::default()
+                },
+                CacheMetadata::cached_for_seconds(60),
+            ))]),
+            calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    )
+    .with_structure_resolver(resolver.clone())
+    .with_region_names(Arc::new(HashMap::from([(
+        region_id,
+        "Metropolis".to_string(),
+    )])))
+    .collect_cycle()
+    .await
+    .expect("collect and deliver the matching regional contract");
+
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].message.description.as_deref(),
+        Some(
+            "`<url=\"contract:0//99\">Public contract - Turnur</url>`\n**in:** [Turnur](http://evemaps.dotlan.net/system/30002086) ([Metropolis](http://evemaps.dotlan.net/region/10000042))\n**on:** [Summit's Beacon](https://zkillboard.com/location/1024000000099/)"
+        )
+    );
+    drop(sent);
+    let evidence = LocationEvidenceService::new(&store)
+        .resolve(structure_id, Utc::now())
+        .await
+        .expect("read current authenticated structure evidence")
+        .expect("retain current authenticated structure evidence");
+    assert_eq!(
+        evidence.evidence_class,
+        LocationEvidenceClass::AccessQualified
+    );
+    assert_eq!(evidence.structure_id, Some(structure_id));
+    assert_eq!(evidence.solar_system_id, 30_002_086);
+    assert_eq!(evidence.region_id, Some(region_id));
+    assert_eq!(evidence.provenance, "authenticated ESI structure response");
+    assert_eq!(evidence.actor, "character:90000001");
+    assert!(evidence.expires_at.is_some());
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn collector_renders_expired_current_structure_as_last_verified_location() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let structure_id = 1_024_000_000_100;
+    let region_id = 10_000_042;
+    let mut contract = item_exchange_contract(100);
+    contract.start_location_id = structure_id;
+    contract.end_location_id = Some(structure_id);
+    LocationEvidenceService::new(&store)
+        .record_access_qualified(
+            structure_id,
+            30_002_086,
+            Some(region_id),
+            "character:90000001",
+            now - chrono::Duration::hours(2),
+            now - chrono::Duration::hours(1),
+            now,
+        )
+        .await
+        .expect("retain the previously current authenticated structure");
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![region_id],
+            pages: HashMap::from([(
+                (region_id, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent regional baseline");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "last-verified-structure".to_string(),
+            description: "preserve expired structure precision".to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::Condition(ContractFilterCondition::Regions(vec![
+                    region_id,
+                ])),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist the regional subscription");
+    store
+        .initialize_structure_resolver_runtime(&resolver_test_config().runtime_status(), now)
+        .await
+        .expect("initialize the authenticated resolver runtime");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
         Arc::new(PositionEsi {
             inner: FakeEsi {
                 regions: vec![region_id],
@@ -2608,21 +2746,31 @@ async fn matching_region_subscription_resolves_structure_location_for_the_embed(
         Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
         delivery.clone(),
     )
-    .with_structure_resolver(resolver.clone())
+    .with_structure_resolver(Arc::new(FailingStructureResolver::access_denied()))
+    .with_region_names(Arc::new(HashMap::from([(
+        region_id,
+        "Metropolis".to_string(),
+    )])))
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
     .collect_cycle()
     .await
-    .expect("collect and deliver the matching regional contract");
+    .expect("a denied revalidation only reduces player-structure precision");
 
-    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
     let sent = delivery.sent.lock().unwrap();
     assert_eq!(sent.len(), 1);
-    assert!(sent[0]
+    let description = sent[0]
         .message
         .description
         .as_deref()
-        .is_some_and(|description| {
-            description.contains("Turnur") && description.contains("Summit's Beacon")
-        }));
+        .expect("render a compact listing description");
+    assert!(description.contains("**in:** [Turnur]"));
+    assert!(description.contains("([Metropolis]"));
+    assert!(description.contains("**on:** Player-owned structure"));
+    assert!(description.contains(&format!(
+        "**location verified:** {}",
+        (now - chrono::Duration::hours(2)).format("%Y-%m-%d")
+    )));
+    assert!(!description.contains("Summit's Beacon"));
     drop(sent);
 
     database.destroy().await;
@@ -3414,6 +3562,7 @@ async fn stale_structure_success_cannot_create_evidence_or_mutate_a_new_generati
                 response_metadata: CacheMetadata::cached_for_seconds(0),
                 representation_cacheable: true,
             },
+            None,
             "credential-v1",
             first_generation,
             "character:90000001",
@@ -3509,6 +3658,7 @@ async fn runtime_rotation_fences_all_inflight_structure_completion_effects() {
                 response_metadata: CacheMetadata::cached_for_seconds(0),
                 representation_cacheable: true,
             },
+            None,
             "credential-v1",
             generation,
             "character:90000001",
@@ -3630,6 +3780,7 @@ async fn resolver_success_locks_location_before_state_and_serializes_public_evid
         resolver_store
             .record_structure_resolution_success_with_evidence(
                 &resolved,
+                None,
                 "1",
                 generation,
                 "character:90000001",
@@ -19202,6 +19353,7 @@ async fn contract_delivery_rerender_reconstructs_and_persists_legacy_matched_ran
             location: ContractLocationContext {
                 location_name: Some("Jita IV - Moon 4".to_string()),
                 location_kind: Some("station".to_string()),
+                last_verified_at: None,
                 solar_system_id: Some(30_000_142),
                 solar_system_name: Some("Jita".to_string()),
                 solar_system_position: Some(position_at_light_years(0.0)),
@@ -19366,6 +19518,7 @@ async fn contract_delivery_rerender_does_not_reconstruct_a_range_from_a_failed_n
             location: ContractLocationContext {
                 location_name: Some("Jita IV - Moon 4".to_string()),
                 location_kind: Some("station".to_string()),
+                last_verified_at: None,
                 solar_system_id: Some(30_000_142),
                 solar_system_name: Some("Jita".to_string()),
                 solar_system_position: Some(position_at_light_years(0.0)),
