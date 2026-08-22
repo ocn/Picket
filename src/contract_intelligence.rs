@@ -10119,14 +10119,17 @@ impl ContractCollector {
         self.reconcile_proximity_evidence(&ship_groups).await?;
         let deferred_matches = self.store.deferred_contract_matches().await?;
         for deferred in deferred_matches {
+            let mut embed_enrichment_deadline =
+                (!matches!(deferred.event.kind, ContractEventKind::Listed))
+                    .then(|| self.esi.observed_embed_enrichment_deadline());
             let event = self
-                .event_with_observed_context(
+                .event_with_observed_context_before_enrichment_deadline(
                     &deferred.event,
                     std::slice::from_ref(&deferred.subscription),
                     &ship_groups,
+                    embed_enrichment_deadline,
                 )
                 .await?;
-            let mut embed_enrichment_deadline = None;
             match self
                 .notify_subscription(
                     &deferred.subscription,
@@ -10204,14 +10207,17 @@ impl ContractCollector {
                             .closed_outcome_unknown = ContractEventAction::Post
                     }
                 }
+                let mut embed_enrichment_deadline =
+                    (!matches!(deferred.event.kind, ContractEventKind::Listed))
+                        .then(|| self.esi.observed_embed_enrichment_deadline());
                 let event = self
-                    .event_with_observed_context(
+                    .event_with_observed_context_before_enrichment_deadline(
                         &deferred.event,
                         std::slice::from_ref(&retained_context_subscription),
                         ship_groups,
+                        embed_enrichment_deadline,
                     )
                     .await?;
-                let mut embed_enrichment_deadline = None;
                 match self
                     .notify_subscription(
                         &deferred.subscription,
@@ -10280,7 +10286,11 @@ impl ContractCollector {
         for event in events {
             let mut embed_enrichment_deadline = attempted_embed_enrichment_deadlines
                 .get(&event.contract.contract_id)
-                .copied();
+                .copied()
+                .or_else(|| {
+                    (!matches!(event.kind, ContractEventKind::Listed))
+                        .then(|| self.esi.observed_embed_enrichment_deadline())
+                });
             let event = self
                 .event_with_observed_context_before_enrichment_deadline(
                     event,
@@ -10329,7 +10339,7 @@ impl ContractCollector {
                 .await;
         };
         if tokio::time::Instant::now() >= deadline {
-            return Ok(event.clone());
+            return self.event_with_persisted_observation_context(event).await;
         }
         match tokio::time::timeout_at(
             deadline,
@@ -10338,7 +10348,7 @@ impl ContractCollector {
         .await
         {
             Ok(result) => result,
-            Err(_) => Ok(event.clone()),
+            Err(_) => self.event_with_persisted_observation_context(event).await,
         }
     }
 
@@ -10434,6 +10444,18 @@ impl ContractCollector {
         event.context.normalize_resolutions();
 
         if !matches!(event.kind, ContractEventKind::Listed) {
+            let missing_current_structure_evidence = (requirements.solar_system
+                || requirements.security_status
+                || !requirements.ly_ranges.is_empty())
+                && u32::try_from(event.contract.start_location_id).is_err()
+                && LocationEvidenceService::new(&self.store)
+                    .resolve(event.contract.start_location_id, evidence_now)
+                    .await?
+                    .is_none();
+            if missing_current_structure_evidence {
+                self.resolve_structure_location_evidence(&mut event, evidence_now)
+                    .await?;
+            }
             if requirements.solar_system
                 || requirements.security_status
                 || !requirements.ly_ranges.is_empty()
@@ -11787,6 +11809,24 @@ impl ContractCollector {
                 .location_name
                 .as_deref()
                 .is_none_or(|name| name.trim().is_empty());
+        let location_is_solar_system = u32::try_from(event.contract.start_location_id)
+            .ok()
+            .is_some_and(|location_id| (30_000_000..33_000_000).contains(&location_id));
+        let incomplete_terminal_location = event.kind != ContractEventKind::Listed
+            && (enriched.embed_context.location.solar_system_id.is_none()
+                || enriched
+                    .embed_context
+                    .location
+                    .solar_system_name
+                    .as_deref()
+                    .is_none_or(|name| name.trim().is_empty())
+                || (!location_is_solar_system
+                    && enriched
+                        .embed_context
+                        .location
+                        .location_name
+                        .as_deref()
+                        .is_none_or(|name| name.trim().is_empty())));
         let required_region_missing = self.esi.supports_region_name_lookup()
             && enriched
                 .embed_context
@@ -11797,6 +11837,7 @@ impl ContractCollector {
         let needs_live_enrichment = (snapshot.is_none()
             && (event.kind == ContractEventKind::Listed || primary_name_missing))
             || incomplete_station_listing
+            || incomplete_terminal_location
             || required_region_missing;
         if needs_live_enrichment
             && self

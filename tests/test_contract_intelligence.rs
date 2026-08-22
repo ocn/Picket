@@ -9790,6 +9790,11 @@ struct ResolutionEsi {
     probe_calls: StdMutex<Vec<(i64, Option<String>)>>,
 }
 
+struct ResolutionWithTerminalContextEsi {
+    inner: ResolutionEsi,
+    context: ContractEmbedContext,
+}
+
 #[async_trait]
 impl PublicContractEsi for ResolutionEsi {
     async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
@@ -9825,6 +9830,53 @@ impl PublicContractEsi for ResolutionEsi {
             .unwrap()
             .push((contract_id, etag.map(str::to_owned)));
         self.probes.lock().unwrap().remove(0)
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for ResolutionWithTerminalContextEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+
+    async fn public_contract_items_probe(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<ContractItemProbe, EsiError> {
+        self.inner
+            .public_contract_items_probe(contract_id, etag)
+            .await
+    }
+
+    async fn observed_contract_embed_context(
+        &self,
+        _contract: &PublicContract,
+        _items: &[PublicContractItem],
+    ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
+        Ok(EsiResponse::fresh(
+            self.context.clone(),
+            CacheMetadata::cached_for_seconds(60),
+        ))
     }
 }
 
@@ -17294,6 +17346,562 @@ async fn terminal_only_subscription_uses_the_persisted_observation_time_context(
         .fields
         .iter()
         .all(|field| !matches!(field.name.as_str(), "Buyer" | "Counterparty")));
+    drop(sent);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_events_preserve_observation_enrichment_after_disappearance_and_restart() {
+    for (label, expected_kind) in [
+        ("sale", ContractEventKind::SaleConfirmed),
+        ("purchase", ContractEventKind::PurchaseConfirmed),
+        ("expired", ContractEventKind::Expired),
+        ("closed", ContractEventKind::ClosedOutcomeUnknown),
+    ] {
+        let database = TemporaryDatabase::new().await;
+        let store = database.store().await;
+        let mut contract = item_exchange_contract(44);
+        contract.date_expired = Utc::now() + chrono::Duration::hours(1);
+        let (items, probe, direction) = match expected_kind {
+            ContractEventKind::SaleConfirmed => (
+                vec![offered_ship(1)],
+                ContractItemProbe::AcceptedByPlayer(expiring_cache()),
+                ContractItemDirection::Offered,
+            ),
+            ContractEventKind::PurchaseConfirmed => {
+                contract.price = 0.0;
+                contract.reward = 1_000_000_000.0;
+                let mut requested = offered_ship(1);
+                requested.is_included = false;
+                (
+                    vec![requested],
+                    ContractItemProbe::AcceptedByPlayer(expiring_cache()),
+                    ContractItemDirection::Requested,
+                )
+            }
+            ContractEventKind::Expired => {
+                contract.date_expired = Utc::now() - chrono::Duration::hours(1);
+                (
+                    vec![offered_ship(1)],
+                    ContractItemProbe::NotFound(expiring_cache()),
+                    ContractItemDirection::Offered,
+                )
+            }
+            ContractEventKind::ClosedOutcomeUnknown => (
+                vec![offered_ship(1)],
+                ContractItemProbe::NotFound(expiring_cache()),
+                ContractItemDirection::Offered,
+            ),
+            ContractEventKind::Listed => unreachable!("terminal case only"),
+        };
+        ContractCollector::new(
+            store.clone(),
+            Arc::new(SnapshottingEsi {
+                inner: FakeEsi {
+                    regions: vec![10_000_002],
+                    pages: HashMap::from([(
+                        (10_000_002, 1),
+                        Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                    )]),
+                    items: HashMap::from([(44, Ok(EsiResponse::fresh(items, expiring_cache())))]),
+                },
+                contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+                    ContractEmbedContext {
+                        location: killbot_rust::contract_intelligence::ContractLocationContext {
+                            region_id: Some(10_000_002),
+                            region_name: Some("The Forge".to_string()),
+                            ..Default::default()
+                        },
+                        issuer_character_name: Some("Observed Issuer".to_string()),
+                        issuer_corporation_name: Some("Observed Corporation".to_string()),
+                        issuer_alliance_id: Some(99_000_111),
+                        issuer_alliance_name: Some("Observed Alliance".to_string()),
+                        issuer_identity_provenance: Some(IssuerIdentityProvenance::PublicEsi),
+                        ..ContractEmbedContext::default()
+                    },
+                    CacheMetadata::cached_for_seconds(60),
+                ))]),
+                calls: StdMutex::new(Vec::new()),
+            }),
+        )
+        .collect_cycle()
+        .await
+        .expect("persist the public observation before disappearance");
+
+        let subscription = match expected_kind {
+            ContractEventKind::SaleConfirmed | ContractEventKind::PurchaseConfirmed => {
+                confirmed_ship_subscription(
+                    &format!("terminal-{label}"),
+                    expected_kind,
+                    direction,
+                    ContractEventAction::Post,
+                )
+            }
+            ContractEventKind::Expired | ContractEventKind::ClosedOutcomeUnknown => {
+                terminal_ship_subscription(
+                    &format!("terminal-{label}"),
+                    expected_kind,
+                    ContractEventAction::Post,
+                )
+            }
+            ContractEventKind::Listed => unreachable!("terminal case only"),
+        };
+        store
+            .upsert_contract_subscription(&subscription)
+            .await
+            .expect("persist the terminal subscription");
+        let delivery = Arc::new(RecordingDelivery {
+            store: store.clone(),
+            sent: StdMutex::new(Vec::new()),
+        });
+        ContractCollector::new(
+            store.clone(),
+            Arc::new(ResolutionWithTerminalContextEsi {
+                inner: ResolutionEsi {
+                    inner: FakeEsi {
+                        regions: vec![10_000_002],
+                        pages: HashMap::from([(
+                            (10_000_002, 1),
+                            Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                        )]),
+                        items: HashMap::new(),
+                    },
+                    probes: StdMutex::new(vec![Ok(probe)]),
+                    probe_calls: StdMutex::new(Vec::new()),
+                },
+                context: ContractEmbedContext {
+                    location: killbot_rust::contract_intelligence::ContractLocationContext {
+                        location_name: Some("Current Private Keepstar".to_string()),
+                        location_kind: Some("Structure".to_string()),
+                        solar_system_id: Some(30_000_044),
+                        solar_system_name: Some("Uitra".to_string()),
+                        region_id: Some(10_000_002),
+                        region_name: Some("The Forge".to_string()),
+                        ..Default::default()
+                    },
+                    issuer_character_name: Some("Current Issuer Must Not Replace".to_string()),
+                    issuer_corporation_name: Some("Observed Corporation".to_string()),
+                    issuer_alliance_id: Some(99_000_111),
+                    issuer_alliance_name: Some("Observed Alliance".to_string()),
+                    item_names: BTreeMap::from([(587, "Rifter".to_string())]),
+                    ..ContractEmbedContext::default()
+                },
+            }),
+        )
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+            delivery.clone(),
+        )
+        .collect_cycle()
+        .await
+        .expect("classify and deliver the terminal event after restart");
+
+        let sent = delivery.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "{label} produces one terminal delivery");
+        assert_eq!(sent[0].event_kind, expected_kind);
+        let embed = contract_notification_embed(&sent[0].message).0;
+        assert_eq!(
+            embed["author"]["name"].as_str(),
+            Some("Public Contract\nissuer: [Observed Alliance] Observed Issuer"),
+            "{label} retains the observed Issuer and affiliation"
+        );
+        let description = sent[0]
+            .message
+            .description
+            .as_deref()
+            .expect("terminal embeds retain a supported location");
+        for expected in ["Uitra", "The Forge", "Current Private Keepstar"] {
+            assert!(description.contains(expected), "{label}: {description}");
+        }
+        let serialized = serde_json::to_string(&embed).expect("serialize terminal embed");
+        for raw_id in ["90000001", "98000001", "99000111"] {
+            assert!(!serialized.contains(raw_id), "{label}: {serialized}");
+        }
+        assert!(
+            !description.contains("Region 10000002"),
+            "{label}: {description}"
+        );
+        assert!(
+            !serialized.contains("Current Issuer Must Not Replace"),
+            "{label}: {serialized}"
+        );
+        assert!(!serialized.contains("Acceptor"), "{label}: {serialized}");
+        assert!(!serialized.contains("Buyer"), "{label}: {serialized}");
+        drop(sent);
+
+        database.destroy().await;
+    }
+}
+
+#[tokio::test]
+async fn expired_terminal_structure_evidence_is_revalidated_before_delivery() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let region_id = 10_000_042;
+    let structure_id = 1_024_000_000_201;
+    let mut contract = item_exchange_contract(44);
+    contract.start_location_id = structure_id;
+    contract.end_location_id = Some(structure_id);
+    contract.date_expired = now + chrono::Duration::hours(1);
+    LocationEvidenceService::new(&store)
+        .record_access_qualified(
+            structure_id,
+            30_002_086,
+            Some(region_id),
+            "character:90000001",
+            now - chrono::Duration::hours(2),
+            now - chrono::Duration::hours(1),
+            now,
+        )
+        .await
+        .expect("retain expired observation-time structure evidence");
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(SnapshottingEsi {
+            inner: FakeEsi {
+                regions: vec![region_id],
+                pages: HashMap::from([(
+                    (region_id, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+                ContractEmbedContext {
+                    location: ContractLocationContext {
+                        location_name: Some("Observation Keepstar".to_string()),
+                        location_kind: Some("Player-owned structure".to_string()),
+                        solar_system_id: Some(30_002_086),
+                        solar_system_name: Some("Turnur".to_string()),
+                        region_id: Some(region_id),
+                        region_name: Some("Metropolis".to_string()),
+                        ..ContractLocationContext::default()
+                    },
+                    issuer_character_name: Some("Observed Issuer".to_string()),
+                    ..ContractEmbedContext::default()
+                },
+                CacheMetadata::cached_for_seconds(60),
+            ))]),
+            calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+    .collect_cycle()
+    .await
+    .expect("retain the public observation before terminal revalidation");
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "terminal-structure-revalidation",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the terminal subscription");
+    initialize_resolver_runtime(&store, "1", now).await;
+    let resolver = Arc::new(SuccessfulStructureResolver {
+        calls: AtomicU64::new(0),
+        solar_system_id: 30_002_086,
+    });
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(ResolutionEsi {
+            inner: FakeEsi {
+                regions: vec![region_id],
+                pages: HashMap::from([(
+                    (region_id, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                )]),
+                items: HashMap::new(),
+            },
+            probes: StdMutex::new(vec![Ok(ContractItemProbe::AcceptedByPlayer(
+                expiring_cache(),
+            ))]),
+            probe_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    )
+    .with_structure_resolver(resolver.clone())
+    .with_region_names(Arc::new(HashMap::from([(
+        region_id,
+        "Metropolis".to_string(),
+    )])))
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+    .collect_cycle()
+    .await
+    .expect("revalidate expired terminal structure evidence before delivery");
+
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let description = sent[0]
+        .message
+        .description
+        .as_deref()
+        .expect("render the revalidated terminal location");
+    assert!(description.contains("Summit's Beacon"), "{description}");
+    assert!(description.contains("**in:** [Turnur]"), "{description}");
+    assert!(description.contains("([Metropolis]"), "{description}");
+    assert!(!description.contains("location verified:"), "{description}");
+    drop(sent);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn missing_terminal_structure_evidence_is_resolved_before_delivery() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let region_id = 10_000_042;
+    let structure_id = 1_024_000_000_202;
+    let mut contract = item_exchange_contract(45);
+    contract.start_location_id = structure_id;
+    contract.end_location_id = Some(structure_id);
+    contract.date_expired = now + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(SnapshottingEsi {
+            inner: FakeEsi {
+                regions: vec![region_id],
+                pages: HashMap::from([(
+                    (region_id, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+                ContractEmbedContext {
+                    location: ContractLocationContext {
+                        region_id: Some(region_id),
+                        region_name: Some("Metropolis".to_string()),
+                        ..ContractLocationContext::default()
+                    },
+                    issuer_character_name: Some("Observed Issuer".to_string()),
+                    ..ContractEmbedContext::default()
+                },
+                CacheMetadata::cached_for_seconds(60),
+            ))]),
+            calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+    .collect_cycle()
+    .await
+    .expect("retain the regional observation before terminal resolution");
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "terminal-structure-resolution",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the terminal subscription");
+    initialize_resolver_runtime(&store, "1", now).await;
+    let resolver = Arc::new(SuccessfulStructureResolver {
+        calls: AtomicU64::new(0),
+        solar_system_id: 30_002_086,
+    });
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(ResolutionWithTerminalContextEsi {
+            inner: ResolutionEsi {
+                inner: FakeEsi {
+                    regions: vec![region_id],
+                    pages: HashMap::from([(
+                        (region_id, 1),
+                        Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                    )]),
+                    items: HashMap::new(),
+                },
+                probes: StdMutex::new(vec![Ok(ContractItemProbe::AcceptedByPlayer(
+                    expiring_cache(),
+                ))]),
+                probe_calls: StdMutex::new(Vec::new()),
+            },
+            context: ContractEmbedContext {
+                location: ContractLocationContext {
+                    solar_system_id: Some(30_002_086),
+                    solar_system_name: Some("Turnur".to_string()),
+                    region_id: Some(region_id),
+                    region_name: Some("Metropolis".to_string()),
+                    ..ContractLocationContext::default()
+                },
+                ..ContractEmbedContext::default()
+            },
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    )
+    .with_structure_resolver(resolver.clone())
+    .with_region_names(Arc::new(HashMap::from([(
+        region_id,
+        "Metropolis".to_string(),
+    )])))
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+    .collect_cycle()
+    .await
+    .expect("resolve missing terminal structure evidence before delivery");
+
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let description = sent[0]
+        .message
+        .description
+        .as_deref()
+        .expect("render the resolved terminal location");
+    assert!(description.contains("Summit's Beacon"), "{description}");
+    assert!(description.contains("**in:** [Turnur]"), "{description}");
+    assert!(description.contains("([Metropolis]"), "{description}");
+    drop(sent);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn failed_terminal_structure_revalidation_preserves_observation_location() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let region_id = 10_000_042;
+    let structure_id = 1_024_000_000_203;
+    let mut contract = item_exchange_contract(46);
+    contract.start_location_id = structure_id;
+    contract.end_location_id = Some(structure_id);
+    contract.date_expired = now + chrono::Duration::hours(1);
+    LocationEvidenceService::new(&store)
+        .record_access_qualified(
+            structure_id,
+            30_002_086,
+            Some(region_id),
+            "character:90000001",
+            now - chrono::Duration::hours(2),
+            now - chrono::Duration::hours(1),
+            now,
+        )
+        .await
+        .expect("retain expired structure evidence");
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(SnapshottingEsi {
+            inner: FakeEsi {
+                regions: vec![region_id],
+                pages: HashMap::from([(
+                    (region_id, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+                ContractEmbedContext {
+                    location: ContractLocationContext {
+                        location_name: Some("Observation Keepstar".to_string()),
+                        location_kind: Some("Player-owned structure".to_string()),
+                        solar_system_id: Some(30_002_086),
+                        solar_system_name: Some("Turnur".to_string()),
+                        region_id: Some(region_id),
+                        region_name: Some("Metropolis".to_string()),
+                        ..ContractLocationContext::default()
+                    },
+                    issuer_character_name: Some("Observed Issuer".to_string()),
+                    ..ContractEmbedContext::default()
+                },
+                CacheMetadata::cached_for_seconds(60),
+            ))]),
+            calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+    .collect_cycle()
+    .await
+    .expect("retain the strongest observation-time structure location");
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "terminal-structure-failure",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the terminal subscription");
+    initialize_resolver_runtime(&store, "test-credential-v1", now).await;
+    let resolver = Arc::new(FailingStructureResolver::access_denied());
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(ResolutionEsi {
+            inner: FakeEsi {
+                regions: vec![region_id],
+                pages: HashMap::from([(
+                    (region_id, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                )]),
+                items: HashMap::new(),
+            },
+            probes: StdMutex::new(vec![Ok(ContractItemProbe::AcceptedByPlayer(
+                expiring_cache(),
+            ))]),
+            probe_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    )
+    .with_structure_resolver(resolver.clone())
+    .with_region_names(Arc::new(HashMap::from([(
+        region_id,
+        "Metropolis".to_string(),
+    )])))
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+    .collect_cycle()
+    .await
+    .expect("a failed terminal revalidation remains an ordinary delivery");
+
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let description = sent[0]
+        .message
+        .description
+        .as_deref()
+        .expect("retain the observation-time location after revalidation failure");
+    assert!(
+        description.contains("Observation Keepstar"),
+        "{description}"
+    );
+    assert!(description.contains("**in:** [Turnur]"), "{description}");
+    assert!(description.contains("([Metropolis]"), "{description}");
+    assert!(!description.contains("location verified:"), "{description}");
     drop(sent);
 
     database.destroy().await;
