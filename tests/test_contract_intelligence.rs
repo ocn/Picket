@@ -9795,6 +9795,12 @@ struct ResolutionWithTerminalContextEsi {
     context: ContractEmbedContext,
 }
 
+struct ShortDeadlineResolutionEsi {
+    inner: ResolutionEsi,
+    budget: Duration,
+    context_calls: AtomicU64,
+}
+
 #[async_trait]
 impl PublicContractEsi for ResolutionEsi {
     async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
@@ -9877,6 +9883,57 @@ impl PublicContractEsi for ResolutionWithTerminalContextEsi {
             self.context.clone(),
             CacheMetadata::cached_for_seconds(60),
         ))
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for ShortDeadlineResolutionEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+
+    async fn public_contract_items_probe(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<ContractItemProbe, EsiError> {
+        self.inner
+            .public_contract_items_probe(contract_id, etag)
+            .await
+    }
+
+    fn observed_embed_enrichment_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.budget
+    }
+
+    async fn observed_contract_embed_context_limited_until(
+        &self,
+        _contract: &PublicContract,
+        _items: &[PublicContractItem],
+        _limiter: &dyn ContractContextLimiter,
+        _deadline: tokio::time::Instant,
+    ) -> Result<EsiResponse<ContractEmbedContext>, EsiError> {
+        self.context_calls.fetch_add(1, Ordering::Relaxed);
+        Err(EsiError::retryable("terminal deadline was renewed", None))
     }
 }
 
@@ -12245,18 +12302,10 @@ async fn retained_evidence_reconciles_each_terminal_lifecycle_without_recursive_
     assert!(reconciled.sent.lock().unwrap().is_empty());
     let intermediate_edits = reconciled.edits.lock().unwrap();
     let intermediate_edit_count = intermediate_edits.len();
-    assert!(
-        (1..=4).contains(&intermediate_edit_count),
-        "only stale retained terminal presentations need an intermediate U-preserving repair"
+    assert_eq!(
+        intermediate_edit_count, 0,
+        "terminal enrichment never edits an accepted U-preserving original"
     );
-    assert!(intermediate_edits.iter().all(|edit| {
-        edit.message.presentation_revision == CONTRACT_NOTIFICATION_PRESENTATION_REVISION
-            && edit
-                .message
-                .fields
-                .iter()
-                .any(|field| field.name == "Alert" && field.value == "Proximity-Unverified")
-    }));
     drop(intermediate_edits);
     let stale_context = ContractEmbedContext {
         location: ContractLocationContext {
@@ -12323,8 +12372,8 @@ async fn retained_evidence_reconciles_each_terminal_lifecycle_without_recursive_
     let reconciled_edits = reconciled.edits.lock().unwrap();
     assert_eq!(
         reconciled_edits.len(),
-        intermediate_edit_count + 4,
-        "each terminal receives one authoritative edit after any needed presentation repair"
+        4,
+        "each terminal receives one authoritative proximity correction"
     );
     assert_eq!(
         reconciled.sent.lock().unwrap().len(),
@@ -17532,6 +17581,443 @@ async fn terminal_events_preserve_observation_enrichment_after_disappearance_and
 
         database.destroy().await;
     }
+}
+
+#[tokio::test]
+async fn terminal_live_context_never_backfills_post_disappearance_identity() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let region_id = 10_000_002;
+    let observed_at = Utc
+        .with_ymd_and_hms(2026, 8, 20, 12, 0, 0)
+        .single()
+        .expect("fixed observation time");
+    let mut contract = item_exchange_contract(44);
+    contract.date_expired = Utc::now() + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(SnapshottingEsi {
+            inner: FakeEsi {
+                regions: vec![region_id],
+                pages: HashMap::from([(
+                    (region_id, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+                ContractEmbedContext {
+                    observed_at: Some(observed_at),
+                    location: ContractLocationContext {
+                        region_id: Some(region_id),
+                        region_name: Some("The Forge".to_string()),
+                        ..ContractLocationContext::default()
+                    },
+                    issuer_character_name: Some("Observed Issuer".to_string()),
+                    issuer_identity_provenance: Some(IssuerIdentityProvenance::PublicEsi),
+                    ..ContractEmbedContext::default()
+                },
+                CacheMetadata::cached_for_seconds(60),
+            ))]),
+            calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("persist the observed issuer before disappearance");
+    let subscription = confirmed_ship_subscription(
+        "terminal-no-post-disappearance-identity",
+        ContractEventKind::SaleConfirmed,
+        ContractItemDirection::Offered,
+        ContractEventAction::Post,
+    );
+    store
+        .upsert_contract_subscription(&subscription)
+        .await
+        .expect("persist terminal subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(ResolutionWithTerminalContextEsi {
+            inner: ResolutionEsi {
+                inner: FakeEsi {
+                    regions: vec![region_id],
+                    pages: HashMap::from([(
+                        (region_id, 1),
+                        Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                    )]),
+                    items: HashMap::new(),
+                },
+                probes: StdMutex::new(vec![Ok(ContractItemProbe::AcceptedByPlayer(
+                    expiring_cache(),
+                ))]),
+                probe_calls: StdMutex::new(Vec::new()),
+            },
+            context: ContractEmbedContext {
+                observed_at: Some(Utc::now()),
+                location: ContractLocationContext {
+                    location_name: Some("Current Private Keepstar".to_string()),
+                    location_kind: Some("Structure".to_string()),
+                    solar_system_id: Some(30_000_044),
+                    solar_system_name: Some("Uitra".to_string()),
+                    region_id: Some(region_id),
+                    region_name: Some("The Forge".to_string()),
+                    ..ContractLocationContext::default()
+                },
+                issuer_character_name: Some("Current Issuer".to_string()),
+                issuer_corporation_name: Some("Current Corporation".to_string()),
+                issuer_alliance_id: Some(99_000_222),
+                issuer_alliance_name: Some("Current Alliance".to_string()),
+                issuer_identity_provenance: Some(IssuerIdentityProvenance::PublicEsi),
+                item_names: BTreeMap::from([(587, "Rifter".to_string())]),
+                ..ContractEmbedContext::default()
+            },
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("deliver a terminal event from retained observation evidence");
+
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let embed = contract_notification_embed(&sent[0].message).0;
+    assert_eq!(
+        embed["author"]["name"].as_str(),
+        Some("Public Contract\nissuer: Observed Issuer")
+    );
+    let description = sent[0]
+        .message
+        .description
+        .as_deref()
+        .expect("terminal delivery retains useful current location");
+    assert!(
+        description.contains("Current Private Keepstar"),
+        "{description}"
+    );
+    drop(sent);
+    let persisted = store
+        .observed_embed_context(region_id, contract.contract_id)
+        .await
+        .expect("read persisted observation")
+        .expect("observation remains retained");
+    assert_eq!(persisted.observed_at, Some(observed_at));
+    assert_eq!(
+        persisted.issuer_character_name.as_deref(),
+        Some("Observed Issuer")
+    );
+    assert_eq!(persisted.issuer_corporation_name, None);
+    assert_eq!(persisted.issuer_alliance_id, None);
+    assert_eq!(persisted.issuer_alliance_name, None);
+    assert_eq!(
+        persisted.issuer_identity_provenance,
+        Some(IssuerIdentityProvenance::PublicEsi)
+    );
+    assert_eq!(
+        persisted.location.location_name.as_deref(),
+        Some("Current Private Keepstar")
+    );
+    assert_eq!(
+        persisted.item_names.get(&587).map(String::as_str),
+        Some("Rifter")
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn sent_terminal_delivery_is_not_repaired_after_restart_enrichment() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let region_id = 10_000_002;
+    let mut contract = item_exchange_contract(44);
+    contract.date_expired = Utc::now() + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(SnapshottingEsi {
+            inner: FakeEsi {
+                regions: vec![region_id],
+                pages: HashMap::from([(
+                    (region_id, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+                ContractEmbedContext {
+                    location: ContractLocationContext {
+                        region_id: Some(region_id),
+                        region_name: Some("The Forge".to_string()),
+                        ..ContractLocationContext::default()
+                    },
+                    issuer_character_name: Some("Observed Issuer".to_string()),
+                    ..ContractEmbedContext::default()
+                },
+                CacheMetadata::cached_for_seconds(60),
+            ))]),
+            calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("persist the terminal observation before disappearance");
+    let subscription = confirmed_ship_subscription(
+        "sent-terminal-does-not-repair",
+        ContractEventKind::SaleConfirmed,
+        ContractItemDirection::Offered,
+        ContractEventAction::Post,
+    );
+    store
+        .upsert_contract_subscription(&subscription)
+        .await
+        .expect("persist the terminal subscription");
+    let initial_delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(ResolutionWithTerminalContextEsi {
+            inner: ResolutionEsi {
+                inner: FakeEsi {
+                    regions: vec![region_id],
+                    pages: HashMap::from([(
+                        (region_id, 1),
+                        Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                    )]),
+                    items: HashMap::new(),
+                },
+                probes: StdMutex::new(vec![Ok(ContractItemProbe::AcceptedByPlayer(
+                    expiring_cache(),
+                ))]),
+                probe_calls: StdMutex::new(Vec::new()),
+            },
+            context: ContractEmbedContext {
+                location: ContractLocationContext {
+                    region_id: Some(region_id),
+                    region_name: Some("The Forge".to_string()),
+                    ..ContractLocationContext::default()
+                },
+                ..ContractEmbedContext::default()
+            },
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        initial_delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("send the original terminal alert");
+    let delivery_id = initial_delivery.sent.lock().unwrap()[0].delivery_id;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to schedule terminal reprocessing after restart");
+    sqlx::query("INSERT INTO contract_deferred_subscription_matches (guild_id, channel_id, subscription_id, contract_id, event_kind, event, proximity_unverified) SELECT guild_id, channel_id, subscription_id, contract_id, event_kind, event, FALSE FROM contract_outbound_deliveries WHERE id = $1")
+        .bind(delivery_id)
+        .execute(&pool)
+        .await
+        .expect("schedule terminal reprocessing after the sent alert");
+    pool.close().await;
+
+    let restart_delivery = Arc::new(ScriptedRepairDelivery {
+        sent: StdMutex::new(Vec::new()),
+        edits: StdMutex::new(Vec::new()),
+        edit_outcomes: StdMutex::new(vec![Err(ContractDeliveryError::transient(
+            "unexpected terminal repair",
+        ))]),
+    });
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(ResolutionWithTerminalContextEsi {
+            inner: ResolutionEsi {
+                inner: FakeEsi {
+                    regions: vec![region_id],
+                    pages: HashMap::from([(
+                        (region_id, 1),
+                        Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                    )]),
+                    items: HashMap::new(),
+                },
+                probes: StdMutex::new(Vec::new()),
+                probe_calls: StdMutex::new(Vec::new()),
+            },
+            context: ContractEmbedContext {
+                location: ContractLocationContext {
+                    location_name: Some("Current Private Keepstar".to_string()),
+                    location_kind: Some("Structure".to_string()),
+                    solar_system_id: Some(30_000_044),
+                    solar_system_name: Some("Uitra".to_string()),
+                    region_id: Some(region_id),
+                    region_name: Some("The Forge".to_string()),
+                    ..ContractLocationContext::default()
+                },
+                ..ContractEmbedContext::default()
+            },
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        restart_delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("reprocess the already-sent terminal alert after restart");
+
+    assert!(restart_delivery.sent.lock().unwrap().is_empty());
+    assert!(
+        restart_delivery.edits.lock().unwrap().is_empty(),
+        "terminal enrichment never edits an accepted alert"
+    );
+    let inspection = store
+        .inspect_contract_delivery(delivery_id)
+        .await
+        .expect("inspect original terminal delivery")
+        .expect("original terminal delivery remains retained");
+    assert_eq!(
+        inspection.repair_status,
+        killbot_rust::contract_intelligence::ContractRepairStatus::None
+    );
+    assert_eq!(inspection.desired_message, None);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_enrichment_deadline_falls_back_to_retained_observation_without_renewal() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let region_id = 10_000_042;
+    let structure_id = 1_024_000_000_203;
+    let mut contract = item_exchange_contract(46);
+    contract.start_location_id = structure_id;
+    contract.end_location_id = Some(structure_id);
+    contract.date_expired = now + chrono::Duration::hours(1);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(SnapshottingEsi {
+            inner: FakeEsi {
+                regions: vec![region_id],
+                pages: HashMap::from([(
+                    (region_id, 1),
+                    Ok(EsiResponse::fresh(vec![contract.clone()], expiring_page(1))),
+                )]),
+                items: HashMap::from([(
+                    contract.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                )]),
+            },
+            contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+                ContractEmbedContext {
+                    location: ContractLocationContext {
+                        location_name: Some("Observation Keepstar".to_string()),
+                        location_kind: Some("Player-owned structure".to_string()),
+                        solar_system_id: Some(30_002_086),
+                        solar_system_name: Some("Turnur".to_string()),
+                        region_id: Some(region_id),
+                        region_name: Some("Metropolis".to_string()),
+                        ..ContractLocationContext::default()
+                    },
+                    issuer_character_name: Some("Observed Issuer".to_string()),
+                    item_names: BTreeMap::from([(587, "Rifter".to_string())]),
+                    ..ContractEmbedContext::default()
+                },
+                CacheMetadata::cached_for_seconds(60),
+            ))]),
+            calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
+    .collect_cycle()
+    .await
+    .expect("persist the complete observation before terminal enrichment");
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "terminal-deadline-fallback",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist terminal subscription");
+    initialize_resolver_runtime(&store, "1", now).await;
+    let resolver = Arc::new(GatedStructureResolver::new(
+        StructureResolverError::transient(None),
+    ));
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let esi = Arc::new(ShortDeadlineResolutionEsi {
+        inner: ResolutionEsi {
+            inner: FakeEsi {
+                regions: vec![region_id],
+                pages: HashMap::from([(
+                    (region_id, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                )]),
+                items: HashMap::new(),
+            },
+            probes: StdMutex::new(vec![Ok(ContractItemProbe::AcceptedByPlayer(
+                expiring_cache(),
+            ))]),
+            probe_calls: StdMutex::new(Vec::new()),
+        },
+        budget: Duration::from_millis(100),
+        context_calls: AtomicU64::new(0),
+    });
+    let entered = resolver.entered.notified();
+    let collector = ContractCollector::new(store.clone(), esi.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+            delivery.clone(),
+        )
+        .with_structure_resolver(resolver.clone())
+        .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))));
+    let terminal_collection = tokio::spawn(async move { collector.collect_cycle().await });
+    tokio::time::timeout(Duration::from_secs(2), entered)
+        .await
+        .expect("terminal revalidation begins within the injected deadline");
+    tokio::time::timeout(Duration::from_secs(2), terminal_collection)
+        .await
+        .expect("terminal deadline expires without a renewed enrichment window")
+        .expect("terminal collector task completes")
+        .expect("terminal deadline falls back to retained observation");
+
+    assert_eq!(esi.context_calls.load(Ordering::Relaxed), 0);
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(
+        sent.len(),
+        1,
+        "deadline fallback still prepares one payload"
+    );
+    let description = sent[0]
+        .message
+        .description
+        .as_deref()
+        .expect("retained terminal location renders");
+    for expected in ["Observation Keepstar", "Turnur", "Metropolis"] {
+        assert!(description.contains(expected), "{description}");
+    }
+    assert!(sent[0].message.title.contains("Rifter"));
+    drop(sent);
+
+    database.destroy().await;
 }
 
 #[tokio::test]

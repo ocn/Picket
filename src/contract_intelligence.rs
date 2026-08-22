@@ -4378,6 +4378,49 @@ impl ContractEmbedContext {
             self.item_names.entry(*id).or_insert_with(|| name.clone());
         }
     }
+
+    fn merge_terminal_stable_facts_from(&mut self, source: &Self) {
+        self.location.location_name = self
+            .location
+            .location_name
+            .clone()
+            .or_else(|| source.location.location_name.clone());
+        self.location.location_kind = self
+            .location
+            .location_kind
+            .clone()
+            .or_else(|| source.location.location_kind.clone());
+        self.location.last_verified_at = self
+            .location
+            .last_verified_at
+            .or(source.location.last_verified_at);
+        self.location.solar_system_id = self
+            .location
+            .solar_system_id
+            .or(source.location.solar_system_id);
+        self.location.solar_system_name = self
+            .location
+            .solar_system_name
+            .clone()
+            .or_else(|| source.location.solar_system_name.clone());
+        self.location.solar_system_position = self
+            .location
+            .solar_system_position
+            .or(source.location.solar_system_position);
+        self.location.security_status = self
+            .location
+            .security_status
+            .or(source.location.security_status);
+        self.location.region_id = self.location.region_id.or(source.location.region_id);
+        self.location.region_name = self
+            .location
+            .region_name
+            .clone()
+            .or_else(|| source.location.region_name.clone());
+        for (id, name) in &source.item_names {
+            self.item_names.entry(*id).or_insert_with(|| name.clone());
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -11582,11 +11625,14 @@ impl ContractCollector {
             message: stored_message,
         } = preparation
         {
-            let desired_message = repaired_contract_message(&stored_message, &message, event.kind);
-            if desired_message != stored_message {
-                self.store
-                    .prepare_delivery_repair(delivery_id, desired_message)
-                    .await?;
+            if event.kind == ContractEventKind::Listed {
+                let desired_message =
+                    repaired_contract_message(&stored_message, &message, event.kind);
+                if desired_message != stored_message {
+                    self.store
+                        .prepare_delivery_repair(delivery_id, desired_message)
+                        .await?;
+                }
             }
         }
         Ok(if proximity_unverified {
@@ -11871,9 +11917,14 @@ impl ContractCollector {
                 .await?
             {
                 Some(response) => {
-                    enriched
-                        .embed_context
-                        .merge_missing_from(&response.value.unwrap_or_default());
+                    let response = response.value.unwrap_or_default();
+                    if event.kind == ContractEventKind::Listed {
+                        enriched.embed_context.merge_missing_from(&response);
+                    } else {
+                        enriched
+                            .embed_context
+                            .merge_terminal_stable_facts_from(&response);
+                    }
                     self.store
                         .save_observed_embed_context(
                             event.region_id,
