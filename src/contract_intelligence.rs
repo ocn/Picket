@@ -4482,7 +4482,7 @@ pub struct ContractEmbedField {
     pub inline: bool,
 }
 
-pub const CONTRACT_NOTIFICATION_PRESENTATION_REVISION: u32 = 4;
+pub const CONTRACT_NOTIFICATION_PRESENTATION_REVISION: u32 = 5;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContractNotificationMessage {
@@ -11523,16 +11523,14 @@ impl ContractCollector {
                 PrimaryDisplayItem::Deferred => return Ok(NotificationResolution::Deferred),
             }
         } else {
-            if required_direction
-                .is_some_and(|direction| !evaluator.has_matching_ship_item(direction))
-            {
-                return Ok(NotificationResolution::Complete);
-            }
-            match evaluator.primary_display_item().await {
+            match evaluator.primary_display_item(required_direction).await {
                 PrimaryDisplayItem::Resolved {
                     item,
                     strategic_priority,
-                } => (item, strategic_priority),
+                } if required_direction.is_none() || item.is_some() => (item, strategic_priority),
+                PrimaryDisplayItem::Resolved { .. } => {
+                    return Ok(NotificationResolution::Complete);
+                }
                 PrimaryDisplayItem::Deferred => return Ok(NotificationResolution::Deferred),
             }
         };
@@ -12636,9 +12634,34 @@ impl<'a> ContractFilterEvaluator<'a> {
         group
     }
 
-    async fn primary_display_item(&mut self) -> PrimaryDisplayItem<'a> {
-        let matching_ship_items = self.matching_ship_items.clone();
-        self.primary_display_item_for(&matching_ship_items).await
+    async fn primary_display_item(
+        &mut self,
+        required_direction: Option<ContractItemDirection>,
+    ) -> PrimaryDisplayItem<'a> {
+        let matching_ship_items = self
+            .matching_ship_items
+            .iter()
+            .copied()
+            .filter(|(direction, _)| {
+                required_direction.is_none_or(|required| *direction == required)
+            })
+            .collect::<HashSet<_>>();
+        if !matching_ship_items.is_empty() {
+            return self.primary_display_item_for(&matching_ship_items).await;
+        }
+        if !self.matching_ship_items.is_empty() {
+            return PrimaryDisplayItem::Resolved {
+                item: None,
+                strategic_priority: usize::MAX,
+            };
+        }
+        let fallback_ship_items = contract_items_with_direction(self.event)
+            .filter(|(direction, _)| {
+                required_direction.is_none_or(|required| *direction == required)
+            })
+            .map(|(direction, item)| (direction, item.record_id))
+            .collect::<HashSet<_>>();
+        self.primary_display_item_for(&fallback_ship_items).await
     }
 
     async fn primary_display_item_for(
@@ -12672,12 +12695,6 @@ impl<'a> ContractFilterEvaluator<'a> {
             item: primary.map(|(item, _)| item),
             strategic_priority: primary.map(|(_, priority)| priority).unwrap_or(usize::MAX),
         }
-    }
-
-    fn has_matching_ship_item(&self, direction: ContractItemDirection) -> bool {
-        self.matching_ship_items
-            .iter()
-            .any(|(item_direction, _)| *item_direction == direction)
     }
 }
 
@@ -14779,12 +14796,14 @@ mod embed_tests {
                     security_status: Some(0.945_913_136_005_401_6),
                     region_id: Some(10_000_002),
                     region_name: Some("The Forge".to_string()),
+                    last_verified_at: None,
                 },
                 matched_range: None,
                 issuer_character_name: Some("Issuer Name".to_string()),
                 issuer_corporation_name: Some("Issuer Corp".to_string()),
                 issuer_alliance_id: Some(99_000_001),
                 issuer_alliance_name: Some("Issuer Alliance".to_string()),
+                issuer_identity_provenance: None,
                 item_names: BTreeMap::from([
                     (19_720, "Ragnarok".to_string()),
                     (587, "Rifter".to_string()),

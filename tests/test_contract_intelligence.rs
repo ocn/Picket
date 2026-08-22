@@ -10332,6 +10332,149 @@ fn requested_ship(record_id: i64) -> PublicContractItem {
 }
 
 #[tokio::test]
+async fn contract_subscription_filters_share_listing_presentation_at_the_collector_seam() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let server = GatedObservedLocationEnrichmentHttpServer::start_ungated();
+    let esi = Arc::new(
+        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+            .expect("construct controlled public ESI client"),
+    );
+
+    ContractCollector::new(store.clone(), esi.clone())
+        .collect_cycle()
+        .await
+        .expect("establish the silent public-contract baseline");
+
+    let subscriptions = [
+        (
+            "region",
+            77,
+            ContractFilterNode::Condition(ContractFilterCondition::Regions(vec![10_000_002])),
+        ),
+        (
+            "issuer",
+            78,
+            ContractFilterNode::Condition(ContractFilterCondition::IssuerCharacters(vec![
+                90_000_001,
+            ])),
+        ),
+        (
+            "item",
+            79,
+            ContractFilterNode::Condition(ContractFilterCondition::ItemTypes {
+                direction: ContractItemDirection::Offered,
+                ids: vec![587],
+            }),
+        ),
+        (
+            "proximity",
+            80,
+            ContractFilterNode::Condition(ContractFilterCondition::LyRangeFrom(vec![
+                config::SystemRange {
+                    system_id: 30_000_142,
+                    range: 1.0,
+                },
+            ])),
+        ),
+    ];
+    for (id, channel_id, root) in subscriptions {
+        store
+            .upsert_contract_subscription(&ContractSubscription {
+                guild_id: 42,
+                channel_id,
+                id: id.to_string(),
+                description: format!("{id} contract subscription"),
+                filter: ContractFilter { root },
+                event_actions: ContractEventActions {
+                    listed: ContractEventAction::Post,
+                    sale_confirmed: ContractEventAction::PostAndPing,
+                    ..ContractEventActions::default()
+                },
+            })
+            .await
+            .expect("persist an equivalent contract subscription");
+    }
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+
+    ContractCollector::new(store, esi)
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+            delivery.clone(),
+        )
+        .collect_cycle()
+        .await
+        .expect("collect the equivalent listed contract subscriptions");
+
+    let expected_description = "`<url=\"contract:0//45\">Rifter - Jita</url>`\n**in:** [Jita](http://evemaps.dotlan.net/system/30000142) ([The Forge](http://evemaps.dotlan.net/region/10000002))\n**on:** [Jita IV Moon 4 Caldari Navy Assembly Plant](https://zkillboard.com/location/60003760/)";
+    let expected_range = "\n**range:** 0.0 LY from Jita ([Supers](https://evemaps.dotlan.net/jump/Nyx,555/Jita:Jita)|[FAX](https://evemaps.dotlan.net/jump/Lif,555/Jita:Jita)|[Blops](https://evemaps.dotlan.net/jump/Sin,555/Jita:Jita))";
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 4);
+    for (id, channel_id, has_range) in [
+        ("region", 77, false),
+        ("issuer", 78, false),
+        ("item", 79, false),
+        ("proximity", 80, true),
+    ] {
+        let notification = sent
+            .iter()
+            .find(|notification| {
+                notification.subscription_id == id && notification.channel_id == channel_id
+            })
+            .expect("deliver the matched contract subscription");
+        let embed = contract_notification_embed(&notification.message).0;
+        let description = embed["description"]
+            .as_str()
+            .expect("render a compact contract description");
+        assert_eq!(
+            description,
+            if has_range {
+                format!("{expected_description}{expected_range}")
+            } else {
+                expected_description.to_string()
+            },
+            "{id} uses the shared compact presentation"
+        );
+        assert_eq!(
+            notification.message.author.as_deref(),
+            Some("Public Contract\nissuer: [Issuer Alliance] Issuer"),
+            "{id} uses the contextual issuer grammar"
+        );
+        assert_eq!(
+            notification.message.presentation_revision, 5,
+            "{id} uses the current shared presentation revision"
+        );
+        assert!(
+            !notification.ping,
+            "{id} does not inherit acceptance-only ping eligibility for a listing"
+        );
+        assert_eq!(notification.message.fields.len(), 0, "{id} remains compact");
+        let serialized = serde_json::to_string(&embed).expect("serialize the compact embed");
+        for prohibited in [
+            "Acceptor",
+            "90000001",
+            "98000001",
+            "99000111",
+            "Unknown",
+            "evidence class",
+            "HTTP",
+        ] {
+            assert!(
+                !serialized.contains(prohibited),
+                "{id} must omit {prohibited}: {serialized}"
+            );
+        }
+    }
+    drop(sent);
+
+    server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn public_contract_listing_embed_uses_the_compact_killfeed_shell_at_the_collector_seam() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
