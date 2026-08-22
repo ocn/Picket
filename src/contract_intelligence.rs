@@ -77,6 +77,22 @@ fn configured_contract_region_names() -> Result<HashMap<i64, String>, String> {
         .and_then(|systems| contract_region_names_from_systems(&systems))
 }
 
+fn configured_contract_system_names() -> HashMap<i64, String> {
+    match crate::config::load_systems() {
+        Ok(systems) => systems
+            .into_values()
+            .filter_map(|system| {
+                let name = system.name.trim();
+                (!name.is_empty()).then_some((i64::from(system.id), name.to_string()))
+            })
+            .collect(),
+        Err(error) => {
+            warn!("historical rerender system catalog unavailable; retained system names remain available: {error}");
+            HashMap::new()
+        }
+    }
+}
+
 fn runtime_contract_region_names() -> Arc<HashMap<i64, String>> {
     match configured_contract_region_names() {
         Ok(region_names) => Arc::new(region_names),
@@ -4714,6 +4730,11 @@ struct ContractDeliveryRerenderSelection {
     excluded: Vec<ContractDeliveryRerenderExclusion>,
 }
 
+enum ContractDeliveryRerenderRow {
+    Candidate(ValidatedContractDeliveryRerenderCandidate),
+    Excluded(ContractDeliveryRerenderExclusion),
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum OperatorDeliveryCliResult {
@@ -6444,104 +6465,71 @@ impl ContractCollectionStore {
         selector: &ContractDeliveryRerenderSelector,
         lock_for_queue: bool,
     ) -> Result<ContractDeliveryRerenderSelection, sqlx::Error> {
-        const ELIGIBLE_RERENDER_DELIVERIES: &str = "FROM contract_outbound_deliveries AS deliveries JOIN contract_subscriptions AS subscriptions ON subscriptions.guild_id = deliveries.guild_id AND subscriptions.channel_id = deliveries.channel_id AND subscriptions.subscription_id = deliveries.subscription_id WHERE deliveries.channel_id = $1 AND deliveries.status = 'sent' AND deliveries.discord_message_id IS NOT NULL AND subscriptions.deleted_at IS NULL AND deliveries.repair_status = 'none' AND COALESCE(deliveries.failure_kind, '') <> 'permanent' AND COALESCE(deliveries.repair_failure_kind, '') <> 'permanent' AND (CASE WHEN jsonb_typeof(deliveries.message -> 'presentation_revision') = 'number' AND length(deliveries.message ->> 'presentation_revision') <= 9 AND (deliveries.message ->> 'presentation_revision') ~ '^[0-9]+$' THEN (deliveries.message ->> 'presentation_revision')::INTEGER ELSE 0 END) < $2";
-        let selected_rows = match selector {
-            ContractDeliveryRerenderSelector::Limit(_) => {
-                let query = if lock_for_queue {
-                    format!("SELECT deliveries.id, deliveries.contract_id, deliveries.event_kind, deliveries.discord_message_id, deliveries.event, deliveries.message, subscriptions.guild_id, subscriptions.channel_id, subscriptions.subscription_id, subscriptions.description, subscriptions.filter, subscriptions.event_actions {ELIGIBLE_RERENDER_DELIVERIES} ORDER BY deliveries.id FOR UPDATE OF deliveries SKIP LOCKED")
-                } else {
-                    format!("SELECT deliveries.id, deliveries.contract_id, deliveries.event_kind, deliveries.discord_message_id, deliveries.event, deliveries.message, subscriptions.guild_id, subscriptions.channel_id, subscriptions.subscription_id, subscriptions.description, subscriptions.filter, subscriptions.event_actions {ELIGIBLE_RERENDER_DELIVERIES} ORDER BY deliveries.id")
-                };
-                sqlx::query(&query)
-                    .bind(channel_id as i64)
-                    .bind(CONTRACT_NOTIFICATION_PRESENTATION_REVISION as i32)
-                    .fetch_all(&mut **transaction)
-                    .await?
+        const RERENDER_SELECTION_PAGE_SIZE: i64 = 64;
+        const RERENDER_DELIVERY_COLUMNS: &str = "SELECT deliveries.id, deliveries.contract_id, deliveries.event_kind, deliveries.status, deliveries.discord_message_id, deliveries.repair_status, deliveries.failure_kind, deliveries.repair_failure_kind, deliveries.event, deliveries.message, subscriptions.guild_id AS retained_subscription_guild_id, subscriptions.channel_id AS retained_subscription_channel_id, subscriptions.subscription_id AS retained_subscription_id, subscriptions.description AS retained_subscription_description, subscriptions.filter AS retained_subscription_filter, subscriptions.event_actions AS retained_subscription_event_actions, subscriptions.deleted_at AS retained_subscription_deleted_at FROM contract_outbound_deliveries AS deliveries LEFT JOIN contract_subscriptions AS subscriptions ON subscriptions.guild_id = deliveries.guild_id AND subscriptions.channel_id = deliveries.channel_id AND subscriptions.subscription_id = deliveries.subscription_id";
+        const OUTDATED_PRESENTATION: &str = "(CASE WHEN jsonb_typeof(deliveries.message -> 'presentation_revision') = 'number' AND length(deliveries.message ->> 'presentation_revision') <= 9 AND (deliveries.message ->> 'presentation_revision') ~ '^[0-9]+$' THEN (deliveries.message ->> 'presentation_revision')::INTEGER ELSE 0 END) < $2";
+        let lock_clause = if lock_for_queue {
+            " FOR UPDATE OF deliveries SKIP LOCKED"
+        } else {
+            ""
+        };
+        let mut selection = ContractDeliveryRerenderSelection::default();
+        let mut selected_ids = BTreeSet::new();
+        match selector {
+            ContractDeliveryRerenderSelector::Limit(limit) => {
+                let mut after_delivery_id = 0_i64;
+                while selection.candidates.len() < *limit {
+                    let query = format!(
+                        "{RERENDER_DELIVERY_COLUMNS} WHERE deliveries.channel_id = $1 AND {OUTDATED_PRESENTATION} AND deliveries.id > $3 ORDER BY deliveries.id LIMIT $4{lock_clause}"
+                    );
+                    let rows = sqlx::query(&query)
+                        .bind(channel_id as i64)
+                        .bind(CONTRACT_NOTIFICATION_PRESENTATION_REVISION as i32)
+                        .bind(after_delivery_id)
+                        .bind(RERENDER_SELECTION_PAGE_SIZE)
+                        .fetch_all(&mut **transaction)
+                        .await?;
+                    let Some(last_row) = rows.last() else {
+                        break;
+                    };
+                    after_delivery_id = last_row.get("id");
+                    for row in rows {
+                        match contract_delivery_rerender_row_from_row(row)? {
+                            ContractDeliveryRerenderRow::Candidate(candidate) => {
+                                selection.candidates.push(candidate);
+                                if selection.candidates.len() == *limit {
+                                    break;
+                                }
+                            }
+                            ContractDeliveryRerenderRow::Excluded(exclusion) => {
+                                selection.excluded.push(exclusion);
+                            }
+                        }
+                    }
+                }
             }
             ContractDeliveryRerenderSelector::DeliveryIds(delivery_ids) => {
-                let query = if lock_for_queue {
-                    format!("SELECT deliveries.id, deliveries.contract_id, deliveries.event_kind, deliveries.discord_message_id, deliveries.event, deliveries.message, subscriptions.guild_id, subscriptions.channel_id, subscriptions.subscription_id, subscriptions.description, subscriptions.filter, subscriptions.event_actions {ELIGIBLE_RERENDER_DELIVERIES} AND deliveries.id = ANY($3) ORDER BY array_position($3::BIGINT[], deliveries.id) FOR UPDATE OF deliveries SKIP LOCKED")
-                } else {
-                    format!("SELECT deliveries.id, deliveries.contract_id, deliveries.event_kind, deliveries.discord_message_id, deliveries.event, deliveries.message, subscriptions.guild_id, subscriptions.channel_id, subscriptions.subscription_id, subscriptions.description, subscriptions.filter, subscriptions.event_actions {ELIGIBLE_RERENDER_DELIVERIES} AND deliveries.id = ANY($3) ORDER BY array_position($3::BIGINT[], deliveries.id)")
-                };
-                sqlx::query(&query)
+                let query = format!(
+                    "{RERENDER_DELIVERY_COLUMNS} WHERE deliveries.channel_id = $1 AND {OUTDATED_PRESENTATION} AND deliveries.id = ANY($3) ORDER BY array_position($3::BIGINT[], deliveries.id){lock_clause}"
+                );
+                for row in sqlx::query(&query)
                     .bind(channel_id as i64)
                     .bind(CONTRACT_NOTIFICATION_PRESENTATION_REVISION as i32)
                     .bind(delivery_ids)
                     .fetch_all(&mut **transaction)
                     .await?
-            }
-        };
-        let mut selection = ContractDeliveryRerenderSelection::default();
-        let mut selected_ids = BTreeSet::new();
-        let limit = match selector {
-            ContractDeliveryRerenderSelector::Limit(limit) => Some(*limit),
-            ContractDeliveryRerenderSelector::DeliveryIds(_) => None,
-        };
-        for row in selected_rows {
-            let delivery_id: i64 = row.get("id");
-            selected_ids.insert(delivery_id);
-            let event_kind =
-                contract_delivery_event_kind_from_str(&row.get::<String, _>("event_kind"));
-            let discord_message_id: String = row.get("discord_message_id");
-            let parsed_discord_message_id = parse_contract_discord_message_id(&discord_message_id);
-            let event = serde_json::from_value::<ContractEvent>(row.get("event"));
-            let stored_message =
-                serde_json::from_value::<ContractNotificationMessage>(row.get("message"));
-            let subscription: Result<ContractSubscription, sqlx::Error> = (|| {
-                Ok(ContractSubscription {
-                    guild_id: row.get::<i64, _>("guild_id") as u64,
-                    channel_id: row.get::<i64, _>("channel_id") as u64,
-                    id: row.get("subscription_id"),
-                    description: row.get("description"),
-                    filter: serde_json::from_value(row.get("filter")).map_err(json_to_sqlx)?,
-                    event_actions: serde_json::from_value(row.get("event_actions"))
-                        .map_err(json_to_sqlx)?,
-                })
-            })();
-            let malformed_reason = match (
-                &event_kind,
-                &event,
-                &stored_message,
-                &subscription,
-                &parsed_discord_message_id,
-            ) {
-                (Err(_), _, _, _, _) => Some("invalid_delivery_event_kind"),
-                (_, Err(_), _, _, _) => Some("invalid_retained_event"),
-                (_, _, Err(_), _, _) => Some("invalid_retained_message"),
-                (_, _, _, Err(_), _) => Some("invalid_retained_subscription"),
-                (_, _, _, _, Err(_)) => Some("invalid_discord_message_identity"),
-                (Ok(event_kind), Ok(event), Ok(_), Ok(_), Ok(_)) if *event_kind != event.kind => {
-                    Some("retained_event_kind_mismatch")
+                {
+                    let delivery_id: i64 = row.get("id");
+                    selected_ids.insert(delivery_id);
+                    match contract_delivery_rerender_row_from_row(row)? {
+                        ContractDeliveryRerenderRow::Candidate(candidate) => {
+                            selection.candidates.push(candidate);
+                        }
+                        ContractDeliveryRerenderRow::Excluded(exclusion) => {
+                            selection.excluded.push(exclusion);
+                        }
+                    }
                 }
-                _ => None,
-            };
-            if let Some(reason) = malformed_reason {
-                selection.excluded.push(ContractDeliveryRerenderExclusion {
-                    delivery_id,
-                    reason: reason.to_string(),
-                });
-                continue;
-            }
-            let event_kind = event_kind.expect("validated event kind");
-            let event = event.expect("validated retained event");
-            let stored_message = stored_message.expect("validated retained message");
-            let subscription = subscription.expect("validated retained subscription");
-            selection
-                .candidates
-                .push(ValidatedContractDeliveryRerenderCandidate {
-                    candidate: ContractDeliveryRerenderCandidate {
-                        delivery_id,
-                        contract_id: row.get("contract_id"),
-                        event_kind,
-                        discord_message_id,
-                    },
-                    subscription,
-                    event,
-                    stored_message,
-                });
-            if limit.is_some_and(|limit| selection.candidates.len() == limit) {
-                break;
             }
         }
         if let ContractDeliveryRerenderSelector::DeliveryIds(delivery_ids) = selector {
@@ -6562,7 +6550,7 @@ impl ContractCollectionStore {
                     selection
                         .excluded
                         .iter()
-                        .map(|excluded| excluded.delivery_id.to_string())
+                        .map(|excluded| format!("{} ({})", excluded.delivery_id, excluded.reason))
                         .collect::<Vec<_>>()
                         .join(",")
                 )));
@@ -6592,6 +6580,7 @@ impl ContractCollectionStore {
         if selected.candidates.is_empty() {
             return Ok(selected);
         }
+        let system_names = configured_contract_system_names();
         let mut resolved_region_names = region_names.clone();
         for candidate in &selected.candidates {
             let region_id = candidate.event.region_id;
@@ -6665,7 +6654,12 @@ impl ContractCollectionStore {
             .await?;
         for candidate in &locked.candidates {
             let event = self
-                .reconstruct_historical_matched_range(candidate, &resolved_region_names)
+                .reconstruct_historical_matched_range(
+                    candidate,
+                    &resolved_region_names,
+                    &system_names,
+                    occurred_at,
+                )
                 .await?;
             let (issuer_history, corporation_history) = self
                 .contract_party_history(
@@ -6705,10 +6699,75 @@ impl ContractCollectionStore {
         })
     }
 
+    async fn historical_retained_location(
+        &self,
+        event: &ContractEvent,
+        system_names: &HashMap<i64, String>,
+        evidence_now: DateTime<Utc>,
+    ) -> Result<Option<ContractLocationContext>, sqlx::Error> {
+        let cached_structure = sqlx::query("SELECT evidence.solar_system_id, evidence.region_id, state.structure_name FROM location_evidence AS evidence JOIN structure_resolution_state AS state ON state.structure_id = evidence.structure_id AND state.solar_system_id = evidence.solar_system_id WHERE evidence.location_id = $1 AND evidence.evidence_class = 'access_qualified' AND evidence.observed_at <= $2 AND evidence.superseded_at IS NULL AND evidence.expired_at IS NULL AND evidence.expires_at > $2 AND state.cache_expires_at > $2 ORDER BY evidence.observed_at DESC, evidence.id DESC LIMIT 1")
+            .bind(event.contract.start_location_id)
+            .bind(evidence_now)
+            .fetch_optional(&self.pool)
+            .await?;
+        if let Some(cached_structure) = cached_structure {
+            let structure_name = cached_structure
+                .get::<Option<String>, _>("structure_name")
+                .map(|name| sanitize_contract_text(&name))
+                .filter(|name| !name.is_empty());
+            if let Some(structure_name) = structure_name {
+                let solar_system_id: i64 = cached_structure.get("solar_system_id");
+                return Ok(Some(ContractLocationContext {
+                    location_name: Some(structure_name),
+                    location_kind: Some("Player-owned structure".to_string()),
+                    solar_system_id: Some(solar_system_id),
+                    solar_system_name: system_names.get(&solar_system_id).cloned().or(self
+                        .retained_range_center_name(u32::try_from(solar_system_id).map_err(
+                            |_| {
+                                sqlx::Error::Protocol(format!(
+                                    "retained solar-system ID is invalid: {solar_system_id}"
+                                ))
+                            },
+                        )?)
+                        .await?),
+                    region_id: cached_structure
+                        .get::<Option<i64>, _>("region_id")
+                        .or(Some(event.region_id)),
+                    ..ContractLocationContext::default()
+                }));
+            }
+        }
+        let Some(evidence) = LocationEvidenceService::new(self)
+            .last_verified_access_qualified(event.contract.start_location_id, evidence_now)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ContractLocationContext {
+            location_kind: Some("Player-owned structure".to_string()),
+            last_verified_at: Some(evidence.observed_at),
+            solar_system_id: Some(evidence.solar_system_id),
+            solar_system_name: system_names.get(&evidence.solar_system_id).cloned().or(self
+                .retained_range_center_name(u32::try_from(evidence.solar_system_id).map_err(
+                    |_| {
+                        sqlx::Error::Protocol(format!(
+                            "retained solar-system ID is invalid: {}",
+                            evidence.solar_system_id
+                        ))
+                    },
+                )?)
+                .await?),
+            region_id: evidence.region_id.or(Some(event.region_id)),
+            ..ContractLocationContext::default()
+        }))
+    }
+
     async fn reconstruct_historical_matched_range(
         &self,
         candidate: &ValidatedContractDeliveryRerenderCandidate,
         region_names: &HashMap<i64, String>,
+        system_names: &HashMap<i64, String>,
+        evidence_now: DateTime<Utc>,
     ) -> Result<ContractEvent, sqlx::Error> {
         let mut event = candidate.event.clone();
         if let Some(snapshot) = self
@@ -6716,6 +6775,47 @@ impl ContractCollectionStore {
             .await?
         {
             event.embed_context.merge_missing_from(&snapshot);
+        }
+        if let Some(location) = self
+            .historical_retained_location(&event, system_names, evidence_now)
+            .await?
+        {
+            let retained = &mut event.embed_context.location;
+            let compatible_system = retained
+                .solar_system_id
+                .is_none_or(|system_id| Some(system_id) == location.solar_system_id);
+            let compatible_region = retained
+                .region_id
+                .is_none_or(|region_id| Some(region_id) == location.region_id);
+            let compatible_kind = retained
+                .location_kind
+                .as_deref()
+                .is_none_or(|kind| kind == "Player-owned structure");
+            if retained.location_name.is_none()
+                && compatible_system
+                && compatible_region
+                && compatible_kind
+            {
+                if retained.location_kind.is_none() {
+                    retained.location_kind = location.location_kind;
+                }
+                if retained.last_verified_at.is_none() {
+                    retained.last_verified_at = location.last_verified_at;
+                }
+                if retained.solar_system_id.is_none() {
+                    retained.solar_system_id = location.solar_system_id;
+                }
+                if retained.solar_system_name.is_none() {
+                    retained.solar_system_name = location.solar_system_name;
+                }
+                if retained.region_id.is_none() {
+                    retained.region_id = location.region_id;
+                }
+                if retained.region_name.is_none() {
+                    retained.region_name = location.region_name;
+                }
+                retained.location_name = location.location_name;
+            }
         }
         event.embed_context.location.region_id = Some(event.region_id);
         if event
@@ -8893,6 +8993,127 @@ fn required_operator_delivery_ids(
         return Err(format!("{name} must not contain duplicate IDs"));
     }
     Ok(values)
+}
+
+fn contract_delivery_rerender_row_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<ContractDeliveryRerenderRow, sqlx::Error> {
+    let delivery_id: i64 = row.get("id");
+    let excluded = |reason: &str| {
+        ContractDeliveryRerenderRow::Excluded(ContractDeliveryRerenderExclusion {
+            delivery_id,
+            reason: reason.to_string(),
+        })
+    };
+    match row.get::<String, _>("status").as_str() {
+        "sent" => {}
+        "prepared" => return Ok(excluded("prepared_delivery")),
+        _ => return Ok(excluded("unsent_delivery")),
+    }
+    let Some(discord_message_id) = row.get::<Option<String>, _>("discord_message_id") else {
+        return Ok(excluded("missing_discord_message_identity"));
+    };
+    if parse_contract_discord_message_id(&discord_message_id).is_err() {
+        return Ok(excluded("invalid_discord_message_identity"));
+    }
+    if row
+        .get::<Option<DateTime<Utc>>, _>("retained_subscription_deleted_at")
+        .is_some()
+    {
+        return Ok(excluded("retired_subscription"));
+    }
+    let repair_status: String = row.get("repair_status");
+    let repair_failure_kind: Option<String> = row.get("repair_failure_kind");
+    let failure_kind: Option<String> = row.get("failure_kind");
+    if repair_status == "permanent"
+        || repair_failure_kind.as_deref() == Some("permanent")
+        || failure_kind.as_deref() == Some("permanent")
+    {
+        return Ok(excluded("permanent_failure"));
+    }
+    if repair_status != "none" {
+        return Ok(excluded("active_repair"));
+    }
+    let Some(guild_id) = row.get::<Option<i64>, _>("retained_subscription_guild_id") else {
+        return Ok(excluded("missing_retained_subscription"));
+    };
+    let event_kind = contract_delivery_event_kind_from_str(&row.get::<String, _>("event_kind"));
+    let event = serde_json::from_value::<ContractEvent>(row.get("event"));
+    let stored_message = serde_json::from_value::<ContractNotificationMessage>(row.get("message"));
+    let subscription: Result<ContractSubscription, sqlx::Error> = (|| {
+        Ok(ContractSubscription {
+            guild_id: guild_id as u64,
+            channel_id: row
+                .get::<Option<i64>, _>("retained_subscription_channel_id")
+                .ok_or_else(|| {
+                    sqlx::Error::Protocol("retained subscription channel is missing".to_string())
+                })? as u64,
+            id: row
+                .get::<Option<String>, _>("retained_subscription_id")
+                .ok_or_else(|| {
+                    sqlx::Error::Protocol("retained subscription ID is missing".to_string())
+                })?,
+            description: row
+                .get::<Option<String>, _>("retained_subscription_description")
+                .ok_or_else(|| {
+                    sqlx::Error::Protocol(
+                        "retained subscription description is missing".to_string(),
+                    )
+                })?,
+            filter: serde_json::from_value(
+                row.get::<Option<Value>, _>("retained_subscription_filter")
+                    .ok_or_else(|| {
+                        sqlx::Error::Protocol("retained subscription filter is missing".to_string())
+                    })?,
+            )
+            .map_err(json_to_sqlx)?,
+            event_actions: serde_json::from_value(
+                row.get::<Option<Value>, _>("retained_subscription_event_actions")
+                    .ok_or_else(|| {
+                        sqlx::Error::Protocol(
+                            "retained subscription event actions are missing".to_string(),
+                        )
+                    })?,
+            )
+            .map_err(json_to_sqlx)?,
+        })
+    })()
+    .and_then(|subscription| {
+        subscription
+            .validate()
+            .map(|()| subscription)
+            .map_err(sqlx::Error::Protocol)
+    });
+    let contract_id: i64 = row.get("contract_id");
+    let malformed_reason = match (&event_kind, &event, &stored_message, &subscription) {
+        (Err(_), _, _, _) => Some("invalid_delivery_event_kind"),
+        (_, Err(_), _, _) => Some("invalid_retained_event"),
+        (_, _, Err(_), _) => Some("invalid_retained_message"),
+        (_, _, _, Err(_)) => Some("invalid_retained_subscription"),
+        (Ok(_), Ok(event), Ok(_), Ok(_)) if event.contract.contract_id != contract_id => {
+            Some("retained_event_identity_mismatch")
+        }
+        (Ok(event_kind), Ok(event), Ok(_), Ok(_)) if *event_kind != event.kind => {
+            Some("retained_event_kind_mismatch")
+        }
+        _ => None,
+    };
+    if let Some(reason) = malformed_reason {
+        return Ok(excluded(reason));
+    }
+    Ok(ContractDeliveryRerenderRow::Candidate(
+        ValidatedContractDeliveryRerenderCandidate {
+            candidate: ContractDeliveryRerenderCandidate {
+                delivery_id,
+                contract_id,
+                event_kind: event_kind.expect("validated event kind"),
+                discord_message_id,
+            },
+            subscription: subscription.expect("validated retained subscription"),
+            event: event.expect("validated retained event"),
+            stored_message: stored_message.expect("validated retained message"),
+        },
+    ))
 }
 
 fn contract_subscription_from_row(
