@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — Synchronously enrich public-location listings.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] A collector-level test is written red first for a current authenticated structure and proves the final listing contains the structure name, solar system, and human-readable region.
 - [ ] Only the player-structure operation carries the scoped bearer token; every related public request is demonstrably unauthenticated.

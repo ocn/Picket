@@ -4278,6 +4278,8 @@ pub struct ContractObservationContext {
 pub struct ContractLocationContext {
     pub location_name: Option<String>,
     pub location_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified_at: Option<DateTime<Utc>>,
     pub solar_system_id: Option<i64>,
     pub solar_system_name: Option<String>,
     #[serde(default)]
@@ -4325,6 +4327,10 @@ impl ContractEmbedContext {
             .location_kind
             .clone()
             .or_else(|| source.location.location_kind.clone());
+        self.location.last_verified_at = self
+            .location
+            .last_verified_at
+            .or(source.location.last_verified_at);
         self.location.solar_system_id = self
             .location
             .solar_system_id
@@ -5139,6 +5145,7 @@ impl ContractCollectionStore {
     pub async fn record_structure_resolution_success_with_evidence(
         &self,
         resolved: &ResolvedStructure,
+        region_id: Option<i64>,
         credential_revision: &str,
         generation: i64,
         resolver_identity: &str,
@@ -5165,7 +5172,7 @@ impl ContractCollectionStore {
             &mut transaction,
             resolved.structure_id,
             resolved.solar_system_id,
-            None,
+            region_id,
             resolver_identity,
             resolved.observed_at,
             expires_at,
@@ -10532,10 +10539,32 @@ impl ContractCollector {
         }
 
         if (requirements.solar_system || requirements.security_status)
-            && event.context.solar_system_id.is_none()
+            && (event.context.solar_system_id.is_none()
+                || u32::try_from(event.contract.start_location_id).is_err())
         {
             self.resolve_structure_location_evidence(&mut event, evidence_now)
                 .await?;
+        }
+
+        if (requirements.solar_system || requirements.security_status)
+            && event.context.solar_system_id.is_none()
+        {
+            if let Some(evidence) = LocationEvidenceService::new(&self.store)
+                .last_verified_access_qualified(event.contract.start_location_id, evidence_now)
+                .await?
+            {
+                event.context.solar_system_id = Some(evidence.solar_system_id);
+                event.context.solar_system_resolution = ContractContextResolution::Resolved;
+                event.context.location_evidence_id = Some(evidence.id);
+                event.context.location_evidence_class = Some(evidence.evidence_class);
+                event.embed_context.location.location_name = None;
+                event.embed_context.location.location_kind =
+                    Some("Player-owned structure".to_string());
+                event.embed_context.location.last_verified_at = Some(evidence.observed_at);
+                event.embed_context.location.solar_system_id = Some(evidence.solar_system_id);
+                event.embed_context.location.region_id =
+                    evidence.region_id.or(Some(event.region_id));
+            }
         }
 
         if requirements.security_status {
@@ -10766,6 +10795,7 @@ impl ContractCollector {
                     .store
                     .record_structure_resolution_success_with_evidence(
                         &resolved,
+                        Some(event.region_id),
                         resolver.credential_revision(),
                         generation,
                         resolver.resolver_identity(),
@@ -10804,6 +10834,7 @@ impl ContractCollector {
                 event.context.solar_system_resolution = ContractContextResolution::Resolved;
                 event.context.location_evidence_id = Some(evidence.id);
                 event.context.location_evidence_class = Some(evidence.evidence_class);
+                event.embed_context.location.last_verified_at = None;
                 if let Some(name) = resolved.name {
                     event.embed_context.location.solar_system_id = Some(evidence.solar_system_id);
                     event.embed_context.location.region_id = Some(event.region_id);
@@ -11674,12 +11705,16 @@ impl ContractCollector {
         embed_enrichment_deadline: &mut Option<tokio::time::Instant>,
     ) -> Result<Option<ContractEvent>, ContractCollectionError> {
         let mut enriched = event.clone();
+        let selected_last_verified = enriched.embed_context.location.last_verified_at.is_some();
         let snapshot = self
             .store
             .observed_embed_context(event.region_id, event.contract.contract_id)
             .await?;
         if let Some(snapshot) = snapshot.as_ref() {
             enriched.embed_context.merge_missing_from(&snapshot);
+        }
+        if enriched.context.location_evidence_id.is_some() && !selected_last_verified {
+            enriched.embed_context.location.last_verified_at = None;
         }
         let authoritative_location_changed = enriched.context.location_evidence_id.is_some()
             && enriched.context.solar_system_id.is_some()
@@ -11690,6 +11725,11 @@ impl ContractCollector {
             enriched.embed_context.location.solar_system_name = None;
             enriched.embed_context.location.region_id = None;
             enriched.embed_context.location.region_name = None;
+        }
+        if enriched.embed_context.location.last_verified_at.is_some() {
+            enriched.embed_context.location.location_name = None;
+            enriched.embed_context.location.location_kind =
+                Some("Player-owned structure".to_string());
         }
         if enriched.context.location_evidence_id.is_some() {
             enriched.embed_context.location.solar_system_id = enriched.context.solar_system_id;
@@ -12187,6 +12227,7 @@ fn clear_location_evidence_context(event: &mut ContractEvent) {
     event.context.security_status_resolution = ContractContextResolution::Indeterminate;
     event.embed_context.location.location_name = None;
     event.embed_context.location.location_kind = None;
+    event.embed_context.location.last_verified_at = None;
     event.embed_context.location.solar_system_id = None;
     event.embed_context.location.solar_system_name = None;
     event.embed_context.location.solar_system_position = None;
@@ -13733,7 +13774,15 @@ fn compact_contract_location_description(
         on,
         range,
     });
-    (!description.is_empty()).then_some(description)
+    let mut description = (!description.is_empty()).then_some(description)?;
+    if let Some(verified_at) = context.last_verified_at {
+        description.push_str("\n**on:** Player-owned structure");
+        description.push_str(&format!(
+            "\n**location verified:** {}",
+            verified_at.format("%Y-%m-%d")
+        ));
+    }
+    Some(description)
 }
 
 fn contract_link_place(context: &ContractLocationContext, location_id: i64) -> String {
