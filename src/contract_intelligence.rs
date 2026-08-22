@@ -4812,6 +4812,19 @@ impl Display for ContractDeliveryError {
 
 impl std::error::Error for ContractDeliveryError {}
 
+pub(crate) fn parse_contract_discord_message_id(value: &str) -> Result<u64, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("invalid Discord message ID: expected a nonzero decimal snowflake".to_string());
+    }
+    let message_id = value.parse::<u64>().map_err(|_| {
+        "invalid Discord message ID: expected a nonzero decimal snowflake".to_string()
+    })?;
+    if message_id == 0 {
+        return Err("invalid Discord message ID: expected a nonzero decimal snowflake".to_string());
+    }
+    Ok(message_id)
+}
+
 #[async_trait]
 pub trait ContractDelivery: Send + Sync {
     async fn send(
@@ -6470,6 +6483,8 @@ impl ContractCollectionStore {
             selected_ids.insert(delivery_id);
             let event_kind =
                 contract_delivery_event_kind_from_str(&row.get::<String, _>("event_kind"));
+            let discord_message_id: String = row.get("discord_message_id");
+            let parsed_discord_message_id = parse_contract_discord_message_id(&discord_message_id);
             let event = serde_json::from_value::<ContractEvent>(row.get("event"));
             let stored_message =
                 serde_json::from_value::<ContractNotificationMessage>(row.get("message"));
@@ -6484,12 +6499,19 @@ impl ContractCollectionStore {
                         .map_err(json_to_sqlx)?,
                 })
             })();
-            let malformed_reason = match (&event_kind, &event, &stored_message, &subscription) {
-                (Err(_), _, _, _) => Some("invalid_delivery_event_kind"),
-                (_, Err(_), _, _) => Some("invalid_retained_event"),
-                (_, _, Err(_), _) => Some("invalid_retained_message"),
-                (_, _, _, Err(_)) => Some("invalid_retained_subscription"),
-                (Ok(event_kind), Ok(event), Ok(_), Ok(_)) if *event_kind != event.kind => {
+            let malformed_reason = match (
+                &event_kind,
+                &event,
+                &stored_message,
+                &subscription,
+                &parsed_discord_message_id,
+            ) {
+                (Err(_), _, _, _, _) => Some("invalid_delivery_event_kind"),
+                (_, Err(_), _, _, _) => Some("invalid_retained_event"),
+                (_, _, Err(_), _, _) => Some("invalid_retained_message"),
+                (_, _, _, Err(_), _) => Some("invalid_retained_subscription"),
+                (_, _, _, _, Err(_)) => Some("invalid_discord_message_identity"),
+                (Ok(event_kind), Ok(event), Ok(_), Ok(_), Ok(_)) if *event_kind != event.kind => {
                     Some("retained_event_kind_mismatch")
                 }
                 _ => None,
@@ -6512,7 +6534,7 @@ impl ContractCollectionStore {
                         delivery_id,
                         contract_id: row.get("contract_id"),
                         event_kind,
-                        discord_message_id: row.get("discord_message_id"),
+                        discord_message_id,
                     },
                     subscription,
                     event,
@@ -15097,6 +15119,41 @@ mod embed_tests {
             .expect("edit HTTP body");
         assert_eq!(body["embeds"], serde_json::json!([expected_embed]));
         assert_eq!(body["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn discord_contract_edit_rejects_invalid_message_identities_without_a_patch() {
+        for message_id in ["", "not-a-snowflake", "0", "18446744073709551616"] {
+            let server = DiscordEditWireServer::start(vec![]);
+            let delivery = DiscordContractDelivery::new_with_edit_api_base(
+                Arc::new(Http::new("controlled-auth-token")),
+                server.base_url.clone(),
+            );
+            let mut edit = contract_edit_for_wire(ContractNotificationMessage {
+                title: "Invalid identity correction".to_string(),
+                description: None,
+                fields: vec![],
+                presentation_revision: CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+                author: None,
+                thumbnail_url: None,
+                footer: None,
+                timestamp: None,
+            });
+            edit.discord_message_id = message_id.to_string();
+
+            let error = delivery
+                .edit(edit)
+                .await
+                .expect_err("invalid persisted Discord message identities are permanent");
+            assert!(matches!(error, ContractDeliveryError::Permanent(_)));
+            assert!(error
+                .to_string()
+                .contains("expected a nonzero decimal snowflake"));
+            assert!(
+                server.finish().is_empty(),
+                "invalid message identity {message_id:?} must not issue a PATCH"
+            );
+        }
     }
 
     #[tokio::test]

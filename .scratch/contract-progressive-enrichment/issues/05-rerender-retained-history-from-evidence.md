@@ -4,7 +4,7 @@
 
 **Blocked by:** 04 — Guarantee feed-wide presentation parity.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] A red operator-level test proves dry-run and queue selection target only sent, retained, outdated deliveries with valid Discord message identities and retained data.
 - [ ] Historical reconstruction uses the retained Contract Event, Contract Observation, Retained Enrichment Evidence, structure cache, system catalog, and unauthenticated region-name lookup.
