@@ -5189,6 +5189,93 @@ impl ControlledHttpServer {
     }
 }
 
+struct PathAwareHttpServer {
+    base_url: String,
+    requests: Arc<StdMutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+impl PathAwareHttpServer {
+    fn start(routes: HashMap<String, Vec<WireReply>>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind path-aware HTTP listener");
+        listener
+            .set_nonblocking(true)
+            .expect("make path-aware listener nonblocking");
+        let address = listener.local_addr().expect("path-aware listener address");
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let recorded_requests = requests.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let mut routes = routes;
+            while !stopped.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept path-aware HTTP request: {error}"),
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("make path-aware connection blocking");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .expect("bound path-aware request read");
+                let mut request = [0_u8; 4096];
+                let length = stream
+                    .read(&mut request)
+                    .expect("read path-aware HTTP request");
+                let request = String::from_utf8_lossy(&request[..length]).into_owned();
+                let route = request
+                    .lines()
+                    .next()
+                    .and_then(|line| {
+                        let mut parts = line.split_whitespace();
+                        Some(format!("{} {}", parts.next()?, parts.next()?))
+                    })
+                    .expect("parse path-aware request line");
+                recorded_requests.lock().unwrap().push(request);
+                let reply = routes
+                    .get_mut(&route)
+                    .and_then(|replies| (!replies.is_empty()).then(|| replies.remove(0)))
+                    .unwrap_or(WireReply {
+                        status: 500,
+                        headers: vec![],
+                        body: "unexpected path-aware request",
+                    });
+                let response = format!(
+                    "HTTP/1.1 {} test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
+                    reply.status,
+                    reply.body.len(),
+                    reply
+                        .headers
+                        .iter()
+                        .map(|(name, value)| format!("{name}: {value}\r\n"))
+                        .collect::<String>(),
+                    reply.body,
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write path-aware HTTP response");
+            }
+        });
+        Self {
+            base_url: format!("http://{address}/"),
+            requests,
+            stop,
+            handle,
+        }
+    }
+
+    fn finish(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.handle.join().expect("join path-aware HTTP listener");
+    }
+}
+
 #[derive(Clone, Deserialize)]
 struct PublicEnrichmentWireFixtures {
     regions: Value,
@@ -5989,16 +6076,6 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
     .collect_cycle()
     .await
     .expect("establish the silent baseline before snapshot retention");
-    store
-        .upsert_contract_subscription(&contract_subscription(
-            "snapshot-location-retention",
-            ContractItemDirection::Offered,
-            vec![587],
-            vec![],
-            ContractEventAction::Post,
-        ))
-        .await
-        .expect("persist the listed subscription");
     let raw_pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&database.url)
@@ -6006,10 +6083,6 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
         .expect("connect to fail snapshot public retention");
     install_public_location_evidence_failure_trigger(&raw_pool).await;
     raw_pool.close().await;
-    let delivery = Arc::new(RecordingDelivery {
-        store: store.clone(),
-        sent: StdMutex::new(Vec::new()),
-    });
     let failed_context = EsiResponse::fresh(
         ContractEmbedContext {
             observed_at: Some(Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap()),
@@ -6031,16 +6104,14 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
                 Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
             )]),
         ),
-        contexts: StdMutex::new(vec![Ok(failed_context.clone()), Ok(failed_context)]),
+        contexts: StdMutex::new(vec![Ok(failed_context)]),
         calls: StdMutex::new(Vec::new()),
     });
     let failed = ContractCollector::new(store.clone(), failed_snapshot.clone())
-        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
         .collect_cycle()
         .await
         .expect("optional snapshot retention does not abort the committed listed event");
     assert_eq!(failed.events.len(), 1);
-    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
     assert!(store
         .observed_embed_context(10_000_002, contract.contract_id)
         .await
@@ -6057,6 +6128,56 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
         .expect("read retryable snapshot retention failure")
         .iter()
         .any(|failure| failure.contract_id == Some(contract.contract_id)
+            && failure.resource_key.as_deref() == Some("contract-public-location-evidence:44")
+            && failure.failure_kind == "embed_context_enrichment"));
+
+    let expires_at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    execute_operator_location_evidence_cli(
+        &store,
+        &[
+            "add",
+            "--location-id",
+            &contract.start_location_id.to_string(),
+            "--station-id",
+            &contract.start_location_id.to_string(),
+            "--system-id",
+            "30002086",
+            "--region-id",
+            "10000003",
+            "--expires-at",
+            &expires_at,
+            "--actor",
+            "operator:one",
+            "--provenance",
+            "lower-tier evidence must not resolve a public retry",
+        ],
+        Utc::now(),
+    )
+    .await
+    .expect("retain lower-tier operator evidence");
+    let before_due = Arc::new(SnapshottingEsi {
+        inner: regional_esi(
+            vec![contract.clone()],
+            HashMap::from([(
+                contract.contract_id,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        ),
+        contexts: StdMutex::new(Vec::new()),
+        calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), before_due.clone())
+        .collect_cycle()
+        .await
+        .expect("a not-yet-due retained retry does not need a context request");
+    assert!(before_due.calls.lock().unwrap().is_empty());
+    assert!(store
+        .unresolved_collection_failures()
+        .await
+        .expect("lower-tier evidence cannot resolve a PublicNpc retry")
+        .iter()
+        .any(|failure| failure.contract_id == Some(contract.contract_id)
+            && failure.resource_key.as_deref() == Some("contract-public-location-evidence:44")
             && failure.failure_kind == "embed_context_enrichment"));
 
     let raw_pool = PgPoolOptions::new()
@@ -6065,6 +6186,15 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
         .await
         .expect("connect to restore public retention");
     remove_public_location_evidence_failure_trigger(&raw_pool).await;
+    sqlx::query(
+        "UPDATE contract_collection_failures SET retry_after = now() - interval '1 second' WHERE region_id = $1 AND contract_id = $2 AND resource_key = $3 AND resolved_at IS NULL",
+    )
+    .bind(10_000_002_i64)
+    .bind(contract.contract_id)
+    .bind("contract-public-location-evidence:44")
+    .execute(&raw_pool)
+    .await
+    .expect("make the retained retry due");
     raw_pool.close().await;
     let repaired_snapshot = Arc::new(SnapshottingEsi {
         inner: regional_esi(
@@ -6078,12 +6208,10 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
         calls: StdMutex::new(Vec::new()),
     });
     let repaired = ContractCollector::new(store.clone(), repaired_snapshot.clone())
-        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
         .collect_cycle()
         .await
         .expect("retry the missing snapshot after public retention recovers");
     assert!(repaired.events.is_empty());
-    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
     assert!(store
         .observed_embed_context(10_000_002, contract.contract_id)
         .await
@@ -6105,8 +6233,95 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
         .iter()
         .any(|failure| failure.contract_id == Some(contract.contract_id)
             && failure.failure_kind == "embed_context_enrichment"));
-    assert_eq!(failed_snapshot.calls.lock().unwrap().as_slice(), &[44, 44]);
+    assert_eq!(failed_snapshot.calls.lock().unwrap().as_slice(), &[44]);
     assert!(repaired_snapshot.calls.lock().unwrap().is_empty());
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn public_location_evidence_retries_are_bounded_per_snapshot_cycle() {
+    const RETRY_CAP: usize = 8;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(vec![], HashMap::new())),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline before retained public retries");
+    let contracts = (0..=RETRY_CAP)
+        .map(|offset| item_exchange_contract(44 + i64::try_from(offset).unwrap()))
+        .collect::<Vec<_>>();
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed retained snapshot contexts");
+    let context = serde_json::to_value(ContractEmbedContext {
+        location: ContractLocationContext {
+            location_kind: Some("Station".to_string()),
+            solar_system_id: Some(30_002_086),
+            region_id: Some(10_000_003),
+            ..ContractLocationContext::default()
+        },
+        ..ContractEmbedContext::default()
+    })
+    .expect("serialize retained public location context");
+    for contract in &contracts {
+        sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,now())")
+            .bind(10_000_002_i64)
+            .bind(contract.contract_id)
+            .bind(&context)
+            .execute(&pool)
+            .await
+            .expect("seed retained snapshot context");
+        sqlx::query("INSERT INTO contract_collection_failures (region_id, contract_id, resource_key, observed_at, failure_kind, detail, retry_after) VALUES ($1,$2,$3,now(),'embed_context_enrichment','due public location retry',now() - interval '1 second')")
+            .bind(10_000_002_i64)
+            .bind(contract.contract_id)
+            .bind(format!("contract-public-location-evidence:{}", contract.contract_id))
+            .execute(&pool)
+            .await
+            .expect("seed a due public-location retry");
+    }
+    install_public_location_evidence_failure_trigger(&pool).await;
+    pool.close().await;
+    let items = contracts
+        .iter()
+        .map(|contract| {
+            (
+                contract.contract_id,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let esi = Arc::new(SnapshottingEsi {
+        inner: regional_esi(contracts.clone(), items),
+        contexts: StdMutex::new(Vec::new()),
+        calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), esi.clone())
+        .collect_cycle()
+        .await
+        .expect("bounded retained public retries do not abort the observation");
+
+    let failures = store
+        .unresolved_collection_failures()
+        .await
+        .expect("read bounded retained retry failures");
+    assert_eq!(
+        failures
+            .iter()
+            .filter(|failure| {
+                failure.resource_key.as_deref().is_some_and(|resource_key| {
+                    resource_key.starts_with("contract-public-location-evidence:")
+                }) && failure.detail == "public location evidence retention will be retried"
+            })
+            .count(),
+        RETRY_CAP,
+        "one cycle never exceeds the persisted public-location retry budget"
+    );
+    assert!(esi.calls.lock().unwrap().is_empty());
     database.destroy().await;
 }
 
@@ -7274,7 +7489,7 @@ async fn proximity_evidence_reconciles_unverified_alerts_for_every_contract_life
         store: store.clone(),
         sent: StdMutex::new(Vec::new()),
     });
-    ContractCollector::new(
+    let initial_report = ContractCollector::new(
         store.clone(),
         Arc::new(PositionEsi {
             inner: FakeEsi {
@@ -7304,7 +7519,16 @@ async fn proximity_evidence_reconciles_unverified_alerts_for_every_contract_life
     .await
     .expect("prepare one unverified original message per lifecycle action");
     let initially_unverified = initially_unverified.sent.lock().unwrap();
-    assert_eq!(initially_unverified.len(), 5);
+    assert_eq!(
+        initially_unverified.len(),
+        5,
+        "events={:?}",
+        initial_report
+            .events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>()
+    );
     assert!(
         initially_unverified.iter().all(|delivery| {
             delivery.message.title == "Rifter listed for 1.5B ISK in Jita (The Forge)"
@@ -13260,6 +13484,139 @@ async fn accepted_player_confirms_only_pure_matched_ship_sales_and_purchases() {
 }
 
 #[tokio::test]
+async fn non_item_filters_deliver_confirmed_sale_and_purchase() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let mut sale = item_exchange_contract(44);
+    sale.date_expired = Utc::now() + chrono::Duration::hours(1);
+    let mut purchase = item_exchange_contract(45);
+    purchase.date_expired = Utc::now() + chrono::Duration::hours(1);
+    purchase.price = 0.0;
+    purchase.reward = 1_500_000_000.0;
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![sale.clone(), purchase.clone()],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([
+                (
+                    sale.contract_id,
+                    Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+                ),
+                (
+                    purchase.contract_id,
+                    Ok(EsiResponse::fresh(
+                        vec![requested_ship(2)],
+                        expiring_cache(),
+                    )),
+                ),
+            ]),
+        }),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent terminal baseline");
+    for (id, event_kind, action) in [
+        (
+            "non-item-sale",
+            ContractEventKind::SaleConfirmed,
+            ContractEventAction::Post,
+        ),
+        (
+            "non-item-purchase",
+            ContractEventKind::PurchaseConfirmed,
+            ContractEventAction::Post,
+        ),
+    ] {
+        store
+            .upsert_contract_subscription(&ContractSubscription {
+                guild_id: 42,
+                channel_id: 77,
+                id: id.to_string(),
+                description: "terminal region filter".to_string(),
+                filter: ContractFilter {
+                    root: ContractFilterNode::And(vec![
+                        ContractFilterNode::Condition(ContractFilterCondition::EventKinds(vec![
+                            event_kind,
+                        ])),
+                        ContractFilterNode::Condition(ContractFilterCondition::Regions(vec![
+                            10_000_002,
+                        ])),
+                    ]),
+                },
+                event_actions: ContractEventActions {
+                    sale_confirmed: (event_kind == ContractEventKind::SaleConfirmed)
+                        .then_some(action)
+                        .unwrap_or(ContractEventAction::Ignore),
+                    purchase_confirmed: (event_kind == ContractEventKind::PurchaseConfirmed)
+                        .then_some(action)
+                        .unwrap_or(ContractEventAction::Ignore),
+                    ..ContractEventActions::default()
+                },
+            })
+            .await
+            .expect("persist non-item terminal subscription");
+    }
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let report = ContractCollector::new(
+        store.clone(),
+        Arc::new(ResolutionEsi {
+            inner: FakeEsi {
+                regions: vec![10_000_002],
+                pages: HashMap::from([(
+                    (10_000_002, 1),
+                    Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+                )]),
+                items: HashMap::new(),
+            },
+            probes: StdMutex::new(vec![
+                Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())),
+                Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())),
+            ]),
+            probe_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
+        delivery.clone(),
+    )
+    .collect_cycle()
+    .await
+    .expect("deliver confirmed terminal events matched by region alone");
+
+    assert_eq!(
+        report
+            .events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            ContractEventKind::SaleConfirmed,
+            ContractEventKind::PurchaseConfirmed,
+        ]
+    );
+    let sent = delivery.sent.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert!(sent
+        .iter()
+        .any(|message| message.event_kind == ContractEventKind::SaleConfirmed));
+    assert!(sent
+        .iter()
+        .any(|message| message.event_kind == ContractEventKind::PurchaseConfirmed));
+    drop(sent);
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn contract_cycle_release_seam_preserves_all_public_lifecycle_outcomes_and_deliveries() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
@@ -15119,73 +15476,98 @@ async fn wire_304_responses_preserve_last_modified_for_paginated_snapshot_valida
     let store = database.store().await;
     let page_one = r#"[{"collateral":0.0,"contract_id":44,"date_expired":"2026-08-14T12:00:00Z","date_issued":"2026-08-13T12:00:00Z","days_to_complete":0,"issuer_corporation_id":98000001,"issuer_id":90000001,"price":1500000000.0,"reward":0.0,"start_location_id":60003760,"type":"item_exchange","volume":115000.0}]"#;
     let page_two = r#"[{"collateral":0.0,"contract_id":45,"date_expired":"2026-08-14T12:00:00Z","date_issued":"2026-08-13T12:00:00Z","days_to_complete":0,"issuer_corporation_id":98000001,"issuer_id":90000001,"price":1500000000.0,"reward":0.0,"start_location_id":60003760,"type":"item_exchange","volume":115000.0}]"#;
-    let server = SequenceHttpServer::start(vec![
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=0"), ("ETag", "\"regions-v1\"")],
-            body: "[10000002]",
-        },
-        WireReply {
-            status: 200,
-            headers: vec![
-                ("Cache-Control", "max-age=0"),
-                ("ETag", "\"page-one-v1\""),
-                ("Last-Modified", "Thu, 13 Aug 2026 12:00:00 GMT"),
-                ("X-Pages", "2"),
+    let server = PathAwareHttpServer::start(HashMap::from([
+        (
+            "GET /universe/regions/".to_string(),
+            vec![
+                WireReply {
+                    status: 200,
+                    headers: vec![("Cache-Control", "max-age=0"), ("ETag", "\"regions-v1\"")],
+                    body: "[10000002]",
+                },
+                WireReply {
+                    status: 304,
+                    headers: vec![("Cache-Control", "max-age=0")],
+                    body: "",
+                },
             ],
-            body: page_one,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![
-                ("Cache-Control", "max-age=0"),
-                ("ETag", "\"page-two-v1\""),
-                ("Last-Modified", "Thu, 13 Aug 2026 12:00:00 GMT"),
-                ("X-Pages", "2"),
+        ),
+        (
+            "GET /contracts/public/10000002/?page=1".to_string(),
+            vec![
+                WireReply {
+                    status: 200,
+                    headers: vec![
+                        ("Cache-Control", "max-age=0"),
+                        ("ETag", "\"page-one-v1\""),
+                        ("Last-Modified", "Thu, 13 Aug 2026 12:00:00 GMT"),
+                        ("X-Pages", "2"),
+                    ],
+                    body: page_one,
+                },
+                WireReply {
+                    status: 304,
+                    headers: vec![("Cache-Control", "max-age=0")],
+                    body: "",
+                },
             ],
-            body: page_two,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=0"), ("ETag", "\"items-44-v1\"")],
-            body: "[]",
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=0"), ("ETag", "\"items-45-v1\"")],
-            body: "[]",
-        },
-        WireReply {
-            status: 304,
-            headers: vec![("Cache-Control", "max-age=0")],
-            body: "",
-        },
-        WireReply {
-            status: 304,
-            headers: vec![("Cache-Control", "max-age=0")],
-            body: "",
-        },
-        WireReply {
-            status: 200,
-            headers: vec![
-                ("Cache-Control", "max-age=0"),
-                ("ETag", "\"page-two-v2\""),
-                ("Last-Modified", "Thu, 13 Aug 2026 12:00:00 GMT"),
-                ("X-Pages", "2"),
+        ),
+        (
+            "GET /contracts/public/10000002/?page=2".to_string(),
+            vec![
+                WireReply {
+                    status: 200,
+                    headers: vec![
+                        ("Cache-Control", "max-age=0"),
+                        ("ETag", "\"page-two-v1\""),
+                        ("Last-Modified", "Thu, 13 Aug 2026 12:00:00 GMT"),
+                        ("X-Pages", "2"),
+                    ],
+                    body: page_two,
+                },
+                WireReply {
+                    status: 200,
+                    headers: vec![
+                        ("Cache-Control", "max-age=0"),
+                        ("ETag", "\"page-two-v2\""),
+                        ("Last-Modified", "Thu, 13 Aug 2026 12:00:00 GMT"),
+                        ("X-Pages", "2"),
+                    ],
+                    body: page_two,
+                },
             ],
-            body: page_two,
-        },
-        WireReply {
-            status: 304,
-            headers: vec![("Cache-Control", "max-age=0")],
-            body: "",
-        },
-        WireReply {
-            status: 304,
-            headers: vec![("Cache-Control", "max-age=0")],
-            body: "",
-        },
-    ]);
+        ),
+        (
+            "GET /contracts/public/items/44/".to_string(),
+            vec![
+                WireReply {
+                    status: 200,
+                    headers: vec![("Cache-Control", "max-age=0"), ("ETag", "\"items-44-v1\"")],
+                    body: "[]",
+                },
+                WireReply {
+                    status: 304,
+                    headers: vec![("Cache-Control", "max-age=0")],
+                    body: "",
+                },
+            ],
+        ),
+        (
+            "GET /contracts/public/items/45/".to_string(),
+            vec![
+                WireReply {
+                    status: 200,
+                    headers: vec![("Cache-Control", "max-age=0"), ("ETag", "\"items-45-v1\"")],
+                    body: "[]",
+                },
+                WireReply {
+                    status: 304,
+                    headers: vec![("Cache-Control", "max-age=0")],
+                    body: "",
+                },
+            ],
+        ),
+    ]));
     let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
         .expect("construct HTTP ESI client");
     let pool = PgPoolOptions::new()
@@ -15232,9 +15614,47 @@ async fn wire_304_responses_preserve_last_modified_for_paginated_snapshot_valida
             observed_contracts: 2,
         }]
     );
-    assert!(server.requests.lock().unwrap()[5]
-        .to_ascii_lowercase()
-        .contains("if-none-match: \"regions-v1\""));
+    let requests = server.requests.lock().unwrap();
+    for (path, etag) in [
+        ("GET /universe/regions/", "\"regions-v1\""),
+        ("GET /contracts/public/10000002/?page=1", "\"page-one-v1\""),
+        ("GET /contracts/public/10000002/?page=2", "\"page-two-v1\""),
+        ("GET /contracts/public/items/44/", "\"items-44-v1\""),
+        ("GET /contracts/public/items/45/", "\"items-45-v1\""),
+    ] {
+        let matching = requests
+            .iter()
+            .filter(|request| request.starts_with(&format!("{path} HTTP/")))
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 2, "{path} is fetched once per cycle");
+        assert!(
+            matching[1]
+                .to_ascii_lowercase()
+                .contains(&format!("if-none-match: {etag}").to_ascii_lowercase()),
+            "{path} revalidates the first-cycle ETag"
+        );
+    }
+    drop(requests);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect retained page validators");
+    for (resource_key, expected_etag) in [
+        ("contracts/public/10000002/page/1", "\"page-one-v1\""),
+        ("contracts/public/10000002/page/2", "\"page-two-v2\""),
+    ] {
+        let metadata: (Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT etag, last_modified FROM esi_cache_metadata WHERE resource_key = $1",
+        )
+        .bind(resource_key)
+        .fetch_one(&pool)
+        .await
+        .expect("read revalidated page metadata");
+        assert_eq!(metadata.0.as_deref(), Some(expected_etag), "{resource_key}");
+        assert!(metadata.1.is_some(), "{resource_key} retains Last-Modified");
+    }
+    pool.close().await;
     server.finish();
     database.destroy().await;
 }
@@ -27915,53 +28335,119 @@ async fn collection_cycles_retain_context_representations_and_etags_after_a_late
     let store = database.store().await;
     let contract = item_exchange_contract(44);
     let page = r#"[{"collateral":0.0,"contract_id":44,"date_expired":"2026-08-14T12:00:00Z","date_issued":"2026-08-13T12:00:00Z","days_to_complete":0,"issuer_corporation_id":98000001,"issuer_id":90000001,"price":1500000000.0,"reward":0.0,"start_location_id":60003760,"type":"item_exchange","volume":115000.0}]"#;
-    let server = SequenceHttpServer::start(vec![
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: "[10000002]",
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60"), ("X-Pages", "1")],
-            body: page,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"[{"is_included":true,"is_singleton":true,"quantity":1,"record_id":1,"type_id":587}]"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("ETag", "station-v1"), ("Cache-Control", "max-age=0")],
-            body: r#"{"name":"Jita IV - Moon 4","system_id":30000142}"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"{"name":"Jita","security_status":0.9,"constellation_id":20000020}"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"{"region_id":10000002}"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"{"name":"The Forge"}"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"[{"alliance_id":99000111}]"#,
-        },
-        WireReply {
-            status: 500,
-            headers: vec![],
-            body: "{}",
-        },
-    ]);
+    let server = PathAwareHttpServer::start(HashMap::from([
+        (
+            "GET /universe/regions/".to_string(),
+            vec![
+                WireReply {
+                    status: 200,
+                    headers: vec![("Cache-Control", "max-age=0"), ("ETag", "\"regions-v1\"")],
+                    body: "[10000002]",
+                },
+                WireReply {
+                    status: 304,
+                    headers: vec![("Cache-Control", "max-age=0")],
+                    body: "",
+                },
+            ],
+        ),
+        (
+            "GET /contracts/public/10000002/?page=1".to_string(),
+            vec![
+                WireReply {
+                    status: 200,
+                    headers: vec![
+                        ("Cache-Control", "max-age=0"),
+                        ("ETag", "\"page-v1\""),
+                        ("X-Pages", "1"),
+                    ],
+                    body: page,
+                },
+                WireReply {
+                    status: 304,
+                    headers: vec![("Cache-Control", "max-age=0")],
+                    body: "",
+                },
+            ],
+        ),
+        (
+            "GET /contracts/public/items/44/".to_string(),
+            vec![
+                WireReply {
+                    status: 200,
+                    headers: vec![("Cache-Control", "max-age=0"), ("ETag", "\"items-v1\"")],
+                    body: r#"[{"is_included":true,"is_singleton":true,"quantity":1,"record_id":1,"type_id":587}]"#,
+                },
+                WireReply {
+                    status: 304,
+                    headers: vec![("Cache-Control", "max-age=0")],
+                    body: "",
+                },
+            ],
+        ),
+        (
+            "GET /universe/stations/60003760/".to_string(),
+            vec![
+                WireReply {
+                    status: 200,
+                    headers: vec![("ETag", "station-v1"), ("Cache-Control", "max-age=0")],
+                    body: r#"{"name":"Jita IV - Moon 4","system_id":30000142}"#,
+                },
+                WireReply {
+                    status: 304,
+                    headers: vec![("Cache-Control", "max-age=60")],
+                    body: "",
+                },
+            ],
+        ),
+        (
+            "GET /universe/systems/30000142/".to_string(),
+            vec![WireReply {
+                status: 200,
+                headers: vec![("Cache-Control", "max-age=60")],
+                body: r#"{"name":"Jita","security_status":0.9,"constellation_id":20000020}"#,
+            }],
+        ),
+        (
+            "GET /universe/constellations/20000020/".to_string(),
+            vec![WireReply {
+                status: 200,
+                headers: vec![("Cache-Control", "max-age=60")],
+                body: r#"{"region_id":10000002}"#,
+            }],
+        ),
+        (
+            "GET /universe/regions/10000002/".to_string(),
+            vec![WireReply {
+                status: 200,
+                headers: vec![("Cache-Control", "max-age=60")],
+                body: r#"{"name":"The Forge"}"#,
+            }],
+        ),
+        (
+            "POST /characters/affiliation/".to_string(),
+            vec![WireReply {
+                status: 200,
+                headers: vec![("Cache-Control", "max-age=60")],
+                body: r#"[{"alliance_id":99000111}]"#,
+            }],
+        ),
+        (
+            "POST /universe/names/".to_string(),
+            vec![
+                WireReply {
+                    status: 500,
+                    headers: vec![],
+                    body: "{}",
+                },
+                WireReply {
+                    status: 500,
+                    headers: vec![],
+                    body: "{}",
+                },
+            ],
+        ),
+    ]));
     let esi = Arc::new(
         HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
             .expect("construct local HTTP ESI client"),
@@ -27987,6 +28473,29 @@ async fn collection_cycles_retain_context_representations_and_etags_after_a_late
         .await
         .expect("retain the partial context after the later cycle")
         .is_some());
+    let requests = server.requests.lock().unwrap();
+    for (path, etag) in [
+        ("GET /universe/regions/", "\"regions-v1\""),
+        ("GET /contracts/public/10000002/?page=1", "\"page-v1\""),
+        ("GET /contracts/public/items/44/", "\"items-v1\""),
+    ] {
+        let matching = requests
+            .iter()
+            .filter(|request| request.starts_with(&format!("{path} HTTP/")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            2,
+            "{path} is revalidated on the second cycle"
+        );
+        assert!(
+            matching[1]
+                .to_ascii_lowercase()
+                .contains(&format!("if-none-match: {etag}").to_ascii_lowercase()),
+            "{path} carries its first-cycle ETag"
+        );
+    }
+    drop(requests);
     server.finish();
     database.destroy().await;
 }
