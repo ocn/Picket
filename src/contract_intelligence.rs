@@ -839,6 +839,10 @@ fn embed_context_resource_key(contract_id: i64) -> String {
     format!("contract-embed-context:{contract_id}")
 }
 
+fn public_location_evidence_resource_key(contract_id: i64) -> String {
+    format!("contract-public-location-evidence:{contract_id}")
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PublicContract {
     pub contract_id: i64,
@@ -11847,7 +11851,14 @@ impl ContractCollector {
                 true,
             )
             .await;
-            if selection.waits_for_non_context {
+            if selection.waits_for_non_context
+                || required_direction.is_some_and(|direction| {
+                    !selection
+                        .all_ship_items()
+                        .iter()
+                        .any(|(item_direction, _)| *item_direction == direction)
+                })
+            {
                 return Ok(NotificationResolution::Deferred);
             }
             match selection_evaluator
@@ -11857,21 +11868,20 @@ impl ContractCollector {
                 PrimaryDisplayItem::Resolved {
                     item,
                     strategic_priority,
-                } if required_direction.is_none() || item.is_some() => (item, strategic_priority),
-                PrimaryDisplayItem::Resolved { .. } => {
-                    return Ok(NotificationResolution::Complete);
-                }
+                } => (item, strategic_priority),
                 PrimaryDisplayItem::Deferred => return Ok(NotificationResolution::Deferred),
             }
         } else {
+            if required_direction
+                .is_some_and(|direction| !evaluator.has_matching_ship_item(direction))
+            {
+                return Ok(NotificationResolution::Complete);
+            }
             match evaluator.primary_display_item(required_direction).await {
                 PrimaryDisplayItem::Resolved {
                     item,
                     strategic_priority,
-                } if required_direction.is_none() || item.is_some() => (item, strategic_priority),
-                PrimaryDisplayItem::Resolved { .. } => {
-                    return Ok(NotificationResolution::Complete);
-                }
+                } => (item, strategic_priority),
                 PrimaryDisplayItem::Deferred => return Ok(NotificationResolution::Deferred),
             }
         };
@@ -12194,6 +12204,14 @@ impl ContractCollector {
                 .location_name
                 .as_deref()
                 .is_none_or(|name| name.trim().is_empty());
+        let incomplete_authoritative_listing_location = event.kind == ContractEventKind::Listed
+            && enriched.context.location_evidence_id.is_some()
+            && enriched
+                .embed_context
+                .location
+                .solar_system_name
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty());
         let location_is_solar_system = u32::try_from(event.contract.start_location_id)
             .ok()
             .is_some_and(|location_id| (30_000_000..33_000_000).contains(&location_id));
@@ -12222,6 +12240,7 @@ impl ContractCollector {
         let needs_live_enrichment = (snapshot.is_none()
             && (event.kind == ContractEventKind::Listed || primary_name_missing))
             || incomplete_station_listing
+            || incomplete_authoritative_listing_location
             || incomplete_terminal_location
             || required_region_missing;
         if needs_live_enrichment
@@ -12328,7 +12347,29 @@ impl ContractCollector {
                         .region_name
                         .as_deref()
                         .is_none_or(|name| name.trim().is_empty());
-                if !required_region_missing {
+                let solar_system_id = context.location.solar_system_id;
+                let station_id = (context.location.location_kind.as_deref() == Some("Station"))
+                    .then_some(observed.contract.start_location_id)
+                    .or_else(|| {
+                        solar_system_id
+                            .filter(|solar_system_id| {
+                                observed.contract.start_location_id == *solar_system_id
+                            })
+                            .map(|_| observed.contract.start_location_id)
+                    });
+                let retry_public_location_evidence = match solar_system_id {
+                    Some(solar_system_id)
+                        if station_id.is_some()
+                            || observed.contract.start_location_id == solar_system_id =>
+                    {
+                        LocationEvidenceService::new(&self.store)
+                            .resolve(observed.contract.start_location_id, evidence_now)
+                            .await?
+                            .is_none()
+                    }
+                    _ => false,
+                };
+                if !required_region_missing && !retry_public_location_evidence {
                     if context.location != prior_location {
                         self.store
                             .save_observed_embed_context(
@@ -12346,6 +12387,66 @@ impl ContractCollector {
                             "embed_context_enrichment",
                         )
                         .await?;
+                    self.store
+                        .resolve_collection_failures(
+                            Some(region_id),
+                            Some(observed.contract.contract_id),
+                            Some(&public_location_evidence_resource_key(
+                                observed.contract.contract_id,
+                            )),
+                            "embed_context_enrichment",
+                        )
+                        .await?;
+                    continue;
+                }
+                if !required_region_missing && retry_public_location_evidence {
+                    let observed_at = context
+                        .observed_at
+                        .unwrap_or(evidence_now)
+                        .min(evidence_now);
+                    if let Some(solar_system_id) = solar_system_id {
+                        match LocationEvidenceService::new(&self.store)
+                            .record_public_npc(
+                                observed.contract.start_location_id,
+                                station_id,
+                                solar_system_id,
+                                context.location.region_id,
+                                observed_at,
+                                evidence_now,
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                self.store
+                                    .resolve_collection_failures(
+                                        Some(region_id),
+                                        Some(observed.contract.contract_id),
+                                        Some(&public_location_evidence_resource_key(
+                                            observed.contract.contract_id,
+                                        )),
+                                        "embed_context_enrichment",
+                                    )
+                                    .await?;
+                            }
+                            Err(error) => {
+                                warn!(
+                                    region_id,
+                                    contract_id = observed.contract.contract_id,
+                                    location_id = observed.contract.start_location_id,
+                                    "could not retry retained public location evidence: {error}"
+                                );
+                            }
+                        }
+                    }
+                    if context.location != prior_location {
+                        self.store
+                            .save_observed_embed_context(
+                                region_id,
+                                observed.contract.contract_id,
+                                &context,
+                            )
+                            .await?;
+                    }
                     continue;
                 }
             }
@@ -12442,7 +12543,7 @@ impl ContractCollector {
                                     .record_failure(
                                         Some(region_id),
                                         Some(observed.contract.contract_id),
-                                        Some(&embed_context_resource_key(
+                                        Some(&public_location_evidence_resource_key(
                                             observed.contract.contract_id,
                                         )),
                                         "embed_context_enrichment",
@@ -12466,6 +12567,16 @@ impl ContractCollector {
                                 region_id,
                                 observed.contract.contract_id,
                                 &context,
+                            )
+                            .await?;
+                        self.store
+                            .resolve_collection_failures(
+                                Some(region_id),
+                                Some(observed.contract.contract_id),
+                                Some(&public_location_evidence_resource_key(
+                                    observed.contract.contract_id,
+                                )),
+                                "embed_context_enrichment",
                             )
                             .await?;
                     }
@@ -13012,6 +13123,12 @@ impl<'a> ContractFilterEvaluator<'a> {
             item: primary.map(|(item, _)| item),
             strategic_priority: primary.map(|(_, priority)| priority).unwrap_or(usize::MAX),
         }
+    }
+
+    fn has_matching_ship_item(&self, direction: ContractItemDirection) -> bool {
+        self.matching_ship_items
+            .iter()
+            .any(|(item_direction, _)| *item_direction == direction)
     }
 }
 
