@@ -6076,6 +6076,29 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
     .collect_cycle()
     .await
     .expect("establish the silent baseline before snapshot retention");
+    store
+        .upsert_contract_subscription(&ContractSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            id: "snapshot-public-location-delivery".to_string(),
+            description: "deliver the listed contract once while public retention retries"
+                .to_string(),
+            filter: ContractFilter {
+                root: ContractFilterNode::Condition(ContractFilterCondition::Regions(vec![
+                    10_000_002,
+                ])),
+            },
+            event_actions: ContractEventActions {
+                listed: ContractEventAction::Post,
+                ..ContractEventActions::default()
+            },
+        })
+        .await
+        .expect("persist the listed delivery subscription");
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
     let raw_pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&database.url)
@@ -6087,11 +6110,15 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
         ContractEmbedContext {
             observed_at: Some(Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap()),
             location: ContractLocationContext {
+                location_name: Some("Turnur Station".to_string()),
                 location_kind: Some("Station".to_string()),
                 solar_system_id: Some(30_002_086),
+                solar_system_name: Some("Turnur".to_string()),
                 region_id: Some(10_000_003),
+                region_name: Some("Heimatar".to_string()),
                 ..ContractLocationContext::default()
             },
+            item_names: BTreeMap::from([(587, "Rifter".to_string())]),
             ..ContractEmbedContext::default()
         },
         CacheMetadata::cached_for_seconds(60),
@@ -6108,10 +6135,12 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
         calls: StdMutex::new(Vec::new()),
     });
     let failed = ContractCollector::new(store.clone(), failed_snapshot.clone())
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
         .collect_cycle()
         .await
         .expect("optional snapshot retention does not abort the committed listed event");
     assert_eq!(failed.events.len(), 1);
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
     assert!(store
         .observed_embed_context(10_000_002, contract.contract_id)
         .await
@@ -6167,10 +6196,12 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
         calls: StdMutex::new(Vec::new()),
     });
     ContractCollector::new(store.clone(), before_due.clone())
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
         .collect_cycle()
         .await
         .expect("a not-yet-due retained retry does not need a context request");
     assert!(before_due.calls.lock().unwrap().is_empty());
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
     assert!(store
         .unresolved_collection_failures()
         .await
@@ -6208,6 +6239,7 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
         calls: StdMutex::new(Vec::new()),
     });
     let repaired = ContractCollector::new(store.clone(), repaired_snapshot.clone())
+        .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
         .collect_cycle()
         .await
         .expect("retry the missing snapshot after public retention recovers");
@@ -6234,7 +6266,105 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
         .any(|failure| failure.contract_id == Some(contract.contract_id)
             && failure.failure_kind == "embed_context_enrichment"));
     assert_eq!(failed_snapshot.calls.lock().unwrap().as_slice(), &[44]);
+    assert!(before_due.calls.lock().unwrap().is_empty());
     assert!(repaired_snapshot.calls.lock().unwrap().is_empty());
+    assert_eq!(delivery.sent.lock().unwrap().len(), 1);
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn snapshot_retains_public_location_retry_without_subscription_context_esi() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let contract = item_exchange_contract(45);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(vec![], HashMap::new())),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish the silent baseline before unmatched snapshot retention");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to fail unmatched public retention");
+    install_public_location_evidence_failure_trigger(&pool).await;
+    pool.close().await;
+    let failed_snapshot = Arc::new(SnapshottingEsi {
+        inner: regional_esi(
+            vec![contract.clone()],
+            HashMap::from([(
+                contract.contract_id,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        ),
+        contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
+            ContractEmbedContext {
+                location: ContractLocationContext {
+                    location_kind: Some("Station".to_string()),
+                    solar_system_id: Some(30_002_086),
+                    region_id: Some(10_000_003),
+                    ..ContractLocationContext::default()
+                },
+                ..ContractEmbedContext::default()
+            },
+            CacheMetadata::cached_for_seconds(60),
+        ))]),
+        calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), failed_snapshot.clone())
+        .collect_cycle()
+        .await
+        .expect("unmatched listing retains the failed public snapshot");
+    assert!(store
+        .observed_embed_context(10_000_002, contract.contract_id)
+        .await
+        .expect("read unmatched retained snapshot")
+        .is_some());
+    assert_eq!(failed_snapshot.calls.lock().unwrap().as_slice(), &[45]);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to make the unmatched public retry due");
+    remove_public_location_evidence_failure_trigger(&pool).await;
+    sqlx::query(
+        "UPDATE contract_collection_failures SET retry_after = now() - interval '1 second' WHERE region_id = $1 AND contract_id = $2 AND resource_key = $3 AND resolved_at IS NULL",
+    )
+    .bind(10_000_002_i64)
+    .bind(contract.contract_id)
+    .bind("contract-public-location-evidence:45")
+    .execute(&pool)
+    .await
+    .expect("make the unmatched retained retry due");
+    pool.close().await;
+    let repaired_snapshot = Arc::new(SnapshottingEsi {
+        inner: regional_esi(
+            vec![contract.clone()],
+            HashMap::from([(
+                contract.contract_id,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        ),
+        contexts: StdMutex::new(Vec::new()),
+        calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store.clone(), repaired_snapshot.clone())
+        .collect_cycle()
+        .await
+        .expect("unmatched retained snapshot repairs without a context request");
+    assert!(repaired_snapshot.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        LocationEvidenceService::new(&store)
+            .current_public_npc(contract.start_location_id, Utc::now())
+            .await
+            .expect("read repaired unmatched public evidence")
+            .expect("persisted unmatched public evidence")
+            .evidence_class,
+        LocationEvidenceClass::PublicNpc
+    );
     database.destroy().await;
 }
 
