@@ -325,18 +325,17 @@ impl EsiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
-
     #[tokio::test]
     async fn test_esi_timeout_is_configured() {
         // Verify that a client with a short timeout produces a bounded error
         // (timeout or connect error) rather than hanging indefinitely.
         // Uses a local TCP listener that accepts but never responds.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            loop {
-                let _ = listener.accept();
+            let mut connections = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                connections.push(stream);
             }
         });
 
