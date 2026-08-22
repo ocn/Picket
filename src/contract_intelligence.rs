@@ -10919,7 +10919,7 @@ impl ContractCollector {
                     .resolve(event.contract.start_location_id, evidence_now)
                     .await?
                 {
-                    if event.context.location_evidence_id != Some(evidence.id) {
+                    if event.context.solar_system_id != Some(evidence.solar_system_id) {
                         clear_location_evidence_context(&mut event);
                     }
                     event.context.solar_system_id = Some(evidence.solar_system_id);
