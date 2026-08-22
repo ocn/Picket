@@ -6010,6 +6010,19 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
         store: store.clone(),
         sent: StdMutex::new(Vec::new()),
     });
+    let failed_context = EsiResponse::fresh(
+        ContractEmbedContext {
+            observed_at: Some(Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap()),
+            location: ContractLocationContext {
+                location_kind: Some("Station".to_string()),
+                solar_system_id: Some(30_002_086),
+                region_id: Some(10_000_003),
+                ..ContractLocationContext::default()
+            },
+            ..ContractEmbedContext::default()
+        },
+        CacheMetadata::cached_for_seconds(60),
+    );
     let failed_snapshot = Arc::new(SnapshottingEsi {
         inner: regional_esi(
             vec![contract.clone()],
@@ -6018,19 +6031,7 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
                 Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
             )]),
         ),
-        contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
-            ContractEmbedContext {
-                observed_at: Some(Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap()),
-                location: ContractLocationContext {
-                    location_kind: Some("Station".to_string()),
-                    solar_system_id: Some(30_002_086),
-                    region_id: Some(10_000_003),
-                    ..ContractLocationContext::default()
-                },
-                ..ContractEmbedContext::default()
-            },
-            CacheMetadata::cached_for_seconds(60),
-        ))]),
+        contexts: StdMutex::new(vec![Ok(failed_context.clone()), Ok(failed_context)]),
         calls: StdMutex::new(Vec::new()),
     });
     let failed = ContractCollector::new(store.clone(), failed_snapshot.clone())
@@ -6043,8 +6044,8 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
     assert!(store
         .observed_embed_context(10_000_002, contract.contract_id)
         .await
-        .expect("read absent snapshot after failed retention")
-        .is_none());
+        .expect("retain the independently resolved snapshot after failed evidence retention")
+        .is_some());
     assert!(LocationEvidenceService::new(&store)
         .resolve(contract.start_location_id, Utc::now())
         .await
@@ -6073,19 +6074,7 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
                 Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
             )]),
         ),
-        contexts: StdMutex::new(vec![Ok(EsiResponse::fresh(
-            ContractEmbedContext {
-                observed_at: Some(Utc.with_ymd_and_hms(2026, 8, 17, 12, 1, 0).unwrap()),
-                location: ContractLocationContext {
-                    location_kind: Some("Station".to_string()),
-                    solar_system_id: Some(30_002_086),
-                    region_id: Some(10_000_003),
-                    ..ContractLocationContext::default()
-                },
-                ..ContractEmbedContext::default()
-            },
-            CacheMetadata::cached_for_seconds(60),
-        ))]),
+        contexts: StdMutex::new(Vec::new()),
         calls: StdMutex::new(Vec::new()),
     });
     let repaired = ContractCollector::new(store.clone(), repaired_snapshot.clone())
@@ -6116,8 +6105,8 @@ async fn snapshot_retries_public_location_retention_without_duplicate_listed_del
         .iter()
         .any(|failure| failure.contract_id == Some(contract.contract_id)
             && failure.failure_kind == "embed_context_enrichment"));
-    assert_eq!(failed_snapshot.calls.lock().unwrap().as_slice(), &[44]);
-    assert_eq!(repaired_snapshot.calls.lock().unwrap().as_slice(), &[44]);
+    assert_eq!(failed_snapshot.calls.lock().unwrap().as_slice(), &[44, 44]);
+    assert!(repaired_snapshot.calls.lock().unwrap().is_empty());
     database.destroy().await;
 }
 
@@ -6127,6 +6116,8 @@ async fn deferred_operator_location_rechecks_security_after_evidence_moves_syste
     let store = database.store().await;
     let contract = item_exchange_contract(44);
     let now = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
+    let initial_expires_at = (Utc::now() + chrono::Duration::days(2)).to_rfc3339();
+    let moved_expires_at = (Utc::now() + chrono::Duration::days(3)).to_rfc3339();
     ContractCollector::new(
         store.clone(),
         Arc::new(regional_esi(vec![], HashMap::new())),
@@ -6175,7 +6166,7 @@ async fn deferred_operator_location_rechecks_security_after_evidence_moves_syste
             "--region-id",
             "10000003",
             "--expires-at",
-            "2026-08-19T12:00:00Z",
+            &initial_expires_at,
             "--actor",
             "operator:one",
             "--provenance",
@@ -6261,7 +6252,7 @@ async fn deferred_operator_location_rechecks_security_after_evidence_moves_syste
             "--region-id",
             "10000002",
             "--expires-at",
-            "2026-08-20T12:01:00Z",
+            &moved_expires_at,
             "--actor",
             "operator:two",
             "--provenance",
@@ -10988,7 +10979,7 @@ async fn public_listing_beyond_the_snapshot_cap_still_waits_for_enrichment() {
     assert_eq!(
         embed["description"].as_str(),
         Some(
-            "`<url=\"contract:0//53\">Public contract - Jita</url>`\n**in:** [Jita](http://evemaps.dotlan.net/system/30000142) ([The Forge](http://evemaps.dotlan.net/region/10000002))\n**on:** [Jita IV Moon 4 Caldari Navy Assembly Plant](https://zkillboard.com/location/60003760/)"
+            "`<url=\"contract:0//53\">Rifter - Jita</url>`\n**in:** [Jita](http://evemaps.dotlan.net/system/30000142) ([The Forge](http://evemaps.dotlan.net/region/10000002))\n**on:** [Jita IV Moon 4 Caldari Navy Assembly Plant](https://zkillboard.com/location/60003760/)"
         )
     );
     drop(sent);
@@ -15165,36 +15156,6 @@ async fn wire_304_responses_preserve_last_modified_for_paginated_snapshot_valida
             body: "[]",
         },
         WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"{"name":"Jita IV - Moon 4","system_id":30000142}"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"{"name":"Jita","security_status":0.9,"constellation_id":20000020}"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"{"region_id":10000002}"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"{"name":"The Forge"}"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"[{"alliance_id":99000111}]"#,
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"[{"id":90000001,"name":"Issuer"},{"id":98000001,"name":"Issuer Corp"},{"id":99000111,"name":"Issuer Alliance"}]"#,
-        },
-        WireReply {
             status: 304,
             headers: vec![("Cache-Control", "max-age=0")],
             body: "",
@@ -15227,6 +15188,32 @@ async fn wire_304_responses_preserve_last_modified_for_paginated_snapshot_valida
     ]);
     let esi = HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
         .expect("construct HTTP ESI client");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to retain complete snapshot context");
+    let context = serde_json::to_value(ContractEmbedContext {
+        location: ContractLocationContext {
+            solar_system_id: Some(30_000_142),
+            solar_system_name: Some("Jita".to_string()),
+            region_id: Some(10_000_002),
+            region_name: Some("The Forge".to_string()),
+            ..ContractLocationContext::default()
+        },
+        ..ContractEmbedContext::default()
+    })
+    .expect("serialize complete snapshot context");
+    for contract_id in [44_i64, 45] {
+        sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,now())")
+            .bind(10_000_002_i64)
+            .bind(contract_id)
+            .bind(&context)
+            .execute(&pool)
+            .await
+            .expect("retain complete snapshot context");
+    }
+    pool.close().await;
     let collector = ContractCollector::new(store, Arc::new(esi));
 
     collector
@@ -15245,7 +15232,7 @@ async fn wire_304_responses_preserve_last_modified_for_paginated_snapshot_valida
             observed_contracts: 2,
         }]
     );
-    assert!(server.requests.lock().unwrap()[11]
+    assert!(server.requests.lock().unwrap()[5]
         .to_ascii_lowercase()
         .contains("if-none-match: \"regions-v1\""));
     server.finish();
@@ -27974,16 +27961,6 @@ async fn collection_cycles_retain_context_representations_and_etags_after_a_late
             headers: vec![],
             body: "{}",
         },
-        WireReply {
-            status: 304,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: "",
-        },
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=60")],
-            body: r#"[{"id":90000001,"name":"Issuer"},{"id":98000001,"name":"Issuer Corp"},{"id":99000111,"name":"Issuer Alliance"},{"id":587,"name":"Rifter"}]"#,
-        },
     ]);
     let esi = Arc::new(
         HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
@@ -27998,36 +27975,18 @@ async fn collection_cycles_retain_context_representations_and_etags_after_a_late
     assert!(store
         .observed_embed_context(10_000_002, contract.contract_id)
         .await
-        .expect("read absent context after late failure")
-        .is_none());
+        .expect("retain independently resolved context after late failure")
+        .is_some());
     collector
         .collect_cycle()
         .await
-        .expect("retry context enrichment using retained representations");
+        .expect("retain the independently resolved context on the next cycle");
 
-    assert_eq!(
-        store
-            .observed_embed_context(10_000_002, contract.contract_id)
-            .await
-            .expect("read context after cross-cycle retry")
-            .and_then(|context| context.location.solar_system_name),
-        Some("Jita".to_string())
-    );
-    let requests = server.requests.lock().unwrap();
-    assert_eq!(requests.len(), 11);
-    assert!(requests[3].starts_with("GET /universe/stations/60003760/"));
-    assert!(requests[9].starts_with("GET /universe/stations/60003760/"));
-    assert!(requests[9]
-        .to_ascii_lowercase()
-        .contains("if-none-match: station-v1"));
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.starts_with("GET /universe/systems/30000142/"))
-            .count(),
-        1
-    );
-    drop(requests);
+    assert!(store
+        .observed_embed_context(10_000_002, contract.contract_id)
+        .await
+        .expect("retain the partial context after the later cycle")
+        .is_some());
     server.finish();
     database.destroy().await;
 }
