@@ -4,7 +4,7 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** claimed
+**Status:** resolved
 
 - [ ] A production-shaped health cycle with current public-contract cache or collection evidence reports current ESI progress rather than the deployed false-critical result.
 - [ ] Missing or genuinely stale public-contract progress still degrades and becomes critical under the existing thresholds.
@@ -15,3 +15,11 @@
 - [ ] Existing heartbeat, regional progress, backlog, delivery, resolver, R2Z2, and feed-validation health behavior remains unchanged.
 - [ ] Focused health tests, formatting, compilation, and diff checks pass.
 - [ ] A Sol high Standards/Spec review finds no blocking issue before the ticket is resolved.
+
+## Answer
+
+- Commit: `c262d8f` — public-contract cache evidence drives ESI-progress health.
+- RED: the new health-cycle regression reported `Critical` instead of expected `Healthy` (0/1).
+- GREEN: focused health cycle tests 6/6; adjacent R2Z2 health telemetry 1/1.
+- Checks: `cargo fmt --check`, `git diff --check`, and `cargo check` passed.
+- Sol high Standards/Spec review: PASS, 0 findings.
