@@ -8390,6 +8390,13 @@ struct SequentialManifestEsi {
     manifest_calls: AtomicU64,
 }
 
+struct RateLimitedMissingManifestEsi {
+    pages: StdMutex<Vec<Vec<PublicContract>>>,
+    missing_contract_id: i64,
+    retry_after: DateTime<Utc>,
+    manifest_calls: StdMutex<Vec<i64>>,
+}
+
 #[derive(Default)]
 struct NoPublicCollectionEsi {
     calls: AtomicU64,
@@ -8706,6 +8713,43 @@ impl PublicContractEsi for SequentialManifestEsi {
             .get(&contract_id)
             .expect("configured manifest for every new summary")
             .clone())
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for RateLimitedMissingManifestEsi {
+    async fn regions(&self, _etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        Ok(EsiResponse::fresh(
+            vec![10_000_002],
+            CacheMetadata::cached_for_seconds(0),
+        ))
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        assert_eq!(region_id, 10_000_002);
+        assert_eq!(page, 1);
+        Ok(EsiResponse::fresh(
+            self.pages.lock().unwrap().remove(0),
+            expiring_page(1),
+        ))
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.manifest_calls.lock().unwrap().push(contract_id);
+        assert_eq!(contract_id, self.missing_contract_id);
+        Err(EsiError::retryable(
+            "rate limited missing manifest",
+            Some(self.retry_after),
+        ))
     }
 }
 
@@ -17104,6 +17148,73 @@ async fn regional_item_requests_scale_with_missing_manifests_not_retained_summar
         .await
         .expect("collect only manifests absent from the large regional page");
     assert_eq!(esi.manifest_calls.load(Ordering::Relaxed), 26);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_rate_limited_missing_manifest_does_not_skip_later_retained_manifests() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let retained = item_exchange_contract(44);
+    ContractCollector::new(
+        store.clone(),
+        Arc::new(regional_esi(
+            vec![retained.clone()],
+            HashMap::from([(
+                retained.contract_id,
+                Ok(EsiResponse::fresh(vec![offered_ship(1)], expiring_cache())),
+            )]),
+        )),
+    )
+    .collect_cycle()
+    .await
+    .expect("establish a complete retained manifest");
+    let first_last_observed_at = store
+        .region_contracts(10_000_002)
+        .await
+        .expect("read retained baseline")[0]
+        .last_observed_at;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let retry_after = Utc::now() + chrono::Duration::seconds(30);
+    let rate_limited = Arc::new(RateLimitedMissingManifestEsi {
+        pages: StdMutex::new(vec![vec![item_exchange_contract(45), retained]]),
+        missing_contract_id: 45,
+        retry_after,
+        manifest_calls: StdMutex::new(Vec::new()),
+    });
+
+    let report = ContractCollector::new(store.clone(), rate_limited.clone())
+        .collect_cycle()
+        .await
+        .expect("retain current summaries after the public rate boundary");
+
+    assert_eq!(report.retry_after, Some(retry_after));
+    assert_eq!(
+        rate_limited.manifest_calls.lock().unwrap().as_slice(),
+        &[45]
+    );
+    let stored = store
+        .region_contracts(10_000_002)
+        .await
+        .expect("read current retained manifest");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].contract_id, 44);
+    assert_eq!(stored[0].offered_items[0].type_id, 587);
+    assert!(stored[0].last_observed_at > first_last_observed_at);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect pending manifests");
+    let pending_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT contract_id FROM contract_manifest_pending ORDER BY contract_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read only the missing manifest as pending");
+    assert_eq!(pending_ids, vec![45]);
+    pool.close().await;
 
     database.destroy().await;
 }
