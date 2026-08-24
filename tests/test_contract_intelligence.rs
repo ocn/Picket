@@ -8379,6 +8379,17 @@ struct FakeEsi {
     items: HashMap<i64, Result<EsiResponse<Vec<PublicContractItem>>, EsiError>>,
 }
 
+struct CountingManifestEsi {
+    inner: FakeEsi,
+    manifest_calls: AtomicU64,
+}
+
+struct SequentialManifestEsi {
+    pages: StdMutex<Vec<Vec<PublicContract>>>,
+    items: HashMap<i64, EsiResponse<Vec<PublicContractItem>>>,
+    manifest_calls: AtomicU64,
+}
+
 #[derive(Default)]
 struct NoPublicCollectionEsi {
     calls: AtomicU64,
@@ -8631,6 +8642,70 @@ impl PublicContractEsi for FakeEsi {
             .get(&contract_id)
             .expect("fake ESI manifest configured")
             .clone()
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for CountingManifestEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.manifest_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for SequentialManifestEsi {
+    async fn regions(&self, _etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        Ok(EsiResponse::fresh(
+            vec![10_000_002],
+            CacheMetadata::cached_for_seconds(0),
+        ))
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        assert_eq!(region_id, 10_000_002);
+        assert_eq!(page, 1);
+        Ok(EsiResponse::fresh(
+            self.pages.lock().unwrap().remove(0),
+            expiring_page(1),
+        ))
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.manifest_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(self
+            .items
+            .get(&contract_id)
+            .expect("configured manifest for every new summary")
+            .clone())
     }
 }
 
@@ -15749,8 +15824,6 @@ async fn wire_304_responses_preserve_last_modified_for_paginated_snapshot_valida
         ("GET /universe/regions/", "\"regions-v1\""),
         ("GET /contracts/public/10000002/?page=1", "\"page-one-v1\""),
         ("GET /contracts/public/10000002/?page=2", "\"page-two-v1\""),
-        ("GET /contracts/public/items/44/", "\"items-44-v1\""),
-        ("GET /contracts/public/items/45/", "\"items-45-v1\""),
     ] {
         let matching = requests
             .iter()
@@ -15763,6 +15836,21 @@ async fn wire_304_responses_preserve_last_modified_for_paginated_snapshot_valida
                 .contains(&format!("if-none-match: {etag}").to_ascii_lowercase()),
             "{path} revalidates the first-cycle ETag"
         );
+    }
+    for path in [
+        "GET /contracts/public/items/44/",
+        "GET /contracts/public/items/45/",
+    ] {
+        let matching = requests
+            .iter()
+            .filter(|request| request.starts_with(&format!("{path} HTTP/")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "{path} is reused after its first collection"
+        );
+        assert!(!matching[0].to_ascii_lowercase().contains("authorization:"));
     }
     drop(requests);
     let pool = PgPoolOptions::new()
@@ -16887,41 +16975,48 @@ async fn a_rate_boundary_stops_follow_on_requests_and_persists_the_pause() {
 async fn unchanged_contracts_reuse_facts_and_manifests_while_extending_one_presence_interval() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
-    let fake_esi = FakeEsi {
-        regions: vec![10_000_002],
-        pages: HashMap::from([(
-            (10_000_002, 1),
-            Ok(EsiResponse::fresh(
-                vec![item_exchange_contract(44)],
-                expiring_page(1),
-            )),
-        )]),
-        items: HashMap::from([(
-            44,
-            Ok(EsiResponse::fresh(
-                vec![PublicContractItem {
-                    record_id: 1,
-                    type_id: 587,
-                    quantity: 1,
-                    is_included: true,
-                    item_id: Some(1_001),
-                    raw_quantity: None,
-                    is_singleton: None,
-                    is_blueprint_copy: None,
-                    material_efficiency: None,
-                    runs: None,
-                    time_efficiency: None,
-                }],
-                expiring_cache(),
-            )),
-        )]),
-    };
-    let collector = ContractCollector::new(store.clone(), Arc::new(fake_esi));
+    let fake_esi = Arc::new(CountingManifestEsi {
+        inner: FakeEsi {
+            regions: vec![10_000_002],
+            pages: HashMap::from([(
+                (10_000_002, 1),
+                Ok(EsiResponse::fresh(
+                    vec![item_exchange_contract(44)],
+                    expiring_page(1),
+                )),
+            )]),
+            items: HashMap::from([(
+                44,
+                Ok(EsiResponse::fresh(
+                    vec![
+                        offered_ship(1),
+                        PublicContractItem {
+                            record_id: 2,
+                            type_id: 34,
+                            quantity: 100,
+                            is_included: false,
+                            item_id: None,
+                            raw_quantity: None,
+                            is_singleton: None,
+                            is_blueprint_copy: None,
+                            material_efficiency: None,
+                            runs: None,
+                            time_efficiency: None,
+                        },
+                    ],
+                    expiring_cache(),
+                )),
+            )]),
+        },
+        manifest_calls: AtomicU64::new(0),
+    });
+    let collector = ContractCollector::new(store.clone(), fake_esi.clone());
 
     collector
         .collect_cycle()
         .await
         .expect("first complete cycle");
+    assert_eq!(fake_esi.manifest_calls.load(Ordering::Relaxed), 1);
     let first_last_observed_at = store
         .region_contracts(10_000_002)
         .await
@@ -16965,6 +17060,50 @@ async fn unchanged_contracts_reuse_facts_and_manifests_while_extending_one_prese
             .last_observed_at
             > first_last_observed_at
     );
+    let stored = store
+        .region_contracts(10_000_002)
+        .await
+        .expect("read retained manifest after stale-cache observation");
+    assert_eq!(stored[0].offered_items[0].type_id, 587);
+    assert_eq!(stored[0].requested_items[0].type_id, 34);
+    assert_eq!(fake_esi.manifest_calls.load(Ordering::Relaxed), 1);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn regional_item_requests_scale_with_missing_manifests_not_retained_summaries() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let retained = (1..=24).map(item_exchange_contract).collect::<Vec<_>>();
+    let newly_observed = (25..=26).map(item_exchange_contract).collect::<Vec<_>>();
+    let mut second_page = retained.clone();
+    second_page.extend(newly_observed);
+    let items = (1..=26)
+        .map(|contract_id| {
+            (
+                contract_id,
+                EsiResponse::fresh(vec![offered_ship(contract_id)], expiring_cache()),
+            )
+        })
+        .collect();
+    let esi = Arc::new(SequentialManifestEsi {
+        pages: StdMutex::new(vec![retained, second_page]),
+        items,
+        manifest_calls: AtomicU64::new(0),
+    });
+    let collector = ContractCollector::new(store, esi.clone());
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("establish the retained-manifest baseline");
+    assert_eq!(esi.manifest_calls.load(Ordering::Relaxed), 24);
+    collector
+        .collect_cycle()
+        .await
+        .expect("collect only manifests absent from the large regional page");
+    assert_eq!(esi.manifest_calls.load(Ordering::Relaxed), 26);
 
     database.destroy().await;
 }
@@ -17000,7 +17139,7 @@ async fn stale_cached_responses_are_conditionally_revalidated_without_losing_pag
             .iter()
             .filter(|etag| etag.is_some())
             .count(),
-        3
+        2
     );
     assert_eq!(
         store

@@ -6071,6 +6071,24 @@ impl ContractCollectionStore {
             .collect()
     }
 
+    async fn retained_contract_manifests(
+        &self,
+        region_id: i64,
+    ) -> Result<HashMap<i64, ItemManifest>, sqlx::Error> {
+        sqlx::query("SELECT DISTINCT ON (presence_intervals.contract_id) presence_intervals.contract_id, contract_item_manifests.manifest FROM presence_intervals JOIN contract_item_manifests ON presence_intervals.manifest_hash = contract_item_manifests.manifest_hash WHERE presence_intervals.region_id = $1 ORDER BY presence_intervals.contract_id, presence_intervals.last_observed_at DESC")
+            .bind(region_id)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.get("contract_id"),
+                    serde_json::from_value(row.get("manifest")).map_err(json_to_sqlx)?,
+                ))
+            })
+            .collect()
+    }
+
     pub async fn storage_counts(&self) -> Result<StorageCounts, sqlx::Error> {
         let row = sqlx::query("SELECT (SELECT count(*) FROM public_contract_facts) AS contract_facts, (SELECT count(*) FROM contract_item_manifests) AS manifests, (SELECT count(*) FROM presence_intervals) AS presence_intervals")
             .fetch_one(&self.pool).await?;
@@ -10183,10 +10201,29 @@ impl ContractCollector {
             Err(error) => return Err(regional_attempt_error(error, &mut evidence)),
         };
         let mut observed = Vec::with_capacity(summaries.len());
+        let retained_manifests = self
+            .store
+            .retained_contract_manifests(region_id)
+            .await
+            .map_err(|error| regional_attempt_error(error.into(), &mut evidence))?;
         let mut manifest_failures = Vec::new();
         let mut limiter_active = false;
         for summary in &summaries {
             if limiter_active {
+                continue;
+            }
+            if let Some(manifest) = retained_manifests.get(&summary.contract.contract_id) {
+                let manifest_hash = match content_hash(manifest) {
+                    Ok(manifest_hash) => manifest_hash,
+                    Err(error) => return Err(regional_attempt_error(error, &mut evidence)),
+                };
+                observed.push(ObservedContract {
+                    contract: summary.contract.clone(),
+                    manifest: manifest.clone(),
+                    fact_hash: summary.fact_hash.clone(),
+                    manifest_hash,
+                });
+                evidence.resolved_contract_count = observed.len();
                 continue;
             }
             match self.contract_items(summary.contract.contract_id).await {
