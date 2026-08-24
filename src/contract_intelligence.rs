@@ -14867,6 +14867,7 @@ pub fn spawn_terminal_resolution_recovery_loop(
         };
         run_terminal_resolution_recovery_loop(
             database_url,
+            TERMINAL_RESOLUTION_RECOVERY_INTERVAL,
             esi,
             ship_groups,
             delivery,
@@ -14877,9 +14878,32 @@ pub fn spawn_terminal_resolution_recovery_loop(
     })
 }
 
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_terminal_resolution_recovery_loop_with_esi(
+    database_url: String,
+    interval: Duration,
+    esi: Arc<dyn PublicContractEsi>,
+    ship_groups: Arc<dyn ShipGroupResolver>,
+    delivery: Arc<dyn ContractDelivery>,
+    ping_limiter: Arc<dyn ContractPingLimiter>,
+    structure_resolver: Option<Arc<dyn StructureResolver>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_terminal_resolution_recovery_loop(
+        database_url,
+        interval,
+        esi,
+        ship_groups,
+        delivery,
+        ping_limiter,
+        structure_resolver,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_terminal_resolution_recovery_loop(
     database_url: String,
+    interval: Duration,
     esi: Arc<dyn PublicContractEsi>,
     ship_groups: Arc<dyn ShipGroupResolver>,
     delivery: Arc<dyn ContractDelivery>,
@@ -14887,7 +14911,8 @@ async fn run_terminal_resolution_recovery_loop(
     structure_resolver: Option<Arc<dyn StructureResolver>>,
 ) {
     let region_names = runtime_contract_region_names();
-    let mut cadence = terminal_resolution_recovery_cadence(tokio::time::Instant::now());
+    let mut cadence = tokio::time::interval_at(tokio::time::Instant::now(), interval);
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         cadence.tick().await;
         match ContractCollectionStore::connect(&database_url).await {
@@ -14912,12 +14937,6 @@ async fn run_terminal_resolution_recovery_loop(
             Err(error) => warn!("terminal resolution recovery database unavailable: {error}"),
         }
     }
-}
-
-fn terminal_resolution_recovery_cadence(starts_at: tokio::time::Instant) -> tokio::time::Interval {
-    let mut cadence = tokio::time::interval_at(starts_at, TERMINAL_RESOLUTION_RECOVERY_INTERVAL);
-    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    cadence
 }
 
 pub fn spawn_contract_collection_loop_with_notifications(
@@ -15228,35 +15247,6 @@ mod embed_tests {
     use super::*;
 
     const MANUAL_CONTRACT_EMBED_NONCE: &str = "ci-manual-contract-check";
-
-    #[tokio::test(start_paused = true)]
-    async fn terminal_resolution_recovery_cadence_skips_missed_ticks() {
-        use std::future::Future;
-        use std::task::Poll;
-
-        let mut cadence = terminal_resolution_recovery_cadence(tokio::time::Instant::now());
-        cadence.tick().await;
-        tokio::time::advance(Duration::from_secs(3 * 60)).await;
-        cadence.tick().await;
-
-        let mut next_tick = Box::pin(cadence.tick());
-        let is_pending = std::future::poll_fn(|context| {
-            Poll::Ready(next_tick.as_mut().poll(context).is_pending())
-        })
-        .await;
-        assert!(
-            is_pending,
-            "missed ticks are skipped instead of replayed immediately"
-        );
-        tokio::time::advance(Duration::from_secs(59)).await;
-        let is_still_pending = std::future::poll_fn(|context| {
-            Poll::Ready(next_tick.as_mut().poll(context).is_pending())
-        })
-        .await;
-        assert!(is_still_pending);
-        tokio::time::advance(Duration::from_secs(1)).await;
-        next_tick.await;
-    }
 
     #[cfg(unix)]
     #[test]
