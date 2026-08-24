@@ -10209,9 +10209,6 @@ impl ContractCollector {
         let mut manifest_failures = Vec::new();
         let mut limiter_active = false;
         for summary in &summaries {
-            if limiter_active {
-                continue;
-            }
             if let Some(manifest) = retained_manifests.get(&summary.contract.contract_id) {
                 let manifest_hash = match content_hash(manifest) {
                     Ok(manifest_hash) => manifest_hash,
@@ -10224,6 +10221,9 @@ impl ContractCollector {
                     manifest_hash,
                 });
                 evidence.resolved_contract_count = observed.len();
+                continue;
+            }
+            if limiter_active {
                 continue;
             }
             match self.contract_items(summary.contract.contract_id).await {
