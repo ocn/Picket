@@ -5523,7 +5523,7 @@ impl ContractCollectionStore {
         .map(|row| (row.get("region_id"), row.get("last_complete_at")))
         .collect();
         let esi_progress_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
-            "SELECT max(updated_at) FROM esi_cache_metadata WHERE resource_key LIKE 'esi:%'",
+            "SELECT max(updated_at) FROM esi_cache_metadata WHERE resource_key LIKE 'contracts/public/%'",
         )
         .fetch_one(&self.pool)
         .await?;

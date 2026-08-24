@@ -17106,7 +17106,7 @@ async fn r2z2_producer_telemetry_is_persisted_by_health_and_recovers_after_a_par
         .await
         .expect("seed current regional progress");
     sqlx::query(
-        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('esi:regions', $1)",
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('contracts/public/10000002/page/1', $1)",
     )
     .bind(now)
     .execute(&pool)
@@ -30613,6 +30613,119 @@ fn health_command_response_is_below_the_discord_limit_and_reports_truncation() {
 }
 
 #[tokio::test]
+async fn health_cycle_uses_public_contract_cache_for_esi_progress_and_excludes_unrelated_namespaces(
+) {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to the ESI health-evidence database");
+    let now = database.now().await;
+    let started_at = now - chrono::Duration::minutes(31);
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $2)",
+    )
+    .bind(now)
+    .bind(started_at)
+    .execute(&pool)
+    .await
+    .expect("seed current heartbeat with an expired ESI startup grace");
+    sqlx::query("INSERT INTO regional_collection_metadata (region_id, baseline_at, complete_observations, last_complete_at) VALUES (10000002, $1, 1, $1)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed current regional progress");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('contracts/public/10000002/page/1', $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("persist the public-contract collection cache evidence");
+
+    let current = HealthCycle::new(store.clone(), clock.clone())
+        .run_once()
+        .await
+        .expect("evaluate current public-contract ESI progress");
+    assert_eq!(current.status, HealthStatus::Healthy);
+    assert!(current
+        .checks
+        .iter()
+        .any(|check| check.key == "esi_progress" && check.status == HealthStatus::Healthy));
+
+    sqlx::query("UPDATE esi_cache_metadata SET updated_at = $1 WHERE resource_key = 'contracts/public/10000002/page/1'")
+        .bind(started_at)
+        .execute(&pool)
+        .await
+        .expect("make the public-contract evidence genuinely stale");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('esi:unrelated', $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed an unrelated current ESI cache namespace");
+    clock.advance(chrono::Duration::seconds(1));
+    let stale = HealthCycle::new(store.clone(), clock.clone())
+        .run_once()
+        .await
+        .expect("evaluate stale public-contract ESI progress");
+    assert!(stale
+        .checks
+        .iter()
+        .any(|check| check.key == "esi_progress" && check.status == HealthStatus::Critical));
+
+    sqlx::query(
+        "DELETE FROM esi_cache_metadata WHERE resource_key = 'contracts/public/10000002/page/1'",
+    )
+    .execute(&pool)
+    .await
+    .expect("remove public-contract ESI progress evidence");
+    clock.advance(chrono::Duration::seconds(1));
+    let missing = HealthCycle::new(store.clone(), clock.clone())
+        .run_once()
+        .await
+        .expect("evaluate missing public-contract ESI progress");
+    assert!(missing
+        .checks
+        .iter()
+        .any(|check| check.key == "esi_progress" && check.status == HealthStatus::Critical));
+
+    let pause_until = clock.now() + chrono::Duration::minutes(5);
+    sqlx::query(
+        "INSERT INTO esi_collection_limiter_state (limiter_scope, pause_until) VALUES (TRUE, $1)",
+    )
+    .bind(pause_until)
+    .execute(&pool)
+    .await
+    .expect("persist an active ESI pause boundary");
+    let paused = HealthCycle::new(store.clone(), clock.clone())
+        .run_once()
+        .await
+        .expect("evaluate the active ESI pause");
+    assert!(paused
+        .checks
+        .iter()
+        .any(|check| check.key == "esi_progress" && check.status == HealthStatus::Healthy));
+
+    clock.advance(chrono::Duration::minutes(5));
+    let after_pause = HealthCycle::new(store, clock)
+        .run_once()
+        .await
+        .expect("evaluate the expired ESI pause");
+    assert!(after_pause
+        .checks
+        .iter()
+        .any(|check| check.key == "esi_progress" && check.status == HealthStatus::Critical));
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn health_cycle_caps_regional_evidence_and_reports_the_omitted_region_count() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
@@ -30633,7 +30746,7 @@ async fn health_cycle_caps_regional_evidence_and_reports_the_omitted_region_coun
     .await
     .expect("seed current heartbeat");
     sqlx::query(
-        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('esi:regions', $1)",
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('contracts/public/10000002/page/1', $1)",
     )
     .bind(now)
     .execute(&pool)
@@ -30693,7 +30806,7 @@ async fn concurrent_health_cycles_serialize_transition_comparison_and_insert() {
         .await
         .expect("seed current contract progress");
     sqlx::query(
-        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('esi:regions', $1)",
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('contracts/public/10000002/page/1', $1)",
     )
     .bind(now)
     .execute(&pool)
@@ -30805,7 +30918,7 @@ async fn older_health_cycle_completion_does_not_overwrite_newer_persisted_health
         .await
         .expect("seed regional health evidence");
     sqlx::query(
-        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('esi:regions', $1)",
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('contracts/public/10000002/page/1', $1)",
     )
     .bind(now)
     .execute(&pool)
@@ -31060,7 +31173,7 @@ async fn health_cycle_persists_thresholds_recovers_after_restart_and_isolates_st
         .await
         .expect("seed initial contract progress");
     sqlx::query(
-        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('esi:regions', $1)",
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('contracts/public/10000002/page/1', $1)",
     )
     .bind(initial_progress_at)
     .execute(&pool)
@@ -31095,7 +31208,7 @@ async fn health_cycle_persists_thresholds_recovers_after_restart_and_isolates_st
     .execute(&pool)
     .await
     .expect("recover contract progress evidence");
-    sqlx::query("UPDATE esi_cache_metadata SET updated_at = $1 WHERE resource_key = 'esi:regions'")
+    sqlx::query("UPDATE esi_cache_metadata SET updated_at = $1 WHERE resource_key = 'contracts/public/10000002/page/1'")
         .bind(current_time)
         .execute(&pool)
         .await
@@ -31276,7 +31389,7 @@ async fn health_cycle_persists_feed_progress_validation_and_a_stable_growing_bac
         .await
         .expect("seed current regional progress");
     sqlx::query(
-        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('esi:regions', $1)",
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('contracts/public/10000002/page/1', $1)",
     )
     .bind(now)
     .execute(&pool)
