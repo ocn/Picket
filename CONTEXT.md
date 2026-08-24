@@ -124,6 +124,28 @@ _Avoid_: Repost, historical replay
 Identity or location facts preserved with their source and observation time after collection. Previously verified location evidence remains part of contract history after structure access changes and is retained until an explicit retention policy replaces indefinite storage.
 _Avoid_: Authorization token, live lookup result
 
+## Killfeed language
+
+**Ship Type**:
+A concrete hull identified by an EVE type ID (e.g., Sidewinder).
+_Avoid_: Ship, hull class
+
+**Ship Group**:
+An EVE group ID naming a category of Ship Types (e.g., Covert Ops).
+_Avoid_: Ship class, ship group type, group type
+
+**Type-Tracked Ship**:
+An attacker whose Ship Type appears in the matched subscription's ship-type filter list. A Type-Tracked Ship is displayed by its Ship Type name; all other ships are displayed by their Ship Group name. Tracking follows the hull an attacker flies, never the weapon they use.
+_Avoid_: Matched ship, tracked hull
+
+**Fleet Composition Tally**:
+The per-kill summary of attacker ship kinds, rendered as a bounded list of Tally Entries plus an overflow count of unnamed remaining ships. Type-Tracked Ships are guaranteed a named entry ahead of count-based selection.
+_Avoid_: Attacker summary, ship breakdown
+
+**Tally Entry**:
+One "Nx Name" element of a Fleet Composition Tally, counted per Ship Group — or per Ship Type for Type-Tracked Ships, which are counted apart from their Ship Group.
+_Avoid_: Line item
+
 ## Release and communication
 
 **Deployment**:

@@ -4,7 +4,7 @@ use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use serenity::model::id::{GuildId, UserId};
 use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Formatter;
 use std::fs;
@@ -308,6 +308,33 @@ impl FilterNode {
                 nodes.iter().any(|n| n.contains_ship_filter())
             }
             FilterNode::Not(node) => node.contains_ship_filter(),
+        }
+    }
+
+    /// Collects the union of all ShipType ID lists in this filter tree.
+    /// Used to determine which attackers are Type-Tracked Ships for display:
+    /// an attacker whose flown hull's type ID is in this set is displayed by
+    /// its Ship Type name instead of its Ship Group name.
+    pub fn ship_type_ids(&self) -> HashSet<u32> {
+        let mut ids = HashSet::new();
+        self.collect_ship_type_ids(&mut ids);
+        ids
+    }
+
+    fn collect_ship_type_ids(&self, ids: &mut HashSet<u32>) {
+        match self {
+            FilterNode::Condition(Filter::Targeted(tf)) => {
+                if let TargetableCondition::ShipType(type_ids) = &tf.condition {
+                    ids.extend(type_ids.iter().copied());
+                }
+            }
+            FilterNode::Condition(Filter::Simple(_)) => {}
+            FilterNode::And(nodes) | FilterNode::Or(nodes) => {
+                for node in nodes {
+                    node.collect_ship_type_ids(ids);
+                }
+            }
+            FilterNode::Not(node) => node.collect_ship_type_ids(ids),
         }
     }
 }
