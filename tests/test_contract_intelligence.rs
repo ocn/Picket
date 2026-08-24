@@ -8519,10 +8519,6 @@ struct ExhaustedWireManifestEsi {
     unavailable_contract_id: i64,
 }
 
-struct HttpRegionsAndTerminalProbeEsi {
-    http: Arc<HttpPublicContractEsi>,
-}
-
 #[derive(Default)]
 struct ConditionalEsi {
     received_etags: StdMutex<Vec<Option<String>>>,
@@ -9193,44 +9189,6 @@ impl PublicContractEsi for ExhaustedWireManifestEsi {
                 .expect("successful manifest configured")
                 .clone())
         }
-    }
-}
-
-#[async_trait]
-impl PublicContractEsi for HttpRegionsAndTerminalProbeEsi {
-    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
-        self.http.regions(etag).await
-    }
-
-    async fn public_contracts_page(
-        &self,
-        _region_id: i64,
-        page: u32,
-        _etag: Option<&str>,
-    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
-        assert_eq!(
-            page, 1,
-            "the terminal-probe wire fixture has one summary page"
-        );
-        Ok(EsiResponse::fresh(vec![], expiring_page(1)))
-    }
-
-    async fn public_contract_items(
-        &self,
-        _contract_id: i64,
-        _etag: Option<&str>,
-    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
-        panic!("the terminal-probe wire fixture has no summary manifests")
-    }
-
-    async fn public_contract_items_probe(
-        &self,
-        contract_id: i64,
-        etag: Option<&str>,
-    ) -> Result<ContractItemProbe, EsiError> {
-        self.http
-            .public_contract_items_probe(contract_id, etag)
-            .await
     }
 }
 
@@ -14685,10 +14643,15 @@ async fn expired_and_unknown_terminal_outcomes_use_independent_actions_and_are_i
         probes: StdMutex::new(vec![Ok(ContractItemProbe::NotFound(expiring_cache()))]),
         probe_calls: StdMutex::new(Vec::new()),
     });
-    let report = ContractCollector::new(store.clone(), resolver.clone())
+    let classifier = ContractCollector::new(store.clone(), resolver.clone());
+    classifier
         .collect_cycle()
         .await
-        .expect("classify only the evidence available to public collection");
+        .expect("record the public disappearance without terminal probing");
+    let report = classifier
+        .recover_terminal_resolutions()
+        .await
+        .expect("classify only the evidence available to public recovery");
     assert_eq!(
         report
             .events
@@ -14720,7 +14683,7 @@ async fn expired_and_unknown_terminal_outcomes_use_independent_actions_and_are_i
         delivery.clone(),
     );
     let recovered = collector
-        .collect_cycle()
+        .recover_terminal_resolutions()
         .await
         .expect("restart and deliver the pending terminal outcomes");
     assert_eq!(
@@ -14783,7 +14746,7 @@ async fn expired_and_unknown_terminal_outcomes_use_independent_actions_and_are_i
     );
 
     let repeated = collector
-        .collect_cycle()
+        .recover_terminal_resolutions()
         .await
         .expect("terminal lifecycle processing is locally idempotent");
     assert!(repeated.events.is_empty());
@@ -14864,9 +14827,9 @@ async fn no_content_at_or_after_expiry_is_expired_not_acceptance_confirmed() {
         probe_calls: StdMutex::new(Vec::new()),
     });
     let report = ContractCollector::new(store.clone(), resolver.clone())
-        .collect_cycle()
+        .recover_terminal_resolutions()
         .await
-        .expect("classify the expiry-boundary no-content response");
+        .expect("classify the expiry-boundary no-content response through recovery");
     assert_eq!(
         report
             .events
@@ -16078,49 +16041,41 @@ async fn malformed_terminal_probe_persists_limiter_metadata_and_blocks_restart()
         .await
         .expect("seed due terminal probe");
     pool.close().await;
-    let server = SequenceHttpServer::start(vec![
-        WireReply {
-            status: 200,
-            headers: vec![("Cache-Control", "max-age=0")],
-            body: "[10000002]",
-        },
-        WireReply {
-            status: 200,
-            headers: vec![
-                ("X-ESI-Error-Limit-Remain", "0"),
-                ("X-ESI-Error-Limit-Reset", "60"),
-            ],
-            body: "{",
-        },
-    ]);
-    let http = Arc::new(
+    let server = SequenceHttpServer::start(vec![WireReply {
+        status: 200,
+        headers: vec![
+            ("X-ESI-Error-Limit-Remain", "0"),
+            ("X-ESI-Error-Limit-Reset", "60"),
+        ],
+        body: "{",
+    }]);
+    let esi = Arc::new(
         HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
             .expect("construct HTTP ESI client"),
     );
-    let esi = Arc::new(HttpRegionsAndTerminalProbeEsi { http });
 
     let report = ContractCollector::new(store, esi.clone())
-        .collect_cycle()
+        .recover_terminal_resolutions()
         .await
-        .expect("a malformed terminal probe remains an isolated regional failure");
-    assert_eq!(
-        report.regions,
-        vec![CollectionOutcome::BaselineEstablished { region_id: REGION }]
-    );
+        .expect("a malformed terminal probe remains an isolated recovery failure");
+    assert!(report.retry_after.is_some());
     assert_eq!(
         server.requests.lock().unwrap().len(),
-        2,
-        "the first cycle sends discovery and one malformed terminal probe"
+        1,
+        "recovery sends only the terminal item probe"
     );
+    assert!(!server.requests.lock().unwrap()[0]
+        .to_ascii_lowercase()
+        .contains("authorization:"));
 
-    let error = ContractCollector::new(database.store().await, esi)
-        .collect_cycle()
+    let restarted = ContractCollector::new(database.store().await, esi)
+        .recover_terminal_resolutions()
         .await
-        .expect_err("the malformed probe's persisted limiter boundary blocks restart discovery");
-    assert!(error.to_string().contains("persisted global ESI limiter"));
+        .expect("the malformed probe's persisted limiter boundary safely stops restart recovery");
+    assert!(restarted.retry_after.is_some());
     assert_eq!(
         server.requests.lock().unwrap().len(),
-        2,
+        1,
         "restart must make no wire request after the malformed 2xx limiter boundary"
     );
 
@@ -25410,38 +25365,32 @@ async fn listings_and_each_terminal_delivery_precede_gated_later_resolution_prob
         sent: StdMutex::new(Vec::new()),
         delivered: Arc::new(Notify::new()),
     });
-    let first_delivery = delivery.delivered.notified();
-    let first_probe_started = esi.first_probe_started.notified();
     let collector = ContractCollector::new(store, esi.clone()).with_notifications(
         Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
         delivery.clone(),
     );
-    let cycle = tokio::spawn(async move { collector.collect_cycle().await });
-
-    if tokio::time::timeout(Duration::from_secs(2), first_delivery)
+    let listed_delivery = delivery.delivered.notified();
+    collector
+        .collect_cycle()
         .await
-        .is_err()
-    {
-        esi.first_probe_release.notify_one();
-        esi.second_probe_release.notify_one();
-        cycle
-            .await
-            .expect("join the released listing-before-probe regression")
-            .expect("finish the released listing-before-probe regression");
-        panic!("the ready listing waited behind the first terminal probe");
-    }
+        .expect("regional discovery delivers the listing before terminal recovery begins");
+    listed_delivery.await;
     assert_eq!(delivery.sent.lock().unwrap()[0].contract_id, LISTED);
     let first_terminal_delivery = delivery.delivered.notified();
+    let first_probe_started = esi.first_probe_started.notified();
+    let recovery_collector = collector.clone();
+    let recovery =
+        tokio::spawn(async move { recovery_collector.recover_terminal_resolutions().await });
     tokio::time::timeout(Duration::from_secs(2), first_probe_started)
         .await
-        .expect("the first terminal probe begins after the listing delivery");
+        .expect("the recovery owner begins its first terminal probe after listing delivery");
     esi.first_probe_release.notify_one();
     if tokio::time::timeout(Duration::from_secs(2), first_terminal_delivery)
         .await
         .is_err()
     {
         esi.second_probe_release.notify_one();
-        cycle
+        recovery
             .await
             .expect("join the released first-terminal regression")
             .expect("finish the released first-terminal regression");
@@ -25451,20 +25400,20 @@ async fn listings_and_each_terminal_delivery_precede_gated_later_resolution_prob
     let second_probe_started = esi.second_probe_started.notified();
     tokio::time::timeout(Duration::from_secs(2), second_probe_started)
         .await
-        .expect("the second terminal probe begins only after first terminal dispatch");
+        .expect("the next recovery probe begins only after first terminal dispatch");
     esi.second_probe_release.notify_one();
-    cycle
+    recovery
         .await
-        .expect("join the released lifecycle collection")
-        .expect("finish the released lifecycle collection");
+        .expect("join the single-owner terminal recovery")
+        .expect("finish the single-owner terminal recovery");
     database.destroy().await;
 }
 
 #[tokio::test]
-async fn transient_terminal_probe_failures_back_off_so_the_ninth_due_case_advances() {
+async fn transient_terminal_probe_failures_back_off_so_the_next_due_case_advances() {
     const REGION: i64 = 10_000_002;
     const FIRST_CONTRACT: i64 = 44;
-    const NINTH_CONTRACT: i64 = 52;
+    const LAST_CONTRACT: i64 = FIRST_CONTRACT + 32;
 
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
@@ -25487,7 +25436,7 @@ async fn transient_terminal_probe_failures_back_off_so_the_ninth_due_case_advanc
         .connect(&database.url)
         .await
         .expect("connect to seed more than one regional terminal-probe batch");
-    for contract_id in FIRST_CONTRACT..=NINTH_CONTRACT {
+    for contract_id in FIRST_CONTRACT..=LAST_CONTRACT {
         sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,now(),now(),now() - interval '1 second','awaiting_resolution')")
             .bind(REGION)
             .bind(contract_id)
@@ -25508,7 +25457,7 @@ async fn transient_terminal_probe_failures_back_off_so_the_ninth_due_case_advanc
             items: HashMap::new(),
         },
         probes: StdMutex::new(
-            (FIRST_CONTRACT..NINTH_CONTRACT)
+            (FIRST_CONTRACT..LAST_CONTRACT)
                 .map(|_| {
                     Err(EsiError::retryable(
                         "transient terminal probe failure",
@@ -25520,9 +25469,9 @@ async fn transient_terminal_probe_failures_back_off_so_the_ninth_due_case_advanc
         probe_calls: StdMutex::new(Vec::new()),
     });
     ContractCollector::new(store.clone(), first_pass.clone())
-        .collect_cycle()
+        .recover_terminal_resolutions()
         .await
-        .expect("isolated transient probe failures do not abort the regional cycle");
+        .expect("isolated transient probe failures do not abort the recovery tick");
     assert_eq!(
         first_pass
             .probe_calls
@@ -25531,20 +25480,20 @@ async fn transient_terminal_probe_failures_back_off_so_the_ninth_due_case_advanc
             .iter()
             .map(|(contract_id, _)| *contract_id)
             .collect::<Vec<_>>(),
-        (FIRST_CONTRACT..NINTH_CONTRACT).collect::<Vec<_>>(),
-        "the first bounded regional pass attempts the first eight due cases"
+        (FIRST_CONTRACT..LAST_CONTRACT).collect::<Vec<_>>(),
+        "the first bounded recovery tick attempts 32 due cases"
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM contract_resolution_cases WHERE region_id = $1 AND contract_id < $2 AND next_probe_at > now()",
         )
         .bind(REGION)
-        .bind(NINTH_CONTRACT)
+        .bind(LAST_CONTRACT)
         .fetch_one(&pool)
         .await
         .expect("read durable retry scheduling for transient probe failures"),
-        8,
-        "each transient failure advances its persisted next-probe boundary before the next fair pass"
+        32,
+        "each transient failure advances its persisted next-probe boundary before the next fair tick"
     );
 
     let second_pass = Arc::new(ResolutionEsi {
@@ -25563,13 +25512,13 @@ async fn transient_terminal_probe_failures_back_off_so_the_ninth_due_case_advanc
         probe_calls: StdMutex::new(Vec::new()),
     });
     ContractCollector::new(store, second_pass.clone())
-        .collect_cycle()
+        .recover_terminal_resolutions()
         .await
-        .expect("the fair follow-up pass resolves the still-due ninth case");
+        .expect("the fair follow-up tick resolves the still-due final case");
     assert_eq!(
         second_pass.probe_calls.lock().unwrap().as_slice(),
-        [(NINTH_CONTRACT, None)],
-        "the ninth case advances instead of the first eight being selected again"
+        [(LAST_CONTRACT, None)],
+        "the final case advances instead of the retried cases being selected again"
     );
     pool.close().await;
     database.destroy().await;
@@ -34059,5 +34008,242 @@ async fn inconclusive_attempt_evidence_rolls_back_when_failure_lifecycle_insert_
     .expect("count attempt evidence after rollback");
     assert_eq!(counts, (0, 0, 0));
     pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_tick_drains_one_oldest_due_batch_without_regional_discovery() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 100;
+    const DUE_CASES: i64 = 33;
+
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed due terminal recovery cases");
+    let now = Utc::now();
+    for offset in 0..DUE_CASES {
+        let contract_id = FIRST_CONTRACT + offset;
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize due recovery contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(DUE_CASES - offset))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+    }
+    pool.close().await;
+
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "terminal-recovery",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist terminal recovery delivery action");
+    let esi = Arc::new(ResolutionEsi {
+        inner: FakeEsi::default(),
+        probes: StdMutex::new(
+            (0..DUE_CASES)
+                .map(|_| Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())))
+                .collect(),
+        ),
+        probe_calls: StdMutex::new(Vec::new()),
+    });
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let collector = ContractCollector::new(store, esi.clone()).with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+        delivery,
+    );
+
+    let first_tick = collector
+        .recover_terminal_resolutions()
+        .await
+        .expect("recover the first bounded terminal batch");
+    assert_eq!(first_tick.events.len(), 32);
+    assert_eq!(
+        esi.probe_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(contract_id, _)| *contract_id)
+            .collect::<Vec<_>>(),
+        (FIRST_CONTRACT..FIRST_CONTRACT + 32).collect::<Vec<_>>(),
+        "the recovery owner admits the fixed oldest-due batch"
+    );
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect the recovery seam");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM regional_observation_batches")
+            .fetch_one(&pool)
+            .await
+            .expect("count regional observations"),
+        0,
+        "a recovery tick does not require public regional discovery"
+    );
+    pool.close().await;
+
+    let second_tick = collector
+        .recover_terminal_resolutions()
+        .await
+        .expect("continue with the remaining due case");
+    assert_eq!(
+        second_tick
+            .events
+            .iter()
+            .map(|event| event.contract.contract_id)
+            .collect::<Vec<_>>(),
+        vec![FIRST_CONTRACT + DUE_CASES - 1],
+        "a later recovery tick does not reprocess terminal cases"
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn regional_collection_leaves_due_terminal_probes_to_terminal_recovery() {
+    const REGION: i64 = 10_000_002;
+    const CONTRACT: i64 = 100;
+
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed the regional ownership seam");
+    sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,now(),now(),now() - interval '1 second','awaiting_resolution')")
+        .bind(REGION)
+        .bind(CONTRACT)
+        .bind(serde_json::to_value(item_exchange_contract(CONTRACT)).expect("serialize ownership contract"))
+        .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+        .execute(&pool)
+        .await
+        .expect("seed a due terminal case");
+    pool.close().await;
+
+    let esi = Arc::new(ResolutionEsi {
+        inner: FakeEsi {
+            regions: vec![REGION],
+            pages: HashMap::from([(
+                (REGION, 1),
+                Ok(EsiResponse::fresh(vec![], expiring_page(1))),
+            )]),
+            items: HashMap::new(),
+        },
+        probes: StdMutex::new(vec![Ok(ContractItemProbe::AcceptedByPlayer(
+            expiring_cache(),
+        ))]),
+        probe_calls: StdMutex::new(Vec::new()),
+    });
+    let collector = ContractCollector::new(store, esi.clone());
+    collector
+        .collect_cycle()
+        .await
+        .expect("complete regional discovery without consuming terminal work");
+    assert!(
+        esi.probe_calls.lock().unwrap().is_empty(),
+        "regional completion is not a terminal-resolution consumer"
+    );
+
+    collector
+        .recover_terminal_resolutions()
+        .await
+        .expect("the single recovery owner admits the due terminal probe");
+    assert_eq!(
+        esi.probe_calls.lock().unwrap().as_slice(),
+        [(CONTRACT, None)]
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_stops_at_persisted_and_response_limiter_boundaries() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 100;
+
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed recovery limiter cases");
+    for contract_id in [FIRST_CONTRACT, FIRST_CONTRACT + 1] {
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,now(),now(),now() - interval '1 second','awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize limiter contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .execute(&pool)
+            .await
+            .expect("seed a due limiter case");
+    }
+    sqlx::query("INSERT INTO esi_collection_limiter_state (limiter_scope, pause_until) VALUES (TRUE, now() + interval '1 hour')")
+        .execute(&pool)
+        .await
+        .expect("persist an active ESI pause before recovery");
+    pool.close().await;
+
+    let response_boundary = CacheMetadata {
+        error_limit_remain: Some(0),
+        error_limit_reset: Some(60),
+        ..CacheMetadata::cached_for_seconds(0)
+    };
+    let esi = Arc::new(ResolutionEsi {
+        inner: FakeEsi::default(),
+        probes: StdMutex::new(vec![Ok(ContractItemProbe::Available(EsiResponse::fresh(
+            vec![],
+            response_boundary,
+        )))]),
+        probe_calls: StdMutex::new(Vec::new()),
+    });
+    let collector = ContractCollector::new(store, esi.clone());
+
+    let paused = collector
+        .recover_terminal_resolutions()
+        .await
+        .expect("an active persisted limiter safely stops the recovery tick");
+    assert!(paused.retry_after.is_some());
+    assert!(
+        esi.probe_calls.lock().unwrap().is_empty(),
+        "an active persisted limiter prevents the first public recovery probe"
+    );
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to release the persisted limiter");
+    sqlx::query("UPDATE esi_collection_limiter_state SET pause_until = now() - interval '1 second' WHERE limiter_scope = TRUE")
+        .execute(&pool)
+        .await
+        .expect("release the preexisting limiter boundary");
+    pool.close().await;
+
+    let bounded = collector
+        .recover_terminal_resolutions()
+        .await
+        .expect("a response limiter boundary safely stops later recovery probes");
+    assert!(bounded.retry_after.is_some());
+    assert_eq!(
+        esi.probe_calls.lock().unwrap().as_slice(),
+        [(FIRST_CONTRACT, None)],
+        "the response limiter stops the tick before the next due terminal probe"
+    );
     database.destroy().await;
 }
