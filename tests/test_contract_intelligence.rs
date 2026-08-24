@@ -11,22 +11,24 @@ use killbot_rust::contract_intelligence::{
     execute_operator_delivery_cli_with_region_name_lookup_and_ship_groups,
     new_contract_store_handle, proximity_reconciliation_interval_from,
     spawn_contract_collection_loop_with_notifications,
-    spawn_proximity_reconciliation_loop_with_esi, AppStateContractPingLimiter, CacheMetadata,
-    CollectionOutcome, ContractAcceptanceEvidence, ContractCollectionStore, ContractCollector,
-    ContractContextLimiter, ContractContextRequirements, ContractContextResolution,
-    ContractContextValue, ContractDelivery, ContractDeliveryClock, ContractDeliveryError,
-    ContractEmbedContext, ContractEvent, ContractEventAction, ContractEventActions,
-    ContractEventKind, ContractFilter, ContractFilterCondition, ContractFilterNode,
-    ContractItemDirection, ContractItemProbe, ContractLocationContext, ContractMessageEdit,
-    ContractNotificationMessage, ContractObservationContext, ContractPingLimiter, ContractPingType,
-    ContractRequestPacer, ContractResolutionState, ContractSubscription, DeliveryFailureKind,
-    DeliveryRecord, DeliveryStatus, EsiError, EsiResponse, HealthCheck, HealthClock, HealthCycle,
-    HealthDiscordPublisher, HealthPublishError, HealthRuntimeConfig, HealthStatus, HealthWatchdog,
-    HealthWatchdogConfig, HealthWatchdogRunner, HttpPublicContractEsi, IssuerIdentityProvenance,
-    PreparedContractDelivery, PublicContract, PublicContractEsi, PublicContractItem,
-    ShipGroupLookup, ShipGroupResolver, SolarSystemPosition, StructureResolutionAdmission,
-    CONTRACT_DELIVERY_OPERATOR_ACTOR, CONTRACT_DELIVERY_OPERATOR_TOKEN_MAX_BYTES,
-    CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+    spawn_proximity_reconciliation_loop_with_esi, spawn_terminal_resolution_recovery_loop_with_esi,
+    AppStateContractPingLimiter, CacheMetadata, CollectionOutcome, CollectionReport,
+    ContractAcceptanceEvidence, ContractCollectionError, ContractCollectionStore,
+    ContractCollector, ContractContextLimiter, ContractContextRequirements,
+    ContractContextResolution, ContractContextValue, ContractDelivery, ContractDeliveryClock,
+    ContractDeliveryError, ContractEmbedContext, ContractEvent, ContractEventAction,
+    ContractEventActions, ContractEventKind, ContractFilter, ContractFilterCondition,
+    ContractFilterNode, ContractItemDirection, ContractItemProbe, ContractLocationContext,
+    ContractMessageEdit, ContractNotificationMessage, ContractObservationContext,
+    ContractPingLimiter, ContractPingType, ContractRequestPacer, ContractResolutionState,
+    ContractSubscription, DeliveryFailureKind, DeliveryRecord, DeliveryStatus, EsiError,
+    EsiResponse, HealthCheck, HealthClock, HealthCycle, HealthDiscordPublisher, HealthPublishError,
+    HealthRuntimeConfig, HealthStatus, HealthWatchdog, HealthWatchdogConfig, HealthWatchdogRunner,
+    HttpPublicContractEsi, IssuerIdentityProvenance, PreparedContractDelivery, PublicContract,
+    PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver, SolarSystemPosition,
+    StructureResolutionAdmission, CONTRACT_DELIVERY_OPERATOR_ACTOR,
+    CONTRACT_DELIVERY_OPERATOR_TOKEN_MAX_BYTES, CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+    TERMINAL_RESOLUTION_RECOVERY_INTERVAL,
 };
 use killbot_rust::discord_bot::{contract_notification_embed, DiscordContractDelivery};
 use killbot_rust::esi::EsiClient;
@@ -100,6 +102,26 @@ type PersistedStructureCompletion = (
     Option<DateTime<Utc>>,
     Option<String>,
 );
+
+#[async_trait]
+trait TerminalRecoveryTestSeam {
+    async fn collect_discovery_then_recover(
+        &self,
+    ) -> Result<CollectionReport, ContractCollectionError>;
+}
+
+#[async_trait]
+impl TerminalRecoveryTestSeam for ContractCollector {
+    async fn collect_discovery_then_recover(
+        &self,
+    ) -> Result<CollectionReport, ContractCollectionError> {
+        let mut discovery = self.collect_cycle().await?;
+        let recovery = self.recover_terminal_resolutions().await?;
+        discovery.events.extend(recovery.events);
+        discovery.retry_after = std::cmp::max(discovery.retry_after, recovery.retry_after);
+        Ok(discovery)
+    }
+}
 
 fn app_state_for_ping_limiter() -> Arc<AppState> {
     Arc::new(AppState {
@@ -10249,6 +10271,15 @@ struct ResolutionEsi {
     probe_calls: StdMutex<Vec<(i64, Option<String>)>>,
 }
 
+struct GatedTerminalRecoveryEsi {
+    inner: FakeEsi,
+    probe_count: AtomicU64,
+    first_probe_started: Arc<Notify>,
+    first_probe_release: Arc<Notify>,
+    second_probe_started: Arc<Notify>,
+    third_probe_started: Arc<Notify>,
+}
+
 struct ResolutionWithTerminalContextEsi {
     inner: ResolutionEsi,
     context: ContractEmbedContext,
@@ -10295,6 +10326,52 @@ impl PublicContractEsi for ResolutionEsi {
             .unwrap()
             .push((contract_id, etag.map(str::to_owned)));
         self.probes.lock().unwrap().remove(0)
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for GatedTerminalRecoveryEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+
+    async fn public_contract_items_probe(
+        &self,
+        _contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<ContractItemProbe, EsiError> {
+        match self.probe_count.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                self.first_probe_started.notify_one();
+                self.first_probe_release.notified().await;
+            }
+            1 => self.second_probe_started.notify_one(),
+            2 => self.third_probe_started.notify_one(),
+            call => panic!("unexpected terminal recovery probe {call}"),
+        }
+        Err(EsiError::retryable(
+            "synthetic terminal recovery retry",
+            None,
+        ))
     }
 }
 
@@ -13131,7 +13208,7 @@ async fn retained_evidence_reconciles_each_terminal_lifecycle_without_recursive_
         store: store.clone(),
         sent: StdMutex::new(Vec::new()),
     });
-    let terminal_report = ContractCollector::new(
+    let terminal_collector = ContractCollector::new(
         store.clone(),
         Arc::new(PositionedResolutionEsi {
             inner: ResolutionEsi {
@@ -13162,10 +13239,52 @@ async fn retained_evidence_reconciles_each_terminal_lifecycle_without_recursive_
     .with_notifications(
         Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
         initial.clone(),
+    );
+    let discovery = terminal_collector
+        .collect_cycle()
+        .await
+        .expect("record the public disappearance before terminal recovery");
+    assert!(
+        discovery.events.is_empty(),
+        "regional discovery does not own terminal classification"
+    );
+    let recovery_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect terminal cases handed from discovery to recovery");
+    let due_contract_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT contract_id FROM contract_resolution_cases WHERE state = 'awaiting_resolution' ORDER BY contract_id",
     )
-    .collect_cycle()
+    .fetch_all(&recovery_pool)
     .await
-    .expect("produce the genuine sale, purchase, expired, and closed terminal events");
+    .expect("read terminal cases handed from discovery to recovery");
+    assert_eq!(due_contract_ids, vec![201, 202, 203, 204]);
+    sqlx::query(
+        "UPDATE contract_resolution_cases SET next_probe_at = now() - interval '1 second' WHERE state = 'awaiting_resolution'",
+    )
+    .execute(&recovery_pool)
+    .await
+    .expect("make the persisted terminal cases due for the recovery owner");
+    recovery_pool.close().await;
+    let terminal_report = terminal_collector
+        .recover_terminal_resolutions()
+        .await
+        .expect("produce the genuine sale, purchase, expired, and closed terminal events");
+    assert_eq!(
+        terminal_report
+            .events
+            .iter()
+            .map(|event| (event.contract.contract_id, event.kind))
+            .collect::<Vec<_>>(),
+        vec![
+            (201, ContractEventKind::SaleConfirmed),
+            (202, ContractEventKind::PurchaseConfirmed),
+            (203, ContractEventKind::Expired),
+            (204, ContractEventKind::ClosedOutcomeUnknown),
+        ],
+        "the recovery owner classifies each persisted terminal case once"
+    );
     let initial_sent = initial.sent.lock().unwrap();
     assert_eq!(
         initial_sent.len(),
@@ -13235,9 +13354,12 @@ async fn retained_evidence_reconciles_each_terminal_lifecycle_without_recursive_
     assert!(initial_promotion_pings
         .iter()
         .any(|(id, ping)| id == "terminal-sale" && *ping));
-    assert!(initial_promotion_pings
-        .iter()
-        .any(|(id, ping)| id == "terminal-purchase" && !*ping));
+    assert!(
+        initial_promotion_pings
+            .iter()
+            .any(|(id, ping)| id == "terminal-purchase" && !*ping),
+        "terminal purchase retains Post (non-pinging) authority: {initial_promotion_pings:?}"
+    );
     initial_delivery_pool.close().await;
     LocationEvidenceService::new(&store)
         .record_access_qualified(
@@ -13550,8 +13672,12 @@ async fn accepted_player_confirms_only_pure_matched_ship_sales_and_purchases() {
         delivery.clone(),
     );
 
-    let report = collector
+    collector
         .collect_cycle()
+        .await
+        .expect("record the disappeared public contracts");
+    let report = collector
+        .recover_terminal_resolutions()
         .await
         .expect("resolve the disappeared public contracts");
 
@@ -13675,14 +13801,15 @@ async fn accepted_player_confirms_only_pure_matched_ship_sales_and_purchases() {
     .with_notifications(
         Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
         delivery.clone(),
-    )
-    .collect_cycle()
-    .await
-    .expect("a later public observation cannot invalidate acceptance evidence");
+    );
+    let relisted = relisted
+        .collect_cycle()
+        .await
+        .expect("a later public observation cannot invalidate acceptance evidence");
     assert!(relisted.events.is_empty());
 
     let repeated = collector
-        .collect_cycle()
+        .recover_terminal_resolutions()
         .await
         .expect("leave positive acceptance evidence terminal");
     assert!(repeated.events.is_empty());
@@ -13774,7 +13901,7 @@ async fn non_item_filters_deliver_confirmed_sale_and_purchase() {
         store: store.clone(),
         sent: StdMutex::new(Vec::new()),
     });
-    let report = ContractCollector::new(
+    let collector = ContractCollector::new(
         store.clone(),
         Arc::new(ResolutionEsi {
             inner: FakeEsi {
@@ -13795,10 +13922,15 @@ async fn non_item_filters_deliver_confirmed_sale_and_purchase() {
     .with_notifications(
         Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
         delivery.clone(),
-    )
-    .collect_cycle()
-    .await
-    .expect("deliver confirmed terminal events matched by region alone");
+    );
+    collector
+        .collect_cycle()
+        .await
+        .expect("record the public disappearance before terminal recovery");
+    let report = collector
+        .recover_terminal_resolutions()
+        .await
+        .expect("deliver confirmed terminal events matched by region alone");
 
     assert_eq!(
         report
@@ -13990,10 +14122,6 @@ async fn contract_cycle_release_seam_preserves_all_public_lifecycle_outcomes_and
         .events
         .iter()
         .any(|event| event.kind == ContractEventKind::Listed));
-    assert!(first_transition
-        .events
-        .iter()
-        .any(|event| event.kind == ContractEventKind::Expired));
 
     let records = store
         .contract_resolution_records()
@@ -14013,7 +14141,7 @@ async fn contract_cycle_release_seam_preserves_all_public_lifecycle_outcomes_and
     }));
     assert!(records.iter().any(|record| {
         record.contract_id == expired.contract_id
-            && record.state == ContractResolutionState::Expired
+            && record.state == ContractResolutionState::AwaitingResolution
     }));
 
     let raw_pool = PgPoolOptions::new()
@@ -14022,7 +14150,7 @@ async fn contract_cycle_release_seam_preserves_all_public_lifecycle_outcomes_and
         .await
         .expect("connect to release-seam database");
     sqlx::query(
-        "UPDATE contract_resolution_cases SET next_probe_at = now() - interval '1 second' WHERE contract_id IN (44,45,47)",
+        "UPDATE contract_resolution_cases SET next_probe_at = now() - interval '1 second' WHERE contract_id IN (44,45,46,47)",
     )
     .execute(&raw_pool)
     .await
@@ -14054,10 +14182,11 @@ async fn contract_cycle_release_seam_preserves_all_public_lifecycle_outcomes_and
             probe_calls: StdMutex::new(Vec::new()),
         }),
     )
-    .with_notifications(ship_groups, delivery.clone())
-    .collect_cycle()
-    .await
-    .expect("resolve persisted public evidence");
+    .with_notifications(ship_groups, delivery.clone());
+    let resolved = resolved
+        .recover_terminal_resolutions()
+        .await
+        .expect("resolve persisted public evidence");
     assert!(resolved
         .events
         .iter()
@@ -14178,17 +14307,29 @@ async fn a_resolution_probe_failure_does_not_discard_prior_listings_or_confirmat
         delivery.clone(),
     );
 
-    let first = collector
+    let discovery = collector
         .collect_cycle()
         .await
-        .expect("the independent resolution failure must not abort the cycle");
+        .expect("record the listing and public disappearances");
+    let first = collector
+        .recover_terminal_resolutions()
+        .await
+        .expect("the independent resolution failure must not abort terminal recovery");
+    assert_eq!(
+        discovery
+            .events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        vec![ContractEventKind::Listed]
+    );
     assert_eq!(
         first
             .events
             .iter()
             .map(|event| event.kind)
             .collect::<Vec<_>>(),
-        vec![ContractEventKind::Listed, ContractEventKind::SaleConfirmed]
+        vec![ContractEventKind::SaleConfirmed]
     );
     assert_eq!(delivery.sent.lock().unwrap().len(), 2);
     let resolutions = store
@@ -14253,12 +14394,13 @@ async fn a_resolution_probe_failure_does_not_discard_prior_listings_or_confirmat
         )))]),
         probe_calls: StdMutex::new(Vec::new()),
     });
-    let second = ContractCollector::new(store.clone(), restarted_resolver.clone())
+    let restarted = ContractCollector::new(store.clone(), restarted_resolver.clone())
         .with_notifications(
             Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
             delivery.clone(),
-        )
-        .collect_cycle()
+        );
+    let second = restarted
+        .recover_terminal_resolutions()
         .await
         .expect("a restarted collector retries the unresolved independent case");
     assert!(second.events.is_empty());
@@ -14360,7 +14502,7 @@ async fn fresh_cached_item_evidence_resolves_only_its_matching_probe_failure_aft
         probe_calls: StdMutex::new(Vec::new()),
     });
     ContractCollector::new(store.clone(), restarted_esi.clone())
-        .collect_cycle()
+        .recover_terminal_resolutions()
         .await
         .expect("reuse the persisted 200/304 representation after restart");
 
@@ -14452,7 +14594,7 @@ async fn persisted_no_content_evidence_resolves_only_its_matching_probe_failure_
             items: HashMap::new(),
         }),
     )
-    .collect_cycle()
+    .recover_terminal_resolutions()
     .await
     .expect("reconcile persisted 204 acceptance evidence after restart");
 
@@ -14545,7 +14687,7 @@ async fn cached_item_evidence_defers_resolution_for_200_and_conditional_304() {
         .await
         .expect("schedule the cached item probe");
     let second = collector
-        .collect_cycle()
+        .recover_terminal_resolutions()
         .await
         .expect("a fresh 200 item representation remains non-terminal evidence");
     assert!(second.events.is_empty());
@@ -14559,7 +14701,7 @@ async fn cached_item_evidence_defers_resolution_for_200_and_conditional_304() {
         .await
         .expect("schedule the conditional item probe");
     let third = collector
-        .collect_cycle()
+        .recover_terminal_resolutions()
         .await
         .expect("a conditional 304 item representation remains non-terminal evidence");
     assert!(third.events.is_empty());
@@ -18527,7 +18669,7 @@ async fn snapshot_backfill_cap_counts_missing_contexts_and_terminal_delivery_use
             Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
             delivery.clone(),
         )
-        .collect_cycle()
+        .collect_discovery_then_recover()
         .await
         .expect("deliver the terminal event with backfilled observation context");
 
@@ -18715,7 +18857,7 @@ async fn terminal_only_subscription_uses_the_persisted_observation_time_context(
             Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
             delivery.clone(),
         )
-        .collect_cycle()
+        .collect_discovery_then_recover()
         .await
         .expect("confirm the disappeared public sale");
 
@@ -18898,7 +19040,7 @@ async fn terminal_events_preserve_observation_enrichment_after_disappearance_and
             Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
             delivery.clone(),
         )
-        .collect_cycle()
+        .collect_discovery_then_recover()
         .await
         .expect("classify and deliver the terminal event after restart");
 
@@ -19040,7 +19182,7 @@ async fn terminal_live_context_never_backfills_post_disappearance_identity() {
         Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
         delivery.clone(),
     )
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("deliver a terminal event from retained observation evidence");
 
@@ -19174,7 +19316,7 @@ async fn sent_terminal_delivery_is_not_repaired_after_restart_enrichment() {
         Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
         initial_delivery.clone(),
     )
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("send the original terminal alert");
     let delivery_id = initial_delivery.sent.lock().unwrap()[0].delivery_id;
@@ -19230,7 +19372,7 @@ async fn sent_terminal_delivery_is_not_repaired_after_restart_enrichment() {
         Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
         restart_delivery.clone(),
     )
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("reprocess the already-sent terminal alert after restart");
 
@@ -19345,7 +19487,8 @@ async fn terminal_enrichment_deadline_falls_back_to_retained_observation_without
         )
         .with_structure_resolver(resolver.clone())
         .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))));
-    let terminal_collection = tokio::spawn(async move { collector.collect_cycle().await });
+    let terminal_collection =
+        tokio::spawn(async move { collector.collect_discovery_then_recover().await });
     tokio::time::timeout(Duration::from_secs(2), entered)
         .await
         .expect("terminal revalidation begins within the injected deadline");
@@ -19481,7 +19624,7 @@ async fn expired_terminal_structure_evidence_is_revalidated_before_delivery() {
         "Metropolis".to_string(),
     )])))
     .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("revalidate expired terminal structure evidence before delivery");
 
@@ -19603,7 +19746,7 @@ async fn missing_terminal_structure_evidence_is_resolved_before_delivery() {
         "Metropolis".to_string(),
     )])))
     .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("resolve missing terminal structure evidence before delivery");
 
@@ -19725,7 +19868,7 @@ async fn failed_terminal_structure_revalidation_preserves_observation_location()
         "Metropolis".to_string(),
     )])))
     .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("a failed terminal revalidation remains an ordinary delivery");
 
@@ -19829,7 +19972,7 @@ async fn terminal_light_year_range_uses_the_observation_snapshot_after_restart()
             Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
             delivery.clone(),
         )
-        .collect_cycle()
+        .collect_discovery_then_recover()
         .await
         .expect("resolve the terminal event after restart");
 
@@ -19958,7 +20101,7 @@ async fn terminal_same_system_evidence_supersession_clears_stale_facts_preservin
             Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
             delivery.clone(),
         )
-        .collect_cycle()
+        .collect_discovery_then_recover()
         .await
         .expect("reconcile newer same-system terminal evidence");
 
@@ -20160,7 +20303,7 @@ async fn terminal_light_year_range_reuses_location_resolved_at_observation_time(
             delivery.clone(),
         )
         .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))))
-        .collect_cycle()
+        .collect_discovery_then_recover()
         .await
         .expect("resolve the terminal event after restart");
 
@@ -26012,25 +26155,52 @@ async fn bounded_regional_collection_dispatches_fast_terminal_evidence_before_a_
             delivery.clone(),
         )
         .with_max_concurrent_regions(2);
+    let recovery_collector = collector.clone();
     let cycle = tokio::spawn(async move { collector.collect_cycle().await });
 
     tokio::time::timeout(Duration::from_secs(2), slow_started)
         .await
         .expect("the unrelated slow regional attempt starts");
+    assert!(
+        delivery.sent.lock().unwrap().is_empty(),
+        "regional discovery does not own terminal delivery"
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if store
+                .contract_resolution_records()
+                .await
+                .expect("read the case published by fast regional discovery")
+                .iter()
+                .any(|record| record.contract_id == sale.contract_id)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fast regional discovery publishes the terminal case before slow discovery ends");
+    let recovery =
+        tokio::spawn(async move { recovery_collector.recover_terminal_resolutions().await });
     if tokio::time::timeout(Duration::from_secs(2), delivered)
         .await
         .is_err()
     {
         esi.slow_release.notify_one();
+        recovery
+            .await
+            .expect("join the failed recovery assertion")
+            .expect("complete recovery after the failed assertion");
         cycle
             .await
             .expect("join the released cycle after the failing assertion")
             .expect("complete the released slow region");
-        panic!("conclusive fast terminal evidence waited for an unrelated slow region");
+        panic!("the independent recovery owner did not dispatch fast terminal evidence");
     }
     assert!(
         !cycle.is_finished(),
-        "the fast terminal notification is sent while the slow region remains in flight"
+        "the recovery-owned terminal notification is sent while the slow region remains in flight"
     );
     let sent = delivery.sent.lock().unwrap();
     assert_eq!(sent.len(), 1);
@@ -26056,7 +26226,15 @@ async fn bounded_regional_collection_dispatches_fast_terminal_evidence_before_a_
         .await
         .expect("join bounded terminal-evidence cycle")
         .expect("finish the released slow region");
-    assert!(report.events.iter().any(|event| {
+    assert!(report
+        .events
+        .iter()
+        .all(|event| event.kind == ContractEventKind::Listed));
+    let recovery_report = recovery
+        .await
+        .expect("join the independent terminal recovery owner")
+        .expect("complete the independent terminal recovery owner");
+    assert!(recovery_report.events.iter().any(|event| {
         event.region_id == FAST_REGION && event.kind == ContractEventKind::SaleConfirmed
     }));
 
@@ -26527,7 +26705,7 @@ async fn recovery_retains_stale_nonfinancial_closures_without_discord_delivery()
     )
     .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
     .with_recovery_gap(chrono::Duration::minutes(30))
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("retain stale terminal lifecycle facts during recovery");
 
@@ -26619,7 +26797,7 @@ async fn recovery_still_notifies_fresh_pre_expiry_acceptance_evidence() {
     )
     .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
     .with_recovery_gap(chrono::Duration::minutes(30))
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("confirm fresh acceptance evidence after recovery");
 
@@ -28985,7 +29163,6 @@ async fn collection_cycles_retain_context_representations_and_etags_after_a_late
     for (path, etag) in [
         ("GET /universe/regions/", "\"regions-v1\""),
         ("GET /contracts/public/10000002/?page=1", "\"page-v1\""),
-        ("GET /contracts/public/items/44/", "\"items-v1\""),
     ] {
         let matching = requests
             .iter()
@@ -29003,6 +29180,14 @@ async fn collection_cycles_retain_context_representations_and_etags_after_a_late
             "{path} carries its first-cycle ETag"
         );
     }
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("GET /contracts/public/items/44/ HTTP/"))
+            .count(),
+        1,
+        "a still-public contract is not a terminal probe owned by recovery"
+    );
     drop(requests);
     server.finish();
     database.destroy().await;
@@ -32110,12 +32295,21 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         probes: StdMutex::new(vec![Ok(ContractItemProbe::NotPublic(expiring_cache()))]),
         probe_calls: StdMutex::new(Vec::new()),
     });
-    let disappearance_report =
+    let disappearance_collector =
         ContractCollector::new(upgraded_store.clone(), disappearance.clone())
-            .with_recovery_gap(chrono::Duration::milliseconds(i64::MAX))
-            .collect_cycle()
-            .await
-            .expect("resolve an upgraded same-epoch disappearance");
+            .with_recovery_gap(chrono::Duration::milliseconds(i64::MAX));
+    let discovery = disappearance_collector
+        .collect_cycle()
+        .await
+        .expect("record an upgraded same-epoch disappearance");
+    assert!(
+        discovery.events.is_empty(),
+        "regional discovery does not resolve the upgraded terminal case"
+    );
+    let disappearance_report = disappearance_collector
+        .recover_terminal_resolutions()
+        .await
+        .expect("resolve an upgraded same-epoch disappearance");
     assert_eq!(
         disappearance_report
             .events
@@ -32579,7 +32773,7 @@ async fn accepted_player_evidence_confirms_even_after_contract_expiry() {
         }),
     )
     .with_notifications(Arc::new(StaticShipGroups(HashMap::new())), delivery.clone())
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("classify exact public contract evidence");
 
@@ -32712,7 +32906,7 @@ async fn recovery_epoch_tracks_summary_presence_through_a_failed_manifest_then_d
         }),
     )
     .with_recovery_gap(chrono::Duration::minutes(30))
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("detect the disappearance from summary-level epoch presence");
     assert_eq!(
@@ -32783,7 +32977,7 @@ async fn no_content_is_closed_unknown_while_accepted_player_is_definitive() {
             probe_calls: StdMutex::new(Vec::new()),
         }),
     )
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("record non-definitive and definitive pre-expiry outcomes");
 
@@ -32926,7 +33120,7 @@ async fn definitive_acceptance_restart_seam_renders_factual_offered_and_requeste
             probe_calls: StdMutex::new(Vec::new()),
         }),
     )
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("persist definitive and ambiguous terminal provenance before restart");
 
@@ -32979,7 +33173,7 @@ async fn definitive_acceptance_restart_seam_renders_factual_offered_and_requeste
         Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
         delivery.clone(),
     )
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("render retained definitive acceptance evidence after restart");
 
@@ -33147,7 +33341,7 @@ async fn no_content_closure_release_seam_is_non_pinging_and_uses_evidence_safe_t
             probe_calls: StdMutex::new(Vec::new()),
         }),
     )
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("classify controlled ESI no-content evidence");
     assert_eq!(
@@ -33157,8 +33351,8 @@ async fn no_content_closure_release_seam_is_non_pinging_and_uses_evidence_safe_t
             .map(|event| event.kind)
             .collect::<Vec<_>>(),
         vec![
-            ContractEventKind::ClosedOutcomeUnknown,
             ContractEventKind::Expired,
+            ContractEventKind::ClosedOutcomeUnknown,
         ]
     );
     assert!(resolution.events.iter().all(|event| {
@@ -33212,7 +33406,7 @@ async fn no_content_closure_release_seam_is_non_pinging_and_uses_evidence_safe_t
         Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
         delivery.clone(),
     )
-    .collect_cycle()
+    .collect_discovery_then_recover()
     .await
     .expect("serialize the retained terminal notifications after restart");
 
@@ -34245,5 +34439,92 @@ async fn terminal_recovery_stops_at_persisted_and_response_limiter_boundaries() 
         [(FIRST_CONTRACT, None)],
         "the response limiter stops the tick before the next due terminal probe"
     );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_runtime_reconnects_and_skips_missed_fixed_minute_ticks() {
+    const REGION: i64 = 10_000_002;
+    const TEST_INTERVAL: Duration = Duration::from_secs(2);
+    assert_eq!(
+        TERMINAL_RESOLUTION_RECOVERY_INTERVAL,
+        Duration::from_secs(60),
+        "the production recovery runtime owns a fixed one-minute cadence"
+    );
+    let database = TemporaryDatabase::unavailable().await;
+    let esi = Arc::new(GatedTerminalRecoveryEsi {
+        inner: FakeEsi::default(),
+        probe_count: AtomicU64::new(0),
+        first_probe_started: Arc::new(Notify::new()),
+        first_probe_release: Arc::new(Notify::new()),
+        second_probe_started: Arc::new(Notify::new()),
+        third_probe_started: Arc::new(Notify::new()),
+    });
+    let first_probe_started = esi.first_probe_started.notified();
+    let second_probe_started = esi.second_probe_started.notified();
+    let third_probe_started = esi.third_probe_started.notified();
+    let recovery_task = spawn_terminal_resolution_recovery_loop_with_esi(
+        database.url.clone(),
+        TEST_INTERVAL,
+        esi.clone(),
+        Arc::new(StaticShipGroups(HashMap::new())),
+        Arc::new(NoopDelivery),
+        Arc::new(RecordingContractPingLimiter {
+            outcomes: StdMutex::new(Vec::new()),
+            channels: StdMutex::new(Vec::new()),
+        }),
+        None,
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(esi.probe_count.load(Ordering::SeqCst), 0);
+    database.create().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed recovery work after PostgreSQL reconnects");
+    let now = Utc::now();
+    for (contract_id, due_after_seconds) in [(100, -1), (101, 7), (102, 9)] {
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,now(),now(),$5,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize terminal runtime contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now + chrono::Duration::seconds(due_after_seconds))
+            .execute(&pool)
+            .await
+            .expect("seed terminal recovery work");
+    }
+    pool.close().await;
+    drop(store);
+
+    first_probe_started.await;
+    tokio::time::sleep(Duration::from_millis(6_100)).await;
+    esi.first_probe_release.notify_one();
+    second_probe_started.await;
+    assert_eq!(
+        esi.probe_count.load(Ordering::SeqCst),
+        2,
+        "one current tick follows blocked recovery work instead of replaying missed ticks"
+    );
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), third_probe_started)
+            .await
+            .is_err(),
+        "skipped ticks do not replay terminal recovery work immediately"
+    );
+    tokio::time::timeout(Duration::from_secs(3), esi.third_probe_started.notified())
+        .await
+        .expect("the next fixed cadence tick eventually admits terminal recovery work");
+    assert_eq!(esi.probe_count.load(Ordering::SeqCst), 3);
+
+    recovery_task.abort();
+    assert!(recovery_task
+        .await
+        .expect_err("cancel the terminal recovery runtime")
+        .is_cancelled());
     database.destroy().await;
 }
