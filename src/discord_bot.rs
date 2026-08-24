@@ -161,6 +161,74 @@ fn select_top_groups(filtered: Vec<(u32, u32)>, limit: usize) -> Vec<(u32, u32)>
     selected
 }
 
+/// A Fleet Composition Tally key: either a Ship Group (today's behavior) or a
+/// Type-Tracked Ship's Ship Type, carrying its parent Ship Group for category
+/// classification and display-position sorting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TallyKey {
+    Group(u32),
+    Type { type_id: u32, parent_group: u32 },
+}
+
+impl TallyKey {
+    /// The Ship Group a Tally Entry is classified and sorted by.
+    fn parent_group(&self) -> u32 {
+        match self {
+            TallyKey::Group(group_id) => *group_id,
+            TallyKey::Type { parent_group, .. } => *parent_group,
+        }
+    }
+
+    /// The ID used to tie-break same-count Tally Entries: a Ship Type's own type ID,
+    /// or a Ship Group's group ID.
+    fn sort_id(&self) -> u32 {
+        match self {
+            TallyKey::Group(group_id) => *group_id,
+            TallyKey::Type { type_id, .. } => *type_id,
+        }
+    }
+}
+
+/// Select top N Tally Entries, preferring Type-Tracked Ships over Ship Groups.
+/// Type entries claim named slots first (sorted by count DESC, tie-break by type_id),
+/// then remaining slots are filled by the existing group selection (`select_top_groups`)
+/// over the non-type entries. Group entries gain no new priority: with no type entries,
+/// this is byte-identical to `select_top_groups`. Final output sorts by each entry's
+/// parent group's GROUP_NAMES display priority.
+fn select_top_entries(filtered: Vec<(TallyKey, u32)>, limit: usize) -> Vec<(TallyKey, u32)> {
+    let (mut type_entries, group_entries): (Vec<_>, Vec<_>) = filtered
+        .into_iter()
+        .partition(|(key, _)| matches!(key, TallyKey::Type { .. }));
+
+    type_entries.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.sort_id().cmp(&b.0.sort_id()))
+    });
+
+    let mut selected: Vec<(TallyKey, u32)> = type_entries.into_iter().take(limit).collect();
+    let remaining_slots = limit.saturating_sub(selected.len());
+
+    if remaining_slots > 0 {
+        let group_input: Vec<(u32, u32)> = group_entries
+            .into_iter()
+            .map(|(key, count)| (key.parent_group(), count))
+            .collect();
+        selected.extend(
+            select_top_groups(group_input, remaining_slots)
+                .into_iter()
+                .map(|(group_id, count)| (TallyKey::Group(group_id), count)),
+        );
+    }
+
+    selected.sort_by_key(|(key, _)| {
+        GROUP_NAMES
+            .iter()
+            .position(|(id, _, _)| *id == key.parent_group())
+            .unwrap_or(usize::MAX)
+    });
+    selected
+}
+
 /// Get a group name dynamically - checks GROUP_NAMES first, then ESI cache
 /// Returns the ESI name (e.g., "Cruiser") if not in our custom GROUP_NAMES
 async fn get_dynamic_group_name(app_state: &Arc<AppState>, group_id: u32, count: u32) -> String {
@@ -198,6 +266,11 @@ async fn get_dynamic_group_name(app_state: &Arc<AppState>, group_id: u32, count:
 pub(crate) struct MatchedEntity {
     pub ship_name: String,
     pub type_id: u32,
+    /// The flown hull's type ID, if the attacker actually has one. `None` when the
+    /// attacker was only identified via `weapon_type_id` (i.e. `type_id` above is the
+    /// weapon, not a hull). Type-Tracked Ship display must gate on this field, never
+    /// on `type_id`, so a weapon ID is never mistaken for a hull.
+    pub hull_type_id: Option<u32>,
     pub group_id: u32,
     pub corp_id: Option<u64>,
     pub alliance_id: Option<u64>,
@@ -1172,6 +1245,7 @@ async fn select_best_entity_for_display(
                             .await
                             .unwrap_or_default(),
                         type_id,
+                        hull_type_id: attacker.ship_type_id,
                         group_id,
                         corp_id: attacker.corporation_id,
                         alliance_id: attacker.alliance_id,
@@ -1192,6 +1266,7 @@ async fn select_best_entity_for_display(
                     .await
                     .unwrap_or_default(),
                 type_id: zk_data.killmail.victim.ship_type_id,
+                hull_type_id: Some(zk_data.killmail.victim.ship_type_id),
                 group_id,
                 corp_id: zk_data.killmail.victim.corporation_id,
                 alliance_id: zk_data.killmail.victim.alliance_id,
@@ -1594,18 +1669,43 @@ pub async fn build_killmail_embed(
             (None, None)
         };
 
-    // --- Fleet Composition ---
-    let fleet_comp = compute_fleet_composition(app_state, &killmail.attackers).await;
-
     // --- Determine Display Ship Type for Title ---
-    // For ship type/group tracking (Green): use matched ship group count
-    // For entity tracking (alliance/corp) or victim matches: use most common attacker group
+    // Type-Tracked Ship (Green, matched hull is in the subscription's ShipType set):
+    //   use the Ship Type name, count scoped to that exact hull.
+    // For other ship type/group tracking (Green): use matched ship group count.
+    // For entity tracking (alliance/corp) or victim matches: use most common attacker group.
     // Also capture a representative ship type ID for the author icon
+    let ship_type_ids = subscription.root_filter.ship_type_ids();
+
+    // --- Fleet Composition ---
+    let fleet_comp =
+        compute_fleet_composition(app_state, &killmail.attackers, &ship_type_ids).await;
     let (title_ship_count, title_ship_group_name, title_ship_type_id) = if let Some(ref matched) =
         best_match
     {
-        if matched.color == Color::Green && subscription.root_filter.contains_ship_filter() {
-            // Ship tracking: count all attackers with the matched ship group
+        if matched.color == Color::Green
+            && matched
+                .hull_type_id
+                .is_some_and(|hull| ship_type_ids.contains(&hull))
+        {
+            // Type-Tracked Ship: count only attackers flying this exact hull (never the weapon).
+            // Gating on `hull_type_id` (not `type_id`) matters when an attacker has no
+            // `ship_type_id` and matched the subscription's ShipType filter only via
+            // `weapon_type_id` — `type_id` would be the weapon in that case.
+            let tracked_type = matched
+                .hull_type_id
+                .expect("checked by the `is_some_and` guard above");
+            let count = killmail
+                .attackers
+                .iter()
+                .filter(|a| a.ship_type_id == Some(tracked_type))
+                .count() as u64;
+            let type_name = get_name(app_state, tracked_type as u64)
+                .await
+                .unwrap_or_default();
+            (count.max(1), type_name, Some(tracked_type))
+        } else if matched.color == Color::Green && subscription.root_filter.contains_ship_filter() {
+            // Ship Group tracking: count all attackers with the matched ship group
             let tracked_group = matched.group_id;
             let mut count = 0u64;
             for attacker in &killmail.attackers {
@@ -1810,12 +1910,24 @@ pub async fn build_killmail_embed(
 const SUPER_GROUPS: &[u32] = &[30, 659]; // Titans, Supercarriers
 const CAP_GROUPS: &[u32] = &[4594, 485, 1538, 547, 883, 902, 513]; // Lancers, Dreads, FAX, Carriers, Cap Indy, JF, Freighters
 
+/// Get the display name for a Tally Entry: the Ship Type name (always singular)
+/// for Type-Tracked Ships, the dynamic Ship Group name (singular/plural by count)
+/// for everything else.
+async fn get_tally_entry_name(app_state: &Arc<AppState>, key: TallyKey, count: u32) -> String {
+    match key {
+        TallyKey::Group(group_id) => get_dynamic_group_name(app_state, group_id, count).await,
+        TallyKey::Type { type_id, .. } => get_name(app_state, type_id as u64)
+            .await
+            .unwrap_or_else(|| "ships".to_string()),
+    }
+}
+
 /// Fleet composition data for attackers
 struct FleetComposition {
-    /// Overall counts by group_id, sorted by priority
-    overall: Vec<(u32, u32)>,
-    /// Per-affiliation counts: affiliation_id -> Vec<(group_id, count)>
-    by_affiliation: Vec<(u64, u32, Vec<(u32, u32)>)>, // (affiliation_id, total_count, groups)
+    /// Overall counts by Tally Entry key, sorted by priority
+    overall: Vec<(TallyKey, u32)>,
+    /// Per-affiliation counts: affiliation_id -> Vec<(key, count)>
+    by_affiliation: Vec<(u64, u32, Vec<(TallyKey, u32)>)>, // (affiliation_id, total_count, entries)
 }
 
 impl FleetComposition {
@@ -1868,15 +1980,15 @@ impl FleetComposition {
     }
 
     /// Format a category line for overall (no └ prefix), up to 2 types + overflow
-    /// Selects top 2 by count, displays in GROUP_NAMES priority order
+    /// Selects top 2 (Type-Tracked Ships first), displays in GROUP_NAMES priority order
     async fn format_category_line_plain(
-        groups: &[(u32, u32)],
+        entries: &[(TallyKey, u32)],
         category_filter: impl Fn(u32) -> bool,
         app_state: &Arc<AppState>,
     ) -> Option<String> {
-        let filtered: Vec<_> = groups
+        let filtered: Vec<_> = entries
             .iter()
-            .filter(|(gid, _)| category_filter(*gid))
+            .filter(|(key, _)| category_filter(key.parent_group()))
             .cloned()
             .collect();
 
@@ -1886,14 +1998,14 @@ impl FleetComposition {
 
         let total: u32 = filtered.iter().map(|(_, c)| c).sum();
 
-        // Select top 2, preferring known groups over unknown
-        let top2 = select_top_groups(filtered, 2);
+        // Select top 2, Type-Tracked Ships first, then preferring known groups over unknown
+        let top2 = select_top_entries(filtered, 2);
 
         let mut parts = Vec::new();
         let mut shown_count = 0u32;
 
-        for (group_id, count) in top2.iter() {
-            let name = get_dynamic_group_name(app_state, *group_id, *count).await;
+        for (key, count) in top2.iter() {
+            let name = get_tally_entry_name(app_state, *key, *count).await;
             parts.push(format!("{}x {}", count, name));
             shown_count += count;
         }
@@ -1911,15 +2023,15 @@ impl FleetComposition {
     }
 
     /// Format a category line (supers, caps, or subcaps) with up to 2 types + overflow
-    /// Selects top 2, preferring known groups. Displays in GROUP_NAMES priority order.
+    /// Selects top 2, Type-Tracked Ships first. Displays in GROUP_NAMES priority order.
     async fn format_category_line(
-        groups: &[(u32, u32)],
+        entries: &[(TallyKey, u32)],
         category_filter: impl Fn(u32) -> bool,
         app_state: &Arc<AppState>,
     ) -> Option<String> {
-        let filtered: Vec<_> = groups
+        let filtered: Vec<_> = entries
             .iter()
-            .filter(|(gid, _)| category_filter(*gid))
+            .filter(|(key, _)| category_filter(key.parent_group()))
             .cloned()
             .collect();
 
@@ -1929,14 +2041,14 @@ impl FleetComposition {
 
         let total: u32 = filtered.iter().map(|(_, c)| c).sum();
 
-        // Select top 2, preferring known groups over unknown
-        let top2 = select_top_groups(filtered, 2);
+        // Select top 2, Type-Tracked Ships first, then preferring known groups over unknown
+        let top2 = select_top_entries(filtered, 2);
 
         let mut parts = Vec::new();
         let mut shown_count = 0u32;
 
-        for (group_id, count) in top2.iter() {
-            let name = get_dynamic_group_name(app_state, *group_id, *count).await;
+        for (key, count) in top2.iter() {
+            let name = get_tally_entry_name(app_state, *key, *count).await;
             parts.push(format!("{} {}", count, name));
             shown_count += count;
         }
@@ -2018,15 +2130,18 @@ impl FleetComposition {
     }
 }
 
-/// Compute fleet composition by aggregating attackers by ship group
+/// Compute fleet composition by aggregating attackers by Tally Entry key: a Type-Tracked
+/// Ship's flown hull is in `ship_type_ids` tallies under its Ship Type, apart from its
+/// Ship Group; everyone else tallies under their Ship Group as before. No double counting.
 async fn compute_fleet_composition(
     app_state: &Arc<AppState>,
     attackers: &[Attacker],
+    ship_type_ids: &HashSet<u32>,
 ) -> FleetComposition {
-    // Count by group overall
-    let mut group_counts: HashMap<u32, u32> = HashMap::new();
-    // Count by (affiliation, group) - for ship breakdown
-    let mut affiliation_groups: HashMap<u64, HashMap<u32, u32>> = HashMap::new();
+    // Count by Tally Entry key overall
+    let mut entry_counts: HashMap<TallyKey, u32> = HashMap::new();
+    // Count by (affiliation, key) - for ship breakdown
+    let mut affiliation_entries: HashMap<u64, HashMap<TallyKey, u32>> = HashMap::new();
     // Count total attackers per affiliation (including those without ships)
     let mut affiliation_totals: HashMap<u64, u32> = HashMap::new();
     // Track unknown groups for debugging
@@ -2052,11 +2167,20 @@ async fn compute_fleet_composition(
                 *unknown_groups.entry(group_id).or_insert(0) += 1;
             }
 
-            *group_counts.entry(group_id).or_insert(0) += 1;
-            *affiliation_groups
+            let key = if ship_type_ids.contains(&ship_id) {
+                TallyKey::Type {
+                    type_id: ship_id,
+                    parent_group: group_id,
+                }
+            } else {
+                TallyKey::Group(group_id)
+            };
+
+            *entry_counts.entry(key).or_insert(0) += 1;
+            *affiliation_entries
                 .entry(affiliation_id)
                 .or_default()
-                .entry(group_id)
+                .entry(key)
                 .or_insert(0) += 1;
         }
     }
@@ -2069,37 +2193,41 @@ async fn compute_fleet_composition(
         );
     }
 
-    // Sort overall by GROUP_NAMES order (priority)
-    let mut overall: Vec<(u32, u32)> = group_counts.into_iter().collect();
-    overall.sort_by_key(|(group_id, _)| {
+    // Sort overall by GROUP_NAMES order (priority); a type entry sorts at its parent's position
+    let mut overall: Vec<(TallyKey, u32)> = entry_counts.into_iter().collect();
+    overall.sort_by_key(|(key, _)| {
         GROUP_NAMES
             .iter()
-            .position(|(id, _, _)| id == group_id)
+            .position(|(id, _, _)| *id == key.parent_group())
             .unwrap_or(usize::MAX)
     });
 
     // Sort affiliations by total count (using affiliation_totals which includes ALL attackers)
-    let mut by_affiliation: Vec<(u64, u32, Vec<(u32, u32)>)> = affiliation_totals
+    let mut by_affiliation: Vec<(u64, u32, Vec<(TallyKey, u32)>)> = affiliation_totals
         .into_iter()
         .map(|(aff_id, total)| {
-            // Get ship groups for this affiliation (may be empty if all attackers had no ship)
-            let groups = affiliation_groups.remove(&aff_id).unwrap_or_default();
-            let mut group_vec: Vec<(u32, u32)> = groups.into_iter().collect();
-            group_vec.sort_by_key(|(group_id, _)| {
+            // Get entries for this affiliation (may be empty if all attackers had no ship)
+            let entries = affiliation_entries.remove(&aff_id).unwrap_or_default();
+            let mut entry_vec: Vec<(TallyKey, u32)> = entries.into_iter().collect();
+            entry_vec.sort_by_key(|(key, _)| {
                 GROUP_NAMES
                     .iter()
-                    .position(|(id, _, _)| id == group_id)
+                    .position(|(id, _, _)| *id == key.parent_group())
                     .unwrap_or(usize::MAX)
             });
-            (aff_id, total, group_vec)
+            (aff_id, total, entry_vec)
         })
         .collect();
     by_affiliation.sort_by(|a, b| {
         b.1.cmp(&a.1)
             .then_with(|| {
                 // Prefer affiliations with known ship groups over NPC-only groups
-                let a_known = a.2.iter().any(|(gid, _)| is_known_group(*gid));
-                let b_known = b.2.iter().any(|(gid, _)| is_known_group(*gid));
+                let a_known =
+                    a.2.iter()
+                        .any(|(key, _)| is_known_group(key.parent_group()));
+                let b_known =
+                    b.2.iter()
+                        .any(|(key, _)| is_known_group(key.parent_group()));
                 b_known.cmp(&a_known)
             })
             .then_with(|| {
@@ -2215,6 +2343,102 @@ mod tests {
         let input = vec![(358, 7)];
         let result = select_top_groups(input, 2);
         assert_eq!(result, vec![(358, 7)]);
+    }
+
+    #[test]
+    fn select_top_entries_with_no_type_entries_matches_select_top_groups() {
+        // Group-only input must be byte-identical to select_top_groups: this is the
+        // key regression guarantee for subscriptions without ship-type filters.
+        let group_input = vec![(9990, 50), (9991, 30), (358, 10), (832, 5)];
+        let entries: Vec<(TallyKey, u32)> = group_input
+            .iter()
+            .map(|(gid, count)| (TallyKey::Group(*gid), *count))
+            .collect();
+        let expected: Vec<(TallyKey, u32)> = select_top_groups(group_input, 2)
+            .into_iter()
+            .map(|(gid, count)| (TallyKey::Group(gid), count))
+            .collect();
+        assert_eq!(select_top_entries(entries, 2), expected);
+    }
+
+    #[test]
+    fn select_top_entries_claims_a_slot_for_a_small_count_type_before_larger_groups() {
+        // A small-count Type-Tracked Ship (Malediction, parent Ceptor 831, count 1)
+        // must claim a named slot ahead of larger untracked groups (Dictor 541 count 2,
+        // AF 324 count 2), displacing the second-largest group into overflow.
+        let input = vec![
+            (TallyKey::Group(324), 2), // AF
+            (TallyKey::Group(541), 2), // Dictor
+            (
+                TallyKey::Type {
+                    type_id: 11186,
+                    parent_group: 831,
+                },
+                1,
+            ), // Malediction (Ceptor)
+        ];
+        let result = select_top_entries(input, 2);
+        // Dictor wins the remaining group slot (541 has display priority over 324 on
+        // a count tie); Malediction claims the guaranteed type slot; AF is displaced.
+        // Final order by parent group's GROUP_NAMES position: Dictor (541) before
+        // Ceptor's position (831).
+        assert_eq!(
+            result,
+            vec![
+                (TallyKey::Group(541), 2),
+                (
+                    TallyKey::Type {
+                        type_id: 11186,
+                        parent_group: 831
+                    },
+                    1
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn select_top_entries_orders_multiple_type_entries_by_count_then_type_id() {
+        let input = vec![
+            (
+                TallyKey::Type {
+                    type_id: 22456,
+                    parent_group: 541,
+                },
+                1,
+            ),
+            (
+                TallyKey::Type {
+                    type_id: 11393,
+                    parent_group: 324,
+                },
+                3,
+            ),
+            (TallyKey::Group(832), 10),
+        ];
+        // Both type entries claim slots (limit 2) ahead of the much larger Logi group;
+        // final display order follows each entry's parent group's GROUP_NAMES position
+        // (Dictor 541 before AF 324), not the count-based selection order.
+        let result = select_top_entries(input, 2);
+        assert_eq!(
+            result,
+            vec![
+                (
+                    TallyKey::Type {
+                        type_id: 22456,
+                        parent_group: 541
+                    },
+                    1
+                ),
+                (
+                    TallyKey::Type {
+                        type_id: 11393,
+                        parent_group: 324
+                    },
+                    3
+                ),
+            ]
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Shared test helpers for integration tests.
 
-use killbot_rust::config::{load_app_config, AppState, Subscription};
+use killbot_rust::config::{load_app_config, AppConfig, AppState, Subscription, System};
 use killbot_rust::models::ZkData;
 use moka::future::Cache;
 use serenity::model::id::GuildId;
@@ -56,6 +56,66 @@ pub async fn create_app_state_with_subscriptions(
     let group_names = killbot_rust::config::load_group_names().unwrap_or_default();
 
     // Create subscription map with a fake guild ID
+    let fake_guild_id = GuildId(123456789);
+    let mut subs_map = HashMap::new();
+    subs_map.insert(fake_guild_id, subscriptions);
+
+    Arc::new(AppState {
+        subscriptions: Arc::new(std::sync::RwLock::new(subs_map)),
+        systems: Arc::new(std::sync::RwLock::new(systems)),
+        ships: Arc::new(std::sync::RwLock::new(ships)),
+        names: Arc::new(std::sync::RwLock::new(names)),
+        tickers: Arc::new(std::sync::RwLock::new(tickers)),
+        group_names: Arc::new(std::sync::RwLock::new(group_names)),
+        celestial_cache: Cache::new(10_000),
+        esi_client: Default::default(),
+        systems_file_lock: Mutex::new(()),
+        ships_file_lock: Mutex::new(()),
+        names_file_lock: Mutex::new(()),
+        tickers_file_lock: Mutex::new(()),
+        group_names_file_lock: Mutex::new(()),
+        subscriptions_file_lock: Mutex::new(()),
+        app_config: Arc::new(app_config),
+        last_ping_times: Mutex::new(HashMap::new()),
+        user_standings: Arc::new(Default::default()),
+        user_standings_file_lock: Default::default(),
+        sso_states: Arc::new(Default::default()),
+    })
+}
+
+/// Create an AppState with pre-seeded ships/names/tickers/group_names caches and no
+/// network-touching config load. Unlike `create_app_state_with_subscriptions`, this does
+/// NOT call `load_app_config` (which requires `DISCORD_BOT_TOKEN`), so it is safe to use
+/// from non-ignored tests that must run without a `.env` file or network access.
+#[allow(dead_code)]
+pub fn create_app_state_with_seeded_caches(
+    subscriptions: Vec<Subscription>,
+    systems: HashMap<u32, System>,
+    ships: HashMap<u32, u32>,
+    names: HashMap<u64, String>,
+    tickers: HashMap<u64, String>,
+    group_names: HashMap<u32, String>,
+) -> Arc<AppState> {
+    let app_config = AppConfig {
+        discord_bot_token: String::new(),
+        discord_client_id: 0,
+        eve_client_id: String::new(),
+        eve_client_secret: String::new(),
+        esi_http_timeout_secs: 15,
+        killmail_process_timeout_secs: 60,
+        redisq_connect_timeout_secs: 10,
+        redisq_request_timeout_secs: 60,
+        r2z2_connect_timeout_secs: 10,
+        r2z2_request_timeout_secs: 15,
+        r2z2_poll_interval_secs: 6,
+        r2z2_max_consecutive_404s: 10,
+        r2z2_resync_timeout_secs: 300,
+        killmail_feed_provider: Default::default(),
+        killmail_post_process_sleep_ms: 0,
+        killmail_workers: 4,
+        killmail_queue_size: 512,
+    };
+
     let fake_guild_id = GuildId(123456789);
     let mut subs_map = HashMap::new();
     subs_map.insert(fake_guild_id, subscriptions);
