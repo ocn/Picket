@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — Correct public-contract ESI health evidence; 02 — Reuse Retained Contract Manifests; 03 — Establish single-owner Terminal Resolution Recovery.
 
-**Status:** claimed
+**Status:** resolved
 
 - [ ] The three completed slices are present together without reintroducing sweep-coupled terminal probes, unnecessary retained-manifest requests, or false ESI-progress health.
 - [ ] Focused cross-slice regressions prove collection, terminal recovery, health evaluation, Progressive Enrichment, and delivery remain compatible.
@@ -24,3 +24,9 @@
 - 2026-08-24 — New bounded evidence on that candidate: clean/current migration compatibility; corrected ESI-progress health; retained-manifest request scaling; bounded sole-owner terminal recovery; public and authenticated ESI authorization wires; subscription/presentation; ping eligibility; and read-only historical repair dry-run tests all passed (10 focused tests). Safe library suite: 95 passed, 1 credentialed visual test ignored, with only the documented independently proven ESI-timeout test skipped. `cargo fmt --check`, `cargo check`, `git diff --check`, and `docker compose config --quiet` passed. `cargo clippy -- -W clippy::all` exited 0 with 87 pre-existing warnings outside the recovery diff range: 74 `uninlined_format_args`, 5 `too_many_arguments`, 3 `result_large_err`, 2 `type_complexity`, and one each of `large_enum_variant`, `needless_borrow`, and `needless_return`.
 - 2026-08-24 — Documentation reconciles the Retained Contract Manifest, Terminal Resolution Recovery, corrected public-contract ESI progress, observational watchdog, Recovery Deployment, Production Verification, and historical-repair gate without creating a canary or automated production action. No deployment, service restart, production database or subscription mutation, Discord call, or historical queue action occurred. The protected unstaged `ON CONFLICT` test hunk remains untouched.
 - 2026-08-24 — Status remains claimed pending final Sol high Standards/Spec review of `6b2b3ad1f2b8d3a6ad25a73b26d799bb78fbbbb8..fc19b5de6e845a0d0b734e24b7975f2499fdca0c`.
+
+## Answer
+
+- Candidate: `bf29e773cb72adb35136b73f137d9bdc3952cf76`; recovery source/test/migration fixed point: `cf617d047686d4c821277a1c6899ad116399cc8d`.
+- Evidence: retained serial real-PostgreSQL suite 273/273 in 325.96s; 10 focused cross-slice, wire, subscription/ping/presentation/history-repair, and clean/current migration tests; safe library suite 95 passed/1 credentialed visual ignored; formatting, typecheck, Clippy, diff, and quiet Compose validation passed.
+- Final Sol review of `6b2b3ad1f2b8d3a6ad25a73b26d799bb78fbbbb8..fc19b5de6e845a0d0b734e24b7975f2499fdca0c`: Spec PASS (0 findings); Standards PASS (0 blocking findings). Nonblocking judgments: duplicated loop harness, recovery-report name, and duplicated manifest fakes.
