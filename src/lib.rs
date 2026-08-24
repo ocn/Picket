@@ -296,6 +296,14 @@ pub async fn run() {
                 warn!("contract collection disabled by invalid CONTRACT_REGIONAL_CONCURRENCY: {error}");
             }
         }
+        contract_intelligence::spawn_terminal_resolution_recovery_loop(
+            database_url.clone(),
+            timeout,
+            ship_groups.clone(),
+            delivery.clone(),
+            ping_limiter.clone(),
+            structure_resolver.clone(),
+        );
         match contract_intelligence::proximity_reconciliation_interval_from_environment() {
             Ok(interval) => {
                 contract_intelligence::spawn_proximity_reconciliation_loop(

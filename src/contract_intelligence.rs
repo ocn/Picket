@@ -104,7 +104,7 @@ fn runtime_contract_region_names() -> Arc<HashMap<i64, String>> {
         }
     }
 }
-const MAX_TERMINAL_RESOLUTION_PROBES_PER_COMPLETED_REGION: usize = 8;
+const TERMINAL_RESOLUTION_RECOVERY_BATCH_SIZE: usize = 32;
 const RESOLUTION_PROBE_RETRY_BASE_SECONDS: i64 = 30;
 const RESOLUTION_PROBE_RETRY_MAX_SECONDS: i64 = 15 * 60;
 pub const DEFAULT_CONTRACT_REGIONAL_CONCURRENCY: usize = 2;
@@ -8411,60 +8411,12 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
         Ok(())
     }
 
-    async fn awaiting_resolution_cases(
+    async fn awaiting_resolution_cases_for_recovery(
         &self,
-    ) -> Result<Vec<AwaitingContractResolution>, sqlx::Error> {
-        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, suppresses_nonfinancial_notification FROM contract_resolution_cases WHERE state = 'awaiting_resolution' AND next_probe_at <= now() ORDER BY region_id, contract_id")
-            .fetch_all(&self.pool)
-            .await?
-            .into_iter()
-            .map(|row| {
-                Ok(AwaitingContractResolution {
-                    region_id: row.get("region_id"),
-                    contract_id: row.get("contract_id"),
-                    contract: serde_json::from_value(row.get("contract")).map_err(json_to_sqlx)?,
-                    manifest: serde_json::from_value(row.get("manifest")).map_err(json_to_sqlx)?,
-                    last_public_observed_at: row.get("last_public_observed_at"),
-                    absence_observed_at: row.get("absence_observed_at"),
-                    suppresses_nonfinancial_notification: row
-                        .get("suppresses_nonfinancial_notification"),
-                })
-            })
-            .collect()
-    }
-
-    async fn awaiting_resolution_cases_for_region(
-        &self,
-        region_id: i64,
         limit: usize,
     ) -> Result<Vec<AwaitingContractResolution>, sqlx::Error> {
-        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, suppresses_nonfinancial_notification FROM contract_resolution_cases WHERE state = 'awaiting_resolution' AND next_probe_at <= now() AND region_id = $1 ORDER BY contract_id LIMIT $2")
-            .bind(region_id)
+        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, suppresses_nonfinancial_notification FROM contract_resolution_cases WHERE state = 'awaiting_resolution' AND next_probe_at <= now() ORDER BY next_probe_at, region_id, contract_id LIMIT $1")
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .fetch_all(&self.pool)
-            .await?
-            .into_iter()
-            .map(|row| {
-                Ok(AwaitingContractResolution {
-                    region_id: row.get("region_id"),
-                    contract_id: row.get("contract_id"),
-                    contract: serde_json::from_value(row.get("contract")).map_err(json_to_sqlx)?,
-                    manifest: serde_json::from_value(row.get("manifest")).map_err(json_to_sqlx)?,
-                    last_public_observed_at: row.get("last_public_observed_at"),
-                    absence_observed_at: row.get("absence_observed_at"),
-                    suppresses_nonfinancial_notification: row
-                        .get("suppresses_nonfinancial_notification"),
-                })
-            })
-            .collect()
-    }
-
-    async fn awaiting_resolution_cases_excluding_regions(
-        &self,
-        excluded_region_ids: &[i64],
-    ) -> Result<Vec<AwaitingContractResolution>, sqlx::Error> {
-        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, suppresses_nonfinancial_notification FROM contract_resolution_cases WHERE state = 'awaiting_resolution' AND next_probe_at <= now() AND NOT (region_id = ANY($1)) ORDER BY region_id, contract_id")
-            .bind(excluded_region_ids)
             .fetch_all(&self.pool)
             .await?
             .into_iter()
@@ -8487,60 +8439,6 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
         &self,
     ) -> Result<Vec<TerminalContractResolution>, sqlx::Error> {
         sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at, acceptance_provenance, state FROM contract_resolution_cases WHERE state <> 'awaiting_resolution' AND notification_pending = TRUE ORDER BY region_id, contract_id")
-            .fetch_all(&self.pool)
-            .await?
-            .into_iter()
-            .map(|row| {
-                Ok(TerminalContractResolution {
-                    region_id: row.get("region_id"),
-                    contract_id: row.get("contract_id"),
-                    contract: serde_json::from_value(row.get("contract")).map_err(json_to_sqlx)?,
-                    manifest: serde_json::from_value(row.get("manifest")).map_err(json_to_sqlx)?,
-                    last_public_observed_at: row.get("last_public_observed_at"),
-                    absence_observed_at: row.get("absence_observed_at"),
-                    acceptance_evidence_at: row.get("acceptance_evidence_at"),
-                    acceptance_provenance: contract_acceptance_provenance_from_optional_str(
-                        row.get::<Option<String>, _>("acceptance_provenance").as_deref(),
-                    )?,
-                    state: contract_resolution_state_from_str(&row.get::<String, _>("state"))?,
-                })
-            })
-            .collect()
-    }
-
-    async fn pending_terminal_notifications_for_region(
-        &self,
-        region_id: i64,
-    ) -> Result<Vec<TerminalContractResolution>, sqlx::Error> {
-        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at, acceptance_provenance, state FROM contract_resolution_cases WHERE state <> 'awaiting_resolution' AND notification_pending = TRUE AND region_id = $1 ORDER BY contract_id")
-            .bind(region_id)
-            .fetch_all(&self.pool)
-            .await?
-            .into_iter()
-            .map(|row| {
-                Ok(TerminalContractResolution {
-                    region_id: row.get("region_id"),
-                    contract_id: row.get("contract_id"),
-                    contract: serde_json::from_value(row.get("contract")).map_err(json_to_sqlx)?,
-                    manifest: serde_json::from_value(row.get("manifest")).map_err(json_to_sqlx)?,
-                    last_public_observed_at: row.get("last_public_observed_at"),
-                    absence_observed_at: row.get("absence_observed_at"),
-                    acceptance_evidence_at: row.get("acceptance_evidence_at"),
-                    acceptance_provenance: contract_acceptance_provenance_from_optional_str(
-                        row.get::<Option<String>, _>("acceptance_provenance").as_deref(),
-                    )?,
-                    state: contract_resolution_state_from_str(&row.get::<String, _>("state"))?,
-                })
-            })
-            .collect()
-    }
-
-    async fn pending_terminal_notifications_excluding_regions(
-        &self,
-        excluded_region_ids: &[i64],
-    ) -> Result<Vec<TerminalContractResolution>, sqlx::Error> {
-        sqlx::query("SELECT region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, acceptance_evidence_at, acceptance_provenance, state FROM contract_resolution_cases WHERE state <> 'awaiting_resolution' AND notification_pending = TRUE AND NOT (region_id = ANY($1)) ORDER BY region_id, contract_id")
-            .bind(excluded_region_ids)
             .fetch_all(&self.pool)
             .await?
             .into_iter()
@@ -8591,17 +8489,6 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
     ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE contract_collection_failures AS failure SET resolved_at = now() FROM contract_resolution_cases AS resolution WHERE resolution.state <> 'awaiting_resolution' AND failure.region_id = resolution.region_id AND failure.contract_id = resolution.contract_id AND failure.resource_key = 'contracts/public/items/' || resolution.contract_id::text AND failure.failure_kind = 'resolution_probe' AND failure.resolved_at IS NULL AND failure.classification IS NULL AND ($1::bigint IS NULL OR resolution.region_id = $1)")
             .bind(region_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn resolve_terminal_resolution_failures_excluding_regions(
-        &self,
-        excluded_region_ids: &[i64],
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE contract_collection_failures AS failure SET resolved_at = now() FROM contract_resolution_cases AS resolution WHERE resolution.state <> 'awaiting_resolution' AND failure.region_id = resolution.region_id AND failure.contract_id = resolution.contract_id AND failure.resource_key = 'contracts/public/items/' || resolution.contract_id::text AND failure.failure_kind = 'resolution_probe' AND failure.resolved_at IS NULL AND failure.classification IS NULL AND NOT (resolution.region_id = ANY($1))")
-            .bind(excluded_region_ids)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -9876,7 +9763,7 @@ impl ContractCollector {
                 &mut attempted_embed_enrichment_deadlines,
             )
             .await?;
-        let mut events = recorded
+        let events = recorded
             .newly_observed
             .into_iter()
             .map(|observed| ContractEvent {
@@ -9894,10 +9781,6 @@ impl ContractCollector {
             self.notify_fresh_events_with_deadlines(&events, &attempted_embed_enrichment_deadlines)
                 .await?;
         }
-        let resolution_batch = self
-            .resolve_awaiting_resolutions_for_region(region_id)
-            .await?;
-        events.extend(resolution_batch.events);
         let outcome = if recorded.baseline_established {
             CollectionOutcome::BaselineEstablished { region_id }
         } else if recorded.recovery_baseline {
@@ -9912,7 +9795,7 @@ impl ContractCollector {
             outcome,
             events,
             consumed_embed_context_enrichments: consumed,
-            retry_after: std::cmp::max(recorded.retry_after, resolution_batch.retry_after),
+            retry_after: recorded.retry_after,
         })
     }
 
@@ -10066,26 +9949,7 @@ impl ContractCollector {
         if let Some(error) = parent_error {
             return Err(error);
         }
-        let completed_region_ids = outcomes
-            .iter()
-            .filter_map(|outcome| match outcome {
-                Some(CollectionOutcome::BaselineEstablished { region_id })
-                | Some(CollectionOutcome::RecoveryBaselineEstablished { region_id })
-                | Some(CollectionOutcome::Complete { region_id, .. }) => Some(*region_id),
-                Some(CollectionOutcome::Inconclusive { .. }) | None => None,
-            })
-            .collect::<Vec<_>>();
         let mut events = events.into_iter().flatten().collect::<Vec<_>>();
-        let resolution_batch = if self.store.active_esi_limiter_deadline().await?.is_some() {
-            ResolutionBatch::default()
-        } else if completed_region_ids.is_empty() {
-            self.resolve_awaiting_resolutions().await?
-        } else {
-            self.resolve_awaiting_resolutions_excluding_regions(&completed_region_ids)
-                .await?
-        };
-        retry_after = std::cmp::max(retry_after, resolution_batch.retry_after);
-        events.extend(resolution_batch.events);
         events.sort_by_key(|event| {
             region_order
                 .get(&event.region_id)
@@ -10291,61 +10155,39 @@ impl ContractCollector {
             .map_err(|error| regional_attempt_error(error.into(), &mut evidence))
     }
 
-    async fn resolve_awaiting_resolutions(
+    pub async fn recover_terminal_resolutions(
         &self,
-    ) -> Result<ResolutionBatch, ContractCollectionError> {
+    ) -> Result<CollectionReport, ContractCollectionError> {
+        if let Some(notifications) = &self.notifications {
+            self.deliver_prepared_notifications(notifications).await?;
+        }
+        let retry_after = self.store.active_esi_limiter_deadline().await?;
+        if retry_after.is_some() {
+            return Ok(CollectionReport {
+                regions: Vec::new(),
+                events: Vec::new(),
+                retry_after,
+            });
+        }
         self.store
             .resolve_terminal_resolution_failures(None)
             .await?;
-        self.resolve_resolution_batch(
-            self.store.pending_terminal_notifications().await?,
-            self.store.awaiting_resolution_cases().await?,
-        )
-        .await
-    }
-
-    async fn resolve_awaiting_resolutions_excluding_regions(
-        &self,
-        excluded_region_ids: &[i64],
-    ) -> Result<ResolutionBatch, ContractCollectionError> {
-        self.store
-            .resolve_terminal_resolution_failures_excluding_regions(excluded_region_ids)
+        let batch = self
+            .resolve_resolution_batch(
+                self.store.pending_terminal_notifications().await?,
+                self.store
+                    .awaiting_resolution_cases_for_recovery(TERMINAL_RESOLUTION_RECOVERY_BATCH_SIZE)
+                    .await?,
+            )
             .await?;
-        self.resolve_resolution_batch(
-            self.store
-                .pending_terminal_notifications_excluding_regions(excluded_region_ids)
-                .await?,
-            self.store
-                .awaiting_resolution_cases_excluding_regions(excluded_region_ids)
-                .await?,
-        )
-        .await
-    }
-
-    async fn resolve_awaiting_resolutions_for_region(
-        &self,
-        region_id: i64,
-    ) -> Result<ResolutionBatch, ContractCollectionError> {
-        self.store
-            .resolve_terminal_resolution_failures(Some(region_id))
-            .await?;
-        let awaiting_resolutions = if self.store.active_esi_limiter_deadline().await?.is_some() {
-            Vec::new()
-        } else {
-            self.store
-                .awaiting_resolution_cases_for_region(
-                    region_id,
-                    MAX_TERMINAL_RESOLUTION_PROBES_PER_COMPLETED_REGION,
-                )
-                .await?
-        };
-        self.resolve_resolution_batch(
-            self.store
-                .pending_terminal_notifications_for_region(region_id)
-                .await?,
-            awaiting_resolutions,
-        )
-        .await
+        Ok(CollectionReport {
+            regions: Vec::new(),
+            events: batch.events,
+            retry_after: std::cmp::max(
+                batch.retry_after,
+                self.store.active_esi_limiter_deadline().await?,
+            ),
+        })
     }
 
     async fn resolve_resolution_batch(
@@ -10371,6 +10213,10 @@ impl ContractCollector {
             }
         }
         for resolution in awaiting_resolutions {
+            if let Some(deadline) = self.store.active_esi_limiter_deadline().await? {
+                batch.retry_after = std::cmp::max(batch.retry_after, Some(deadline));
+                break;
+            }
             let resolution_key = ResolutionCaseKey {
                 region_id: resolution.region_id,
                 contract_id: resolution.contract_id,
@@ -10416,6 +10262,10 @@ impl ContractCollector {
                 }
             }
         }
+        batch.retry_after = std::cmp::max(
+            batch.retry_after,
+            self.store.active_esi_limiter_deadline().await?,
+        );
         Ok(batch)
     }
 
@@ -14868,6 +14718,7 @@ pub async fn run_contract_collection_loop(
 
 pub const DEFAULT_PROXIMITY_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
 pub const MAX_PROXIMITY_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
+pub const TERMINAL_RESOLUTION_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
 pub fn proximity_reconciliation_interval_from(value: Option<&str>) -> Result<Duration, String> {
     let Some(value) = value else {
@@ -14993,6 +14844,80 @@ async fn run_proximity_reconciliation_loop(
             Err(error) => warn!("proximity reconciliation database unavailable: {error}"),
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_terminal_resolution_recovery_loop(
+    database_url: String,
+    esi_timeout: Duration,
+    ship_groups: Arc<dyn ShipGroupResolver>,
+    delivery: Arc<dyn ContractDelivery>,
+    ping_limiter: Arc<dyn ContractPingLimiter>,
+    structure_resolver: Option<Arc<dyn StructureResolver>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let esi = loop {
+            match HttpPublicContractEsi::new(esi_timeout) {
+                Ok(esi) => break Arc::new(esi),
+                Err(error) => {
+                    warn!("terminal resolution recovery HTTP client unavailable: {error}");
+                    tokio::time::sleep(TERMINAL_RESOLUTION_RECOVERY_INTERVAL).await;
+                }
+            }
+        };
+        run_terminal_resolution_recovery_loop(
+            database_url,
+            esi,
+            ship_groups,
+            delivery,
+            ping_limiter,
+            structure_resolver,
+        )
+        .await;
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_terminal_resolution_recovery_loop(
+    database_url: String,
+    esi: Arc<dyn PublicContractEsi>,
+    ship_groups: Arc<dyn ShipGroupResolver>,
+    delivery: Arc<dyn ContractDelivery>,
+    ping_limiter: Arc<dyn ContractPingLimiter>,
+    structure_resolver: Option<Arc<dyn StructureResolver>>,
+) {
+    let region_names = runtime_contract_region_names();
+    let mut cadence = terminal_resolution_recovery_cadence(tokio::time::Instant::now());
+    loop {
+        cadence.tick().await;
+        match ContractCollectionStore::connect(&database_url).await {
+            Ok(store) => {
+                let collector = ContractCollector::new(store, esi.clone())
+                    .with_region_names(region_names.clone())
+                    .with_notifications_and_ping_limiter(
+                        ship_groups.clone(),
+                        delivery.clone(),
+                        ping_limiter.clone(),
+                    )
+                    .with_optional_structure_resolver(structure_resolver.clone());
+                match collector.recover_terminal_resolutions().await {
+                    Ok(report) => info!(
+                        events = report.events.len(),
+                        limiter_active = report.retry_after.is_some(),
+                        "terminal resolution recovery tick finished"
+                    ),
+                    Err(error) => warn!("terminal resolution recovery tick failed: {error}"),
+                }
+            }
+            Err(error) => warn!("terminal resolution recovery database unavailable: {error}"),
+        }
+    }
+}
+
+fn terminal_resolution_recovery_cadence(starts_at: tokio::time::Instant) -> tokio::time::Interval {
+    let mut cadence = tokio::time::interval_at(starts_at, TERMINAL_RESOLUTION_RECOVERY_INTERVAL);
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    cadence
 }
 
 pub fn spawn_contract_collection_loop_with_notifications(
@@ -15303,6 +15228,35 @@ mod embed_tests {
     use super::*;
 
     const MANUAL_CONTRACT_EMBED_NONCE: &str = "ci-manual-contract-check";
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_resolution_recovery_cadence_skips_missed_ticks() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let mut cadence = terminal_resolution_recovery_cadence(tokio::time::Instant::now());
+        cadence.tick().await;
+        tokio::time::advance(Duration::from_secs(3 * 60)).await;
+        cadence.tick().await;
+
+        let mut next_tick = Box::pin(cadence.tick());
+        let is_pending = std::future::poll_fn(|context| {
+            Poll::Ready(next_tick.as_mut().poll(context).is_pending())
+        })
+        .await;
+        assert!(
+            is_pending,
+            "missed ticks are skipped instead of replayed immediately"
+        );
+        tokio::time::advance(Duration::from_secs(59)).await;
+        let is_still_pending = std::future::poll_fn(|context| {
+            Poll::Ready(next_tick.as_mut().poll(context).is_pending())
+        })
+        .await;
+        assert!(is_still_pending);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        next_tick.await;
+    }
 
     #[cfg(unix)]
     #[test]
