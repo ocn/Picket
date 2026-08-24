@@ -72,6 +72,10 @@ _Avoid_: Sold, completed
 The internal lifecycle state of a Public Contract that is No Longer Public but whose terminal outcome has not yet been established. It never supports a user-facing sale or purchase claim.
 _Avoid_: Likely sold, provisional sale
 
+**Terminal Resolution Recovery**:
+Bounded processing of due Awaiting Resolution cases independently of regional discovery. It preserves the existing public-evidence requirements and cannot force, infer, or discard a terminal outcome merely to reduce backlog.
+_Avoid_: Backlog replay, bulk closure
+
 **Acceptance Confirmed**:
 The terminal outcome established when public evidence reports that a contract was recently accepted before its known expiration time. The accepting party remains unknown.
 _Avoid_: Acceptance inferred, absence confirmed
@@ -124,6 +128,10 @@ _Avoid_: Repost, historical replay
 Identity or location facts preserved with their source and observation time after collection. Previously verified location evidence remains part of contract history after structure access changes and is retained until an explicit retention policy replaces indefinite storage.
 _Avoid_: Authorization token, live lookup result
 
+**Retained Contract Manifest**:
+The complete Offered Item and Requested Item membership captured for one Contract ID. Because a submitted contract cannot be altered, a complete manifest remains authoritative; only an absent, incomplete, or previously failed manifest requires collection.
+_Avoid_: Expired item cache, mutable contract contents
+
 ## Killfeed language
 
 **Ship Type**:
@@ -151,6 +159,22 @@ _Avoid_: Line item
 **Deployment**:
 A change to the version running in production.
 _Avoid_: Release
+
+**Runtime Health Snapshot**:
+The watchdog's persisted assessment of current operational evidence. It reports runtime conditions but does not itself authorize or prevent collection and delivery.
+_Avoid_: Deployment gate
+
+**Rollout Health Gate**:
+The release-specific decision predicate that authorizes Deployment, Production Verification, or Historical Enrichment Repair from current operational evidence.
+_Avoid_: Runtime Health Snapshot
+
+**Recovery Deployment**:
+A bounded Deployment whose reviewed purpose is to repair a condition preventing the Runtime Health Snapshot from recovering. It may pass the Rollout Health Gate under the documented recovery exception, but it cannot authorize Historical Enrichment Repair until post-deployment recovery is demonstrated.
+_Avoid_: Healthy deployment, emergency bypass
+
+**Production Verification**:
+A bounded check of the deployed behavior in the sole production environment using one controlled non-pinging message in the testing channel. It is not a canary environment, partial deployment, traffic split, or authority for automated remediation.
+_Avoid_: Canary deployment, staging environment
 
 **GitHub Release**:
 The tagged public record of a deployable version, with technical release notes.

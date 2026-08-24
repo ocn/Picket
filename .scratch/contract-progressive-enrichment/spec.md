@@ -115,7 +115,7 @@ Replace the existing Turnur-area proximity subscription in the designated region
 - PostgreSQL remains authoritative for Contract Observations, Retained Enrichment Evidence, lifecycle events, subscriptions, prepared deliveries, and Historical Enrichment Repair state, consistent with the persistence ADR.
 - No additional token encryption, multi-user authorization, per-channel consent, security workflow, or credential UI is introduced. Existing credential validation and storage behavior remain unchanged.
 - The next presentation change increments the contract presentation revision. All live event kinds and Historical Enrichment Repair use the same revision.
-- Deployment follows the existing health and rollout gate: validate Compose configuration, deploy the reviewed revision, verify collector and resolver health, dry-run historical scope, edit representative canaries, then execute only the explicitly approved bounded remainder while monitoring failures and Retry-After state.
+- Deployment uses one production environment and the guarded Recovery Deployment exception because the deployed runtime cannot repair its own incorrect health evidence or sweep-coupled recovery capacity. Validate Compose configuration and the backup, deploy the reviewed revision once, and let the existing watchdog detect and report regressions without automatically stopping services, changing images, restoring data, or reversing migrations.
 
 ## Testing Decisions
 
@@ -137,8 +137,9 @@ Replace the existing Turnur-area proximity subscription in the designated region
 - Existing location-evidence ordering, structure-resolver authorization, collection rate-limit, restart, terminal lifecycle, compact renderer, and repair tests are prior art and remain part of the regression suite.
 - Automated tests use loopback HTTP fixtures and temporary PostgreSQL and require no live ESI, Discord, or SSO credentials.
 - Final verification includes the focused primary seam, the complete serial contract suite, safe library tests, formatting, typechecking, Clippy, and quiet Docker Compose configuration validation.
-- Production validation re-queries health rather than relying on historical counts. It verifies regional progress, deferred-backlog movement, resolver readiness, prepared delivery count, unresolved permanent failures, Discord errors, duplicate-post indicators, and rate-limit failures before historical work.
-- Live canary acceptance verifies the original Discord message identifiers, no mentions, correct Issuer presentation, human-readable region, strongest retained specific location, no raw identifiers, no replacement posts, and the approved compact style.
+- Production validation re-queries health rather than relying on historical counts. The Rollout Health Gate requires one complete post-deployment regional sweep within the existing 30-minute critical boundary, a smaller backlog with measured throughput projecting clearance within 24 hours, current corrected ESI progress, ready bot/PostgreSQL/watchdog/resolver services, and no new prepared or permanent delivery, authentication-boundary, Discord, panic, database, or sustained rate-limit failure. The 15-minute sweep threshold remains a performance target rather than a rollout blocker.
+- Production Verification uses one controlled non-pinging message in testing channel `1115807643748012072`; it is not a canary environment, staged fleet, or traffic split. It verifies no mentions, correct Issuer presentation, human-readable region, strongest supported location, no raw identifiers, and the approved compact style.
+- Historical Enrichment Repair remains untouched until Production Verification succeeds. A fresh read-only channel-scoped dry run must then report the current eligible count, and the operator must explicitly approve that exact count before any historical edit is queued.
 
 ## Out of Scope
 
