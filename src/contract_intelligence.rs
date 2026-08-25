@@ -16228,18 +16228,7 @@ mod embed_tests {
         assert!(MANUAL_CONTRACT_EMBED_NONCE.chars().count() <= 25);
     }
 
-    #[tokio::test]
-    #[ignore = "manual visual check; requires DISCORD_BOT_TOKEN and CONTRACT_TEST_DISCORD_CHANNEL_ID and sends one non-pinging embed"]
-    async fn manual_contract_embed_visual_delivery() {
-        dotenvy::dotenv().ok();
-        let token = std::env::var("DISCORD_BOT_TOKEN")
-            .expect("DISCORD_BOT_TOKEN is required for the manual contract embed check");
-        let channel_id = std::env::var("CONTRACT_TEST_DISCORD_CHANNEL_ID")
-            .expect(
-                "CONTRACT_TEST_DISCORD_CHANNEL_ID is required for the manual contract embed check",
-            )
-            .parse()
-            .expect("CONTRACT_TEST_DISCORD_CHANNEL_ID must be a Discord snowflake");
+    fn manual_contract_embed_visual_message() -> ContractNotificationMessage {
         let mut event = event(ContractEventKind::SaleConfirmed);
         event.contract.contract_id = 234_057_619;
         event.contract.title = Some("Manual public Hel sale visual check".to_string());
@@ -16272,39 +16261,109 @@ mod embed_tests {
                 observed_at: Utc::now() - ChronoDuration::minutes(30),
             }),
         };
-        let message = contract_notification_message(
+        contract_notification_message(
             &event,
             Some(&event.offered_items[0]),
             &issuer_history,
             &corporation_history,
             false,
+        )
+    }
+
+    fn assert_manual_contract_embed_visual_preflight(message: &ContractNotificationMessage) {
+        assert_eq!(message.title, "Hel contract accepted • 77.5B ISK");
+        assert_eq!(
+            message.presentation_revision,
+            CONTRACT_NOTIFICATION_PRESENTATION_REVISION
         );
-        assert_eq!(message.title, "Hel sold for 77.5B in Jita (The Forge)");
+        assert_eq!(
+            message.author.as_deref(),
+            Some("Public Contract\nissuer: [Issuer Alliance] Issuer Name")
+        );
+        assert_eq!(
+            message.description.as_deref(),
+            Some(concat!(
+                "`<url=\"contract:0//234057619\">Hel - Jita</url>`\n",
+                "**in:** [Jita](http://evemaps.dotlan.net/system/30000142) ([The Forge](http://evemaps.dotlan.net/region/10000002))\n",
+                "**on:** [Jita IV Moon 4 Caldari Navy Assembly Plant](https://zkillboard.com/location/60003760/)"
+            ))
+        );
+        assert_eq!(
+            message.footer.as_deref(),
+            Some("Contract #234057619 • 90-day history")
+        );
+        let description = message.description.as_deref().expect("description");
+        assert!(!description.contains("Unknown"));
+        assert!(!description.contains("Location ID"));
+        assert!(!description.contains("Region ID"));
+        let presentation = std::iter::once(message.title.as_str())
+            .chain(message.description.as_deref())
+            .chain(message.author.as_deref())
+            .chain(message.footer.as_deref())
+            .chain(
+                message
+                    .fields
+                    .iter()
+                    .flat_map(|field| [field.name.as_str(), field.value.as_str()]),
+            )
+            .collect::<Vec<_>>();
+        assert!(presentation.iter().all(|text| {
+            !text.contains("@everyone") && !text.contains("@here") && !text.contains("<@")
+        }));
         assert!(message
-            .description
-            .as_deref()
-            .is_some_and(|description| description.starts_with(
-                "`<url=\"contract:0//234057619\">Hel - Jita</url>`\nissuer: [Issuer Alliance] Issuer Name"
-            )));
+            .fields
+            .iter()
+            .all(|field| !field.name.trim().is_empty() && !field.value.trim().is_empty()));
+        assert!(message
+            .fields
+            .iter()
+            .find(|field| field.name == "History")
+            .is_some_and(|field| field.value.contains("Issuer: 4 sales")
+                && field.value.contains("Corp: 12 sales")));
+        assert_eq!(
+            message.thumbnail_url.as_deref(),
+            Some("https://images.evetech.net/types/22852/icon?size=64")
+        );
+        let embed = contract_notification_embed(message);
+        assert_eq!(
+            embed.0["title"].as_str(),
+            Some("Hel contract accepted • 77.5B ISK")
+        );
+        assert_eq!(
+            embed.0["author"]["name"].as_str(),
+            Some("Public Contract\nissuer: [Issuer Alliance] Issuer Name")
+        );
+        assert_eq!(
+            embed.0["thumbnail"]["url"].as_str(),
+            Some("https://images.evetech.net/types/22852/icon?size=64")
+        );
+    }
+
+    #[test]
+    fn manual_contract_embed_visual_preflight_matches_current_presentation() {
+        assert_manual_contract_embed_visual_preflight(&manual_contract_embed_visual_message());
+    }
+
+    #[tokio::test]
+    #[ignore = "manual visual check; requires DISCORD_BOT_TOKEN and CONTRACT_TEST_DISCORD_CHANNEL_ID and sends one non-pinging embed"]
+    async fn manual_contract_embed_visual_delivery() {
+        dotenvy::dotenv().ok();
+        let token = std::env::var("DISCORD_BOT_TOKEN")
+            .expect("DISCORD_BOT_TOKEN is required for the manual contract embed check");
+        let channel_id = std::env::var("CONTRACT_TEST_DISCORD_CHANNEL_ID")
+            .expect(
+                "CONTRACT_TEST_DISCORD_CHANNEL_ID is required for the manual contract embed check",
+            )
+            .parse()
+            .expect("CONTRACT_TEST_DISCORD_CHANNEL_ID must be a Discord snowflake");
+        let message = manual_contract_embed_visual_message();
+        assert_manual_contract_embed_visual_preflight(&message);
         assert!(field(&message, "History")
             .expect("issuer history")
             .contains("4 sales"));
         assert!(field(&message, "History")
             .expect("corporation history")
             .contains("12 sales"));
-        assert_eq!(
-            message.thumbnail_url.as_deref(),
-            Some("https://images.evetech.net/types/22852/icon?size=64")
-        );
-        let embed = contract_notification_embed(&message);
-        assert_eq!(
-            embed.0["title"].as_str(),
-            Some("Hel sold for 77.5B in Jita (The Forge)")
-        );
-        assert_eq!(
-            embed.0["thumbnail"]["url"].as_str(),
-            Some("https://images.evetech.net/types/22852/icon?size=64")
-        );
 
         let delivery = DiscordContractDelivery::new(Arc::new(Http::new(&token)));
         let message_id = delivery
@@ -16313,8 +16372,8 @@ mod embed_tests {
                 guild_id: 0,
                 channel_id,
                 subscription_id: "manual-contract-embed-check".to_string(),
-                contract_id: event.contract.contract_id,
-                event_kind: event.kind,
+                contract_id: 234_057_619,
+                event_kind: ContractEventKind::SaleConfirmed,
                 ping: false,
                 ping_type: ContractPingType::Here,
                 nonce: MANUAL_CONTRACT_EMBED_NONCE.to_string(),
