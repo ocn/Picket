@@ -37,6 +37,7 @@ use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tracing::{info, warn};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -105,13 +106,12 @@ fn runtime_contract_region_names() -> Arc<HashMap<i64, String>> {
     }
 }
 const TERMINAL_RESOLUTION_RECOVERY_BATCH_SIZE: usize = 256;
-const TERMINAL_RESOLUTION_MIN_PROBE_SPACING: ChronoDuration = ChronoDuration::milliseconds(250);
-const TERMINAL_RESOLUTION_ERROR_CHARGED_PROBE_SPACING: ChronoDuration = ChronoDuration::seconds(1);
+const TERMINAL_RESOLUTION_MIN_PROBE_SPACING: Duration = Duration::from_millis(250);
+const TERMINAL_RESOLUTION_ERROR_CHARGED_PROBE_SPACING: Duration = Duration::from_secs(1);
 const TERMINAL_RESOLUTION_ERROR_REMAINING_RESERVE: i64 = 40;
 const TERMINAL_RESOLUTION_FALLBACK_MAX_PROBES: usize = 32;
-const TERMINAL_RESOLUTION_FALLBACK_PROBE_SPACING: ChronoDuration =
-    ChronoDuration::milliseconds(1_875);
-const TERMINAL_RESOLUTION_RECOVERY_WORK_DEADLINE: ChronoDuration = ChronoDuration::seconds(60);
+const TERMINAL_RESOLUTION_FALLBACK_PROBE_SPACING: Duration = Duration::from_millis(1_875);
+const TERMINAL_RESOLUTION_RECOVERY_WORK_DEADLINE: Duration = Duration::from_secs(60);
 const RESOLUTION_PROBE_RETRY_BASE_SECONDS: i64 = 30;
 const RESOLUTION_PROBE_RETRY_MAX_SECONDS: i64 = 15 * 60;
 pub const DEFAULT_CONTRACT_REGIONAL_CONCURRENCY: usize = 2;
@@ -2566,6 +2566,7 @@ enum EsiRequestAdmission {
     Granted,
     WaitUntil(DateTime<Utc>),
     PausedUntil(DateTime<Utc>),
+    ErrorReserve(DateTime<Utc>),
 }
 
 #[derive(Clone, Copy)]
@@ -4909,6 +4910,8 @@ impl ContractDeliveryClock for SystemContractDeliveryClock {
 pub trait ContractRequestPacer: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
     async fn wait_until(&self, deadline: DateTime<Utc>);
+    fn recovery_now(&self) -> Instant;
+    async fn wait_until_recovery(&self, deadline: Instant);
 }
 
 struct SystemContractRequestPacer;
@@ -4924,6 +4927,14 @@ impl ContractRequestPacer for SystemContractRequestPacer {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
+    }
+
+    fn recovery_now(&self) -> Instant {
+        Instant::now()
+    }
+
+    async fn wait_until_recovery(&self, deadline: Instant) {
+        tokio::time::sleep_until(deadline).await;
     }
 }
 
@@ -7889,7 +7900,19 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
             AND esi_collection_limiter_state.next_request_at >= EXCLUDED.next_request_at
         )
     ) THEN TRUE ELSE EXCLUDED.pacing_active END,
-    updated_at = GREATEST(esi_collection_limiter_state.updated_at, EXCLUDED.updated_at)
+    updated_at = CASE
+        WHEN EXCLUDED.error_limit_remain IS NULL
+          OR EXCLUDED.error_limit_reset IS NULL
+            THEN esi_collection_limiter_state.updated_at
+        WHEN esi_collection_limiter_state.error_limit_remain IS NULL
+          OR esi_collection_limiter_state.error_limit_reset IS NULL
+          OR esi_collection_limiter_state.updated_at
+             + (esi_collection_limiter_state.error_limit_reset * interval '1 second')
+             <= EXCLUDED.updated_at
+          OR EXCLUDED.error_limit_remain < esi_collection_limiter_state.error_limit_remain
+            THEN EXCLUDED.updated_at
+        ELSE esi_collection_limiter_state.updated_at
+    END
 "#,
         )
             .bind(pause_until)
@@ -7910,9 +7933,10 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
     async fn reserve_esi_request(
         &self,
         requested_at: DateTime<Utc>,
+        terminal_error_reserve: Option<i64>,
     ) -> Result<EsiRequestAdmission, sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
-        let limiter = sqlx::query("SELECT pause_until, next_request_at, rate_limit_limit, rate_limit_remaining, pacing_active FROM esi_collection_limiter_state WHERE limiter_scope = TRUE FOR UPDATE")
+        let limiter = sqlx::query("SELECT pause_until, next_request_at, rate_limit_limit, rate_limit_remaining, pacing_active, error_limit_remain, error_limit_reset, updated_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE FOR UPDATE")
             .fetch_optional(&mut *transaction)
             .await?;
         let Some(limiter) = limiter else {
@@ -7929,11 +7953,25 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
             transaction.commit().await?;
             return Ok(EsiRequestAdmission::WaitUntil(next_request_at));
         }
+        let error_limit_remaining: Option<i64> = limiter.get("error_limit_remain");
+        let error_limit_reset: Option<i64> = limiter.get("error_limit_reset");
+        let error_limit_updated_at: DateTime<Utc> = limiter.get("updated_at");
+        if let (Some(reserve), Some(remaining), Some(reset_seconds)) = (
+            terminal_error_reserve,
+            error_limit_remaining,
+            error_limit_reset,
+        ) {
+            let reset_at = error_limit_updated_at + ChronoDuration::seconds(reset_seconds.max(0));
+            if reset_at > requested_at && remaining <= reserve {
+                transaction.commit().await?;
+                return Ok(EsiRequestAdmission::ErrorReserve(reset_at));
+            }
+        }
         let rate_limit: Option<String> = limiter.get("rate_limit_limit");
         let remaining: Option<i64> = limiter.get("rate_limit_remaining");
         let pacing_active: bool = limiter.get("pacing_active");
         if pacing_active && remaining.is_some_and(|remaining| remaining <= 0) {
-            sqlx::query("UPDATE esi_collection_limiter_state SET rate_limit_group = NULL, rate_limit_limit = NULL, rate_limit_remaining = NULL, rate_limit_used = NULL, next_request_at = NULL, pacing_active = FALSE, updated_at = $1 WHERE limiter_scope = TRUE")
+            sqlx::query("UPDATE esi_collection_limiter_state SET rate_limit_group = NULL, rate_limit_limit = NULL, rate_limit_remaining = NULL, rate_limit_used = NULL, next_request_at = NULL, pacing_active = FALSE, updated_at = CASE WHEN error_limit_remain IS NULL OR error_limit_reset IS NULL THEN $1 ELSE updated_at END WHERE limiter_scope = TRUE")
                 .bind(requested_at)
                 .execute(&mut *transaction)
                 .await?;
@@ -7942,7 +7980,7 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
             if let Some(next_request_at) =
                 rate_limit_pacing_deadline(&rate_limit, reserved_remaining, requested_at)
             {
-                sqlx::query("UPDATE esi_collection_limiter_state SET rate_limit_remaining = $1, next_request_at = $2, pacing_active = TRUE, updated_at = $3 WHERE limiter_scope = TRUE")
+                sqlx::query("UPDATE esi_collection_limiter_state SET rate_limit_remaining = $1, next_request_at = $2, pacing_active = TRUE, updated_at = CASE WHEN error_limit_remain IS NULL OR error_limit_reset IS NULL THEN $3 ELSE updated_at END WHERE limiter_scope = TRUE")
                     .bind(reserved_remaining)
                     .bind(next_request_at)
                     .bind(requested_at)
@@ -9597,6 +9635,16 @@ fn collection_failure_classification(error: &ContractCollectionError) -> &'stati
     }
 }
 
+fn terminal_resolution_recovery_failure_stop_reason(
+    error: &ContractCollectionError,
+) -> &'static str {
+    match error {
+        ContractCollectionError::Database(_) => "database_error",
+        ContractCollectionError::Esi(_) => "esi_error",
+        ContractCollectionError::Cache(_) => "cache_error",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum CollectionOutcome {
     BaselineEstablished {
@@ -9644,6 +9692,30 @@ pub struct CollectionReport {
     pub regions: Vec<CollectionOutcome>,
     pub events: Vec<ContractEvent>,
     pub retry_after: Option<DateTime<Utc>>,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminalResolutionRecoverySummary {
+    pub attempted_probes: usize,
+    pub resolved_cases: usize,
+    pub error_charged_probes: usize,
+    pub ending_error_limit_remaining: Option<i64>,
+    pub ending_error_limit_reset_at: Option<DateTime<Utc>>,
+    pub stop_reason: &'static str,
+    pub elapsed: Duration,
+}
+
+#[doc(hidden)]
+pub enum TerminalResolutionRecoveryRun {
+    Completed {
+        report: CollectionReport,
+        summary: TerminalResolutionRecoverySummary,
+    },
+    Failed {
+        error: ContractCollectionError,
+        summary: TerminalResolutionRecoverySummary,
+    },
 }
 
 #[derive(Clone)]
@@ -9702,6 +9774,22 @@ struct TerminalResolutionProbeOutcome {
     resolved: bool,
 }
 
+enum PreparedTerminalResolution {
+    Cached(TerminalResolutionProbeOutcome),
+    Probe {
+        key: String,
+        cached: Option<CachedResponse>,
+    },
+}
+
+enum TerminalResolutionProbeAdmission {
+    Granted,
+    Stopped {
+        retry_after: Option<DateTime<Utc>>,
+        stop_reason: &'static str,
+    },
+}
+
 struct CompletedRegionalPostprocessing {
     outcome: CollectionOutcome,
     events: Vec<ContractEvent>,
@@ -9720,7 +9808,7 @@ async fn wait_for_esi_request_admission(
 ) -> Result<(), EsiError> {
     loop {
         match store
-            .reserve_esi_request(request_pacer.now())
+            .reserve_esi_request(request_pacer.now(), None)
             .await
             .map_err(|error| EsiError::retryable(error.to_string(), None))?
         {
@@ -9729,6 +9817,12 @@ async fn wait_for_esi_request_admission(
             EsiRequestAdmission::PausedUntil(deadline) => {
                 return Err(EsiError::retryable(
                     "persisted global ESI limiter boundary remains active",
+                    Some(deadline),
+                ));
+            }
+            EsiRequestAdmission::ErrorReserve(deadline) => {
+                return Err(EsiError::retryable(
+                    "persisted global ESI error reserve remains active",
                     Some(deadline),
                 ));
             }
@@ -10269,63 +10363,115 @@ impl ContractCollector {
     pub async fn recover_terminal_resolutions(
         &self,
     ) -> Result<CollectionReport, ContractCollectionError> {
-        let pass_started_at = self.request_pacer.now();
-        let work_deadline = pass_started_at + TERMINAL_RESOLUTION_RECOVERY_WORK_DEADLINE;
-        if let Some(notifications) = &self.notifications {
-            self.deliver_prepared_notifications(notifications).await?;
+        match self.terminal_resolution_recovery_run().await {
+            TerminalResolutionRecoveryRun::Completed { report, .. } => Ok(report),
+            TerminalResolutionRecoveryRun::Failed { error, .. } => Err(error),
         }
-        let mut batch = if let Some(retry_after) = self.store.active_esi_limiter_deadline().await? {
-            ResolutionBatch {
-                retry_after: Some(retry_after),
-                stop_reason: "persisted_limiter",
-                ..ResolutionBatch::default()
+    }
+
+    #[doc(hidden)]
+    pub async fn terminal_resolution_recovery_run(&self) -> TerminalResolutionRecoveryRun {
+        let pass_started_at = self.request_pacer.recovery_now();
+        let work_deadline = pass_started_at + TERMINAL_RESOLUTION_RECOVERY_WORK_DEADLINE;
+        let mut batch = ResolutionBatch::default();
+        let recovery_result: Result<(), ContractCollectionError> = async {
+            if let Some(notifications) = &self.notifications {
+                self.deliver_prepared_notifications(notifications).await?;
             }
-        } else {
-            self.store
-                .resolve_terminal_resolution_failures(None)
-                .await?;
-            self.resolve_resolution_batch(
-                self.store.pending_terminal_notifications().await?,
+            if let Some(retry_after) = self.store.active_esi_limiter_deadline().await? {
+                batch.retry_after = Some(retry_after);
+                batch.stop_reason = "persisted_limiter";
+            } else {
                 self.store
-                    .awaiting_resolution_cases_for_recovery(TERMINAL_RESOLUTION_RECOVERY_BATCH_SIZE)
-                    .await?,
-                work_deadline,
-            )
-            .await?
-        };
-        let retry_after = std::cmp::max(
-            batch.retry_after,
-            self.store.active_esi_limiter_deadline().await?,
-        );
-        let ending_error_limit_remaining = self
+                    .resolve_terminal_resolution_failures(None)
+                    .await?;
+                self.resolve_resolution_batch(
+                    self.store.pending_terminal_notifications().await?,
+                    self.store
+                        .awaiting_resolution_cases_for_recovery(
+                            TERMINAL_RESOLUTION_RECOVERY_BATCH_SIZE,
+                        )
+                        .await?,
+                    work_deadline,
+                    &mut batch,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        .await;
+        let limiter_result = self.store.active_esi_limiter_deadline().await;
+        let ending_error_limit_result = self
             .store
             .current_legacy_error_limit(self.request_pacer.now())
-            .await?
-            .map(|limit| limit.remaining);
+            .await;
+        let retry_after = std::cmp::max(
+            batch.retry_after,
+            limiter_result.as_ref().ok().copied().flatten(),
+        );
+        let ending_error_limit = ending_error_limit_result
+            .as_ref()
+            .ok()
+            .and_then(|limit| *limit);
+        let final_result = recovery_result
+            .and(
+                limiter_result
+                    .map_err(ContractCollectionError::from)
+                    .map(|_| ()),
+            )
+            .and(
+                ending_error_limit_result
+                    .map_err(ContractCollectionError::from)
+                    .map(|_| ()),
+            );
+        if let Err(error) = &final_result {
+            batch.stop_reason = terminal_resolution_recovery_failure_stop_reason(error);
+        }
+        let summary = TerminalResolutionRecoverySummary {
+            attempted_probes: batch.attempted_probes,
+            resolved_cases: batch.resolved_cases,
+            error_charged_probes: batch.error_charged_probes,
+            ending_error_limit_remaining: ending_error_limit.map(|limit| limit.remaining),
+            ending_error_limit_reset_at: ending_error_limit.map(|limit| limit.reset_at),
+            stop_reason: batch.stop_reason,
+            elapsed: self
+                .request_pacer
+                .recovery_now()
+                .saturating_duration_since(pass_started_at),
+        };
+        let recovery_error = final_result.as_ref().err().map(ToString::to_string);
         info!(
-            attempted_probes = batch.attempted_probes,
-            resolved_cases = batch.resolved_cases,
-            error_charged_probes = batch.error_charged_probes,
-            ending_error_limit_remaining = ?ending_error_limit_remaining,
-            stop_reason = batch.stop_reason,
-            elapsed_ms = (self.request_pacer.now() - pass_started_at).num_milliseconds(),
+            attempted_probes = summary.attempted_probes,
+            resolved_cases = summary.resolved_cases,
+            error_charged_probes = summary.error_charged_probes,
+            ending_error_limit_remaining = ?summary.ending_error_limit_remaining,
+            ending_error_limit_reset_at = ?summary.ending_error_limit_reset_at,
+            stop_reason = summary.stop_reason,
+            elapsed_ms = summary.elapsed.as_millis(),
             limiter_active = retry_after.is_some(),
+            recovery_error = ?recovery_error,
             "terminal resolution recovery pass finished"
         );
-        Ok(CollectionReport {
-            regions: Vec::new(),
-            events: std::mem::take(&mut batch.events),
-            retry_after,
-        })
+        match final_result {
+            Ok(()) => TerminalResolutionRecoveryRun::Completed {
+                report: CollectionReport {
+                    regions: Vec::new(),
+                    events: std::mem::take(&mut batch.events),
+                    retry_after,
+                },
+                summary,
+            },
+            Err(error) => TerminalResolutionRecoveryRun::Failed { error, summary },
+        }
     }
 
     async fn resolve_resolution_batch(
         &self,
         pending_notifications: Vec<TerminalContractResolution>,
         awaiting_resolutions: Vec<AwaitingContractResolution>,
-        work_deadline: DateTime<Utc>,
-    ) -> Result<ResolutionBatch, ContractCollectionError> {
-        let mut batch = ResolutionBatch::default();
+        work_deadline: Instant,
+        batch: &mut ResolutionBatch,
+    ) -> Result<(), ContractCollectionError> {
         let mut last_probe_started = None;
         let mut fallback_probe_count = 0;
         for resolution in pending_notifications {
@@ -10345,7 +10491,7 @@ impl ContractCollector {
             }
         }
         for resolution in awaiting_resolutions {
-            if self.request_pacer.now() >= work_deadline {
+            if self.request_pacer.recovery_now() >= work_deadline {
                 batch.stop_reason = "deadline";
                 break;
             }
@@ -10377,6 +10523,21 @@ impl ContractCollector {
                 batch.stop_reason = "persisted_limiter";
                 break;
             }
+            let resolution_key = ResolutionCaseKey {
+                region_id: resolution.region_id,
+                contract_id: resolution.contract_id,
+            };
+            let (key, cached) = match self.prepare_awaiting_resolution(&resolution).await? {
+                PreparedTerminalResolution::Cached(probe) => {
+                    batch.resolved_cases += usize::from(probe.resolved);
+                    if let Some(event) = probe.event {
+                        self.notify_terminal_event(&event, &resolution_key).await?;
+                        batch.events.push(event);
+                    }
+                    continue;
+                }
+                PreparedTerminalResolution::Probe { key, cached } => (key, cached),
+            };
             if let Some((started_at, error_charged)) = last_probe_started {
                 let spacing = if legacy_error_limit.is_none() {
                     TERMINAL_RESOLUTION_FALLBACK_PROBE_SPACING
@@ -10390,18 +10551,28 @@ impl ContractCollector {
                     batch.stop_reason = "deadline";
                     break;
                 }
-                self.request_pacer.wait_until(next_start_at).await;
-                if self.request_pacer.now() >= work_deadline {
+                self.request_pacer.wait_until_recovery(next_start_at).await;
+                if self.request_pacer.recovery_now() >= work_deadline {
                     batch.stop_reason = "deadline";
                     break;
                 }
             }
-            let resolution_key = ResolutionCaseKey {
-                region_id: resolution.region_id,
-                contract_id: resolution.contract_id,
-            };
-            let probe_started_at = self.request_pacer.now();
-            match self.resolve_awaiting_resolution(&resolution).await {
+            match self.admit_terminal_resolution_probe(work_deadline).await? {
+                TerminalResolutionProbeAdmission::Granted => {}
+                TerminalResolutionProbeAdmission::Stopped {
+                    retry_after,
+                    stop_reason,
+                } => {
+                    batch.retry_after = std::cmp::max(batch.retry_after, retry_after);
+                    batch.stop_reason = stop_reason;
+                    break;
+                }
+            }
+            let probe_started_at = self.request_pacer.recovery_now();
+            match self
+                .resolve_admitted_awaiting_resolution(&resolution, key, cached)
+                .await
+            {
                 Ok(probe) => {
                     if let Some(error_charged) = probe.error_charged {
                         batch.attempted_probes += 1;
@@ -10442,7 +10613,11 @@ impl ContractCollector {
                         .await?;
                     batch.retry_after = std::cmp::max(batch.retry_after, retry_after);
                     match self.store.active_esi_limiter_deadline().await {
-                        Ok(Some(_)) => break,
+                        Ok(Some(deadline)) => {
+                            batch.retry_after = std::cmp::max(batch.retry_after, Some(deadline));
+                            batch.stop_reason = "response_limiter";
+                            break;
+                        }
                         Ok(None) => {}
                         Err(limiter_error) => warn!(
                             region_id = resolution.region_id,
@@ -10457,7 +10632,7 @@ impl ContractCollector {
             batch.retry_after,
             self.store.active_esi_limiter_deadline().await?,
         );
-        Ok(batch)
+        Ok(())
     }
 
     async fn notify_terminal_event(
@@ -10475,10 +10650,54 @@ impl ContractCollector {
         Ok(())
     }
 
-    async fn resolve_awaiting_resolution(
+    async fn admit_terminal_resolution_probe(
+        &self,
+        work_deadline: Instant,
+    ) -> Result<TerminalResolutionProbeAdmission, ContractCollectionError> {
+        if self.request_pacer.recovery_now() >= work_deadline {
+            return Ok(TerminalResolutionProbeAdmission::Stopped {
+                retry_after: None,
+                stop_reason: "deadline",
+            });
+        }
+        match self
+            .store
+            .reserve_esi_request(
+                self.request_pacer.now(),
+                Some(TERMINAL_RESOLUTION_ERROR_REMAINING_RESERVE),
+            )
+            .await?
+        {
+            EsiRequestAdmission::Granted => {
+                if self.request_pacer.recovery_now() >= work_deadline {
+                    Ok(TerminalResolutionProbeAdmission::Stopped {
+                        retry_after: None,
+                        stop_reason: "deadline",
+                    })
+                } else {
+                    Ok(TerminalResolutionProbeAdmission::Granted)
+                }
+            }
+            EsiRequestAdmission::WaitUntil(deadline)
+            | EsiRequestAdmission::PausedUntil(deadline) => {
+                Ok(TerminalResolutionProbeAdmission::Stopped {
+                    retry_after: Some(deadline),
+                    stop_reason: "shared_request_boundary",
+                })
+            }
+            EsiRequestAdmission::ErrorReserve(reset_at) => {
+                Ok(TerminalResolutionProbeAdmission::Stopped {
+                    retry_after: Some(reset_at),
+                    stop_reason: "error_reserve",
+                })
+            }
+        }
+    }
+
+    async fn prepare_awaiting_resolution(
         &self,
         resolution: &AwaitingContractResolution,
-    ) -> Result<TerminalResolutionProbeOutcome, ContractCollectionError> {
+    ) -> Result<PreparedTerminalResolution, ContractCollectionError> {
         let key = format!("contracts/public/items/{}", resolution.contract_id);
         let cached = self.store.cache(&key).await?;
         if let Some(cached) = &cached {
@@ -10493,10 +10712,12 @@ impl ContractCollector {
                             None,
                         )
                         .await
-                        .map(|event| TerminalResolutionProbeOutcome {
-                            event,
-                            error_charged: None,
-                            resolved: true,
+                        .map(|event| {
+                            PreparedTerminalResolution::Cached(TerminalResolutionProbeOutcome {
+                                event,
+                                error_charged: None,
+                                resolved: true,
+                            })
                         });
                 }
                 self.store
@@ -10509,17 +10730,27 @@ impl ContractCollector {
                             .expect("fresh cache has expiration"),
                     )
                     .await?;
-                return Ok(TerminalResolutionProbeOutcome {
-                    event: None,
-                    error_charged: None,
-                    resolved: false,
-                });
+                return Ok(PreparedTerminalResolution::Cached(
+                    TerminalResolutionProbeOutcome {
+                        event: None,
+                        error_charged: None,
+                        resolved: false,
+                    },
+                ));
             }
         }
+        Ok(PreparedTerminalResolution::Probe { key, cached })
+    }
+
+    async fn resolve_admitted_awaiting_resolution(
+        &self,
+        resolution: &AwaitingContractResolution,
+        key: String,
+        cached: Option<CachedResponse>,
+    ) -> Result<TerminalResolutionProbeOutcome, ContractCollectionError> {
         let etag = cached
             .as_ref()
             .and_then(|cached| cached.metadata.etag.clone());
-        self.ensure_esi_limiter_allows_requests().await?;
         let probe = self
             .record_item_probe_result(
                 self.esi
