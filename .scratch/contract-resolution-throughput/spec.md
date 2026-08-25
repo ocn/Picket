@@ -105,6 +105,7 @@ Correct the stale manual Production Verification preflight so its non-sending as
 - Package the scheduler and test-only visual-preflight correction into one reviewed fix-forward candidate. No production code is changed merely to satisfy the manual presentation test.
 - Deploy the exact reviewed candidate once after a fresh backup, migration checksum validation, quiet Compose validation, and immediate read-only preflight. There is no automatic rollback or secondary deployment attempt.
 - The post-deployment gate observes ten complete one-minute error windows. Yielding at the 40 floor is correct; admission below it, cross-route throttle, failure to resume, regional starvation, or another health regression halts progression.
+- **Operator-authorized final evidence interpretation (2026-08-25):** a `deferred_backlog`-only critical transition caused by discovery arrivals is non-blocking only when every other health, service, delivery, limiter, global-auth, and forbidden-error gate remains clean under the already-approved per-structure resolver exception; the same check returns healthy at the immediately following watchdog evaluation within 75 seconds (with its exact duration recorded); the exact ten-minute interval ends with fewer due backlog items than it started with and a defensible positive net-drain ETA; and no `420`, `429`, or recovery admission at or below the 40 reserve occurs. This exception does not weaken any other health regression, regional starvation, delivery debt, global-auth, limiter, or error gate.
 - Production Verification remains exactly one controlled non-pinging message in channel `1115807643748012072`, sent only after the scheduler gate passes. Historical Enrichment Repair remains separately gated.
 
 ## Testing Decisions
@@ -129,7 +130,7 @@ Correct the stale manual Production Verification preflight so its non-sending as
 - Do not use production as a throughput load-test environment. All pacing and boundary cases are proven with controlled time and controlled ESI before deployment.
 - Run focused recovery, limiter, lifecycle, delivery, health, resolver, and presentation tests; then the complete serial real-PostgreSQL contract suite, safe library suite, formatting, typechecking, Clippy, fixed-point diff checks, migration checks, and quiet Compose validation.
 - Require Sol-high Standards and Spec review at the final fixed point. Any finding requiring concurrency, reservation schema, delivery decoupling, another service, or tuning machinery blocks this specification rather than expanding it.
-- Production evidence records each minute’s attempted, resolved, error-charged, remaining allowance, stop reason, service health, regional progress, prepared/permanent delivery counts, and actual Resolution Throughput. The gate requires ten complete windows, not backlog clearance.
+- Production evidence records each minute’s attempted, resolved, error-charged, remaining allowance, stop reason, service health, regional progress, prepared/permanent delivery counts, and actual Resolution Throughput. For the authorized backlog-only exception, it also records the critical-to-healthy duration, all other gate values, the exact due-backlog start/end, and the net-drain ETA. The gate requires ten complete windows, not backlog clearance.
 
 ## Out of Scope
 

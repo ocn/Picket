@@ -27,6 +27,14 @@
 - [x] Historical Enrichment Repair remains untouched throughout this ticket and still requires separate fresh exact-count approval.
 - [ ] Leave the ticket claimed until final Sol-high Standards and Spec review of the production evidence passes; then resolve it without modifying unrelated tracker work.
 
+## Operator-authorized final evidence gate revision
+
+### 2026-08-25 — backlog-only transient-critical interpretation; evidence remains pending
+
+- **Authorization:** the final evidence interval may continue through a `deferred_backlog`-only critical transition caused by discovery arrivals only if all other health, service, delivery, limiter, global-auth, and forbidden-error predicates remain clean under the already-approved per-structure resolver exception; the same check returns healthy at the immediately following watchdog evaluation within 75 seconds with exact duration recorded; the ten-minute interval ends with fewer due backlog items than it started with and a defensible positive net-drain ETA; and no `420`, `429`, or recovery admission at or below `40` occurs. No other health regression, regional starvation, delivery debt, global-auth, limiter, or error condition is relaxed.
+- **Prior failed evidence is preserved:** the original `[18:33:00Z,18:43:00Z)` reconstruction was not sufficient for Spec §132: it lacked retained per-minute starting limiter snapshots and contained a real `deferred_backlog` critical transition at `18:41:33.438Z` (`17,988 -> 18,039`), recovered healthy at `18:42:33.660Z` (`17,979`). The discarded `[19:06:00Z,19:16:00Z)` attempt had a +42-second T0 sample skew and was never counted. The subsequent precisely sampled attempt `[19:08:00Z,19:18:00Z)` stopped in minute three after a real `deferred_backlog` `healthy -> critical` transition at `19:10:48.680Z` (`16,651 -> 16,774`); it was not continued or used as final evidence.
+- **Review state:** the first Sol-high Standards review was **FAIL** because the old evidence did not record all required minute fields or reproducible rate/ETA attribution. The first Sol-high Spec review was **FAIL** because it did not prove ten exact minutes, per-minute health/region/delivery values, or unrelated-traffic attribution. Both findings remain recorded; fresh reviews are pending only after a new fully captured interval is committed. This ticket remains **claimed**.
+
 ## Halt evidence
 
 ### 2026-08-25 — pre-mutation Rollout Health Gate failed; deployment not started
