@@ -35599,6 +35599,131 @@ async fn terminal_recovery_persists_wire_accepted_player_403s_and_spaces_them() 
 }
 
 #[tokio::test]
+async fn terminal_recovery_counts_and_stops_after_a_post_response_accepted_403_failure() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 495;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed post-response accepted-player recovery cases");
+    for contract_id in [FIRST_CONTRACT, FIRST_CONTRACT + 1] {
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize post-response accepted-player recovery contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(1))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+    }
+    sqlx::query("CREATE FUNCTION fail_post_response_accepted_player_confirmation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.state = 'awaiting_resolution' AND NEW.state = 'acceptance_confirmed' THEN RAISE EXCEPTION 'controlled post-response accepted-player confirmation failure'; END IF; RETURN NEW; END; $$")
+        .execute(&pool)
+        .await
+        .expect("create the post-response confirmation failure trigger");
+    sqlx::query("CREATE TRIGGER fail_post_response_accepted_player_confirmation BEFORE UPDATE ON contract_resolution_cases FOR EACH ROW EXECUTE FUNCTION fail_post_response_accepted_player_confirmation()")
+        .execute(&pool)
+        .await
+        .expect("enable the post-response confirmation failure trigger");
+    pool.close().await;
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "post-response-accepted-player-delivery",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the delivery action that must not run after confirmation failure");
+
+    let server = ControlledHttpServer::start(
+        vec![WireReply {
+            status: 403,
+            headers: vec![
+                ("X-ESI-Error-Limit-Remain", "99"),
+                ("X-ESI-Error-Limit-Reset", "60"),
+            ],
+            body: r#"{"error":"Contract accepted by player, requires authorization"}"#,
+        }],
+        WireReply {
+            status: 403,
+            headers: vec![
+                ("X-ESI-Error-Limit-Remain", "98"),
+                ("X-ESI-Error-Limit-Reset", "60"),
+            ],
+            body: r#"{"error":"Contract accepted by player, requires authorization"}"#,
+        },
+    );
+    let wire_requests = server.requests.clone();
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+    let run = ContractCollector::new(
+        store.clone(),
+        Arc::new(
+            HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+                .expect("construct controlled post-response accepted-player ESI client"),
+        ),
+    )
+    .with_notifications(
+        Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+        delivery.clone(),
+    )
+    .with_request_pacer(pacer)
+    .terminal_resolution_recovery_run()
+    .await;
+    server.finish();
+
+    let TerminalResolutionRecoveryRun::Failed { error, summary } = run else {
+        panic!("a post-response acceptance persistence failure must fail the serial recovery pass");
+    };
+    assert!(error
+        .to_string()
+        .contains("controlled post-response accepted-player confirmation failure"));
+    assert_eq!(summary.attempted_probes, 1);
+    assert_eq!(summary.error_charged_probes, 1);
+    assert_eq!(summary.resolved_cases, 0);
+    assert_eq!(summary.stop_reason, "database_error");
+    assert_eq!(
+        wire_requests.lock().unwrap().len(),
+        1,
+        "the failed post-response accepted-player lifecycle write admits no later wire probe"
+    );
+    assert!(
+        delivery.sent.lock().unwrap().is_empty(),
+        "a failed acceptance confirmation does not prepare or send a terminal delivery"
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect the untouched later post-response recovery case");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM contract_resolution_cases WHERE region_id = $1 AND contract_id = $2",
+        )
+        .bind(REGION)
+        .bind(FIRST_CONTRACT + 1)
+        .fetch_one(&pool)
+        .await
+        .expect("read the untouched later recovery state"),
+        "awaiting_resolution"
+    );
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn terminal_recovery_yields_to_an_active_persisted_bucket_boundary() {
     const REGION: i64 = 10_000_002;
     const CONTRACT: i64 = 500;

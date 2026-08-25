@@ -34,3 +34,10 @@
 - Focused exact recovery, limiter, lifecycle, delivery, health, and restart checks passed; `cargo fmt --check`, `cargo check`, and `git diff --check` passed. No full integration suite was run.
 - The cadence check `terminal_recovery_runtime_reconnects_and_skips_missed_fixed_minute_ticks` first exited 101 after 12.75 seconds, then passed unchanged under authorized diagnostic capture in 10.83 seconds; no product change was made for the non-reproducing timing flake.
 - Tests used only named disposable PostgreSQL 16 containers on loopback high ports `55488` and later `55489`; both were removed after their exact checks.
+
+## Second remediation evidence
+
+- A production-shaped loopback accepted-player `403` plus a post-response `contract_resolution_cases` confirmation trigger proves one actual ESI start is counted and error-charged, then fails closed before the next due case or any delivery. The trigger leaves retry persistence writable.
+- A private recovery-only admitted-failure carrier preserves the response charge across post-response lifecycle/cache/database failures. Transient ESI failures retain durable retry/backoff handling; post-admission non-ESI failures and limiter-read failures stop the pass.
+- Exact controlled accepted-player, `5xx` pacing, failure-persistence summary, deadline delivery, delivery-order, structured-summary, limiter-boundary, and post-pacing admission-race checks passed, along with `cargo fmt --check`, `cargo check`, and `git diff --check`. No full suite was run.
+- These checks used only the named disposable PostgreSQL 16 loopback container `ticket01-review2-pg` on high port `55490`; it was removed after verification.
