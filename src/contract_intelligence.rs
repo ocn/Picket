@@ -9617,14 +9617,6 @@ impl ContractCollectionError {
             Self::Database(_) | Self::Cache(_) => None,
         }
     }
-
-    fn is_error_charged(&self) -> bool {
-        matches!(self, Self::Esi(error) if error.is_error_charged())
-    }
-
-    fn attempted_esi_probe(&self) -> bool {
-        matches!(self, Self::Esi(_))
-    }
 }
 
 fn collection_failure_classification(error: &ContractCollectionError) -> &'static str {
@@ -9772,6 +9764,11 @@ struct TerminalResolutionProbeOutcome {
     event: Option<ContractEvent>,
     error_charged: Option<bool>,
     resolved: bool,
+}
+
+struct AdmittedTerminalResolutionFailure {
+    error: ContractCollectionError,
+    error_charged: bool,
 }
 
 enum PreparedTerminalResolution {
@@ -10588,17 +10585,16 @@ impl ContractCollector {
                         batch.events.push(event);
                     }
                 }
-                Err(error) => {
+                Err(failure) => {
+                    let error = failure.error;
                     let retry_after = error.retry_after();
-                    let error_charged = error.is_error_charged();
-                    if error.attempted_esi_probe() {
-                        batch.attempted_probes += 1;
-                        batch.error_charged_probes += usize::from(error_charged);
-                        if legacy_error_limit.is_none() {
-                            fallback_probe_count += 1;
-                        }
-                        last_probe_started = Some((probe_started_at, error_charged));
+                    let error_charged = failure.error_charged;
+                    batch.attempted_probes += 1;
+                    batch.error_charged_probes += usize::from(error_charged);
+                    if legacy_error_limit.is_none() {
+                        fallback_probe_count += 1;
                     }
+                    last_probe_started = Some((probe_started_at, error_charged));
                     warn!(
                         region_id = resolution.region_id,
                         contract_id = resolution.contract_id,
@@ -10612,18 +10608,13 @@ impl ContractCollector {
                         )
                         .await?;
                     batch.retry_after = std::cmp::max(batch.retry_after, retry_after);
-                    match self.store.active_esi_limiter_deadline().await {
-                        Ok(Some(deadline)) => {
-                            batch.retry_after = std::cmp::max(batch.retry_after, Some(deadline));
-                            batch.stop_reason = "response_limiter";
-                            break;
-                        }
-                        Ok(None) => {}
-                        Err(limiter_error) => warn!(
-                            region_id = resolution.region_id,
-                            contract_id = resolution.contract_id,
-                            "could not read the persisted ESI limiter after a resolution failure: {limiter_error}"
-                        ),
+                    if !matches!(error, ContractCollectionError::Esi(_)) {
+                        return Err(error);
+                    }
+                    if let Some(deadline) = self.store.active_esi_limiter_deadline().await? {
+                        batch.retry_after = std::cmp::max(batch.retry_after, Some(deadline));
+                        batch.stop_reason = "response_limiter";
+                        break;
                     }
                 }
             }
@@ -10747,45 +10738,52 @@ impl ContractCollector {
         resolution: &AwaitingContractResolution,
         key: String,
         cached: Option<CachedResponse>,
-    ) -> Result<TerminalResolutionProbeOutcome, ContractCollectionError> {
+    ) -> Result<TerminalResolutionProbeOutcome, AdmittedTerminalResolutionFailure> {
         let etag = cached
             .as_ref()
             .and_then(|cached| cached.metadata.etag.clone());
+        let esi_result = self
+            .esi
+            .public_contract_items_probe(resolution.contract_id, etag.as_deref())
+            .await;
+        let error_charged = match &esi_result {
+            Ok(probe) => probe.is_error_charged(),
+            Err(error) => error.is_error_charged(),
+        };
         let probe = self
-            .record_item_probe_result(
-                self.esi
-                    .public_contract_items_probe(resolution.contract_id, etag.as_deref())
-                    .await,
-            )
-            .await?;
-        let error_charged = probe.is_error_charged();
-        match probe {
-            ContractItemProbe::Available(response) => {
-                let (items, metadata) = if response.not_modified {
-                    let cached = cached.as_ref().ok_or_else(|| {
-                        ContractCollectionError::Cache(format!(
-                            "{key} returned 304 without a cached item representation"
-                        ))
-                    })?;
-                    (
-                        cached.response.clone(),
-                        merge_cache_metadata(&cached.metadata, response.metadata),
-                    )
-                } else {
-                    (
-                        serde_json::to_value(response.value.ok_or_else(|| {
+            .record_item_probe_result(esi_result)
+            .await
+            .map_err(|error| AdmittedTerminalResolutionFailure {
+                error,
+                error_charged,
+            })?;
+        let outcome = async {
+            match probe {
+                ContractItemProbe::Available(response) => {
+                    let (items, metadata) = if response.not_modified {
+                        let cached = cached.as_ref().ok_or_else(|| {
                             ContractCollectionError::Cache(format!(
-                                "{key} returned no item representation"
+                                "{key} returned 304 without a cached item representation"
                             ))
-                        })?)
-                        .map_err(|error| ContractCollectionError::Cache(error.to_string()))?,
-                        response.metadata,
-                    )
-                };
-                self.store.save_cache(&key, &items, &metadata).await?;
-                if Utc::now() >= resolution.contract.date_expired {
-                    return self
-                        .resolve_nonfinancial_terminal(
+                        })?;
+                        (
+                            cached.response.clone(),
+                            merge_cache_metadata(&cached.metadata, response.metadata),
+                        )
+                    } else {
+                        (
+                            serde_json::to_value(response.value.ok_or_else(|| {
+                                ContractCollectionError::Cache(format!(
+                                    "{key} returned no item representation"
+                                ))
+                            })?)
+                            .map_err(|error| ContractCollectionError::Cache(error.to_string()))?,
+                            response.metadata,
+                        )
+                    };
+                    self.store.save_cache(&key, &items, &metadata).await?;
+                    if Utc::now() >= resolution.contract.date_expired {
+                        self.resolve_nonfinancial_terminal(
                             resolution,
                             ContractResolutionState::Expired,
                             Utc::now(),
@@ -10797,92 +10795,99 @@ impl ContractCollector {
                             event,
                             error_charged: Some(error_charged),
                             resolved: true,
-                        });
+                        })
+                    } else {
+                        self.store
+                            .schedule_resolution_probe(
+                                resolution.region_id,
+                                resolution.contract_id,
+                                metadata.expires_at.unwrap_or_else(Utc::now),
+                            )
+                            .await?;
+                        Ok(TerminalResolutionProbeOutcome {
+                            event: None,
+                            error_charged: Some(error_charged),
+                            resolved: false,
+                        })
+                    }
                 }
-                self.store
-                    .schedule_resolution_probe(
+                ContractItemProbe::AcceptedByPlayer(metadata) => {
+                    let evidence_response_at = Utc::now();
+                    let event = acceptance_event(
                         resolution.region_id,
-                        resolution.contract_id,
-                        metadata.expires_at.unwrap_or_else(Utc::now),
-                    )
-                    .await?;
-                Ok(TerminalResolutionProbeOutcome {
-                    event: None,
-                    error_charged: Some(error_charged),
-                    resolved: false,
-                })
-            }
-            ContractItemProbe::AcceptedByPlayer(metadata) => {
-                let evidence_response_at = Utc::now();
-                let event = acceptance_event(
-                    resolution.region_id,
-                    &resolution.contract,
-                    &resolution.manifest,
-                    resolution.last_public_observed_at,
-                    resolution.absence_observed_at,
-                    evidence_response_at,
-                    ContractAcceptanceProvenance::AcceptedByPlayer,
-                );
-                if self
-                    .store
-                    .confirm_acceptance(
-                        resolution,
+                        &resolution.contract,
+                        &resolution.manifest,
+                        resolution.last_public_observed_at,
+                        resolution.absence_observed_at,
                         evidence_response_at,
-                        &metadata,
-                        event.is_some(),
-                    )
-                    .await?
-                {
-                    Ok(TerminalResolutionProbeOutcome {
-                        event,
-                        error_charged: Some(error_charged),
-                        resolved: true,
-                    })
-                } else {
-                    Ok(TerminalResolutionProbeOutcome {
-                        event: None,
-                        error_charged: Some(error_charged),
-                        resolved: false,
-                    })
+                        ContractAcceptanceProvenance::AcceptedByPlayer,
+                    );
+                    if self
+                        .store
+                        .confirm_acceptance(
+                            resolution,
+                            evidence_response_at,
+                            &metadata,
+                            event.is_some(),
+                        )
+                        .await?
+                    {
+                        Ok(TerminalResolutionProbeOutcome {
+                            event,
+                            error_charged: Some(error_charged),
+                            resolved: true,
+                        })
+                    } else {
+                        Ok(TerminalResolutionProbeOutcome {
+                            event: None,
+                            error_charged: Some(error_charged),
+                            resolved: false,
+                        })
+                    }
                 }
-            }
-            ContractItemProbe::NoContent(metadata) => {
-                let observed_at = Utc::now();
-                let state = if observed_at >= resolution.contract.date_expired {
-                    ContractResolutionState::Expired
-                } else {
-                    ContractResolutionState::ClosedOutcomeUnknown
-                };
-                self.resolve_nonfinancial_terminal(
-                    resolution,
-                    state,
-                    observed_at,
-                    Some(ContractAcceptanceProvenance::NoContent),
-                    Some(&metadata),
-                )
-                .await
-                .map(|event| TerminalResolutionProbeOutcome {
-                    event,
-                    error_charged: Some(error_charged),
-                    resolved: true,
-                })
-            }
-            ContractItemProbe::NotPublic(_) | ContractItemProbe::NotFound(_) => {
-                let observed_at = Utc::now();
-                let state = if observed_at >= resolution.contract.date_expired {
-                    ContractResolutionState::Expired
-                } else {
-                    ContractResolutionState::ClosedOutcomeUnknown
-                };
-                self.resolve_nonfinancial_terminal(resolution, state, observed_at, None, None)
+                ContractItemProbe::NoContent(metadata) => {
+                    let observed_at = Utc::now();
+                    let state = if observed_at >= resolution.contract.date_expired {
+                        ContractResolutionState::Expired
+                    } else {
+                        ContractResolutionState::ClosedOutcomeUnknown
+                    };
+                    self.resolve_nonfinancial_terminal(
+                        resolution,
+                        state,
+                        observed_at,
+                        Some(ContractAcceptanceProvenance::NoContent),
+                        Some(&metadata),
+                    )
                     .await
                     .map(|event| TerminalResolutionProbeOutcome {
                         event,
                         error_charged: Some(error_charged),
                         resolved: true,
                     })
+                }
+                ContractItemProbe::NotPublic(_) | ContractItemProbe::NotFound(_) => {
+                    let observed_at = Utc::now();
+                    let state = if observed_at >= resolution.contract.date_expired {
+                        ContractResolutionState::Expired
+                    } else {
+                        ContractResolutionState::ClosedOutcomeUnknown
+                    };
+                    self.resolve_nonfinancial_terminal(resolution, state, observed_at, None, None)
+                        .await
+                        .map(|event| TerminalResolutionProbeOutcome {
+                            event,
+                            error_charged: Some(error_charged),
+                            resolved: true,
+                        })
+                }
             }
         }
+        .await;
+        outcome.map_err(|error| AdmittedTerminalResolutionFailure {
+            error,
+            error_charged,
+        })
     }
 
     async fn resolve_nonfinancial_terminal(
