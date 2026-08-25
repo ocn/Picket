@@ -4,17 +4,17 @@
 
 **Blocked by:** None — can start immediately
 
-**Status:** claimed
+**Status:** resolved
 
-- [ ] A non-ignored preflight renders the current canonical terminal presentation without constructing a Discord client or issuing a request.
-- [ ] The preflight verifies title, description, Issuer, strongest supported human-readable location, presentation revision, thumbnail, history, and empty-placeholder behavior.
-- [ ] The preflight verifies no raw identifier labels and no unexpected mention content.
-- [ ] The controlled delivery remains non-pinging with empty allowed mentions.
-- [ ] The ignored live Discord seam reuses the same canonical fixture and preflight rather than duplicating presentation expectations.
-- [ ] A stale or failing preflight makes zero Discord requests and cannot create a replacement post.
-- [ ] The current obsolete title assertions are replaced with the canonical terminal title without changing production rendering behavior.
-- [ ] Focused presentation, embed-budget, mention, nonce, and delivery-wire regressions pass.
-- [ ] No production, database, subscription, credential, historical-repair, or Discord mutation occurs while implementing and testing this ticket.
+- [x] A non-ignored preflight renders the current canonical terminal presentation without constructing a Discord client or issuing a request.
+- [x] The preflight verifies title, description, Issuer, strongest supported human-readable location, presentation revision, thumbnail, history, and empty-placeholder behavior.
+- [x] The preflight verifies no raw identifier labels and no unexpected mention content.
+- [x] The controlled delivery remains non-pinging with empty allowed mentions.
+- [x] The ignored live Discord seam reuses the same canonical fixture and preflight rather than duplicating presentation expectations.
+- [x] A stale or failing preflight makes zero Discord requests and cannot create a replacement post.
+- [x] The current obsolete title assertions are replaced with the canonical terminal title without changing production rendering behavior.
+- [x] Focused presentation, embed-budget, mention, nonce, and delivery-wire regressions pass.
+- [x] No production, database, subscription, credential, historical-repair, or Discord mutation occurs while implementing and testing this ticket.
 
 ## Implementation evidence
 
@@ -23,3 +23,7 @@
 - GREEN: `cargo test --lib contract_intelligence::embed_tests::failed_manual_contract_embed_visual_preflight_makes_no_post_attempt -- --exact` passed (1 test); a stale title stops before the post-attempt boundary.
 - Adjacent safe tests passed for terminal embed structure and budget, nonce, suppressed edit mentions, and explicit non-pinging delivery allowed mentions.
 - `cargo fmt --check`, `cargo check`, and `git diff --check` passed. The ignored sending seam was not rerun.
+
+## Answer
+
+Resolved in `c90e9d2` and `83ae9f9`. RED stopped before HTTP/send; GREEN covered the canonical render, outbound policy, and zero-post failure boundary. Focused presentation, embed-budget, mention, nonce, delivery-wire, formatting, typecheck, and diff checks passed. Sol high Spec: PASS (0 findings). Sol high Standards: PASS; accepted low judgment calls on redundant description raw-label checks and `post_attempts` naming. No production, Discord, database, subscription, credential, or historical-repair mutation occurred.
