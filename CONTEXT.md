@@ -76,6 +76,14 @@ _Avoid_: Likely sold, provisional sale
 Bounded processing of due Awaiting Resolution cases independently of regional discovery. It preserves the existing public-evidence requirements and cannot force, infer, or discard a terminal outcome merely to reduce backlog.
 _Avoid_: Backlog replay, bulk closure
 
+**Resolution Throughput**:
+The rate at which due Awaiting Resolution cases receive a durably committed terminal outcome. It excludes probe attempts and Discord deliveries.
+_Avoid_: Request rate, alert throughput
+
+**Error-Charged Probe**:
+A Terminal Resolution Recovery probe whose HTTP response consumes ESI's shared legacy error allowance, even when that response establishes a valid terminal outcome.
+_Avoid_: Failed probe, unsuccessful resolution
+
 **Acceptance Confirmed**:
 The terminal outcome established when public evidence reports that a contract was recently accepted before its known expiration time. The accepting party remains unknown.
 _Avoid_: Acceptance inferred, absence confirmed
