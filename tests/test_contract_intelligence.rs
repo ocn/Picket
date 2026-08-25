@@ -261,8 +261,30 @@ fn signed_resolver_access_token_with(
     sub: &str,
     kid: &str,
 ) -> String {
+    signed_resolver_access_token_with_optional_kid(aud, exp, iss, scp, sub, Some(kid))
+}
+
+fn signed_resolver_access_token_without_kid() -> String {
+    signed_resolver_access_token_with_optional_kid(
+        vec!["existing-eve-application", "EVE Online"],
+        4_102_444_800,
+        "https://login.eveonline.com/",
+        vec!["esi-universe.read_structures.v1"],
+        "CHARACTER:EVE:90000001",
+        None,
+    )
+}
+
+fn signed_resolver_access_token_with_optional_kid(
+    aud: Vec<&str>,
+    exp: usize,
+    iss: &str,
+    scp: Vec<&str>,
+    sub: &str,
+    kid: Option<&str>,
+) -> String {
     let mut header = Header::new(Algorithm::RS256);
-    header.kid = Some(kid.to_string());
+    header.kid = kid.map(ToOwned::to_owned);
     encode(
         &header,
         &ResolverTestClaims {
@@ -334,6 +356,103 @@ async fn structure_resolver_refreshes_a_signed_token_and_authorizes_only_the_str
     token_server.finish();
     metadata_server.finish();
     jwks_server.finish();
+}
+
+#[tokio::test]
+async fn current_mixed_sso_jwks_preserves_authenticated_structure_enrichment() {
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let structure_id = 1_024_000_001_105;
+    prepare_resolver_global_deadline_collection(&store, now).await;
+    let access_token = signed_resolver_access_token();
+    let jwks_server = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}},{{"kty":"EC","kid":"current-ec-key","alg":"ES256","crv":"P-256","x":"test-x","y":"test-y"}}]}}"#
+        ),
+    );
+    let metadata_server = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(
+            r#"{{"issuer":"https://login.eveonline.com","jwks_uri":"{}jwks"}}"#,
+            jwks_server.base_url
+        ),
+    );
+    let token_server = OneShotHttpServer::start(
+        200,
+        &[],
+        &format!(r#"{{"access_token":"{access_token}","refresh_token":"rotated-refresh-secret"}}"#),
+    );
+    let structure_server = ControlledHttpServer::start(
+        vec![WireReply {
+            status: 200,
+            headers: vec![("Expires", "Wed, 21 Oct 2099 07:28:00 GMT")],
+            body: r#"{"name":"Turnur - Summit's Beacon","solar_system_id":30002086}"#,
+        }],
+        WireReply {
+            status: 500,
+            headers: vec![],
+            body: "unexpected authenticated structure request",
+        },
+    );
+    let resolver = Arc::new(
+        AuthenticatedStructureResolver::with_endpoints(
+            resolver_test_config(),
+            &structure_server.base_url,
+            format!("{}token", token_server.base_url),
+            format!("{}metadata", metadata_server.base_url),
+            Duration::from_secs(1),
+        )
+        .expect("construct authenticated structure resolver"),
+    );
+
+    resolver_deadline_collector(
+        store.clone(),
+        vec![PublicContract {
+            start_location_id: structure_id,
+            end_location_id: Some(structure_id),
+            ..item_exchange_contract(1_105)
+        }],
+        resolver,
+        now,
+    )
+    .collect_cycle()
+    .await
+    .expect("current mixed JWKS preserves public collection and authenticated enrichment");
+
+    assert_eq!(structure_server.requests.lock().unwrap().len(), 1);
+    assert!(structure_server.requests.lock().unwrap()[0]
+        .to_ascii_lowercase()
+        .contains(&format!("authorization: bearer {access_token}").to_ascii_lowercase()));
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect resolver runtime and evidence");
+    let runtime: (String, Option<String>) = sqlx::query_as(
+        "SELECT status, last_error FROM structure_resolver_runtime WHERE singleton = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read resolver runtime");
+    let evidence_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM location_evidence WHERE location_id = $1 AND evidence_class = 'access_qualified'",
+    )
+    .bind(structure_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read retained access-qualified evidence");
+    assert_eq!(runtime, ("ready".to_string(), None));
+    assert_eq!(evidence_count, 1);
+    pool.close().await;
+    structure_server.finish();
+    token_server.finish();
+    metadata_server.finish();
+    jwks_server.finish();
+    database.destroy().await;
 }
 
 #[tokio::test]
@@ -608,13 +727,22 @@ fn signed_hs256_resolver_access_token() -> String {
 }
 
 async fn assert_wire_rejects_resolver_access_token(name: &str, access_token: String) {
-    let jwks_server = OneShotHttpServer::start(
-        200,
-        &[],
-        &format!(
+    assert_wire_rejects_resolver_access_token_with_jwks(
+        name,
+        access_token,
+        format!(
             r#"{{"keys":[{{"kty":"RSA","kid":"resolver-test-key","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
         ),
-    );
+    )
+    .await;
+}
+
+async fn assert_wire_rejects_resolver_access_token_with_jwks(
+    name: &str,
+    access_token: String,
+    jwks_body: String,
+) {
+    let jwks_server = OneShotHttpServer::start(200, &[], &jwks_body);
     let metadata_server = OneShotHttpServer::start(
         200,
         &[],
@@ -622,7 +750,14 @@ async fn assert_wire_rejects_resolver_access_token(name: &str, access_token: Str
     );
     let token_server =
         OneShotHttpServer::start(200, &[], &format!(r#"{{"access_token":"{access_token}"}}"#));
-    let structure_server = SequenceHttpServer::start(Vec::new());
+    let structure_server = ControlledHttpServer::start(
+        Vec::new(),
+        WireReply {
+            status: 500,
+            headers: vec![],
+            body: "unexpected authenticated structure request",
+        },
+    );
     let resolver = AuthenticatedStructureResolver::with_endpoints(
         resolver_test_config(),
         &structure_server.base_url,
@@ -649,10 +784,23 @@ async fn assert_wire_rejects_resolver_access_token(name: &str, access_token: Str
 }
 
 #[tokio::test]
+async fn structure_resolver_rejects_a_kidless_token_and_jwk_before_esi() {
+    assert_wire_rejects_resolver_access_token_with_jwks(
+        "missing-header-and-jwk-kid",
+        signed_resolver_access_token_without_kid(),
+        format!(
+            r#"{{"keys":[{{"kty":"RSA","alg":"RS256","n":"{RESOLVER_TEST_JWK_N}","e":"AQAB"}}]}}"#
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn structure_resolver_rejects_signed_algorithm_key_and_claim_mismatches_before_esi() {
     let now = Utc::now().timestamp() as usize;
     for (name, token) in [
         ("algorithm", signed_hs256_resolver_access_token()),
+        ("missing-kid", signed_resolver_access_token_without_kid()),
         (
             "kid",
             signed_resolver_access_token_with(
