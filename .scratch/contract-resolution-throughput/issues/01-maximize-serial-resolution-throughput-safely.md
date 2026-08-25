@@ -4,7 +4,7 @@
 
 **Blocked by:** None — can start immediately
 
-**Status:** claimed
+**Status:** resolved
 
 - [x] A production-shaped recovery seam proves an acceptance-confirming `403` establishes the correct terminal outcome while counting as an Error-Charged Probe for admission.
 - [x] Recovery admits no new probe when authoritative current-window remaining error allowance is 40 or lower.
@@ -41,3 +41,10 @@
 - A private recovery-only admitted-failure carrier preserves the response charge across post-response lifecycle/cache/database failures. Transient ESI failures retain durable retry/backoff handling; post-admission non-ESI failures and limiter-read failures stop the pass.
 - Exact controlled accepted-player, `5xx` pacing, failure-persistence summary, deadline delivery, delivery-order, structured-summary, limiter-boundary, and post-pacing admission-race checks passed, along with `cargo fmt --check`, `cargo check`, and `git diff --check`. No full suite was run.
 - These checks used only the named disposable PostgreSQL 16 loopback container `ticket01-review2-pg` on high port `55490`; it was removed after verification.
+
+## Answer
+
+- Resolved by `7dbc368`, `73696cb`, and `6f44726`.
+- TDD covered the accepted-player post-response failure RED, then GREEN with admitted-start/error-charge accounting and fail-closed recovery.
+- Focused recovery, limiter, lifecycle, delivery, health, and restart checks passed; both final reviews passed with zero blocking findings.
+- The cadence check first flaked, then passed unchanged under diagnostic capture; no full suite, production access, deployment, or production mutation occurred.
