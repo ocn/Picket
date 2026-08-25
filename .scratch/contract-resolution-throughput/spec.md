@@ -62,7 +62,7 @@ Correct the stale manual Production Verification preflight so its non-sending as
 37. As an operator, I want existing health queries to remain the source for backlog and ETA, so that this change adds no dashboard or persisted metrics model.
 38. As an operator, I want actual Resolution Throughput and projected clearance recorded after deployment, so that safe capacity improvement is demonstrated rather than assumed.
 39. As an operator, I want the new scheduler to exceed 32 committed outcomes per minute when upstream capacity permits, so that the fix-forward produces a measurable benefit.
-40. As an operator, I want unrelated ESI traffic allowed to reduce recovery capacity, so that global service health takes priority over backlog speed.
+40. As an operator, I want recovery to recheck and honor the shared persisted limiter reserve regardless of which ESI caller contributed to it, so that global service health takes priority over backlog speed without requiring production attribution of a shared counter.
 41. As an operator, I want future `X-Ratelimit-*` bucket headers to remain authoritative without automatically enabling concurrency, so that upstream migration does not silently expand local machinery.
 42. As an operator, I want any future concurrent design to require fresh evidence and review, so that today’s serial safety decision is not bypassed.
 43. As a maintainer, I want the current presentation preflight expressed as a non-sending automated test, so that stale visual assertions fail before Discord transport.
@@ -91,7 +91,7 @@ Correct the stale manual Production Verification preflight so its non-sending as
 - A `2xx`/`3xx` response permits the next serial probe after the universal 250-millisecond minimum.
 - Recovery uses the latest valid persisted legacy error-limit remaining/reset observation whose reset deadline is still current. A response with missing headers does not erase that observation.
 - Recovery admits no probe when the authoritative remaining-error value is 40 or lower. It waits for the current reset rather than consuming the reserve.
-- Regional Observation and all other ESI work retain authority to consume the shared budget. If they reach the floor first, recovery yields even when it processed fewer cases than expected.
+- Regional Observation and all other ESI work retain authority to consume the shared budget. Recovery rechecks the shared persisted limiter before admission and yields at the floor regardless of which caller contributed; controlled integration tests prove the shared-writer case, while production evidence need not and cannot exclusively attribute shared-counter consumption.
 - When no valid current-window legacy error-limit observation exists, recovery admits at most 32 probes during the pass, spaced approximately 1.875 seconds apart.
 - Existing bucket-limit, error-limit, persisted pause, pacing, `429`, and `Retry-After` behavior remains authoritative. An observed boundary stops admission for the current pass.
 - If CCP later supplies new bucket headers for this route, the existing bucket pacing path applies. It does not enable concurrency or automatically raise reviewed constants.
