@@ -886,11 +886,16 @@ struct JsonWebKeySet {
 
 #[derive(Clone, Deserialize)]
 struct JsonWebKey {
+    #[serde(default)]
     alg: Option<String>,
-    e: String,
-    kid: String,
-    kty: String,
-    n: String,
+    #[serde(default)]
+    e: Option<String>,
+    #[serde(default)]
+    kid: Option<String>,
+    #[serde(default)]
+    kty: Option<String>,
+    #[serde(default)]
+    n: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1715,7 +1720,12 @@ fn jwt_kid_is_missing_from(access_token: &str, jwks: &JsonWebKeySet) -> bool {
     decode_header(access_token)
         .ok()
         .and_then(|header| header.kid)
-        .is_some_and(|kid| !jwks.keys.iter().any(|key| key.kid == kid))
+        .is_some_and(|kid| {
+            !jwks
+                .keys
+                .iter()
+                .any(|key| key.kid.as_deref() == Some(&kid) && is_rs256_rsa_key(key))
+        })
 }
 
 fn trusted_eve_sso_metadata(metadata: &OpenIdMetadata) -> bool {
@@ -1743,17 +1753,17 @@ fn validate_eve_access_token_for_client(
     if header.alg != Algorithm::RS256 {
         return Err(invalid_access_token());
     }
+    let kid = header.kid.as_deref().ok_or_else(invalid_access_token)?;
     let key = jwks
         .keys
         .iter()
-        .find(|key| {
-            Some(key.kid.as_str()) == header.kid.as_deref()
-                && key.kty == "RSA"
-                && key.alg.as_deref() == Some("RS256")
-        })
+        .find(|key| key.kid.as_deref() == Some(kid) && is_rs256_rsa_key(key))
         .ok_or_else(invalid_access_token)?;
-    let decoding_key =
-        DecodingKey::from_rsa_components(&key.n, &key.e).map_err(|_| invalid_access_token())?;
+    let decoding_key = DecodingKey::from_rsa_components(
+        key.n.as_deref().ok_or_else(invalid_access_token)?,
+        key.e.as_deref().ok_or_else(invalid_access_token)?,
+    )
+    .map_err(|_| invalid_access_token())?;
     let mut validation = Validation::new(Algorithm::RS256);
     validation.leeway = 0;
     validation.set_issuer(EVE_SSO_ISSUERS);
@@ -1783,6 +1793,13 @@ fn validate_eve_access_token_for_client(
         character_id: character_id.expect("checked above"),
         expires_at,
     })
+}
+
+fn is_rs256_rsa_key(key: &JsonWebKey) -> bool {
+    key.kty.as_deref() == Some("RSA")
+        && key.alg.as_deref() == Some("RS256")
+        && key.n.as_deref().is_some_and(|n| !n.is_empty())
+        && key.e.as_deref().is_some_and(|e| !e.is_empty())
 }
 
 fn invalid_access_token() -> StructureResolverError {
