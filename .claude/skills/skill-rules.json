@@ -117,48 +117,32 @@
             "type": "domain",
             "enforcement": "suggest",
             "priority": "high",
-            "description": "EVE Online ESI API patterns - authentication, endpoints, rate limiting, data models",
+            "description": "EVE ESI domain patterns for contracts, caching, authentication, structures, shared rate limits, and killmail data",
             "promptTriggers": {
                 "keywords": [
-                    "esi",
-                    "eve online",
-                    "eve api",
                     "zkillboard",
                     "zkb",
                     "killmail",
                     "killboard",
-                    "character",
-                    "corporation",
-                    "alliance",
-                    "solar system",
-                    "region",
-                    "ship type",
-                    "type id",
+                    "public contract",
+                    "contract intelligence",
+                    "contract_intelligence",
+                    "contract collection",
+                    "contract items",
+                    "terminal resolution",
+                    "resolution probe",
+                    "structure resolver",
+                    "player structure",
                     "redisq"
                 ],
                 "intentPatterns": [
-                    "(fetch|get|load|query).*?(esi|eve|killmail|character|corp|alliance)",
-                    "(eve|esi).*?(api|endpoint|data)",
-                    "(zkillboard|zkb|redisq).*?(data|feed|killmail)",
-                    "(ship|system|region|character|corp|alliance).*?(id|name|info)"
-                ]
-            },
-            "fileTriggers": {
-                "pathPatterns": [
-                    "src/esi.rs",
-                    "src/models.rs",
-                    "src/redis_q.rs",
-                    "src/processor.rs"
-                ],
-                "contentPatterns": [
-                    "esi\\.evetech\\.net",
-                    "zkillboard\\.com",
-                    "redisq\\.zkillboard",
-                    "killmail",
-                    "solar_system",
-                    "type_id",
-                    "alliance_id",
-                    "corporation_id"
+                    "\\b(esi|eve online|eve api)\\b",
+                    "\\b(fetch|get|load|query)\\b.*?\\b(esi|eve|killmail|zkillboard|redisq)\\b",
+                    "\\b(zkillboard|zkb|redisq)\\b.*?\\b(data|feed|killmail)\\b",
+                    "\\b(eve|esi)\\b.*?\\b(etag|304|conditional|rate limit|error limit|jwks|jwt|sso|single sign-on|pacing|reserve|retry|header)\\b",
+                    "\\b(etag|304|conditional|rate limit|error limit|jwks|jwt|sso|single sign-on)\\b.*?\\b(eve|esi)\\b",
+                    "\\b(eve|esi)\\b.*?\\b(character|corporation|alliance|solar system|region|ship type|type id|group id|structure)\\b.*?\\b(id|info|lookup|resolve|resolution)\\b",
+                    "\\b(character|corporation|alliance|solar system|region|ship type|type id|group id|structure)\\b.*?\\b(id|info|lookup|resolve|resolution)\\b.*?\\b(eve|esi)\\b"
                 ]
             }
         },
