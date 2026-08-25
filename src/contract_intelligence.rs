@@ -104,7 +104,14 @@ fn runtime_contract_region_names() -> Arc<HashMap<i64, String>> {
         }
     }
 }
-const TERMINAL_RESOLUTION_RECOVERY_BATCH_SIZE: usize = 32;
+const TERMINAL_RESOLUTION_RECOVERY_BATCH_SIZE: usize = 256;
+const TERMINAL_RESOLUTION_MIN_PROBE_SPACING: ChronoDuration = ChronoDuration::milliseconds(250);
+const TERMINAL_RESOLUTION_ERROR_CHARGED_PROBE_SPACING: ChronoDuration = ChronoDuration::seconds(1);
+const TERMINAL_RESOLUTION_ERROR_REMAINING_RESERVE: i64 = 40;
+const TERMINAL_RESOLUTION_FALLBACK_MAX_PROBES: usize = 32;
+const TERMINAL_RESOLUTION_FALLBACK_PROBE_SPACING: ChronoDuration =
+    ChronoDuration::milliseconds(1_875);
+const TERMINAL_RESOLUTION_RECOVERY_WORK_DEADLINE: ChronoDuration = ChronoDuration::seconds(60);
 const RESOLUTION_PROBE_RETRY_BASE_SECONDS: i64 = 30;
 const RESOLUTION_PROBE_RETRY_MAX_SECONDS: i64 = 15 * 60;
 pub const DEFAULT_CONTRACT_REGIONAL_CONCURRENCY: usize = 2;
@@ -1054,6 +1061,13 @@ impl ContractItemProbe {
             Self::NotFound(metadata) => metadata,
         }
     }
+
+    fn is_error_charged(&self) -> bool {
+        matches!(
+            self,
+            Self::AcceptedByPlayer(_) | Self::NotPublic(_) | Self::NotFound(_)
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1121,6 +1135,11 @@ impl EsiError {
 
     fn is_not_found(&self) -> bool {
         self.status == Some(StatusCode::NOT_FOUND)
+    }
+
+    fn is_error_charged(&self) -> bool {
+        self.status
+            .is_some_and(|status| status.is_client_error() || status.is_server_error())
     }
 }
 
@@ -2547,6 +2566,12 @@ enum EsiRequestAdmission {
     Granted,
     WaitUntil(DateTime<Utc>),
     PausedUntil(DateTime<Utc>),
+}
+
+#[derive(Clone, Copy)]
+struct CurrentLegacyErrorLimit {
+    remaining: i64,
+    reset_at: DateTime<Utc>,
 }
 
 pub type ContractStoreHandle = Arc<RwLock<Option<Arc<ContractCollectionStore>>>>;
@@ -7690,6 +7715,52 @@ impl ContractCollectionStore {
         .await
     }
 
+    async fn active_esi_request_boundary(
+        &self,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        let Some(row) = sqlx::query(
+            "SELECT pause_until, next_request_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        Ok([
+            row.get::<Option<DateTime<Utc>>, _>("pause_until"),
+            row.get::<Option<DateTime<Utc>>, _>("next_request_at"),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|deadline| *deadline > observed_at)
+        .max())
+    }
+
+    async fn current_legacy_error_limit(
+        &self,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<CurrentLegacyErrorLimit>, sqlx::Error> {
+        let Some(row) = sqlx::query("SELECT error_limit_remain, error_limit_reset, updated_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE")
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let (Some(remaining), Some(reset_seconds)) = (
+            row.get::<Option<i64>, _>("error_limit_remain"),
+            row.get::<Option<i64>, _>("error_limit_reset"),
+        ) else {
+            return Ok(None);
+        };
+        let reset_at = row.get::<DateTime<Utc>, _>("updated_at")
+            + ChronoDuration::seconds(reset_seconds.max(0));
+        Ok((reset_at > observed_at).then_some(CurrentLegacyErrorLimit {
+            remaining,
+            reset_at,
+        }))
+    }
+
     pub(crate) async fn record_esi_limiter_at(
         &self,
         metadata: &CacheMetadata,
@@ -7714,19 +7785,29 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
         ELSE esi_collection_limiter_state.pause_until
     END,
     error_limit_remain = CASE
-        WHEN EXCLUDED.error_limit_remain IS NULL THEN esi_collection_limiter_state.error_limit_remain
+        WHEN EXCLUDED.error_limit_remain IS NULL
+          OR EXCLUDED.error_limit_reset IS NULL
+            THEN esi_collection_limiter_state.error_limit_remain
         WHEN esi_collection_limiter_state.error_limit_remain IS NULL
+          OR esi_collection_limiter_state.error_limit_reset IS NULL
+          OR esi_collection_limiter_state.updated_at
+             + (esi_collection_limiter_state.error_limit_reset * interval '1 second')
+             <= EXCLUDED.updated_at
           OR EXCLUDED.error_limit_remain < esi_collection_limiter_state.error_limit_remain
             THEN EXCLUDED.error_limit_remain
         ELSE esi_collection_limiter_state.error_limit_remain
     END,
     error_limit_reset = CASE
-        WHEN EXCLUDED.error_limit_remain IS NULL THEN esi_collection_limiter_state.error_limit_reset
+        WHEN EXCLUDED.error_limit_remain IS NULL
+          OR EXCLUDED.error_limit_reset IS NULL
+            THEN esi_collection_limiter_state.error_limit_reset
         WHEN esi_collection_limiter_state.error_limit_remain IS NULL
+          OR esi_collection_limiter_state.error_limit_reset IS NULL
+          OR esi_collection_limiter_state.updated_at
+             + (esi_collection_limiter_state.error_limit_reset * interval '1 second')
+             <= EXCLUDED.updated_at
           OR EXCLUDED.error_limit_remain < esi_collection_limiter_state.error_limit_remain
             THEN EXCLUDED.error_limit_reset
-        WHEN EXCLUDED.error_limit_remain = esi_collection_limiter_state.error_limit_remain
-            THEN GREATEST(esi_collection_limiter_state.error_limit_reset, EXCLUDED.error_limit_reset)
         ELSE esi_collection_limiter_state.error_limit_reset
     END,
     rate_limit_group = CASE
@@ -9498,6 +9579,14 @@ impl ContractCollectionError {
             Self::Database(_) | Self::Cache(_) => None,
         }
     }
+
+    fn is_error_charged(&self) -> bool {
+        matches!(self, Self::Esi(error) if error.is_error_charged())
+    }
+
+    fn attempted_esi_probe(&self) -> bool {
+        matches!(self, Self::Esi(_))
+    }
 }
 
 fn collection_failure_classification(error: &ContractCollectionError) -> &'static str {
@@ -9585,10 +9674,32 @@ enum NotificationResolution {
     EvidenceChanged,
 }
 
-#[derive(Default)]
 struct ResolutionBatch {
     events: Vec<ContractEvent>,
     retry_after: Option<DateTime<Utc>>,
+    attempted_probes: usize,
+    resolved_cases: usize,
+    error_charged_probes: usize,
+    stop_reason: &'static str,
+}
+
+impl Default for ResolutionBatch {
+    fn default() -> Self {
+        Self {
+            events: Vec::new(),
+            retry_after: None,
+            attempted_probes: 0,
+            resolved_cases: 0,
+            error_charged_probes: 0,
+            stop_reason: "completed",
+        }
+    }
+}
+
+struct TerminalResolutionProbeOutcome {
+    event: Option<ContractEvent>,
+    error_charged: Option<bool>,
+    resolved: bool,
 }
 
 struct CompletedRegionalPostprocessing {
@@ -10158,35 +10269,53 @@ impl ContractCollector {
     pub async fn recover_terminal_resolutions(
         &self,
     ) -> Result<CollectionReport, ContractCollectionError> {
+        let pass_started_at = self.request_pacer.now();
+        let work_deadline = pass_started_at + TERMINAL_RESOLUTION_RECOVERY_WORK_DEADLINE;
         if let Some(notifications) = &self.notifications {
             self.deliver_prepared_notifications(notifications).await?;
         }
-        let retry_after = self.store.active_esi_limiter_deadline().await?;
-        if retry_after.is_some() {
-            return Ok(CollectionReport {
-                regions: Vec::new(),
-                events: Vec::new(),
-                retry_after,
-            });
-        }
-        self.store
-            .resolve_terminal_resolution_failures(None)
-            .await?;
-        let batch = self
-            .resolve_resolution_batch(
+        let mut batch = if let Some(retry_after) = self.store.active_esi_limiter_deadline().await? {
+            ResolutionBatch {
+                retry_after: Some(retry_after),
+                stop_reason: "persisted_limiter",
+                ..ResolutionBatch::default()
+            }
+        } else {
+            self.store
+                .resolve_terminal_resolution_failures(None)
+                .await?;
+            self.resolve_resolution_batch(
                 self.store.pending_terminal_notifications().await?,
                 self.store
                     .awaiting_resolution_cases_for_recovery(TERMINAL_RESOLUTION_RECOVERY_BATCH_SIZE)
                     .await?,
+                work_deadline,
             )
-            .await?;
+            .await?
+        };
+        let retry_after = std::cmp::max(
+            batch.retry_after,
+            self.store.active_esi_limiter_deadline().await?,
+        );
+        let ending_error_limit_remaining = self
+            .store
+            .current_legacy_error_limit(self.request_pacer.now())
+            .await?
+            .map(|limit| limit.remaining);
+        info!(
+            attempted_probes = batch.attempted_probes,
+            resolved_cases = batch.resolved_cases,
+            error_charged_probes = batch.error_charged_probes,
+            ending_error_limit_remaining = ?ending_error_limit_remaining,
+            stop_reason = batch.stop_reason,
+            elapsed_ms = (self.request_pacer.now() - pass_started_at).num_milliseconds(),
+            limiter_active = retry_after.is_some(),
+            "terminal resolution recovery pass finished"
+        );
         Ok(CollectionReport {
             regions: Vec::new(),
-            events: batch.events,
-            retry_after: std::cmp::max(
-                batch.retry_after,
-                self.store.active_esi_limiter_deadline().await?,
-            ),
+            events: std::mem::take(&mut batch.events),
+            retry_after,
         })
     }
 
@@ -10194,8 +10323,11 @@ impl ContractCollector {
         &self,
         pending_notifications: Vec<TerminalContractResolution>,
         awaiting_resolutions: Vec<AwaitingContractResolution>,
+        work_deadline: DateTime<Utc>,
     ) -> Result<ResolutionBatch, ContractCollectionError> {
         let mut batch = ResolutionBatch::default();
+        let mut last_probe_started = None;
+        let mut fallback_probe_count = 0;
         for resolution in pending_notifications {
             if let Some(event) = terminal_resolution_event(&resolution) {
                 let resolution_key = ResolutionCaseKey {
@@ -10213,42 +10345,101 @@ impl ContractCollector {
             }
         }
         for resolution in awaiting_resolutions {
+            if self.request_pacer.now() >= work_deadline {
+                batch.stop_reason = "deadline";
+                break;
+            }
+            if let Some(boundary) = self
+                .store
+                .active_esi_request_boundary(self.request_pacer.now())
+                .await?
+            {
+                batch.retry_after = std::cmp::max(batch.retry_after, Some(boundary));
+                batch.stop_reason = "shared_request_boundary";
+                break;
+            }
+            let legacy_error_limit = self
+                .store
+                .current_legacy_error_limit(self.request_pacer.now())
+                .await?;
+            if let Some(limit) = legacy_error_limit {
+                if limit.remaining <= TERMINAL_RESOLUTION_ERROR_REMAINING_RESERVE {
+                    batch.retry_after = std::cmp::max(batch.retry_after, Some(limit.reset_at));
+                    batch.stop_reason = "error_reserve";
+                    break;
+                }
+            } else if fallback_probe_count >= TERMINAL_RESOLUTION_FALLBACK_MAX_PROBES {
+                batch.stop_reason = "fallback_budget";
+                break;
+            }
             if let Some(deadline) = self.store.active_esi_limiter_deadline().await? {
                 batch.retry_after = std::cmp::max(batch.retry_after, Some(deadline));
+                batch.stop_reason = "persisted_limiter";
                 break;
+            }
+            if let Some((started_at, error_charged)) = last_probe_started {
+                let spacing = if legacy_error_limit.is_none() {
+                    TERMINAL_RESOLUTION_FALLBACK_PROBE_SPACING
+                } else if error_charged {
+                    TERMINAL_RESOLUTION_ERROR_CHARGED_PROBE_SPACING
+                } else {
+                    TERMINAL_RESOLUTION_MIN_PROBE_SPACING
+                };
+                let next_start_at = started_at + spacing;
+                if next_start_at >= work_deadline {
+                    batch.stop_reason = "deadline";
+                    break;
+                }
+                self.request_pacer.wait_until(next_start_at).await;
+                if self.request_pacer.now() >= work_deadline {
+                    batch.stop_reason = "deadline";
+                    break;
+                }
             }
             let resolution_key = ResolutionCaseKey {
                 region_id: resolution.region_id,
                 contract_id: resolution.contract_id,
             };
+            let probe_started_at = self.request_pacer.now();
             match self.resolve_awaiting_resolution(&resolution).await {
-                Ok(Some(event)) => {
-                    self.notify_terminal_event(&event, &resolution_key).await?;
-                    batch.events.push(event);
+                Ok(probe) => {
+                    if let Some(error_charged) = probe.error_charged {
+                        batch.attempted_probes += 1;
+                        batch.error_charged_probes += usize::from(error_charged);
+                        if legacy_error_limit.is_none() {
+                            fallback_probe_count += 1;
+                        }
+                        last_probe_started = Some((probe_started_at, error_charged));
+                    }
+                    batch.resolved_cases += usize::from(probe.resolved);
+                    if let Some(event) = probe.event {
+                        self.notify_terminal_event(&event, &resolution_key).await?;
+                        batch.events.push(event);
+                    }
                 }
-                Ok(None) => {}
                 Err(error) => {
                     let retry_after = error.retry_after();
+                    let error_charged = error.is_error_charged();
+                    if error.attempted_esi_probe() {
+                        batch.attempted_probes += 1;
+                        batch.error_charged_probes += usize::from(error_charged);
+                        if legacy_error_limit.is_none() {
+                            fallback_probe_count += 1;
+                        }
+                        last_probe_started = Some((probe_started_at, error_charged));
+                    }
                     warn!(
                         region_id = resolution.region_id,
                         contract_id = resolution.contract_id,
                         "contract resolution remains retryable after an independent failure: {error}"
                     );
-                    if let Err(record_error) = self
-                        .store
+                    self.store
                         .record_resolution_probe_failure(
                             &resolution,
                             &error.to_string(),
                             retry_after,
                         )
-                        .await
-                    {
-                        warn!(
-                            region_id = resolution.region_id,
-                            contract_id = resolution.contract_id,
-                            "failed to persist contract resolution failure: {record_error}"
-                        );
-                    }
+                        .await?;
                     batch.retry_after = std::cmp::max(batch.retry_after, retry_after);
                     match self.store.active_esi_limiter_deadline().await {
                         Ok(Some(_)) => break,
@@ -10287,7 +10478,7 @@ impl ContractCollector {
     async fn resolve_awaiting_resolution(
         &self,
         resolution: &AwaitingContractResolution,
-    ) -> Result<Option<ContractEvent>, ContractCollectionError> {
+    ) -> Result<TerminalResolutionProbeOutcome, ContractCollectionError> {
         let key = format!("contracts/public/items/{}", resolution.contract_id);
         let cached = self.store.cache(&key).await?;
         if let Some(cached) = &cached {
@@ -10301,7 +10492,12 @@ impl ContractCollector {
                             None,
                             None,
                         )
-                        .await;
+                        .await
+                        .map(|event| TerminalResolutionProbeOutcome {
+                            event,
+                            error_charged: None,
+                            resolved: true,
+                        });
                 }
                 self.store
                     .schedule_resolution_probe(
@@ -10313,7 +10509,11 @@ impl ContractCollector {
                             .expect("fresh cache has expiration"),
                     )
                     .await?;
-                return Ok(None);
+                return Ok(TerminalResolutionProbeOutcome {
+                    event: None,
+                    error_charged: None,
+                    resolved: false,
+                });
             }
         }
         let etag = cached
@@ -10327,6 +10527,7 @@ impl ContractCollector {
                     .await,
             )
             .await?;
+        let error_charged = probe.is_error_charged();
         match probe {
             ContractItemProbe::Available(response) => {
                 let (items, metadata) = if response.not_modified {
@@ -10360,7 +10561,12 @@ impl ContractCollector {
                             None,
                             None,
                         )
-                        .await;
+                        .await
+                        .map(|event| TerminalResolutionProbeOutcome {
+                            event,
+                            error_charged: Some(error_charged),
+                            resolved: true,
+                        });
                 }
                 self.store
                     .schedule_resolution_probe(
@@ -10369,7 +10575,11 @@ impl ContractCollector {
                         metadata.expires_at.unwrap_or_else(Utc::now),
                     )
                     .await?;
-                Ok(None)
+                Ok(TerminalResolutionProbeOutcome {
+                    event: None,
+                    error_charged: Some(error_charged),
+                    resolved: false,
+                })
             }
             ContractItemProbe::AcceptedByPlayer(metadata) => {
                 let evidence_response_at = Utc::now();
@@ -10392,9 +10602,17 @@ impl ContractCollector {
                     )
                     .await?
                 {
-                    Ok(event)
+                    Ok(TerminalResolutionProbeOutcome {
+                        event,
+                        error_charged: Some(error_charged),
+                        resolved: true,
+                    })
                 } else {
-                    Ok(None)
+                    Ok(TerminalResolutionProbeOutcome {
+                        event: None,
+                        error_charged: Some(error_charged),
+                        resolved: false,
+                    })
                 }
             }
             ContractItemProbe::NoContent(metadata) => {
@@ -10412,6 +10630,11 @@ impl ContractCollector {
                     Some(&metadata),
                 )
                 .await
+                .map(|event| TerminalResolutionProbeOutcome {
+                    event,
+                    error_charged: Some(error_charged),
+                    resolved: true,
+                })
             }
             ContractItemProbe::NotPublic(_) | ContractItemProbe::NotFound(_) => {
                 let observed_at = Utc::now();
@@ -10422,6 +10645,11 @@ impl ContractCollector {
                 };
                 self.resolve_nonfinancial_terminal(resolution, state, observed_at, None, None)
                     .await
+                    .map(|event| TerminalResolutionProbeOutcome {
+                        event,
+                        error_charged: Some(error_charged),
+                        resolved: true,
+                    })
             }
         }
     }
@@ -14925,13 +15153,8 @@ async fn run_terminal_resolution_recovery_loop(
                         ping_limiter.clone(),
                     )
                     .with_optional_structure_resolver(structure_resolver.clone());
-                match collector.recover_terminal_resolutions().await {
-                    Ok(report) => info!(
-                        events = report.events.len(),
-                        limiter_active = report.retry_after.is_some(),
-                        "terminal resolution recovery tick finished"
-                    ),
-                    Err(error) => warn!("terminal resolution recovery tick failed: {error}"),
+                if let Err(error) = collector.recover_terminal_resolutions().await {
+                    warn!("terminal resolution recovery tick failed: {error}");
                 }
             }
             Err(error) => warn!("terminal resolution recovery database unavailable: {error}"),

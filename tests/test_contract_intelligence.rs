@@ -10419,6 +10419,20 @@ struct ResolutionEsi {
     probe_calls: StdMutex<Vec<(i64, Option<String>)>>,
 }
 
+struct TimestampedResolutionEsi {
+    inner: FakeEsi,
+    probes: StdMutex<Vec<Result<ContractItemProbe, EsiError>>>,
+    pacer: Arc<AdvancingRequestPacer>,
+    probe_calls: StdMutex<Vec<(i64, DateTime<Utc>)>>,
+    first_probe_gate: Option<Arc<ResolutionProbeGate>>,
+}
+
+struct ResolutionProbeGate {
+    first_started: Arc<Notify>,
+    first_release: Arc<Notify>,
+    first_pending: AtomicBool,
+}
+
 struct GatedTerminalRecoveryEsi {
     inner: FakeEsi,
     probe_count: AtomicU64,
@@ -10473,6 +10487,50 @@ impl PublicContractEsi for ResolutionEsi {
             .lock()
             .unwrap()
             .push((contract_id, etag.map(str::to_owned)));
+        self.probes.lock().unwrap().remove(0)
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for TimestampedResolutionEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+
+    async fn public_contract_items_probe(
+        &self,
+        contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<ContractItemProbe, EsiError> {
+        self.probe_calls
+            .lock()
+            .unwrap()
+            .push((contract_id, self.pacer.now()));
+        if let Some(gate) = &self.first_probe_gate {
+            if gate.first_pending.swap(false, Ordering::SeqCst) {
+                gate.first_started.notify_one();
+                gate.first_release.notified().await;
+            }
+        }
         self.probes.lock().unwrap().remove(0)
     }
 }
@@ -25759,7 +25817,12 @@ async fn transient_terminal_probe_failures_back_off_so_the_next_due_case_advance
         ),
         probe_calls: StdMutex::new(Vec::new()),
     });
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(database.now().await),
+        waits: StdMutex::new(Vec::new()),
+    });
     ContractCollector::new(store.clone(), first_pass.clone())
+        .with_request_pacer(pacer)
         .recover_terminal_resolutions()
         .await
         .expect("isolated transient probe failures do not abort the recovery tick");
@@ -34404,10 +34467,16 @@ async fn terminal_recovery_tick_drains_one_oldest_due_batch_without_regional_dis
         store: store.clone(),
         sent: StdMutex::new(Vec::new()),
     });
-    let collector = ContractCollector::new(store, esi.clone()).with_notifications(
-        Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
-        delivery,
-    );
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let collector = ContractCollector::new(store, esi.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+            delivery,
+        )
+        .with_request_pacer(pacer);
 
     let first_tick = collector
         .recover_terminal_resolutions()
@@ -34453,6 +34522,830 @@ async fn terminal_recovery_tick_drains_one_oldest_due_batch_without_regional_dis
         vec![FIRST_CONTRACT + DUE_CASES - 1],
         "a later recovery tick does not reprocess terminal cases"
     );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_persists_accepted_player_403_and_spaces_error_charged_probes() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 100;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed serial terminal recovery cases");
+    for contract_id in [FIRST_CONTRACT, FIRST_CONTRACT + 1] {
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize due recovery contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(1))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+    }
+    pool.close().await;
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "error-charged-terminal-recovery",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist terminal recovery delivery action");
+
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let error_metadata = CacheMetadata {
+        error_limit_remain: Some(99),
+        error_limit_reset: Some(60),
+        ..CacheMetadata::cached_for_seconds(0)
+    };
+    let esi = Arc::new(TimestampedResolutionEsi {
+        inner: FakeEsi::default(),
+        probes: StdMutex::new(vec![
+            Ok(ContractItemProbe::AcceptedByPlayer(error_metadata.clone())),
+            Ok(ContractItemProbe::AcceptedByPlayer(error_metadata)),
+        ]),
+        pacer: pacer.clone(),
+        probe_calls: StdMutex::new(Vec::new()),
+        first_probe_gate: None,
+    });
+    let delivery = Arc::new(RecordingDelivery {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+    });
+
+    let report = ContractCollector::new(store.clone(), esi.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+            delivery.clone(),
+        )
+        .with_request_pacer(pacer)
+        .recover_terminal_resolutions()
+        .await
+        .expect("resolve accepted-player terminal cases safely");
+
+    assert_eq!(report.events.len(), 2);
+    assert_eq!(
+        esi.probe_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(contract_id, _)| *contract_id)
+            .collect::<Vec<_>>(),
+        vec![FIRST_CONTRACT, FIRST_CONTRACT + 1],
+        "recovery stays oldest-first and serial"
+    );
+    let calls = esi.probe_calls.lock().unwrap();
+    assert!(
+        calls[1].1 - calls[0].1 >= chrono::Duration::seconds(1),
+        "an accepted-player 403 is an error-charged probe even though it resolves durably"
+    );
+    drop(calls);
+    assert_eq!(delivery.sent.lock().unwrap().len(), 2);
+    assert_eq!(
+        store
+            .contract_resolution_records()
+            .await
+            .expect("read durable terminal outcomes")
+            .iter()
+            .map(|record| record.state)
+            .collect::<Vec<_>>(),
+        vec![
+            ContractResolutionState::AcceptanceConfirmed,
+            ContractResolutionState::AcceptanceConfirmed,
+        ]
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_stops_at_the_error_reserve_and_resumes_after_reset() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 200;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed recovery reserve evidence");
+    for contract_id in [FIRST_CONTRACT, FIRST_CONTRACT + 1] {
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize reserve recovery contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(1))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+    }
+    sqlx::query("INSERT INTO esi_collection_limiter_state (limiter_scope, error_limit_remain, error_limit_reset, updated_at) VALUES (TRUE, 41, 60, $1)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed current shared ESI error evidence immediately above reserve");
+    pool.close().await;
+
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let exhausted_reserve = CacheMetadata {
+        error_limit_remain: Some(40),
+        error_limit_reset: Some(60),
+        ..CacheMetadata::cached_for_seconds(0)
+    };
+    let esi = Arc::new(TimestampedResolutionEsi {
+        inner: FakeEsi::default(),
+        probes: StdMutex::new(vec![
+            Ok(ContractItemProbe::AcceptedByPlayer(exhausted_reserve)),
+            Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())),
+        ]),
+        pacer: pacer.clone(),
+        probe_calls: StdMutex::new(Vec::new()),
+        first_probe_gate: None,
+    });
+    let collector = ContractCollector::new(store, esi.clone()).with_request_pacer(pacer.clone());
+
+    collector
+        .recover_terminal_resolutions()
+        .await
+        .expect("admit exactly the last safe current-window probe");
+    assert_eq!(
+        esi.probe_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(contract_id, _)| *contract_id)
+            .collect::<Vec<_>>(),
+        vec![FIRST_CONTRACT],
+        "recovery leaves the shared forty-error reserve untouched"
+    );
+
+    pacer.advance(chrono::Duration::seconds(61));
+    collector
+        .recover_terminal_resolutions()
+        .await
+        .expect("resume after the authoritative error window resets");
+    assert_eq!(
+        esi.probe_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(contract_id, _)| *contract_id)
+            .collect::<Vec<_>>(),
+        vec![FIRST_CONTRACT, FIRST_CONTRACT + 1],
+        "the oldest remaining due case resumes after reset without replay"
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_replaces_expired_legacy_error_evidence_with_the_latest_window() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 250;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed expired recovery limiter evidence");
+    for contract_id in [FIRST_CONTRACT, FIRST_CONTRACT + 1] {
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize rollover recovery contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(1))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+    }
+    sqlx::query("INSERT INTO esi_collection_limiter_state (limiter_scope, error_limit_remain, error_limit_reset, updated_at) VALUES (TRUE, 40, 60, $1)")
+        .bind(now - chrono::Duration::seconds(61))
+        .execute(&pool)
+        .await
+        .expect("seed expired shared ESI error evidence");
+    pool.close().await;
+
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let fresh_window = CacheMetadata {
+        error_limit_remain: Some(99),
+        error_limit_reset: Some(60),
+        ..CacheMetadata::cached_for_seconds(0)
+    };
+    let esi = Arc::new(TimestampedResolutionEsi {
+        inner: FakeEsi::default(),
+        probes: StdMutex::new(vec![
+            Ok(ContractItemProbe::AcceptedByPlayer(fresh_window)),
+            Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())),
+        ]),
+        pacer: pacer.clone(),
+        probe_calls: StdMutex::new(Vec::new()),
+        first_probe_gate: None,
+    });
+
+    ContractCollector::new(store, esi.clone())
+        .with_request_pacer(pacer.clone())
+        .recover_terminal_resolutions()
+        .await
+        .expect("admit the refreshed current error window");
+
+    let calls = esi.probe_calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|(contract_id, _)| *contract_id)
+            .collect::<Vec<_>>(),
+        vec![FIRST_CONTRACT, FIRST_CONTRACT + 1],
+        "the latest valid error window replaces expired reserve evidence"
+    );
+    assert!(
+        calls[1].1 - calls[0].1 >= chrono::Duration::seconds(1),
+        "the accepted-player response remains error-charged after rollover"
+    );
+    drop(calls);
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_spreads_the_no_header_fallback_and_leaves_excess_due() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 300;
+    const DUE_CASES: i64 = 33;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed no-header recovery cases");
+    for offset in 0..DUE_CASES {
+        let contract_id = FIRST_CONTRACT + offset;
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize no-header recovery contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(DUE_CASES - offset))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+    }
+    pool.close().await;
+
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let esi = Arc::new(TimestampedResolutionEsi {
+        inner: FakeEsi::default(),
+        probes: StdMutex::new(
+            (0..DUE_CASES)
+                .map(|_| Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())))
+                .collect(),
+        ),
+        pacer: pacer.clone(),
+        probe_calls: StdMutex::new(Vec::new()),
+        first_probe_gate: None,
+    });
+    ContractCollector::new(store.clone(), esi.clone())
+        .with_request_pacer(pacer)
+        .recover_terminal_resolutions()
+        .await
+        .expect("use the conservative no-header fallback");
+
+    let calls = esi.probe_calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        32,
+        "the fallback admits no more than 32 probes"
+    );
+    assert!(calls
+        .windows(2)
+        .all(|calls| { calls[1].1 - calls[0].1 >= chrono::Duration::milliseconds(1_875) }));
+    assert_eq!(
+        calls
+            .iter()
+            .map(|(contract_id, _)| *contract_id)
+            .collect::<Vec<_>>(),
+        (FIRST_CONTRACT..FIRST_CONTRACT + 32).collect::<Vec<_>>(),
+        "the fallback preserves oldest-first admission"
+    );
+    drop(calls);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect the untouched selected case");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM contract_resolution_cases WHERE state = 'awaiting_resolution'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count cases left due by the fallback"),
+        1,
+        "the unprocessed selected case remains due without a claim"
+    );
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_advances_only_the_256_oldest_due_cached_cases() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 400;
+    const DUE_CASES: i64 = 257;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed bounded cached recovery cases");
+    for offset in 0..DUE_CASES {
+        let contract_id = FIRST_CONTRACT + offset;
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize bounded cached recovery contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(DUE_CASES - offset))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+        sqlx::query("INSERT INTO esi_cache_metadata (resource_key, expires_at, response, updated_at) VALUES ($1, $2, $3, $4)")
+            .bind(format!("contracts/public/items/{contract_id}"))
+            .bind(now + chrono::Duration::hours(1))
+            .bind(serde_json::to_value(vec![offered_ship(1)]).expect("serialize fresh cached items"))
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("seed fresh cached terminal evidence");
+    }
+    pool.close().await;
+
+    let esi = Arc::new(ResolutionEsi {
+        inner: FakeEsi::default(),
+        probes: StdMutex::new(Vec::new()),
+        probe_calls: StdMutex::new(Vec::new()),
+    });
+    ContractCollector::new(store, esi.clone())
+        .recover_terminal_resolutions()
+        .await
+        .expect("advance the fixed oldest due batch without probing fresh cache");
+
+    assert!(
+        esi.probe_calls.lock().unwrap().is_empty(),
+        "fresh cache advancement does not add public ESI probes"
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect bounded cached recovery cases");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM contract_resolution_cases WHERE region_id = $1 AND state = 'awaiting_resolution' AND next_probe_at <= now()")
+            .bind(REGION)
+            .fetch_one(&pool)
+            .await
+            .expect("count unchanged due cases"),
+        1,
+        "only the 257th case remains due after the fixed batch"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT contract_id FROM contract_resolution_cases WHERE region_id = $1 AND state = 'awaiting_resolution' AND next_probe_at <= now()")
+            .bind(REGION)
+            .fetch_one(&pool)
+            .await
+            .expect("read untouched due case"),
+        FIRST_CONTRACT + DUE_CASES - 1,
+        "the oldest 256 cases advance before the final due case is left untouched"
+    );
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_finishes_an_inflight_probe_after_deadline_without_starting_another() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 400;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed deadline-bound recovery cases");
+    for contract_id in [FIRST_CONTRACT, FIRST_CONTRACT + 1] {
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize deadline recovery contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(1))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+    }
+    pool.close().await;
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let first_started = Arc::new(Notify::new());
+    let first_release = Arc::new(Notify::new());
+    let esi = Arc::new(TimestampedResolutionEsi {
+        inner: FakeEsi::default(),
+        probes: StdMutex::new(vec![
+            Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())),
+            Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())),
+        ]),
+        pacer: pacer.clone(),
+        probe_calls: StdMutex::new(Vec::new()),
+        first_probe_gate: Some(Arc::new(ResolutionProbeGate {
+            first_started: first_started.clone(),
+            first_release: first_release.clone(),
+            first_pending: AtomicBool::new(true),
+        })),
+    });
+    let collector =
+        ContractCollector::new(store.clone(), esi.clone()).with_request_pacer(pacer.clone());
+    let recovery = tokio::spawn(async move { collector.recover_terminal_resolutions().await });
+
+    first_started.notified().await;
+    pacer.advance(chrono::Duration::seconds(61));
+    first_release.notify_one();
+    recovery
+        .await
+        .expect("join recovery pass")
+        .expect("finish the in-flight terminal probe durably");
+
+    assert_eq!(
+        esi.probe_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(contract_id, _)| *contract_id)
+            .collect::<Vec<_>>(),
+        vec![FIRST_CONTRACT],
+        "the pass does not admit a new start after its deadline"
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to inspect deadline lifecycle state");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM contract_resolution_cases WHERE region_id = $1 AND contract_id = $2",
+        )
+        .bind(REGION)
+        .bind(FIRST_CONTRACT)
+        .fetch_one(&pool)
+        .await
+        .expect("read completed in-flight terminal state"),
+        "acceptance_confirmed"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM contract_resolution_cases WHERE region_id = $1 AND contract_id = $2",
+        )
+        .bind(REGION)
+        .bind(FIRST_CONTRACT + 1)
+        .fetch_one(&pool)
+        .await
+        .expect("read untouched selected terminal state"),
+        "awaiting_resolution"
+    );
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_fails_closed_when_a_probe_failure_cannot_be_persisted() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 450;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed fail-closed terminal recovery cases");
+    for contract_id in [FIRST_CONTRACT, FIRST_CONTRACT + 1] {
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize fail-closed recovery contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(1))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+    }
+    sqlx::query("CREATE FUNCTION fail_terminal_resolution_probe_persistence() RETURNS trigger AS $$ BEGIN IF NEW.failure_kind = 'resolution_probe' THEN RAISE EXCEPTION 'controlled resolution probe persistence failure'; END IF; RETURN NEW; END; $$ LANGUAGE plpgsql")
+        .execute(&pool)
+        .await
+        .expect("install the isolated probe-persistence failure trigger");
+    sqlx::query("CREATE TRIGGER fail_terminal_resolution_probe_persistence BEFORE INSERT ON contract_collection_failures FOR EACH ROW EXECUTE FUNCTION fail_terminal_resolution_probe_persistence()")
+        .execute(&pool)
+        .await
+        .expect("enable the isolated probe-persistence failure trigger");
+    pool.close().await;
+
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let esi = Arc::new(TimestampedResolutionEsi {
+        inner: FakeEsi::default(),
+        probes: StdMutex::new(vec![
+            Err(EsiError::retryable(
+                "transient terminal probe failure",
+                None,
+            )),
+            Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())),
+        ]),
+        pacer: pacer.clone(),
+        probe_calls: StdMutex::new(Vec::new()),
+        first_probe_gate: None,
+    });
+
+    let error = ContractCollector::new(store.clone(), esi.clone())
+        .with_request_pacer(pacer)
+        .recover_terminal_resolutions()
+        .await
+        .expect_err("a recovery owner must not admit another case without durable failure state");
+    assert!(error
+        .to_string()
+        .contains("controlled resolution probe persistence failure"));
+    assert_eq!(
+        esi.probe_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(contract_id, _)| *contract_id)
+            .collect::<Vec<_>>(),
+        vec![FIRST_CONTRACT],
+        "a failed durable retry record stops the serial owner before the next probe"
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect the untouched later terminal case");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM contract_resolution_cases WHERE region_id = $1 AND contract_id = $2"
+        )
+        .bind(REGION)
+        .bind(FIRST_CONTRACT + 1)
+        .fetch_one(&pool)
+        .await
+        .expect("read untouched later terminal state"),
+        "awaiting_resolution"
+    );
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_spaces_error_charged_http_failures_after_their_persisted_headers() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 475;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed error-charged failure recovery cases");
+    for contract_id in [FIRST_CONTRACT, FIRST_CONTRACT + 1] {
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize error-charged failure recovery contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(1))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+    }
+    pool.close().await;
+
+    let server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 500,
+            headers: vec![
+                ("X-ESI-Error-Limit-Remain", "99"),
+                ("X-ESI-Error-Limit-Reset", "60"),
+            ],
+            body: "upstream failure",
+        },
+        WireReply {
+            status: 200,
+            headers: vec![("Cache-Control", "max-age=60")],
+            body: "[]",
+        },
+    ]);
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let esi = Arc::new(
+        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+            .expect("construct controlled public ESI client"),
+    );
+    ContractCollector::new(store, esi)
+        .with_request_pacer(pacer.clone())
+        .recover_terminal_resolutions()
+        .await
+        .expect("persist the independent HTTP failure and advance the next due case");
+
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        pacer.waits.lock().unwrap().as_slice(),
+        &[now + chrono::Duration::seconds(1)],
+        "a persisted 5xx error-charged probe enforces one-second spacing"
+    );
+    server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_yields_to_an_active_persisted_bucket_boundary() {
+    const REGION: i64 = 10_000_002;
+    const CONTRACT: i64 = 500;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed persisted bucket boundary");
+    sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+        .bind(REGION)
+        .bind(CONTRACT)
+        .bind(serde_json::to_value(item_exchange_contract(CONTRACT)).expect("serialize bucket-bound recovery contract"))
+        .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+        .bind(now - chrono::Duration::hours(1))
+        .bind(now - chrono::Duration::seconds(1))
+        .execute(&pool)
+        .await
+        .expect("seed a due terminal recovery case");
+    sqlx::query("INSERT INTO esi_collection_limiter_state (limiter_scope, next_request_at, pacing_active, updated_at) VALUES (TRUE, $1, TRUE, $2)")
+        .bind(now + chrono::Duration::seconds(30))
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed an active shared bucket pacing boundary");
+    pool.close().await;
+
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let esi = Arc::new(TimestampedResolutionEsi {
+        inner: FakeEsi::default(),
+        probes: StdMutex::new(vec![Ok(ContractItemProbe::AcceptedByPlayer(
+            expiring_cache(),
+        ))]),
+        pacer: pacer.clone(),
+        probe_calls: StdMutex::new(Vec::new()),
+        first_probe_gate: None,
+    });
+    let report = ContractCollector::new(store, esi.clone())
+        .with_request_pacer(pacer.clone())
+        .recover_terminal_resolutions()
+        .await
+        .expect("yield to the persisted bucket boundary");
+
+    assert!(report.retry_after.is_some());
+    assert!(esi.probe_calls.lock().unwrap().is_empty());
+    assert!(
+        pacer.waits.lock().unwrap().is_empty(),
+        "recovery ends this pass rather than waiting through a shared bucket boundary"
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_retains_legacy_headers_across_mixed_success_and_error_responses() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 600;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed mixed terminal recovery responses");
+    for offset in 0..5_i64 {
+        let contract_id = FIRST_CONTRACT + offset;
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize mixed recovery contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(5 - offset))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+    }
+    sqlx::query("INSERT INTO esi_cache_metadata (resource_key, etag, expires_at, response, updated_at) VALUES ($1, 'mixed-items', $2, $3, $4)")
+        .bind(format!("contracts/public/items/{}", FIRST_CONTRACT + 2))
+        .bind(now - chrono::Duration::seconds(1))
+        .bind(serde_json::to_value(vec![offered_ship(1)]).expect("serialize cached 304 items"))
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed the stale cached representation for the 304 response");
+    pool.close().await;
+
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let legacy_headers = CacheMetadata {
+        error_limit_remain: Some(99),
+        error_limit_reset: Some(60),
+        ..CacheMetadata::cached_for_seconds(0)
+    };
+    let esi = Arc::new(TimestampedResolutionEsi {
+        inner: FakeEsi::default(),
+        probes: StdMutex::new(vec![
+            Ok(ContractItemProbe::Available(EsiResponse::fresh(
+                vec![],
+                legacy_headers,
+            ))),
+            Ok(ContractItemProbe::NoContent(expiring_cache())),
+            Ok(ContractItemProbe::Available(EsiResponse::not_modified(
+                expiring_cache(),
+            ))),
+            Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())),
+            Ok(ContractItemProbe::Available(EsiResponse::fresh(
+                vec![],
+                expiring_cache(),
+            ))),
+        ]),
+        pacer: pacer.clone(),
+        probe_calls: StdMutex::new(Vec::new()),
+        first_probe_gate: None,
+    });
+    ContractCollector::new(store, esi.clone())
+        .with_request_pacer(pacer)
+        .recover_terminal_resolutions()
+        .await
+        .expect("resolve the mixed serial recovery responses");
+
+    let calls = esi.probe_calls.lock().unwrap();
+    assert_eq!(calls.len(), 5);
+    assert_eq!(
+        calls
+            .iter()
+            .map(|(contract_id, _)| *contract_id)
+            .collect::<Vec<_>>(),
+        (FIRST_CONTRACT..FIRST_CONTRACT + 5).collect::<Vec<_>>(),
+        "mixed responses remain serial and oldest-first"
+    );
+    assert_eq!(calls[1].1 - calls[0].1, chrono::Duration::milliseconds(250));
+    assert_eq!(calls[2].1 - calls[1].1, chrono::Duration::milliseconds(250));
+    assert_eq!(calls[3].1 - calls[2].1, chrono::Duration::milliseconds(250));
+    assert_eq!(calls[4].1 - calls[3].1, chrono::Duration::seconds(1));
     database.destroy().await;
 }
 
@@ -34509,6 +35402,79 @@ async fn regional_collection_leaves_due_terminal_probes_to_terminal_recovery() {
     assert_eq!(
         esi.probe_calls.lock().unwrap().as_slice(),
         [(CONTRACT, None)]
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn regional_collection_does_not_raise_a_live_shared_error_reserve() {
+    const REGION: i64 = 10_000_002;
+    const CONTRACT: i64 = 101;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed shared reserve evidence");
+    sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+        .bind(REGION)
+        .bind(CONTRACT)
+        .bind(serde_json::to_value(item_exchange_contract(CONTRACT)).expect("serialize shared reserve contract"))
+        .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+        .bind(now - chrono::Duration::hours(1))
+        .bind(now - chrono::Duration::seconds(1))
+        .execute(&pool)
+        .await
+        .expect("seed a due terminal recovery case");
+    sqlx::query("INSERT INTO esi_collection_limiter_state (limiter_scope, error_limit_remain, error_limit_reset, updated_at) VALUES (TRUE, 40, 60, $1)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed a live shared error reserve");
+    pool.close().await;
+
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let newer_higher_remaining = CacheMetadata {
+        error_limit_remain: Some(99),
+        error_limit_reset: Some(60),
+        ..CacheMetadata::cached_for_seconds(0)
+    };
+    let esi = Arc::new(TimestampedResolutionEsi {
+        inner: FakeEsi {
+            regions: vec![REGION],
+            pages: HashMap::from([(
+                (REGION, 1),
+                Ok(EsiResponse::fresh(vec![], newer_higher_remaining)),
+            )]),
+            items: HashMap::new(),
+        },
+        probes: StdMutex::new(vec![Ok(ContractItemProbe::AcceptedByPlayer(
+            expiring_cache(),
+        ))]),
+        pacer: pacer.clone(),
+        probe_calls: StdMutex::new(Vec::new()),
+        first_probe_gate: None,
+    });
+    let collector = ContractCollector::new(store, esi.clone()).with_request_pacer(pacer);
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("record the shared collection response");
+    let report = collector
+        .recover_terminal_resolutions()
+        .await
+        .expect("read the shared error reserve before terminal admission");
+
+    assert!(report.retry_after.is_some());
+    assert!(
+        esi.probe_calls.lock().unwrap().is_empty(),
+        "a newer higher remaining header cannot raise a live shared error reserve"
     );
     database.destroy().await;
 }
