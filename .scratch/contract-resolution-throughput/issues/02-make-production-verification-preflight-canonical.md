@@ -18,7 +18,8 @@
 
 ## Implementation evidence
 
-- RED: the ignored manual seam stopped at its stale title assertion before reading a token, constructing an HTTP client, or sending a Discord request.
-- GREEN: `cargo test --lib contract_intelligence::embed_tests::manual_contract_embed_visual_preflight_matches_current_presentation -- --exact --nocapture` passed (1 test).
+- RED: the ignored manual seam read its token, then stopped at its stale title assertion before constructing an HTTP client or sending a Discord request.
+- GREEN: `cargo test --lib contract_intelligence::embed_tests::manual_contract_embed_visual_preflight_matches_current_presentation_and_outbound_policy -- --exact` passed (1 test), including the pure outbound builder's empty content, empty allowed mentions, nonce, and non-pinging policy.
+- GREEN: `cargo test --lib contract_intelligence::embed_tests::failed_manual_contract_embed_visual_preflight_makes_no_post_attempt -- --exact` passed (1 test); a stale title stops before the post-attempt boundary.
 - Adjacent safe tests passed for terminal embed structure and budget, nonce, suppressed edit mentions, and explicit non-pinging delivery allowed mentions.
 - `cargo fmt --check`, `cargo check`, and `git diff --check` passed. The ignored sending seam was not rerun.

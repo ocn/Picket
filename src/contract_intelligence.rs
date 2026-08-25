@@ -15234,11 +15234,16 @@ fn collection_recovery_gap(interval: Duration) -> ChronoDuration {
 
 #[cfg(test)]
 mod embed_tests {
-    use crate::discord_bot::{contract_notification_embed, DiscordContractDelivery};
+    use crate::discord_bot::{
+        configured_contract_delivery_payload_for_test, contract_notification_embed,
+        DiscordContractDelivery,
+    };
     use chrono::TimeZone;
     use serenity::http::Http;
+    use std::cell::Cell;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
     use std::thread::JoinHandle;
@@ -16228,7 +16233,7 @@ mod embed_tests {
         assert!(MANUAL_CONTRACT_EMBED_NONCE.chars().count() <= 25);
     }
 
-    fn manual_contract_embed_visual_message() -> ContractNotificationMessage {
+    fn manual_contract_embed_visual_delivery_fixture(channel_id: u64) -> PreparedContractDelivery {
         let mut event = event(ContractEventKind::SaleConfirmed);
         event.contract.contract_id = 234_057_619;
         event.contract.title = Some("Manual public Hel sale visual check".to_string());
@@ -16261,16 +16266,40 @@ mod embed_tests {
                 observed_at: Utc::now() - ChronoDuration::minutes(30),
             }),
         };
-        contract_notification_message(
+        let message = contract_notification_message(
             &event,
             Some(&event.offered_items[0]),
             &issuer_history,
             &corporation_history,
             false,
-        )
+        );
+        PreparedContractDelivery {
+            delivery_id: 0,
+            guild_id: 0,
+            channel_id,
+            subscription_id: "manual-contract-embed-check".to_string(),
+            contract_id: event.contract.contract_id,
+            event_kind: event.kind,
+            ping: false,
+            ping_type: ContractPingType::Here,
+            nonce: MANUAL_CONTRACT_EMBED_NONCE.to_string(),
+            enforce_nonce: false,
+            message,
+            delivery_claim_token: None,
+        }
     }
 
-    fn assert_manual_contract_embed_visual_preflight(message: &ContractNotificationMessage) {
+    fn assert_manual_contract_embed_visual_preflight(delivery: &PreparedContractDelivery) {
+        assert_eq!(delivery.delivery_id, 0);
+        assert_eq!(delivery.guild_id, 0);
+        assert_eq!(delivery.subscription_id, "manual-contract-embed-check");
+        assert_eq!(delivery.contract_id, 234_057_619);
+        assert_eq!(delivery.event_kind, ContractEventKind::SaleConfirmed);
+        assert!(!delivery.ping);
+        assert_eq!(delivery.ping_type, ContractPingType::Here);
+        assert_eq!(delivery.nonce, MANUAL_CONTRACT_EMBED_NONCE);
+        assert!(!delivery.enforce_nonce);
+        let message = &delivery.message;
         assert_eq!(message.title, "Hel contract accepted • 77.5B ISK");
         assert_eq!(
             message.presentation_revision,
@@ -16300,6 +16329,7 @@ mod embed_tests {
             .chain(message.description.as_deref())
             .chain(message.author.as_deref())
             .chain(message.footer.as_deref())
+            .chain(message.thumbnail_url.as_deref())
             .chain(
                 message
                     .fields
@@ -16307,6 +16337,9 @@ mod embed_tests {
                     .flat_map(|field| [field.name.as_str(), field.value.as_str()]),
             )
             .collect::<Vec<_>>();
+        for raw_label in ["Location ID", "Region ID"] {
+            assert!(presentation.iter().all(|text| !text.contains(raw_label)));
+        }
         assert!(presentation.iter().all(|text| {
             !text.contains("@everyone") && !text.contains("@here") && !text.contains("<@")
         }));
@@ -16337,11 +16370,41 @@ mod embed_tests {
             embed.0["thumbnail"]["url"].as_str(),
             Some("https://images.evetech.net/types/22852/icon?size=64")
         );
+        let outbound = configured_contract_delivery_payload_for_test(delivery);
+        assert!(outbound.get("content").is_none());
+        assert_eq!(outbound["allowed_mentions"]["parse"], serde_json::json!([]));
+        assert_eq!(
+            outbound["nonce"].as_str(),
+            Some(MANUAL_CONTRACT_EMBED_NONCE)
+        );
+        assert_eq!(outbound["enforce_nonce"].as_bool(), Some(false));
+        assert_eq!(outbound["embeds"], serde_json::json!([embed.0]));
     }
 
     #[test]
-    fn manual_contract_embed_visual_preflight_matches_current_presentation() {
-        assert_manual_contract_embed_visual_preflight(&manual_contract_embed_visual_message());
+    fn manual_contract_embed_visual_preflight_matches_current_presentation_and_outbound_policy() {
+        let delivery = manual_contract_embed_visual_delivery_fixture(0);
+        assert_manual_contract_embed_visual_preflight(&delivery);
+    }
+
+    #[test]
+    fn failed_manual_contract_embed_visual_preflight_makes_no_post_attempt() {
+        let mut delivery = manual_contract_embed_visual_delivery_fixture(0);
+        delivery.message.title = "obsolete terminal presentation".to_string();
+        let post_attempts = Cell::new(0);
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            assert_manual_contract_embed_visual_preflight(&delivery);
+            post_attempts.set(post_attempts.get() + 1);
+            configured_contract_delivery_payload_for_test(&delivery)
+        }));
+
+        assert!(outcome.is_err(), "stale presentation must fail preflight");
+        assert_eq!(
+            post_attempts.get(),
+            0,
+            "preflight failure cannot create a post"
+        );
     }
 
     #[tokio::test]
@@ -16356,31 +16419,12 @@ mod embed_tests {
             )
             .parse()
             .expect("CONTRACT_TEST_DISCORD_CHANNEL_ID must be a Discord snowflake");
-        let message = manual_contract_embed_visual_message();
-        assert_manual_contract_embed_visual_preflight(&message);
-        assert!(field(&message, "History")
-            .expect("issuer history")
-            .contains("4 sales"));
-        assert!(field(&message, "History")
-            .expect("corporation history")
-            .contains("12 sales"));
+        let delivery = manual_contract_embed_visual_delivery_fixture(channel_id);
+        assert_manual_contract_embed_visual_preflight(&delivery);
 
-        let delivery = DiscordContractDelivery::new(Arc::new(Http::new(&token)));
-        let message_id = delivery
-            .send(PreparedContractDelivery {
-                delivery_id: 0,
-                guild_id: 0,
-                channel_id,
-                subscription_id: "manual-contract-embed-check".to_string(),
-                contract_id: 234_057_619,
-                event_kind: ContractEventKind::SaleConfirmed,
-                ping: false,
-                ping_type: ContractPingType::Here,
-                nonce: MANUAL_CONTRACT_EMBED_NONCE.to_string(),
-                enforce_nonce: false,
-                message,
-                delivery_claim_token: None,
-            })
+        let client = DiscordContractDelivery::new(Arc::new(Http::new(&token)));
+        let message_id = client
+            .send(delivery)
             .await
             .expect("send manual contract embed");
         assert!(!message_id.is_empty());

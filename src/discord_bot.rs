@@ -586,6 +586,19 @@ fn configure_contract_delivery_message<'a, 'builder>(
     builder
 }
 
+#[cfg(test)]
+pub(crate) fn configured_contract_delivery_payload_for_test(
+    delivery: &PreparedContractDelivery,
+) -> serde_json::Map<String, Value> {
+    let mut builder = CreateMessage::default();
+    configure_contract_delivery_message(&mut builder, delivery);
+    builder
+        .0
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
+}
+
 fn contract_delivery_error(error: serenity::Error) -> ContractDeliveryError {
     let message = error.to_string();
     if let serenity::Error::Http(http_error) = &error {
