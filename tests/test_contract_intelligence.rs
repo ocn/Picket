@@ -21736,10 +21736,34 @@ fn run_contract_delivery_cli(
     token_from_stdin: Option<&str>,
     arguments: &[&str],
 ) -> std::process::Output {
+    let temporary_config = tempdir().expect("create isolated contract-delivery CLI config");
+    let config_directory = temporary_config.path().join("config");
+    std::fs::create_dir_all(&config_directory).expect("create isolated config directory");
+    std::fs::write(
+        config_directory.join("systems.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "30000142": {
+                "id": 30000142,
+                "systemName": "Jita",
+                "securityStatus": 0.9,
+                "regionId": 10000002,
+                "regionName": "The Forge"
+            }
+        }))
+        .expect("serialize isolated systems catalog"),
+    )
+    .expect("write isolated systems catalog");
+    std::fs::write(
+        config_directory.join("ships.json"),
+        serde_json::to_vec(&serde_json::json!({ "587": 25 }))
+            .expect("serialize isolated ship groups"),
+    )
+    .expect("write isolated ship groups");
     let mut command = Command::new(env!("CARGO_BIN_EXE_killbot-rust"));
     command
         .arg("contract-delivery")
         .args(arguments)
+        .current_dir(temporary_config.path())
         .env("CONTRACT_DATABASE_URL", database_url)
         .env(
             "CONTRACT_DELIVERY_OPERATOR_ID",
