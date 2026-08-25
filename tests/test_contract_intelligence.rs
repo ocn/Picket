@@ -26,7 +26,7 @@ use killbot_rust::contract_intelligence::{
     HealthRuntimeConfig, HealthStatus, HealthWatchdog, HealthWatchdogConfig, HealthWatchdogRunner,
     HttpPublicContractEsi, IssuerIdentityProvenance, PreparedContractDelivery, PublicContract,
     PublicContractEsi, PublicContractItem, ShipGroupLookup, ShipGroupResolver, SolarSystemPosition,
-    StructureResolutionAdmission, CONTRACT_DELIVERY_OPERATOR_ACTOR,
+    StructureResolutionAdmission, TerminalResolutionRecoveryRun, CONTRACT_DELIVERY_OPERATOR_ACTOR,
     CONTRACT_DELIVERY_OPERATOR_TOKEN_MAX_BYTES, CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
     TERMINAL_RESOLUTION_RECOVERY_INTERVAL,
 };
@@ -60,7 +60,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -70,6 +70,8 @@ use url::Url;
 use common::load_text_fixture;
 
 static DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static VIRTUAL_REQUEST_PACER_EPOCH: OnceLock<(DateTime<Utc>, tokio::time::Instant)> =
+    OnceLock::new();
 const ESI_PUBLIC_CONTRACT_SUMMARY_FIXTURE: &str =
     include_str!("../resources/contracts/public-contract-summary.json");
 const ESI_PUBLIC_CONTRACT_ITEMS_FIXTURE: &str =
@@ -102,6 +104,23 @@ type PersistedStructureCompletion = (
     Option<DateTime<Utc>>,
     Option<String>,
 );
+
+fn virtual_recovery_now(now: DateTime<Utc>) -> tokio::time::Instant {
+    let (wall_epoch, monotonic_epoch) =
+        VIRTUAL_REQUEST_PACER_EPOCH.get_or_init(|| (now, tokio::time::Instant::now()));
+    let elapsed = now.signed_duration_since(*wall_epoch);
+    if elapsed >= chrono::Duration::zero() {
+        *monotonic_epoch
+            + elapsed
+                .to_std()
+                .expect("positive virtual recovery duration")
+    } else {
+        *monotonic_epoch
+            - (-elapsed)
+                .to_std()
+                .expect("negative virtual recovery duration")
+    }
+}
 
 #[async_trait]
 trait TerminalRecoveryTestSeam {
@@ -8607,6 +8626,14 @@ struct GatedAdvancingRequestPacer {
     wait_release: Arc<Notify>,
 }
 
+struct WallDiscontinuousRequestPacer {
+    now: StdMutex<DateTime<Utc>>,
+    monotonic_now: StdMutex<tokio::time::Instant>,
+    waits: StdMutex<Vec<DateTime<Utc>>>,
+    now_calls: AtomicU64,
+    advance_monotonic_at_now_call: u64,
+}
+
 impl AdvancingRequestPacer {
     fn advance(&self, duration: chrono::Duration) {
         *self.now.lock().unwrap() += duration;
@@ -9123,6 +9150,18 @@ impl ContractRequestPacer for AdvancingRequestPacer {
         let mut now = self.now.lock().unwrap();
         *now = std::cmp::max(*now, deadline);
     }
+
+    fn recovery_now(&self) -> tokio::time::Instant {
+        virtual_recovery_now(*self.now.lock().unwrap())
+    }
+
+    async fn wait_until_recovery(&self, deadline: tokio::time::Instant) {
+        let current = self.recovery_now();
+        let elapsed = deadline.saturating_duration_since(current);
+        let mut now = self.now.lock().unwrap();
+        *now += chrono::Duration::from_std(elapsed).expect("virtual recovery wait fits chrono");
+        self.waits.lock().unwrap().push(*now);
+    }
 }
 
 impl GatedAdvancingRequestPacer {
@@ -9143,6 +9182,55 @@ impl ContractRequestPacer for GatedAdvancingRequestPacer {
         self.wait_release.notified().await;
         let mut now = self.now.lock().unwrap();
         *now = std::cmp::max(*now, deadline);
+    }
+
+    fn recovery_now(&self) -> tokio::time::Instant {
+        virtual_recovery_now(*self.now.lock().unwrap())
+    }
+
+    async fn wait_until_recovery(&self, deadline: tokio::time::Instant) {
+        self.wait_entered.notify_one();
+        self.wait_release.notified().await;
+        let current = self.recovery_now();
+        let elapsed = deadline.saturating_duration_since(current);
+        let mut now = self.now.lock().unwrap();
+        *now += chrono::Duration::from_std(elapsed).expect("virtual recovery wait fits chrono");
+        self.waits.lock().unwrap().push(*now);
+    }
+}
+
+impl WallDiscontinuousRequestPacer {
+    fn monotonic_now(&self) -> tokio::time::Instant {
+        *self.monotonic_now.lock().unwrap()
+    }
+
+    fn jump_wall_clock(&self, duration: chrono::Duration) {
+        *self.now.lock().unwrap() += duration;
+    }
+}
+
+#[async_trait]
+impl ContractRequestPacer for WallDiscontinuousRequestPacer {
+    fn now(&self) -> DateTime<Utc> {
+        if self.now_calls.fetch_add(1, Ordering::SeqCst) + 1 == self.advance_monotonic_at_now_call {
+            *self.monotonic_now.lock().unwrap() += Duration::from_secs(10);
+        }
+        *self.now.lock().unwrap()
+    }
+
+    async fn wait_until(&self, deadline: DateTime<Utc>) {
+        self.waits.lock().unwrap().push(deadline);
+        let mut now = self.now.lock().unwrap();
+        *now = std::cmp::max(*now, deadline);
+    }
+
+    fn recovery_now(&self) -> tokio::time::Instant {
+        *self.monotonic_now.lock().unwrap()
+    }
+
+    async fn wait_until_recovery(&self, deadline: tokio::time::Instant) {
+        let mut monotonic_now = self.monotonic_now.lock().unwrap();
+        *monotonic_now = std::cmp::max(*monotonic_now, deadline);
     }
 }
 
@@ -10427,6 +10515,14 @@ struct TimestampedResolutionEsi {
     first_probe_gate: Option<Arc<ResolutionProbeGate>>,
 }
 
+struct EntryTimestampResolutionEsi {
+    inner: FakeEsi,
+    probes: StdMutex<Vec<Result<ContractItemProbe, EsiError>>>,
+    pacer: Arc<WallDiscontinuousRequestPacer>,
+    probe_entries: StdMutex<Vec<tokio::time::Instant>>,
+    jump_wall_after_first_entry: AtomicBool,
+}
+
 struct ResolutionProbeGate {
     first_started: Arc<Notify>,
     first_release: Arc<Notify>,
@@ -10530,6 +10626,50 @@ impl PublicContractEsi for TimestampedResolutionEsi {
                 gate.first_started.notify_one();
                 gate.first_release.notified().await;
             }
+        }
+        self.probes.lock().unwrap().remove(0)
+    }
+}
+
+#[async_trait]
+impl PublicContractEsi for EntryTimestampResolutionEsi {
+    async fn regions(&self, etag: Option<&str>) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.inner.regions(etag).await
+    }
+
+    async fn public_contracts_page(
+        &self,
+        region_id: i64,
+        page: u32,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContract>>, EsiError> {
+        self.inner
+            .public_contracts_page(region_id, page, etag)
+            .await
+    }
+
+    async fn public_contract_items(
+        &self,
+        contract_id: i64,
+        etag: Option<&str>,
+    ) -> Result<EsiResponse<Vec<PublicContractItem>>, EsiError> {
+        self.inner.public_contract_items(contract_id, etag).await
+    }
+
+    async fn public_contract_items_probe(
+        &self,
+        _contract_id: i64,
+        _etag: Option<&str>,
+    ) -> Result<ContractItemProbe, EsiError> {
+        self.probe_entries
+            .lock()
+            .unwrap()
+            .push(self.pacer.monotonic_now());
+        if self
+            .jump_wall_after_first_entry
+            .swap(false, Ordering::SeqCst)
+        {
+            self.pacer.jump_wall_clock(chrono::Duration::seconds(10));
         }
         self.probes.lock().unwrap().remove(0)
     }
@@ -34788,6 +34928,128 @@ async fn terminal_recovery_replaces_expired_legacy_error_evidence_with_the_lates
 }
 
 #[tokio::test]
+async fn terminal_recovery_keeps_legacy_error_evidence_in_a_fixed_window() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 275;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed fixed-window recovery cases");
+    for contract_id in FIRST_CONTRACT..FIRST_CONTRACT + 4 {
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize fixed-window recovery contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(FIRST_CONTRACT + 4 - contract_id))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+    }
+    pool.close().await;
+
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let current_window = CacheMetadata {
+        error_limit_remain: Some(50),
+        error_limit_reset: Some(60),
+        ..CacheMetadata::cached_for_seconds(3_600)
+    };
+    let higher_same_window = CacheMetadata {
+        error_limit_remain: Some(99),
+        error_limit_reset: Some(60),
+        ..CacheMetadata::cached_for_seconds(3_600)
+    };
+    let esi = Arc::new(TimestampedResolutionEsi {
+        inner: FakeEsi::default(),
+        probes: StdMutex::new(vec![
+            Ok(ContractItemProbe::Available(EsiResponse::fresh(
+                vec![],
+                current_window.clone(),
+            ))),
+            Ok(ContractItemProbe::Available(EsiResponse::fresh(
+                vec![],
+                CacheMetadata::cached_for_seconds(3_600),
+            ))),
+            Ok(ContractItemProbe::Available(EsiResponse::fresh(
+                vec![],
+                current_window,
+            ))),
+            Ok(ContractItemProbe::Available(EsiResponse::fresh(
+                vec![],
+                higher_same_window.clone(),
+            ))),
+            Ok(ContractItemProbe::Available(EsiResponse::fresh(
+                vec![],
+                higher_same_window,
+            ))),
+        ]),
+        pacer: pacer.clone(),
+        probe_calls: StdMutex::new(Vec::new()),
+        first_probe_gate: None,
+    });
+    let collector = ContractCollector::new(store, esi).with_request_pacer(pacer.clone());
+
+    collector
+        .recover_terminal_resolutions()
+        .await
+        .expect("record same-window legacy observations");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect fixed-window limiter evidence");
+    let same_window: (i64, i64, DateTime<Utc>) = sqlx::query_as(
+        "SELECT error_limit_remain, error_limit_reset, updated_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read retained same-window limiter evidence");
+    assert_eq!(same_window, (50, 60, now));
+
+    pacer.advance(chrono::Duration::seconds(61));
+    let rollover_observed_at = pacer.now();
+    let contract_id = FIRST_CONTRACT + 4;
+    sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+        .bind(REGION)
+        .bind(contract_id)
+        .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize rollover recovery contract"))
+        .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+        .bind(now - chrono::Duration::hours(1))
+        .bind(now - chrono::Duration::seconds(1))
+        .execute(&pool)
+        .await
+        .expect("seed a due case after the fixed window expires");
+    pool.close().await;
+
+    collector
+        .recover_terminal_resolutions()
+        .await
+        .expect("replace legacy evidence after its fixed window expires");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect rollover limiter evidence");
+    let expired_window: (i64, i64, DateTime<Utc>) = sqlx::query_as(
+        "SELECT error_limit_remain, error_limit_reset, updated_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read replacement limiter evidence");
+    assert_eq!(expired_window, (99, 60, rollover_observed_at));
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn terminal_recovery_spreads_the_no_header_fallback_and_leaves_excess_due() {
     const REGION: i64 = 10_000_002;
     const FIRST_CONTRACT: i64 = 300;
@@ -34975,6 +35237,15 @@ async fn terminal_recovery_finishes_an_inflight_probe_after_deadline_without_sta
             .expect("seed a due terminal recovery case");
     }
     pool.close().await;
+    store
+        .upsert_contract_subscription(&confirmed_ship_subscription(
+            "deadline-inflight-delivery",
+            ContractEventKind::SaleConfirmed,
+            ContractItemDirection::Offered,
+            ContractEventAction::Post,
+        ))
+        .await
+        .expect("persist the deadline-bound terminal delivery action");
     let pacer = Arc::new(AdvancingRequestPacer {
         now: StdMutex::new(now),
         waits: StdMutex::new(Vec::new()),
@@ -34995,13 +35266,31 @@ async fn terminal_recovery_finishes_an_inflight_probe_after_deadline_without_sta
             first_pending: AtomicBool::new(true),
         })),
     });
-    let collector =
-        ContractCollector::new(store.clone(), esi.clone()).with_request_pacer(pacer.clone());
+    let delivery = Arc::new(FirstDeliveryGate {
+        store: store.clone(),
+        sent: StdMutex::new(Vec::new()),
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        gate_open: AtomicBool::new(true),
+    });
+    let collector = ContractCollector::new(store.clone(), esi.clone())
+        .with_notifications(
+            Arc::new(StaticShipGroups(HashMap::from([(587, 25)]))),
+            delivery.clone(),
+        )
+        .with_request_pacer(pacer.clone());
     let recovery = tokio::spawn(async move { collector.recover_terminal_resolutions().await });
 
     first_started.notified().await;
+    let delivery_entered = delivery.entered.notified();
     pacer.advance(chrono::Duration::seconds(61));
     first_release.notify_one();
+    delivery_entered.await;
+    assert!(
+        !recovery.is_finished(),
+        "the recovery owner awaits the durable first delivery before ending the pass"
+    );
+    delivery.release.notify_one();
     recovery
         .await
         .expect("join recovery pass")
@@ -35016,6 +35305,11 @@ async fn terminal_recovery_finishes_an_inflight_probe_after_deadline_without_sta
             .collect::<Vec<_>>(),
         vec![FIRST_CONTRACT],
         "the pass does not admit a new start after its deadline"
+    );
+    assert_eq!(
+        delivery.sent.lock().unwrap().len(),
+        1,
+        "the completed in-flight case is delivered durably before the deadline-bound pass ends"
     );
     let pool = PgPoolOptions::new()
         .max_connections(1)
@@ -35100,14 +35394,20 @@ async fn terminal_recovery_fails_closed_when_a_probe_failure_cannot_be_persisted
         first_probe_gate: None,
     });
 
-    let error = ContractCollector::new(store.clone(), esi.clone())
+    let run = ContractCollector::new(store.clone(), esi.clone())
         .with_request_pacer(pacer)
-        .recover_terminal_resolutions()
-        .await
-        .expect_err("a recovery owner must not admit another case without durable failure state");
+        .terminal_resolution_recovery_run()
+        .await;
+    let TerminalResolutionRecoveryRun::Failed { error, summary } = run else {
+        panic!("a recovery owner must fail after a probe failure cannot be persisted");
+    };
     assert!(error
         .to_string()
         .contains("controlled resolution probe persistence failure"));
+    assert_eq!(summary.attempted_probes, 1);
+    assert_eq!(summary.error_charged_probes, 0);
+    assert_eq!(summary.resolved_cases, 0);
+    assert_eq!(summary.stop_reason, "database_error");
     assert_eq!(
         esi.probe_calls
             .lock()
@@ -35204,6 +35504,101 @@ async fn terminal_recovery_spaces_error_charged_http_failures_after_their_persis
 }
 
 #[tokio::test]
+async fn terminal_recovery_persists_wire_accepted_player_403s_and_spaces_them() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 490;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed accepted-player wire recovery cases");
+    for contract_id in [FIRST_CONTRACT, FIRST_CONTRACT + 1] {
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize accepted-player wire recovery contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(1))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+    }
+    pool.close().await;
+
+    let server = SequenceHttpServer::start(vec![
+        WireReply {
+            status: 403,
+            headers: vec![
+                ("X-ESI-Error-Limit-Remain", "99"),
+                ("X-ESI-Error-Limit-Reset", "60"),
+            ],
+            body: r#"{"error":"Contract accepted by player, requires authorization"}"#,
+        },
+        WireReply {
+            status: 403,
+            headers: vec![
+                ("X-ESI-Error-Limit-Remain", "98"),
+                ("X-ESI-Error-Limit-Reset", "60"),
+            ],
+            body: r#"{"error":"Contract accepted by player, requires authorization"}"#,
+        },
+    ]);
+    let pacer = Arc::new(AdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+    });
+    let esi = Arc::new(
+        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(1))
+            .expect("construct controlled accepted-player ESI client"),
+    );
+    ContractCollector::new(store, esi)
+        .with_request_pacer(pacer.clone())
+        .recover_terminal_resolutions()
+        .await
+        .expect("durably accept both controlled 403 responses");
+
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        pacer.waits.lock().unwrap().as_slice(),
+        &[now + chrono::Duration::seconds(1)],
+        "accepted-player 403 responses are error-charged and space the later true probe"
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("inspect durable accepted-player wire state");
+    let accepted: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT state, acceptance_provenance FROM contract_resolution_cases WHERE region_id = $1 ORDER BY contract_id",
+    )
+    .bind(REGION)
+    .fetch_all(&pool)
+    .await
+    .expect("read accepted-player wire recovery state");
+    assert_eq!(
+        accepted,
+        vec![
+            (
+                "acceptance_confirmed".to_string(),
+                Some("accepted_by_player".to_string()),
+            ),
+            (
+                "acceptance_confirmed".to_string(),
+                Some("accepted_by_player".to_string()),
+            ),
+        ],
+        "the public recovery seam persists durable accepted-player evidence from the controlled wire response"
+    );
+    pool.close().await;
+    server.finish();
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn terminal_recovery_yields_to_an_active_persisted_bucket_boundary() {
     const REGION: i64 = 10_000_002;
     const CONTRACT: i64 = 500;
@@ -35262,6 +35657,271 @@ async fn terminal_recovery_yields_to_an_active_persisted_bucket_boundary() {
 }
 
 #[tokio::test]
+async fn terminal_recovery_returns_a_structured_summary_for_a_limiter_stop() {
+    const REGION: i64 = 10_000_002;
+    const CONTRACT: i64 = 525;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed a summary-visible limiter boundary");
+    sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+        .bind(REGION)
+        .bind(CONTRACT)
+        .bind(serde_json::to_value(item_exchange_contract(CONTRACT)).expect("serialize summary recovery contract"))
+        .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+        .bind(now - chrono::Duration::hours(1))
+        .bind(now - chrono::Duration::seconds(1))
+        .execute(&pool)
+        .await
+        .expect("seed a due terminal recovery case");
+    sqlx::query("INSERT INTO esi_collection_limiter_state (limiter_scope, pause_until, updated_at) VALUES (TRUE, $1, $2)")
+        .bind(now + chrono::Duration::seconds(30))
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed an active persisted limiter boundary");
+    pool.close().await;
+
+    let run = ContractCollector::new(
+        store,
+        Arc::new(ResolutionEsi {
+            inner: FakeEsi::default(),
+            probes: StdMutex::new(Vec::new()),
+            probe_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .terminal_resolution_recovery_run()
+    .await;
+    let TerminalResolutionRecoveryRun::Completed { summary, .. } = run else {
+        panic!("the persisted limiter boundary stops recovery without failing the pass");
+    };
+    assert_eq!(summary.attempted_probes, 0);
+    assert_eq!(summary.resolved_cases, 0);
+    assert_eq!(summary.error_charged_probes, 0);
+    assert_eq!(summary.stop_reason, "persisted_limiter");
+    assert_eq!(summary.ending_error_limit_remaining, None);
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_summary_names_a_response_created_limiter_stop() {
+    const REGION: i64 = 10_000_002;
+    const CONTRACT: i64 = 540;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed a response-boundary summary case");
+    sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+        .bind(REGION)
+        .bind(CONTRACT)
+        .bind(serde_json::to_value(item_exchange_contract(CONTRACT)).expect("serialize response-boundary recovery contract"))
+        .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+        .bind(now - chrono::Duration::hours(1))
+        .bind(now - chrono::Duration::seconds(1))
+        .execute(&pool)
+        .await
+        .expect("seed a due terminal recovery case");
+    sqlx::query("INSERT INTO esi_collection_limiter_state (limiter_scope, error_limit_remain, error_limit_reset, updated_at) VALUES (TRUE, 99, 60, $1)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed current-window error-limit evidence for the ending summary");
+    pool.close().await;
+
+    let retry_after = now + chrono::Duration::seconds(30);
+    let run = ContractCollector::new(
+        store,
+        Arc::new(ResolutionEsi {
+            inner: FakeEsi::default(),
+            probes: StdMutex::new(vec![Err(EsiError::retryable(
+                "controlled response retry boundary",
+                Some(retry_after),
+            ))]),
+            probe_calls: StdMutex::new(Vec::new()),
+        }),
+    )
+    .terminal_resolution_recovery_run()
+    .await;
+    let TerminalResolutionRecoveryRun::Completed { summary, .. } = run else {
+        panic!("a response-created limiter boundary is a completed stopped pass");
+    };
+    assert_eq!(summary.attempted_probes, 1);
+    assert_eq!(summary.error_charged_probes, 0);
+    assert_eq!(summary.stop_reason, "response_limiter");
+    assert_eq!(summary.ending_error_limit_remaining, Some(99));
+    assert_eq!(
+        summary.ending_error_limit_reset_at,
+        Some(now + chrono::Duration::seconds(60))
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_rechecks_a_shared_error_floor_after_pacing_before_starting() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 550;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed the pacing admission race");
+    for contract_id in [FIRST_CONTRACT, FIRST_CONTRACT + 1] {
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize pacing race contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(FIRST_CONTRACT + 1 - contract_id))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+    }
+    sqlx::query("INSERT INTO esi_collection_limiter_state (limiter_scope, error_limit_remain, error_limit_reset, updated_at) VALUES (TRUE, 99, 60, $1)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed a currently safe shared error window");
+    pool.close().await;
+
+    let pacer = Arc::new(GatedAdvancingRequestPacer {
+        now: StdMutex::new(now),
+        waits: StdMutex::new(Vec::new()),
+        wait_entered: Arc::new(Notify::new()),
+        wait_release: Arc::new(Notify::new()),
+    });
+    let esi = Arc::new(ResolutionEsi {
+        inner: FakeEsi::default(),
+        probes: StdMutex::new(vec![
+            Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())),
+            Ok(ContractItemProbe::AcceptedByPlayer(expiring_cache())),
+        ]),
+        probe_calls: StdMutex::new(Vec::new()),
+    });
+    let collector = ContractCollector::new(store, esi.clone()).with_request_pacer(pacer.clone());
+    let recovery = tokio::spawn(async move { collector.recover_terminal_resolutions().await });
+
+    pacer.wait_entered.notified().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to publish the regional error floor during recovery pacing");
+    sqlx::query("UPDATE esi_collection_limiter_state SET error_limit_remain = 40, error_limit_reset = 60, updated_at = $1 WHERE limiter_scope = TRUE")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("publish the shared error reserve while recovery is waiting");
+    pool.close().await;
+    pacer.wait_release.notify_one();
+
+    let report = recovery
+        .await
+        .expect("join the paced recovery pass")
+        .expect("stop the pass after the published error floor");
+    assert_eq!(
+        esi.probe_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(contract_id, _)| *contract_id)
+            .collect::<Vec<_>>(),
+        vec![FIRST_CONTRACT],
+        "a floor published during the recovery wait prevents the later ESI start"
+    );
+    assert_eq!(
+        report.retry_after,
+        Some(now + chrono::Duration::seconds(60))
+    );
+    assert_eq!(
+        pacer.waits.lock().unwrap().as_slice(),
+        &[now + chrono::Duration::seconds(1)],
+        "the pass stops at the published floor rather than waiting inside generic admission"
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn terminal_recovery_spaces_actual_esi_entries_across_a_wall_clock_jump() {
+    const REGION: i64 = 10_000_002;
+    const FIRST_CONTRACT: i64 = 575;
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let now = database.now().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to seed actual-entry timing recovery cases");
+    for contract_id in [FIRST_CONTRACT, FIRST_CONTRACT + 1] {
+        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,$5,$5,$6,'awaiting_resolution')")
+            .bind(REGION)
+            .bind(contract_id)
+            .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize entry-timing recovery contract"))
+            .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
+            .bind(now - chrono::Duration::hours(1))
+            .bind(now - chrono::Duration::seconds(FIRST_CONTRACT + 1 - contract_id))
+            .execute(&pool)
+            .await
+            .expect("seed a due terminal recovery case");
+    }
+    pool.close().await;
+
+    let pacer = Arc::new(WallDiscontinuousRequestPacer {
+        now: StdMutex::new(now),
+        monotonic_now: StdMutex::new(tokio::time::Instant::now()),
+        waits: StdMutex::new(Vec::new()),
+        now_calls: AtomicU64::new(0),
+        advance_monotonic_at_now_call: 3,
+    });
+    let live_error_window = CacheMetadata {
+        error_limit_remain: Some(99),
+        error_limit_reset: Some(60),
+        ..CacheMetadata::cached_for_seconds(0)
+    };
+    let esi = Arc::new(EntryTimestampResolutionEsi {
+        inner: FakeEsi::default(),
+        probes: StdMutex::new(vec![
+            Ok(ContractItemProbe::Available(EsiResponse::fresh(
+                vec![],
+                live_error_window.clone(),
+            ))),
+            Ok(ContractItemProbe::Available(EsiResponse::fresh(
+                vec![],
+                live_error_window,
+            ))),
+        ]),
+        pacer: pacer.clone(),
+        probe_entries: StdMutex::new(Vec::new()),
+        jump_wall_after_first_entry: AtomicBool::new(true),
+    });
+    ContractCollector::new(store, esi.clone())
+        .with_request_pacer(pacer.clone())
+        .recover_terminal_resolutions()
+        .await
+        .expect("complete the controlled entry-timing recovery pass");
+
+    let entries = esi.probe_entries.lock().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries[1].duration_since(entries[0]) >= Duration::from_millis(250),
+        "the true public ESI call entries retain the recovery spacing despite a wall-clock jump"
+    );
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn terminal_recovery_retains_legacy_headers_across_mixed_success_and_error_responses() {
     const REGION: i64 = 10_000_002;
     const FIRST_CONTRACT: i64 = 600;
@@ -35305,7 +35965,7 @@ async fn terminal_recovery_retains_legacy_headers_across_mixed_success_and_error
         error_limit_reset: Some(60),
         ..CacheMetadata::cached_for_seconds(0)
     };
-    let esi = Arc::new(TimestampedResolutionEsi {
+    let esi = Arc::new(ResolutionEsi {
         inner: FakeEsi::default(),
         probes: StdMutex::new(vec![
             Ok(ContractItemProbe::Available(EsiResponse::fresh(
@@ -35322,12 +35982,10 @@ async fn terminal_recovery_retains_legacy_headers_across_mixed_success_and_error
                 expiring_cache(),
             ))),
         ]),
-        pacer: pacer.clone(),
         probe_calls: StdMutex::new(Vec::new()),
-        first_probe_gate: None,
     });
     ContractCollector::new(store, esi.clone())
-        .with_request_pacer(pacer)
+        .with_request_pacer(pacer.clone())
         .recover_terminal_resolutions()
         .await
         .expect("resolve the mixed serial recovery responses");
@@ -35342,10 +36000,21 @@ async fn terminal_recovery_retains_legacy_headers_across_mixed_success_and_error
         (FIRST_CONTRACT..FIRST_CONTRACT + 5).collect::<Vec<_>>(),
         "mixed responses remain serial and oldest-first"
     );
-    assert_eq!(calls[1].1 - calls[0].1, chrono::Duration::milliseconds(250));
-    assert_eq!(calls[2].1 - calls[1].1, chrono::Duration::milliseconds(250));
-    assert_eq!(calls[3].1 - calls[2].1, chrono::Duration::milliseconds(250));
-    assert_eq!(calls[4].1 - calls[3].1, chrono::Duration::seconds(1));
+    assert_eq!(
+        calls[2],
+        (FIRST_CONTRACT + 2, Some("mixed-items".to_string())),
+        "the stale cached 304 case sends its ETag as the conditional validator"
+    );
+    assert_eq!(
+        pacer.waits.lock().unwrap().as_slice(),
+        &[
+            now + chrono::Duration::milliseconds(250),
+            now + chrono::Duration::milliseconds(500),
+            now + chrono::Duration::milliseconds(750),
+            now + chrono::Duration::milliseconds(1750),
+        ],
+        "the mixed public recovery responses retain their 250ms/1s serial pacing"
+    );
     database.destroy().await;
 }
 
