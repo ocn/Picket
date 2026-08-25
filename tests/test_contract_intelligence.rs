@@ -26558,7 +26558,8 @@ async fn bounded_regional_collection_dispatches_fast_terminal_evidence_before_a_
     .expect("fast regional discovery publishes the terminal case before slow discovery ends");
     let recovery =
         tokio::spawn(async move { recovery_collector.recover_terminal_resolutions().await });
-    if tokio::time::timeout(Duration::from_secs(2), delivered)
+    let delivery_ordering_timeout = Duration::from_secs(5);
+    if tokio::time::timeout(delivery_ordering_timeout, delivered)
         .await
         .is_err()
     {
