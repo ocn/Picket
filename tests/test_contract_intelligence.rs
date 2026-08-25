@@ -26170,21 +26170,21 @@ async fn delayed_same_group_response_retains_active_pacing_for_later_and_restart
         .expect("connect to observe the delayed same-group response");
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            let updated_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
-                "SELECT updated_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
+            let page_cached = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM esi_cache_metadata WHERE resource_key = $1)",
             )
-            .fetch_optional(&pool)
+            .bind("contracts/public/10000003/page/1")
+            .fetch_one(&pool)
             .await
-            .expect("read delayed-response limiter state")
-            .flatten();
-            if updated_at.is_some_and(|updated_at| updated_at >= delayed_response_at) {
+            .expect("read delayed same-group page cache state");
+            if page_cached {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the delayed same-group response is persisted before releasing the third request");
+    .expect("the delayed same-group page cache is persisted before releasing the third request");
     let limiter = sqlx::query(
         "SELECT pacing_active, next_request_at FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
     )
