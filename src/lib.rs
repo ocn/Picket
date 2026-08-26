@@ -11,6 +11,7 @@ pub mod config;
 pub mod contract_intelligence;
 pub mod discord_bot;
 pub mod esi;
+pub mod esi_cache;
 pub mod feed;
 pub mod location_evidence;
 pub mod models;
