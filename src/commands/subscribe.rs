@@ -15,6 +15,88 @@ use tracing::error;
 
 pub struct SubscribeCommand;
 
+#[derive(Debug, PartialEq, Eq)]
+enum PingConfigurationError {
+    PingTypeAndRole,
+    NegativeMaxPingDelay,
+}
+
+impl std::fmt::Display for PingConfigurationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PingTypeAndRole => {
+                formatter.write_str("ping_type and role cannot be selected together")
+            }
+            Self::NegativeMaxPingDelay => {
+                formatter.write_str("max_ping_delay_minutes cannot be negative")
+            }
+        }
+    }
+}
+
+fn configured_ping_type(
+    selected_ping_type: Option<&str>,
+    role_id: Option<u64>,
+    max_ping_delay_minutes: Option<i64>,
+) -> Result<Option<PingType>, PingConfigurationError> {
+    if max_ping_delay_minutes.is_some_and(|delay| delay < 0) {
+        return Err(PingConfigurationError::NegativeMaxPingDelay);
+    }
+    if selected_ping_type.is_some() && role_id.is_some() {
+        return Err(PingConfigurationError::PingTypeAndRole);
+    }
+
+    let max_ping_delay_minutes = max_ping_delay_minutes.map(|delay| delay as u32);
+    if let Some(role_id) = role_id {
+        return Ok(Some(PingType::Role {
+            role_id,
+            max_ping_delay_minutes,
+        }));
+    }
+
+    Ok(match selected_ping_type {
+        Some("here") => Some(PingType::Here {
+            max_ping_delay_minutes,
+        }),
+        Some("everyone") => Some(PingType::Everyone {
+            max_ping_delay_minutes,
+        }),
+        _ => None,
+    })
+}
+
+fn ping_feedback(ping_type: Option<&PingType>) -> String {
+    match ping_type {
+        Some(PingType::Role {
+            role_id,
+            max_ping_delay_minutes,
+        }) => format!(
+            "Role ping: <@&{role_id}>; {}.",
+            freshness_policy(*max_ping_delay_minutes)
+        ),
+        Some(PingType::Here {
+            max_ping_delay_minutes,
+        }) => format!(
+            "Ping: @here; {}.",
+            freshness_policy(*max_ping_delay_minutes)
+        ),
+        Some(PingType::Everyone {
+            max_ping_delay_minutes,
+        }) => format!(
+            "Ping: @everyone; {}.",
+            freshness_policy(*max_ping_delay_minutes)
+        ),
+        None => "No ping configured.".to_string(),
+    }
+}
+
+fn freshness_policy(max_ping_delay_minutes: Option<u32>) -> String {
+    match max_ping_delay_minutes {
+        Some(0) | None => "any killmail age".to_string(),
+        Some(minutes) => format!("killmails up to {minutes} minutes old"),
+    }
+}
+
 fn parse_ids<T: std::str::FromStr>(
     options: &[serenity::model::application::interaction::application_command::CommandDataOption],
     name: &str,
@@ -181,6 +263,12 @@ impl Command for SubscribeCommand {
             })
             .create_option(|option| {
                 option
+                    .name("role")
+                    .description("A Discord role to ping instead of ping_type.")
+                    .kind(CommandOptionType::Role)
+            })
+            .create_option(|option| {
+                option
                     .name("max_ping_delay_minutes")
                     .description("The maximum age of a killmail (in minutes) to be eligible for a    ping.")
                  .kind(CommandOptionType::Integer)
@@ -222,6 +310,48 @@ impl Command for SubscribeCommand {
                 return;
             }
         };
+
+        let selected_ping_type = get_option_value(options, "ping_type").and_then(|value| {
+            if let CommandDataOptionValue::String(value) = value {
+                Some(value.as_str())
+            } else {
+                None
+            }
+        });
+        let role_id = get_option_value(options, "role").and_then(|value| {
+            if let CommandDataOptionValue::Role(role) = value {
+                Some(role.id.0)
+            } else {
+                None
+            }
+        });
+        let max_ping_delay_minutes =
+            get_option_value(options, "max_ping_delay_minutes").and_then(|value| {
+                if let CommandDataOptionValue::Integer(value) = value {
+                    Some(*value)
+                } else {
+                    None
+                }
+            });
+        let ping_type =
+            match configured_ping_type(selected_ping_type, role_id, max_ping_delay_minutes) {
+                Ok(ping_type) => ping_type,
+                Err(validation_error) => {
+                    if let Err(why) = command
+                        .create_interaction_response(&ctx.http, |response| {
+                            response.interaction_response_data(|message| {
+                                message
+                                    .content(format!("Invalid subscription: {validation_error}."))
+                                    .ephemeral(true)
+                            })
+                        })
+                        .await
+                    {
+                        error!("Cannot respond to slash command: {}", why);
+                    }
+                    return;
+                }
+            };
 
         let min_value = get_option_value(options, "min_value").and_then(|v| {
             if let CommandDataOptionValue::Integer(i) = v {
@@ -378,30 +508,6 @@ impl Command for SubscribeCommand {
             filters.push(Filter::Simple(SimpleFilter::Security(s.clone())));
         }
 
-        let max_ping_delay_minutes =
-            get_option_value(options, "max_ping_delay_minutes").and_then(|v| {
-                if let CommandDataOptionValue::Integer(i) = v {
-                    Some(*i as u32)
-                } else {
-                    None
-                }
-            });
-        let ping_type = get_option_value(options, "ping_type").and_then(|v| {
-            if let CommandDataOptionValue::String(s) = v {
-                match s.as_str() {
-                    "here" => Some(PingType::Here {
-                        max_ping_delay_minutes,
-                    }),
-                    "everyone" => Some(PingType::Everyone {
-                        max_ping_delay_minutes,
-                    }),
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        });
-
         let root_filter = if filters.len() > 1 {
             FilterNode::And(filters.into_iter().map(FilterNode::Condition).collect())
         } else {
@@ -432,7 +538,15 @@ impl Command for SubscribeCommand {
             guild_subs.push(new_sub);
 
             match save_subscriptions_for_guild(guild_id, guild_subs) {
-                Ok(_) => format!("Subscription '{}' created/updated successfully!", id),
+                Ok(_) => format!(
+                    "Subscription '{}' created/updated successfully! {}",
+                    id,
+                    ping_feedback(
+                        guild_subs
+                            .last()
+                            .and_then(|subscription| { subscription.action.ping_type.as_ref() })
+                    )
+                ),
                 Err(e) => {
                     error!("Failed to save subscriptions for guild {}: {}", guild_id, e);
                     format!("Error saving subscription '{}'.", id)
@@ -451,5 +565,51 @@ impl Command for SubscribeCommand {
         {
             error!("Cannot respond to slash command: {}", why);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_option_is_native_and_conflicts_with_ping_type() {
+        let mut command = CreateApplicationCommand::default();
+        SubscribeCommand.register(&mut command);
+        let role = command.0["options"]
+            .as_array()
+            .expect("subscribe options")
+            .iter()
+            .find(|option| option["name"] == "role")
+            .expect("role option");
+        assert_eq!(role["type"], CommandOptionType::Role.num());
+
+        assert_eq!(
+            configured_ping_type(Some("here"), Some(123), Some(5)),
+            Err(PingConfigurationError::PingTypeAndRole)
+        );
+    }
+
+    #[test]
+    fn negative_max_ping_delay_is_rejected_before_a_ping_is_constructed() {
+        assert_eq!(
+            configured_ping_type(None, Some(123), Some(-1)),
+            Err(PingConfigurationError::NegativeMaxPingDelay)
+        );
+        assert_eq!(
+            configured_ping_type(Some("everyone"), None, Some(-1)),
+            Err(PingConfigurationError::NegativeMaxPingDelay)
+        );
+    }
+
+    #[test]
+    fn role_ping_feedback_names_the_selected_role_and_freshness_policy() {
+        assert_eq!(
+            ping_feedback(Some(&PingType::Role {
+                role_id: 123,
+                max_ping_delay_minutes: Some(5),
+            })),
+            "Role ping: <@&123>; killmails up to 5 minutes old."
+        );
     }
 }
