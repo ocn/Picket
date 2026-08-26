@@ -15,10 +15,13 @@ use tracing::error;
 
 pub struct SubscribeCommand;
 
+const MAX_PING_DELAY_MINUTES: u32 = u32::MAX;
+
 #[derive(Debug, PartialEq, Eq)]
 enum PingConfigurationError {
     PingTypeAndRole,
     NegativeMaxPingDelay,
+    MaxPingDelayTooLarge,
 }
 
 impl std::fmt::Display for PingConfigurationError {
@@ -30,7 +33,48 @@ impl std::fmt::Display for PingConfigurationError {
             Self::NegativeMaxPingDelay => {
                 formatter.write_str("max_ping_delay_minutes cannot be negative")
             }
+            Self::MaxPingDelayTooLarge => formatter.write_str(&format!(
+                "max_ping_delay_minutes must be at most {MAX_PING_DELAY_MINUTES}"
+            )),
         }
+    }
+}
+
+enum SubscribeCommandValidation {
+    Valid { ping_type: Option<PingType> },
+    Rejected { feedback: String },
+}
+
+impl SubscribeCommandValidation {
+    fn rejection_feedback(&self) -> Option<&str> {
+        match self {
+            Self::Valid { .. } => None,
+            Self::Rejected { feedback } => Some(feedback),
+        }
+    }
+
+    fn apply_persistence<T>(
+        self,
+        persist: impl FnOnce(Option<PingType>) -> T,
+    ) -> Result<T, String> {
+        match self {
+            Self::Valid { ping_type } => Ok(persist(ping_type)),
+            Self::Rejected { feedback } => Err(feedback),
+        }
+    }
+}
+
+fn validate_subscribe_command(
+    selected_ping_type: Option<&str>,
+    role_id: Option<u64>,
+    max_ping_delay_minutes: Option<i64>,
+) -> SubscribeCommandValidation {
+    let ping_type = configured_ping_type(selected_ping_type, role_id, max_ping_delay_minutes);
+    match ping_type {
+        Ok(ping_type) => SubscribeCommandValidation::Valid { ping_type },
+        Err(error) => SubscribeCommandValidation::Rejected {
+            feedback: format!("Invalid subscription: {error}."),
+        },
     }
 }
 
@@ -46,7 +90,10 @@ fn configured_ping_type(
         return Err(PingConfigurationError::PingTypeAndRole);
     }
 
-    let max_ping_delay_minutes = max_ping_delay_minutes.map(|delay| delay as u32);
+    let max_ping_delay_minutes = max_ping_delay_minutes
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| PingConfigurationError::MaxPingDelayTooLarge)?;
     if let Some(role_id) = role_id {
         return Ok(Some(PingType::Role {
             role_id,
@@ -271,8 +318,10 @@ impl Command for SubscribeCommand {
                 option
                     .name("max_ping_delay_minutes")
                     .description("The maximum age of a killmail (in minutes) to be eligible for a    ping.")
-                 .kind(CommandOptionType::Integer)
-         })
+                    .kind(CommandOptionType::Integer)
+                    .min_int_value(0)
+                    .max_int_value(MAX_PING_DELAY_MINUTES)
+            })
             .create_option(|option| {
                 option
                     .name("security")
@@ -333,25 +382,21 @@ impl Command for SubscribeCommand {
                     None
                 }
             });
-        let ping_type =
-            match configured_ping_type(selected_ping_type, role_id, max_ping_delay_minutes) {
-                Ok(ping_type) => ping_type,
-                Err(validation_error) => {
-                    if let Err(why) = command
-                        .create_interaction_response(&ctx.http, |response| {
-                            response.interaction_response_data(|message| {
-                                message
-                                    .content(format!("Invalid subscription: {validation_error}."))
-                                    .ephemeral(true)
-                            })
-                        })
-                        .await
-                    {
-                        error!("Cannot respond to slash command: {}", why);
-                    }
-                    return;
-                }
-            };
+        let validation =
+            validate_subscribe_command(selected_ping_type, role_id, max_ping_delay_minutes);
+        if let Some(feedback) = validation.rejection_feedback() {
+            if let Err(why) = command
+                .create_interaction_response(&ctx.http, |response| {
+                    response.interaction_response_data(|message| {
+                        message.content(feedback).ephemeral(true)
+                    })
+                })
+                .await
+            {
+                error!("Cannot respond to slash command: {}", why);
+            }
+            return;
+        }
 
         let min_value = get_option_value(options, "min_value").and_then(|v| {
             if let CommandDataOptionValue::Integer(i) = v {
@@ -517,41 +562,46 @@ impl Command for SubscribeCommand {
                 .unwrap_or(FilterNode::And(vec![])) // Match all if no filters
         };
 
-        let new_sub = Subscription {
-            id: id.clone(),
-            description,
-            root_filter,
-            action: Action {
-                channel_id: command.channel_id.0.to_string(),
-                ping_type,
-            },
-        };
         let command_channel_id_str = command.channel_id.to_string();
 
         let _lock = app_state.subscriptions_file_lock.lock().await;
         let response_content = {
             let mut subs_map = app_state.subscriptions.write().unwrap();
-            let guild_subs = subs_map.entry(guild_id).or_default();
+            validation
+                .apply_persistence(|ping_type| {
+                    let new_sub = Subscription {
+                        id: id.clone(),
+                        description,
+                        root_filter,
+                        action: Action {
+                            channel_id: command.channel_id.0.to_string(),
+                            ping_type,
+                        },
+                    };
+                    let guild_subs = subs_map.entry(guild_id).or_default();
 
-            guild_subs
-                .retain(|sub| sub.id != id || sub.action.channel_id != command_channel_id_str);
-            guild_subs.push(new_sub);
+                    guild_subs.retain(|sub| {
+                        sub.id != id || sub.action.channel_id != command_channel_id_str
+                    });
+                    guild_subs.push(new_sub);
 
-            match save_subscriptions_for_guild(guild_id, guild_subs) {
-                Ok(_) => format!(
-                    "Subscription '{}' created/updated successfully! {}",
-                    id,
-                    ping_feedback(
-                        guild_subs
-                            .last()
-                            .and_then(|subscription| { subscription.action.ping_type.as_ref() })
-                    )
-                ),
-                Err(e) => {
-                    error!("Failed to save subscriptions for guild {}: {}", guild_id, e);
-                    format!("Error saving subscription '{}'.", id)
-                }
-            }
+                    match save_subscriptions_for_guild(guild_id, guild_subs) {
+                        Ok(_) => {
+                            format!(
+                                "Subscription '{}' created/updated successfully! {}",
+                                id,
+                                ping_feedback(guild_subs.last().and_then(|subscription| {
+                                    subscription.action.ping_type.as_ref()
+                                }))
+                            )
+                        }
+                        Err(e) => {
+                            error!("Failed to save subscriptions for guild {}: {}", guild_id, e);
+                            format!("Error saving subscription '{}'.", id)
+                        }
+                    }
+                })
+                .expect("rejected subscriptions return before persistence")
         };
         drop(_lock);
 
@@ -573,33 +623,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn role_option_is_native_and_conflicts_with_ping_type() {
+    fn subscribe_registers_native_role_and_bounded_ping_delay_options() {
         let mut command = CreateApplicationCommand::default();
         SubscribeCommand.register(&mut command);
-        let role = command.0["options"]
-            .as_array()
-            .expect("subscribe options")
+        let options = command.0["options"].as_array().expect("subscribe options");
+        let role = options
             .iter()
             .find(|option| option["name"] == "role")
             .expect("role option");
         assert_eq!(role["type"], CommandOptionType::Role.num());
-
+        let max_delay = options
+            .iter()
+            .find(|option| option["name"] == "max_ping_delay_minutes")
+            .expect("max ping delay option");
+        assert_eq!(max_delay["type"], CommandOptionType::Integer.num());
+        assert_eq!(max_delay["min_value"], serde_json::json!(0));
         assert_eq!(
-            configured_ping_type(Some("here"), Some(123), Some(5)),
-            Err(PingConfigurationError::PingTypeAndRole)
+            max_delay["max_value"],
+            serde_json::json!(MAX_PING_DELAY_MINUTES)
         );
     }
 
     #[test]
-    fn negative_max_ping_delay_is_rejected_before_a_ping_is_constructed() {
+    fn max_ping_delay_accepts_u32_max_and_rejects_larger_values() {
         assert_eq!(
-            configured_ping_type(None, Some(123), Some(-1)),
-            Err(PingConfigurationError::NegativeMaxPingDelay)
+            configured_ping_type(Some("here"), None, Some(i64::from(MAX_PING_DELAY_MINUTES))),
+            Ok(Some(PingType::Here {
+                max_ping_delay_minutes: Some(MAX_PING_DELAY_MINUTES),
+            }))
         );
         assert_eq!(
-            configured_ping_type(Some("everyone"), None, Some(-1)),
-            Err(PingConfigurationError::NegativeMaxPingDelay)
+            configured_ping_type(
+                Some("here"),
+                None,
+                Some(i64::from(MAX_PING_DELAY_MINUTES) + 1)
+            ),
+            Err(PingConfigurationError::MaxPingDelayTooLarge)
         );
+    }
+
+    #[test]
+    fn rejected_subscribe_validation_returns_feedback_without_persisting_or_mutating() {
+        for (ping_type, role_id, delay, expected_feedback) in [
+            (
+                Some("here"),
+                Some(123),
+                Some(5),
+                "Invalid subscription: ping_type and role cannot be selected together.",
+            ),
+            (
+                None,
+                Some(123),
+                Some(-1),
+                "Invalid subscription: max_ping_delay_minutes cannot be negative.",
+            ),
+        ] {
+            let mut persistence_attempts = 0;
+            let mut mutations = Vec::new();
+            let validation = validate_subscribe_command(ping_type, role_id, delay);
+            assert_eq!(validation.rejection_feedback(), Some(expected_feedback));
+            let result = validation.apply_persistence(|_| {
+                persistence_attempts += 1;
+                mutations.push("subscription mutation");
+            });
+
+            assert_eq!(result, Err(expected_feedback.to_string()));
+            assert_eq!(persistence_attempts, 0);
+            assert!(mutations.is_empty());
+        }
     }
 
     #[test]
