@@ -884,6 +884,7 @@ mod tests {
     async fn configured_channel_ping_cooldowns_share_a_channel_timestamp_and_refresh_it() {
         let ping_times = Mutex::new(HashMap::new());
         let now = Instant::now();
+        let five_minutes = CHANNEL_PING_COOLDOWN;
         let thirty_minutes = Duration::from_secs(30 * 60);
 
         assert!(
@@ -893,20 +894,17 @@ mod tests {
             !try_acquire_channel_ping_with_cooldown_at(
                 &ping_times,
                 77,
-                thirty_minutes,
-                now + thirty_minutes - Duration::from_secs(1),
+                five_minutes,
+                now + five_minutes - Duration::from_secs(1),
             )
             .await
-        );
-        assert!(
-            try_acquire_channel_ping_with_cooldown_at(&ping_times, 78, thirty_minutes, now,).await
         );
         assert!(
             try_acquire_channel_ping_with_cooldown_at(
                 &ping_times,
                 77,
-                thirty_minutes,
-                now + thirty_minutes,
+                five_minutes,
+                now + five_minutes,
             )
             .await
         );
@@ -915,7 +913,7 @@ mod tests {
                 &ping_times,
                 77,
                 thirty_minutes,
-                now + thirty_minutes + thirty_minutes - Duration::from_secs(1),
+                now + five_minutes + thirty_minutes - Duration::from_secs(1),
             )
             .await
         );
@@ -924,9 +922,12 @@ mod tests {
                 &ping_times,
                 77,
                 thirty_minutes,
-                now + thirty_minutes * 2,
+                now + five_minutes + thirty_minutes,
             )
             .await
+        );
+        assert!(
+            try_acquire_channel_ping_with_cooldown_at(&ping_times, 78, thirty_minutes, now,).await
         );
     }
 
