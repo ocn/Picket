@@ -16,12 +16,15 @@ use tracing::error;
 pub struct SubscribeCommand;
 
 const MAX_PING_DELAY_MINUTES: u32 = u32::MAX;
+const MAX_PING_COOLDOWN_MINUTES: u32 = u32::MAX;
 
 #[derive(Debug, PartialEq, Eq)]
 enum PingConfigurationError {
     PingTypeAndRole,
     NegativeMaxPingDelay,
     MaxPingDelayTooLarge,
+    NegativePingCooldown,
+    PingCooldownTooLarge,
 }
 
 impl std::fmt::Display for PingConfigurationError {
@@ -35,6 +38,12 @@ impl std::fmt::Display for PingConfigurationError {
             }
             Self::MaxPingDelayTooLarge => formatter.write_str(&format!(
                 "max_ping_delay_minutes must be at most {MAX_PING_DELAY_MINUTES}"
+            )),
+            Self::NegativePingCooldown => {
+                formatter.write_str("ping_cooldown_minutes cannot be negative")
+            }
+            Self::PingCooldownTooLarge => formatter.write_str(&format!(
+                "ping_cooldown_minutes must be at most {MAX_PING_COOLDOWN_MINUTES}"
             )),
         }
     }
@@ -68,8 +77,14 @@ fn validate_subscribe_command(
     selected_ping_type: Option<&str>,
     role_id: Option<u64>,
     max_ping_delay_minutes: Option<i64>,
+    ping_cooldown_minutes: Option<i64>,
 ) -> SubscribeCommandValidation {
-    let ping_type = configured_ping_type(selected_ping_type, role_id, max_ping_delay_minutes);
+    let ping_type = configured_ping_type(
+        selected_ping_type,
+        role_id,
+        max_ping_delay_minutes,
+        ping_cooldown_minutes,
+    );
     match ping_type {
         Ok(ping_type) => SubscribeCommandValidation::Valid { ping_type },
         Err(error) => SubscribeCommandValidation::Rejected {
@@ -82,9 +97,13 @@ fn configured_ping_type(
     selected_ping_type: Option<&str>,
     role_id: Option<u64>,
     max_ping_delay_minutes: Option<i64>,
+    ping_cooldown_minutes: Option<i64>,
 ) -> Result<Option<PingType>, PingConfigurationError> {
     if max_ping_delay_minutes.is_some_and(|delay| delay < 0) {
         return Err(PingConfigurationError::NegativeMaxPingDelay);
+    }
+    if ping_cooldown_minutes.is_some_and(|cooldown| cooldown < 0) {
+        return Err(PingConfigurationError::NegativePingCooldown);
     }
     if selected_ping_type.is_some() && role_id.is_some() {
         return Err(PingConfigurationError::PingTypeAndRole);
@@ -94,19 +113,26 @@ fn configured_ping_type(
         .map(u32::try_from)
         .transpose()
         .map_err(|_| PingConfigurationError::MaxPingDelayTooLarge)?;
+    let ping_cooldown_minutes = ping_cooldown_minutes
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| PingConfigurationError::PingCooldownTooLarge)?;
     if let Some(role_id) = role_id {
         return Ok(Some(PingType::Role {
             role_id,
             max_ping_delay_minutes,
+            ping_cooldown_minutes,
         }));
     }
 
     Ok(match selected_ping_type {
         Some("here") => Some(PingType::Here {
             max_ping_delay_minutes,
+            ping_cooldown_minutes,
         }),
         Some("everyone") => Some(PingType::Everyone {
             max_ping_delay_minutes,
+            ping_cooldown_minutes,
         }),
         _ => None,
     })
@@ -114,24 +140,36 @@ fn configured_ping_type(
 
 fn ping_feedback(ping_type: Option<&PingType>) -> String {
     match ping_type {
-        Some(PingType::Role {
-            role_id,
-            max_ping_delay_minutes,
-        }) => format!(
-            "Role ping: <@&{role_id}>; {}.",
-            freshness_policy(*max_ping_delay_minutes)
+        Some(
+            ping_type @ PingType::Role {
+                role_id,
+                max_ping_delay_minutes,
+                ..
+            },
+        ) => format!(
+            "Role ping: <@&{role_id}>; {}; {}.",
+            freshness_policy(*max_ping_delay_minutes),
+            cooldown_policy(ping_type)
         ),
-        Some(PingType::Here {
-            max_ping_delay_minutes,
-        }) => format!(
-            "Ping: @here; {}.",
-            freshness_policy(*max_ping_delay_minutes)
+        Some(
+            ping_type @ PingType::Here {
+                max_ping_delay_minutes,
+                ..
+            },
+        ) => format!(
+            "Ping: @here; {}; {}.",
+            freshness_policy(*max_ping_delay_minutes),
+            cooldown_policy(ping_type)
         ),
-        Some(PingType::Everyone {
-            max_ping_delay_minutes,
-        }) => format!(
-            "Ping: @everyone; {}.",
-            freshness_policy(*max_ping_delay_minutes)
+        Some(
+            ping_type @ PingType::Everyone {
+                max_ping_delay_minutes,
+                ..
+            },
+        ) => format!(
+            "Ping: @everyone; {}; {}.",
+            freshness_policy(*max_ping_delay_minutes),
+            cooldown_policy(ping_type)
         ),
         None => "No ping configured.".to_string(),
     }
@@ -142,6 +180,18 @@ fn freshness_policy(max_ping_delay_minutes: Option<u32>) -> String {
         Some(0) | None => "any killmail age".to_string(),
         Some(minutes) => format!("killmails up to {minutes} minutes old"),
     }
+}
+
+fn cooldown_policy(ping_type: &PingType) -> String {
+    let source = if ping_type.configured_ping_cooldown_in_minutes().is_some() {
+        "configured"
+    } else {
+        "default"
+    };
+    format!(
+        "{source} channel-wide cooldown: {} minutes",
+        ping_type.ping_cooldown_in_minutes()
+    )
 }
 
 fn parse_ids<T: std::str::FromStr>(
@@ -324,6 +374,14 @@ impl Command for SubscribeCommand {
             })
             .create_option(|option| {
                 option
+                    .name("ping_cooldown_minutes")
+                    .description("The minimum minutes between pings in this channel.")
+                    .kind(CommandOptionType::Integer)
+                    .min_int_value(0)
+                    .max_int_value(MAX_PING_COOLDOWN_MINUTES)
+            })
+            .create_option(|option| {
+                option
                     .name("security")
                     .description("A security status range (e.g., \"-1.0..=0.4\" for low/nullsec).")
                     .kind(CommandOptionType::String)
@@ -382,8 +440,20 @@ impl Command for SubscribeCommand {
                     None
                 }
             });
-        let validation =
-            validate_subscribe_command(selected_ping_type, role_id, max_ping_delay_minutes);
+        let ping_cooldown_minutes =
+            get_option_value(options, "ping_cooldown_minutes").and_then(|value| {
+                if let CommandDataOptionValue::Integer(value) = value {
+                    Some(*value)
+                } else {
+                    None
+                }
+            });
+        let validation = validate_subscribe_command(
+            selected_ping_type,
+            role_id,
+            max_ping_delay_minutes,
+            ping_cooldown_minutes,
+        );
         if let Some(feedback) = validation.rejection_feedback() {
             if let Err(why) = command
                 .create_interaction_response(&ctx.http, |response| {
@@ -623,7 +693,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subscribe_registers_native_role_and_bounded_ping_delay_options() {
+    fn subscribe_registers_native_role_and_bounded_ping_options() {
         let mut command = CreateApplicationCommand::default();
         SubscribeCommand.register(&mut command);
         let options = command.0["options"].as_array().expect("subscribe options");
@@ -642,32 +712,75 @@ mod tests {
             max_delay["max_value"],
             serde_json::json!(MAX_PING_DELAY_MINUTES)
         );
+        let cooldown = options
+            .iter()
+            .find(|option| option["name"] == "ping_cooldown_minutes")
+            .expect("ping cooldown option");
+        assert_eq!(cooldown["type"], CommandOptionType::Integer.num());
+        assert_eq!(cooldown["min_value"], serde_json::json!(0));
+        assert_eq!(
+            cooldown["max_value"],
+            serde_json::json!(MAX_PING_COOLDOWN_MINUTES)
+        );
     }
 
     #[test]
     fn max_ping_delay_accepts_u32_max_and_rejects_larger_values() {
         assert_eq!(
-            configured_ping_type(Some("here"), None, Some(i64::from(MAX_PING_DELAY_MINUTES))),
+            configured_ping_type(
+                Some("here"),
+                None,
+                Some(i64::from(MAX_PING_DELAY_MINUTES)),
+                None,
+            ),
             Ok(Some(PingType::Here {
                 max_ping_delay_minutes: Some(MAX_PING_DELAY_MINUTES),
+                ping_cooldown_minutes: None,
             }))
         );
         assert_eq!(
             configured_ping_type(
                 Some("here"),
                 None,
-                Some(i64::from(MAX_PING_DELAY_MINUTES) + 1)
+                Some(i64::from(MAX_PING_DELAY_MINUTES) + 1),
+                None,
             ),
             Err(PingConfigurationError::MaxPingDelayTooLarge)
         );
     }
 
     #[test]
+    fn ping_cooldown_accepts_u32_max_and_rejects_larger_values() {
+        assert_eq!(
+            configured_ping_type(
+                Some("everyone"),
+                None,
+                None,
+                Some(i64::from(MAX_PING_COOLDOWN_MINUTES)),
+            ),
+            Ok(Some(PingType::Everyone {
+                max_ping_delay_minutes: None,
+                ping_cooldown_minutes: Some(MAX_PING_COOLDOWN_MINUTES),
+            }))
+        );
+        assert_eq!(
+            configured_ping_type(
+                Some("everyone"),
+                None,
+                None,
+                Some(i64::from(MAX_PING_COOLDOWN_MINUTES) + 1),
+            ),
+            Err(PingConfigurationError::PingCooldownTooLarge)
+        );
+    }
+
+    #[test]
     fn rejected_subscribe_validation_returns_feedback_without_persisting_or_mutating() {
-        for (ping_type, role_id, delay, expected_feedback) in [
+        for (ping_type, role_id, delay, cooldown, expected_feedback) in [
             (
                 Some("here"),
                 Some(123),
+                Some(5),
                 Some(5),
                 "Invalid subscription: ping_type and role cannot be selected together.",
             ),
@@ -675,12 +788,27 @@ mod tests {
                 None,
                 Some(123),
                 Some(-1),
+                None,
                 "Invalid subscription: max_ping_delay_minutes cannot be negative.",
+            ),
+            (
+                Some("here"),
+                None,
+                None,
+                Some(-1),
+                "Invalid subscription: ping_cooldown_minutes cannot be negative.",
+            ),
+            (
+                Some("here"),
+                None,
+                None,
+                Some(i64::from(MAX_PING_COOLDOWN_MINUTES) + 1),
+                "Invalid subscription: ping_cooldown_minutes must be at most 4294967295.",
             ),
         ] {
             let mut persistence_attempts = 0;
             let mut mutations = Vec::new();
-            let validation = validate_subscribe_command(ping_type, role_id, delay);
+            let validation = validate_subscribe_command(ping_type, role_id, delay, cooldown);
             assert_eq!(validation.rejection_feedback(), Some(expected_feedback));
             let result = validation.apply_persistence(|_| {
                 persistence_attempts += 1;
@@ -699,8 +827,16 @@ mod tests {
             ping_feedback(Some(&PingType::Role {
                 role_id: 123,
                 max_ping_delay_minutes: Some(5),
+                ping_cooldown_minutes: Some(30),
             })),
-            "Role ping: <@&123>; killmails up to 5 minutes old."
+            "Role ping: <@&123>; killmails up to 5 minutes old; configured channel-wide cooldown: 30 minutes."
+        );
+        assert_eq!(
+            ping_feedback(Some(&PingType::Here {
+                max_ping_delay_minutes: None,
+                ping_cooldown_minutes: None,
+            })),
+            "Ping: @here; any killmail age; default channel-wide cooldown: 5 minutes."
         );
     }
 }
