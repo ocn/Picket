@@ -1322,11 +1322,12 @@ impl std::error::Error for KillmailSendError {}
 pub enum KillmailAllowedMentions {
     None,
     Everyone,
+    Role(u64),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedKillmailNotification {
-    pub content: Option<&'static str>,
+    pub content: Option<String>,
     pub allowed_mentions: KillmailAllowedMentions,
 }
 
@@ -1348,28 +1349,33 @@ pub fn prepare_killmail_notification(
         .fixed_offset()
         .signed_duration_since(killmail_time);
 
-    let content = match &subscription.action.ping_type {
+    let notification = match &subscription.action.ping_type {
         Some(ping_type)
             if channel_ping_eligible
                 && (ping_type.max_ping_delay_in_minutes().unwrap_or(0) == 0
                     || kill_age.num_minutes()
                         <= i64::from(ping_type.max_ping_delay_in_minutes().unwrap_or(0))) =>
         {
-            Some(match ping_type {
-                PingType::Here { .. } => "@here",
-                PingType::Everyone { .. } => "@everyone",
-            })
+            match ping_type {
+                PingType::Here { .. } => {
+                    (Some("@here".to_string()), KillmailAllowedMentions::Everyone)
+                }
+                PingType::Everyone { .. } => (
+                    Some("@everyone".to_string()),
+                    KillmailAllowedMentions::Everyone,
+                ),
+                PingType::Role { role_id, .. } => (
+                    Some(format!("<@&{role_id}>")),
+                    KillmailAllowedMentions::Role(*role_id),
+                ),
+            }
         }
-        _ => None,
+        _ => (None, KillmailAllowedMentions::None),
     };
 
     PreparedKillmailNotification {
-        content,
-        allowed_mentions: if content.is_some() {
-            KillmailAllowedMentions::Everyone
-        } else {
-            KillmailAllowedMentions::None
-        },
+        content: notification.0,
+        allowed_mentions: notification.1,
     }
 }
 
@@ -1405,10 +1411,10 @@ pub(crate) fn configure_killmail_notification_message(
     builder
         .allowed_mentions(|mentions| {
             let mentions = mentions.empty_parse();
-            if notification.allowed_mentions == KillmailAllowedMentions::Everyone {
-                mentions.parse(ParseValue::Everyone)
-            } else {
-                mentions
+            match notification.allowed_mentions {
+                KillmailAllowedMentions::None => mentions,
+                KillmailAllowedMentions::Everyone => mentions.parse(ParseValue::Everyone),
+                KillmailAllowedMentions::Role(role_id) => mentions.roles([role_id]),
             }
         })
         .set_embed(embed);
@@ -2392,7 +2398,7 @@ mod tests {
         assert_eq!(
             notification,
             PreparedKillmailNotification {
-                content: Some("@here"),
+                content: Some("@here".to_string()),
                 allowed_mentions: KillmailAllowedMentions::Everyone,
             }
         );
@@ -2436,6 +2442,67 @@ mod tests {
     }
 
     #[test]
+    fn fresh_role_notification_allows_exactly_the_selected_role() {
+        let subscription = killmail_subscription(Some(PingType::Role {
+            role_id: 987_654_321_098_765_432,
+            max_ping_delay_minutes: Some(5),
+        }));
+        let notification = prepare_killmail_notification(
+            &subscription,
+            "2025-02-03T04:00:00Z",
+            notification_evaluation_time(),
+            true,
+        );
+
+        assert_eq!(
+            notification,
+            PreparedKillmailNotification {
+                content: Some("<@&987654321098765432>".to_string()),
+                allowed_mentions: KillmailAllowedMentions::Role(987_654_321_098_765_432),
+            }
+        );
+
+        let mut builder = CreateMessage::default();
+        configure_killmail_notification_message(&mut builder, notification, CreateEmbed::default());
+        assert_eq!(
+            builder.0["content"].as_str(),
+            Some("<@&987654321098765432>")
+        );
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            builder.0["allowed_mentions"]["roles"],
+            serde_json::json!(["987654321098765432"])
+        );
+        assert!(builder.0["allowed_mentions"].get("users").is_none());
+    }
+
+    #[test]
+    fn stale_role_notification_omits_mention_content_and_allowlist() {
+        let subscription = killmail_subscription(Some(PingType::Role {
+            role_id: 123,
+            max_ping_delay_minutes: Some(5),
+        }));
+        let notification = prepare_killmail_notification(
+            &subscription,
+            "2025-02-03T03:59:00Z",
+            notification_evaluation_time(),
+            true,
+        );
+        let mut builder = CreateMessage::default();
+        configure_killmail_notification_message(&mut builder, notification, CreateEmbed::default());
+
+        assert!(builder.0.get("content").is_none());
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert!(builder.0["allowed_mentions"].get("roles").is_none());
+    }
+
+    #[test]
     fn cooldown_eligible_everyone_notification_allows_only_everyone_parsing() {
         let subscription = killmail_subscription(Some(PingType::Everyone {
             max_ping_delay_minutes: None,
@@ -2447,7 +2514,7 @@ mod tests {
             true,
         );
 
-        assert_eq!(notification.content, Some("@everyone"));
+        assert_eq!(notification.content.as_deref(), Some("@everyone"));
         assert_eq!(
             notification.allowed_mentions,
             KillmailAllowedMentions::Everyone
@@ -2486,6 +2553,35 @@ mod tests {
         assert_eq!(
             builder.0["embeds"][0]["title"].as_str(),
             Some("matched @everyone killmail")
+        );
+    }
+
+    #[test]
+    fn cooldown_suppressed_role_notification_omits_mention_content_and_allowlist() {
+        let subscription = killmail_subscription(Some(PingType::Role {
+            role_id: 123,
+            max_ping_delay_minutes: None,
+        }));
+        let notification = prepare_killmail_notification(
+            &subscription,
+            "2025-02-03T04:04:00Z",
+            notification_evaluation_time(),
+            false,
+        );
+        let mut embed = CreateEmbed::default();
+        embed.title("matched role killmail");
+        let mut builder = CreateMessage::default();
+        configure_killmail_notification_message(&mut builder, notification, embed);
+
+        assert!(builder.0.get("content").is_none());
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert!(builder.0["allowed_mentions"].get("roles").is_none());
+        assert_eq!(
+            builder.0["embeds"][0]["title"].as_str(),
+            Some("matched role killmail")
         );
     }
 

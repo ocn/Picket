@@ -342,8 +342,16 @@ impl FilterNode {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 pub enum PingType {
-    Here { max_ping_delay_minutes: Option<u32> },
-    Everyone { max_ping_delay_minutes: Option<u32> },
+    Here {
+        max_ping_delay_minutes: Option<u32>,
+    },
+    Everyone {
+        max_ping_delay_minutes: Option<u32>,
+    },
+    Role {
+        role_id: u64,
+        max_ping_delay_minutes: Option<u32>,
+    },
 }
 
 impl PingType {
@@ -354,6 +362,10 @@ impl PingType {
             } => *max_ping_delay_minutes,
             PingType::Everyone {
                 max_ping_delay_minutes,
+            } => *max_ping_delay_minutes,
+            PingType::Role {
+                max_ping_delay_minutes,
+                ..
             } => *max_ping_delay_minutes,
         }
     }
@@ -373,6 +385,16 @@ impl PingType {
             } => {
                 format!(
                     "Everyone (max delay: {} min)",
+                    max_ping_delay_minutes.unwrap_or(0)
+                )
+            }
+            PingType::Role {
+                role_id,
+                max_ping_delay_minutes,
+            } => {
+                format!(
+                    "Role <@&{}> (max delay: {} min)",
+                    role_id,
                     max_ping_delay_minutes.unwrap_or(0)
                 )
             }
@@ -803,6 +825,59 @@ mod tests {
             subscriptions[0].root_filter,
             FilterNode::Condition(Filter::Simple(SimpleFilter::IsNpc(true)))
         );
+    }
+
+    #[test]
+    fn role_ping_subscription_round_trips_and_existing_ping_json_remains_compatible() {
+        let subscription = Subscription {
+            id: "role-ping".to_string(),
+            description: "role notification".to_string(),
+            root_filter: FilterNode::Condition(Filter::Simple(SimpleFilter::IsNpc(true))),
+            action: Action {
+                channel_id: "123456789".to_string(),
+                ping_type: Some(PingType::Role {
+                    role_id: 987_654_321_098_765_432,
+                    max_ping_delay_minutes: Some(15),
+                }),
+            },
+        };
+
+        let serialized = serde_json::to_string(&subscription).expect("serialize role subscription");
+        let serialized_value: serde_json::Value =
+            serde_json::from_str(&serialized).expect("inspect serialized role subscription");
+        assert_eq!(
+            serialized_value["action"]["ping_type"]["Role"]["role_id"],
+            serde_json::json!(987_654_321_098_765_432_u64)
+        );
+        assert_eq!(
+            serialized_value["action"]["ping_type"]["Role"]["max_ping_delay_minutes"],
+            serde_json::json!(15)
+        );
+        let round_tripped: Subscription =
+            serde_json::from_str(&serialized).expect("deserialize role subscription");
+        assert_eq!(round_tripped, subscription);
+
+        for (json, expected_ping_type) in [
+            (
+                r#"{"Here":{"max_ping_delay_minutes":5}}"#,
+                Some(PingType::Here {
+                    max_ping_delay_minutes: Some(5),
+                }),
+            ),
+            (
+                r#"{"Everyone":{"max_ping_delay_minutes":null}}"#,
+                Some(PingType::Everyone {
+                    max_ping_delay_minutes: None,
+                }),
+            ),
+            ("null", None),
+        ] {
+            let legacy: Subscription = serde_json::from_str(&format!(
+                r#"{{"id":"legacy","description":"legacy ping","filter":{{"Condition":{{"Simple":{{"IsNpc":true}}}}}},"action":{{"channel_id":"123456789","ping_type":{json}}}}}"#
+            ))
+            .expect("deserialize existing subscription JSON");
+            assert_eq!(legacy.action.ping_type, expected_ping_type);
+        }
     }
 
     #[test]
