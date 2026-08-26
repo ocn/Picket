@@ -3,7 +3,7 @@ use crate::discord_bot::{self, PreparedDispatch};
 use crate::feed::{FeedError, FeedHealthProvider, FeedHealthTelemetry, KillmailFeed};
 use crate::models::{ZkData, ZkDataNoEsi};
 use crate::processor;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serenity::http::error::Error;
 use serenity::http::Http;
 use serenity::model::id::GuildId;
@@ -363,44 +363,18 @@ async fn send_prepared_dispatch(
         }
     };
 
-    // Evaluate ping logic
-    let content = match &dispatch.subscription.action.ping_type {
-        None => None,
-        Some(ping_type) => {
-            let kill_time = DateTime::parse_from_rfc3339(&dispatch.zk_data.killmail.killmail_time)
-                .unwrap_or_else(|_| Utc::now().into());
-            let kill_age = Utc::now().signed_duration_since(kill_time);
-
-            let max_delay = ping_type.max_ping_delay_in_minutes().unwrap_or(0);
-            if max_delay == 0 || kill_age.num_minutes() <= max_delay as i64 {
-                let channel_id = dispatch
-                    .subscription
-                    .action
-                    .channel_id
-                    .parse::<u64>()
-                    .unwrap_or(0);
-                if config::try_acquire_channel_ping(&app_state.last_ping_times, channel_id).await {
-                    Some(match ping_type {
-                        config::PingType::Here { .. } => "@here",
-                        config::PingType::Everyone { .. } => "@everyone",
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
-    };
+    let notification = discord_bot::prepare_killmail_notification_for_delivery(
+        app_state,
+        &dispatch.subscription,
+        &dispatch.zk_data.killmail.killmail_time,
+        channel.0,
+    )
+    .await;
 
     let result = channel
         .send_message(http_client, |m| {
-            if let Some(content) = content {
-                m.content(content)
-            } else {
-                m
-            }
-            .set_embed(dispatch.embed)
+            discord_bot::configure_killmail_notification_message(m, notification, dispatch.embed);
+            m
         })
         .await;
 

@@ -1318,8 +1318,104 @@ impl std::fmt::Display for KillmailSendError {
 
 impl std::error::Error for KillmailSendError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillmailAllowedMentions {
+    None,
+    Everyone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedKillmailNotification {
+    pub content: Option<&'static str>,
+    pub allowed_mentions: KillmailAllowedMentions,
+}
+
+impl PreparedKillmailNotification {
+    fn requests_channel_ping(self) -> bool {
+        self.content.is_some()
+    }
+}
+
+pub fn prepare_killmail_notification(
+    subscription: &Subscription,
+    killmail_time: &str,
+    evaluated_at: DateTime<Utc>,
+    channel_ping_eligible: bool,
+) -> PreparedKillmailNotification {
+    let killmail_time =
+        DateTime::parse_from_rfc3339(killmail_time).unwrap_or_else(|_| evaluated_at.fixed_offset());
+    let kill_age = evaluated_at
+        .fixed_offset()
+        .signed_duration_since(killmail_time);
+
+    let content = match &subscription.action.ping_type {
+        Some(ping_type)
+            if channel_ping_eligible
+                && (ping_type.max_ping_delay_in_minutes().unwrap_or(0) == 0
+                    || kill_age.num_minutes()
+                        <= i64::from(ping_type.max_ping_delay_in_minutes().unwrap_or(0))) =>
+        {
+            Some(match ping_type {
+                PingType::Here { .. } => "@here",
+                PingType::Everyone { .. } => "@everyone",
+            })
+        }
+        _ => None,
+    };
+
+    PreparedKillmailNotification {
+        content,
+        allowed_mentions: if content.is_some() {
+            KillmailAllowedMentions::Everyone
+        } else {
+            KillmailAllowedMentions::None
+        },
+    }
+}
+
+pub(crate) async fn prepare_killmail_notification_for_delivery(
+    app_state: &AppState,
+    subscription: &Subscription,
+    killmail_time: &str,
+    channel_id: u64,
+) -> PreparedKillmailNotification {
+    let evaluated_at = Utc::now();
+    let eligible_without_cooldown =
+        prepare_killmail_notification(subscription, killmail_time, evaluated_at, true)
+            .requests_channel_ping();
+    let channel_ping_eligible = eligible_without_cooldown
+        && crate::config::try_acquire_channel_ping(&app_state.last_ping_times, channel_id).await;
+
+    prepare_killmail_notification(
+        subscription,
+        killmail_time,
+        evaluated_at,
+        channel_ping_eligible,
+    )
+}
+
+pub(crate) fn configure_killmail_notification_message(
+    builder: &mut CreateMessage<'_>,
+    notification: PreparedKillmailNotification,
+    embed: CreateEmbed,
+) {
+    if let Some(content) = notification.content {
+        builder.content(content);
+    }
+    builder
+        .allowed_mentions(|mentions| {
+            let mentions = mentions.empty_parse();
+            if notification.allowed_mentions == KillmailAllowedMentions::Everyone {
+                mentions.parse(ParseValue::Everyone)
+            } else {
+                mentions
+            }
+        })
+        .set_embed(embed);
+}
+
 /// Standalone send function used by integration embed tests.
-/// Production code uses `pipeline::send_prepared_dispatch` instead.
+/// Production code shares the notification preparation and message configuration helpers.
 pub async fn send_killmail_message(
     http: &Arc<Http>,
     app_state: &Arc<AppState>,
@@ -1338,41 +1434,18 @@ pub async fn send_killmail_message(
         }
     };
     let embed = build_killmail_embed(app_state, zk_data, &filter_result, subscription).await;
-
-    let content = match &subscription.action.ping_type {
-        None => None,
-        Some(ping_type) => {
-            let kill_time = DateTime::parse_from_rfc3339(&zk_data.killmail.killmail_time)
-                .unwrap_or_else(|_| Utc::now().into());
-            let kill_age = Utc::now().signed_duration_since(kill_time);
-
-            let max_delay = ping_type.max_ping_delay_in_minutes().unwrap_or(0);
-            if max_delay == 0 || kill_age.num_minutes() <= max_delay as i64 {
-                let channel_id = subscription.action.channel_id.parse::<u64>().unwrap_or(0);
-                if crate::config::try_acquire_channel_ping(&app_state.last_ping_times, channel_id)
-                    .await
-                {
-                    Some(match ping_type {
-                        PingType::Here { .. } => "@here",
-                        PingType::Everyone { .. } => "@everyone",
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
-    };
+    let notification = prepare_killmail_notification_for_delivery(
+        app_state,
+        subscription,
+        &zk_data.killmail.killmail_time,
+        channel.0,
+    )
+    .await;
 
     let result = channel
         .send_message(http, |m| {
-            if let Some(content) = content {
-                m.content(content)
-            } else {
-                m
-            }
-            .set_embed(embed)
+            configure_killmail_notification_message(m, notification, embed);
+            m
         })
         .await;
 
@@ -2284,6 +2357,156 @@ async fn get_ticker(app_state: &Arc<AppState>, id: u64, is_alliance: bool) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn killmail_subscription(ping_type: Option<PingType>) -> Subscription {
+        Subscription {
+            id: "notification-test".to_string(),
+            description: "notification test".to_string(),
+            root_filter: FilterNode::Condition(Filter::Simple(SimpleFilter::IsNpc(true))),
+            action: crate::config::Action {
+                channel_id: "77".to_string(),
+                ping_type,
+            },
+        }
+    }
+
+    fn notification_evaluation_time() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2025-02-03T04:05:00Z")
+            .expect("valid notification evaluation time")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn fresh_here_notification_prepares_content_and_everyone_parsing() {
+        let subscription = killmail_subscription(Some(PingType::Here {
+            max_ping_delay_minutes: Some(5),
+        }));
+        let evaluated_at = notification_evaluation_time();
+        let notification = prepare_killmail_notification(
+            &subscription,
+            "2025-02-03T04:00:00Z",
+            evaluated_at,
+            true,
+        );
+
+        assert_eq!(
+            notification,
+            PreparedKillmailNotification {
+                content: Some("@here"),
+                allowed_mentions: KillmailAllowedMentions::Everyone,
+            }
+        );
+
+        let mut builder = CreateMessage::default();
+        configure_killmail_notification_message(&mut builder, notification, CreateEmbed::default());
+        assert_eq!(builder.0["content"].as_str(), Some("@here"));
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!(["everyone"])
+        );
+    }
+
+    #[test]
+    fn stale_notification_omits_ping_and_mentions() {
+        let subscription = killmail_subscription(Some(PingType::Here {
+            max_ping_delay_minutes: Some(5),
+        }));
+        let notification = prepare_killmail_notification(
+            &subscription,
+            "2025-02-03T03:59:00Z",
+            notification_evaluation_time(),
+            true,
+        );
+
+        assert_eq!(
+            notification,
+            PreparedKillmailNotification {
+                content: None,
+                allowed_mentions: KillmailAllowedMentions::None,
+            }
+        );
+
+        let mut builder = CreateMessage::default();
+        configure_killmail_notification_message(&mut builder, notification, CreateEmbed::default());
+        assert!(builder.0.get("content").is_none());
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn cooldown_eligible_everyone_notification_allows_only_everyone_parsing() {
+        let subscription = killmail_subscription(Some(PingType::Everyone {
+            max_ping_delay_minutes: None,
+        }));
+        let notification = prepare_killmail_notification(
+            &subscription,
+            "2025-02-03T00:00:00Z",
+            notification_evaluation_time(),
+            true,
+        );
+
+        assert_eq!(notification.content, Some("@everyone"));
+        assert_eq!(
+            notification.allowed_mentions,
+            KillmailAllowedMentions::Everyone
+        );
+
+        let mut builder = CreateMessage::default();
+        configure_killmail_notification_message(&mut builder, notification, CreateEmbed::default());
+        assert_eq!(builder.0["content"].as_str(), Some("@everyone"));
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!(["everyone"])
+        );
+    }
+
+    #[test]
+    fn cooldown_suppressed_notification_still_configures_the_embed() {
+        let subscription = killmail_subscription(Some(PingType::Here {
+            max_ping_delay_minutes: None,
+        }));
+        let notification = prepare_killmail_notification(
+            &subscription,
+            "2025-02-03T04:04:00Z",
+            notification_evaluation_time(),
+            false,
+        );
+        let mut embed = CreateEmbed::default();
+        embed.title("matched @everyone killmail");
+        let mut builder = CreateMessage::default();
+        configure_killmail_notification_message(&mut builder, notification, embed);
+
+        assert!(builder.0.get("content").is_none());
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            builder.0["embeds"][0]["title"].as_str(),
+            Some("matched @everyone killmail")
+        );
+    }
+
+    #[test]
+    fn non_pinging_subscription_explicitly_allows_no_mentions() {
+        let subscription = killmail_subscription(None);
+        let notification = prepare_killmail_notification(
+            &subscription,
+            "2025-02-03T04:04:00Z",
+            notification_evaluation_time(),
+            true,
+        );
+        let mut builder = CreateMessage::default();
+        configure_killmail_notification_message(&mut builder, notification, CreateEmbed::default());
+
+        assert!(builder.0.get("content").is_none());
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+    }
 
     #[test]
     fn contract_repair_authorization_header_is_sensitive_and_redacted() {
