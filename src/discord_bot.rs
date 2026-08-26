@@ -1389,8 +1389,17 @@ pub(crate) async fn prepare_killmail_notification_for_delivery(
     let eligible_without_cooldown =
         prepare_killmail_notification(subscription, killmail_time, evaluated_at, true)
             .requests_channel_ping();
-    let channel_ping_eligible = eligible_without_cooldown
-        && crate::config::try_acquire_channel_ping(&app_state.last_ping_times, channel_id).await;
+    let channel_ping_eligible = match subscription.action.ping_type.as_ref() {
+        Some(ping_type) if eligible_without_cooldown => {
+            crate::config::try_acquire_channel_ping_with_cooldown(
+                &app_state.last_ping_times,
+                channel_id,
+                ping_type.channel_ping_cooldown(),
+            )
+            .await
+        }
+        _ => false,
+    };
 
     prepare_killmail_notification(
         subscription,
@@ -2382,10 +2391,92 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn notification_app_state() -> AppState {
+        AppState::new(
+            crate::config::AppConfig {
+                discord_bot_token: String::new(),
+                discord_client_id: 0,
+                eve_client_id: String::new(),
+                eve_client_secret: String::new(),
+                esi_http_timeout_secs: 15,
+                killmail_process_timeout_secs: 60,
+                redisq_connect_timeout_secs: 10,
+                redisq_request_timeout_secs: 60,
+                r2z2_connect_timeout_secs: 10,
+                r2z2_request_timeout_secs: 15,
+                r2z2_poll_interval_secs: 6,
+                r2z2_max_consecutive_404s: 10,
+                r2z2_resync_timeout_secs: 300,
+                killmail_feed_provider: Default::default(),
+                killmail_post_process_sleep_ms: 0,
+                killmail_workers: 4,
+                killmail_queue_size: 512,
+            },
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn delivery_uses_subscription_cooldown_while_omitted_cooldown_stays_at_five_minutes() {
+        let killmail_time = Utc::now().to_rfc3339();
+        let configured = killmail_subscription(Some(PingType::Here {
+            max_ping_delay_minutes: None,
+            ping_cooldown_minutes: Some(30),
+        }));
+        let configured_app_state = notification_app_state();
+        configured_app_state.last_ping_times.lock().await.insert(
+            77,
+            tokio::time::Instant::now() - Duration::from_secs(10 * 60),
+        );
+
+        let configured_notification = prepare_killmail_notification_for_delivery(
+            &configured_app_state,
+            &configured,
+            &killmail_time,
+            77,
+        )
+        .await;
+        assert_eq!(configured_notification.content, None);
+        assert_eq!(
+            configured_notification.allowed_mentions,
+            KillmailAllowedMentions::None
+        );
+
+        let default = killmail_subscription(Some(PingType::Here {
+            max_ping_delay_minutes: None,
+            ping_cooldown_minutes: None,
+        }));
+        let default_app_state = notification_app_state();
+        default_app_state.last_ping_times.lock().await.insert(
+            77,
+            tokio::time::Instant::now() - Duration::from_secs(10 * 60),
+        );
+
+        let default_notification = prepare_killmail_notification_for_delivery(
+            &default_app_state,
+            &default,
+            &killmail_time,
+            77,
+        )
+        .await;
+        assert_eq!(default_notification.content.as_deref(), Some("@here"));
+        assert_eq!(
+            default_notification.allowed_mentions,
+            KillmailAllowedMentions::Everyone
+        );
+    }
+
     #[test]
     fn fresh_here_notification_prepares_content_and_everyone_parsing() {
         let subscription = killmail_subscription(Some(PingType::Here {
             max_ping_delay_minutes: Some(5),
+            ping_cooldown_minutes: None,
         }));
         let evaluated_at = notification_evaluation_time();
         let notification = prepare_killmail_notification(
@@ -2416,6 +2507,7 @@ mod tests {
     fn stale_notification_omits_ping_and_mentions() {
         let subscription = killmail_subscription(Some(PingType::Here {
             max_ping_delay_minutes: Some(5),
+            ping_cooldown_minutes: None,
         }));
         let notification = prepare_killmail_notification(
             &subscription,
@@ -2446,6 +2538,7 @@ mod tests {
         let subscription = killmail_subscription(Some(PingType::Role {
             role_id: 987_654_321_098_765_432,
             max_ping_delay_minutes: Some(5),
+            ping_cooldown_minutes: None,
         }));
         let notification = prepare_killmail_notification(
             &subscription,
@@ -2484,6 +2577,7 @@ mod tests {
         let subscription = killmail_subscription(Some(PingType::Role {
             role_id: 123,
             max_ping_delay_minutes: Some(5),
+            ping_cooldown_minutes: None,
         }));
         let notification = prepare_killmail_notification(
             &subscription,
@@ -2506,6 +2600,7 @@ mod tests {
     fn cooldown_eligible_everyone_notification_allows_only_everyone_parsing() {
         let subscription = killmail_subscription(Some(PingType::Everyone {
             max_ping_delay_minutes: None,
+            ping_cooldown_minutes: None,
         }));
         let notification = prepare_killmail_notification(
             &subscription,
@@ -2533,6 +2628,7 @@ mod tests {
     fn cooldown_suppressed_notification_still_configures_the_embed() {
         let subscription = killmail_subscription(Some(PingType::Here {
             max_ping_delay_minutes: None,
+            ping_cooldown_minutes: None,
         }));
         let notification = prepare_killmail_notification(
             &subscription,
@@ -2561,6 +2657,7 @@ mod tests {
         let subscription = killmail_subscription(Some(PingType::Role {
             role_id: 123,
             max_ping_delay_minutes: None,
+            ping_cooldown_minutes: None,
         }));
         let notification = prepare_killmail_notification(
             &subscription,

@@ -344,13 +344,19 @@ impl FilterNode {
 pub enum PingType {
     Here {
         max_ping_delay_minutes: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ping_cooldown_minutes: Option<u32>,
     },
     Everyone {
         max_ping_delay_minutes: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ping_cooldown_minutes: Option<u32>,
     },
     Role {
         role_id: u64,
         max_ping_delay_minutes: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ping_cooldown_minutes: Option<u32>,
     },
 }
 
@@ -359,9 +365,11 @@ impl PingType {
         match self {
             PingType::Here {
                 max_ping_delay_minutes,
+                ..
             } => *max_ping_delay_minutes,
             PingType::Everyone {
                 max_ping_delay_minutes,
+                ..
             } => *max_ping_delay_minutes,
             PingType::Role {
                 max_ping_delay_minutes,
@@ -370,10 +378,49 @@ impl PingType {
         }
     }
 
+    pub fn ping_cooldown_in_minutes(&self) -> u32 {
+        match self {
+            PingType::Here {
+                ping_cooldown_minutes,
+                ..
+            }
+            | PingType::Everyone {
+                ping_cooldown_minutes,
+                ..
+            }
+            | PingType::Role {
+                ping_cooldown_minutes,
+                ..
+            } => ping_cooldown_minutes.unwrap_or(DEFAULT_CHANNEL_PING_COOLDOWN_MINUTES),
+        }
+    }
+
+    pub fn configured_ping_cooldown_in_minutes(&self) -> Option<u32> {
+        match self {
+            PingType::Here {
+                ping_cooldown_minutes,
+                ..
+            }
+            | PingType::Everyone {
+                ping_cooldown_minutes,
+                ..
+            }
+            | PingType::Role {
+                ping_cooldown_minutes,
+                ..
+            } => *ping_cooldown_minutes,
+        }
+    }
+
+    pub fn channel_ping_cooldown(&self) -> Duration {
+        Duration::from_secs(u64::from(self.ping_cooldown_in_minutes()) * 60)
+    }
+
     pub fn name(&self) -> String {
         match self {
             PingType::Here {
                 max_ping_delay_minutes,
+                ..
             } => {
                 format!(
                     "Here (max delay: {} min)",
@@ -382,6 +429,7 @@ impl PingType {
             }
             PingType::Everyone {
                 max_ping_delay_minutes,
+                ..
             } => {
                 format!(
                     "Everyone (max delay: {} min)",
@@ -391,6 +439,7 @@ impl PingType {
             PingType::Role {
                 role_id,
                 max_ping_delay_minutes,
+                ..
             } => {
                 format!(
                     "Role <@&{}> (max delay: {} min)",
@@ -574,13 +623,24 @@ pub struct AppState {
     pub sso_states: Arc<Mutex<HashMap<String, SsoState>>>, // For tracking the SSO flow
 }
 
-pub const CHANNEL_PING_COOLDOWN: Duration = Duration::from_secs(300);
+pub const DEFAULT_CHANNEL_PING_COOLDOWN_MINUTES: u32 = 5;
+pub const CHANNEL_PING_COOLDOWN: Duration =
+    Duration::from_secs(DEFAULT_CHANNEL_PING_COOLDOWN_MINUTES as u64 * 60);
 
 pub async fn try_acquire_channel_ping(
     last_ping_times: &Mutex<HashMap<u64, Instant>>,
     channel_id: u64,
 ) -> bool {
-    try_acquire_channel_ping_at(last_ping_times, channel_id, Instant::now()).await
+    try_acquire_channel_ping_with_cooldown(last_ping_times, channel_id, CHANNEL_PING_COOLDOWN).await
+}
+
+pub async fn try_acquire_channel_ping_with_cooldown(
+    last_ping_times: &Mutex<HashMap<u64, Instant>>,
+    channel_id: u64,
+    cooldown: Duration,
+) -> bool {
+    try_acquire_channel_ping_with_cooldown_at(last_ping_times, channel_id, cooldown, Instant::now())
+        .await
 }
 
 pub async fn try_acquire_channel_ping_at(
@@ -588,15 +648,32 @@ pub async fn try_acquire_channel_ping_at(
     channel_id: u64,
     now: Instant,
 ) -> bool {
+    try_acquire_channel_ping_with_cooldown_at(
+        last_ping_times,
+        channel_id,
+        CHANNEL_PING_COOLDOWN,
+        now,
+    )
+    .await
+}
+
+pub async fn try_acquire_channel_ping_with_cooldown_at(
+    last_ping_times: &Mutex<HashMap<u64, Instant>>,
+    channel_id: u64,
+    cooldown: Duration,
+    now: Instant,
+) -> bool {
     let mut ping_times = last_ping_times.lock().await;
-    let last_ping = ping_times
-        .entry(channel_id)
-        .or_insert(now - CHANNEL_PING_COOLDOWN - Duration::from_secs(1));
-    if now.duration_since(*last_ping) > CHANNEL_PING_COOLDOWN {
-        *last_ping = now;
-        true
-    } else {
-        false
+    match ping_times.get_mut(&channel_id) {
+        Some(last_ping) if now.duration_since(*last_ping) < cooldown => false,
+        Some(last_ping) => {
+            *last_ping = now;
+            true
+        }
+        None => {
+            ping_times.insert(channel_id, now);
+            true
+        }
     }
 }
 
@@ -797,12 +874,57 @@ mod tests {
         assert!(try_acquire_channel_ping_at(&ping_times, 77, now).await);
         assert!(!try_acquire_channel_ping_at(&ping_times, 77, now).await);
         assert!(try_acquire_channel_ping_at(&ping_times, 78, now).await);
-        assert!(!try_acquire_channel_ping_at(&ping_times, 77, now + CHANNEL_PING_COOLDOWN,).await);
+        assert!(try_acquire_channel_ping_at(&ping_times, 77, now + CHANNEL_PING_COOLDOWN,).await);
         assert!(
-            try_acquire_channel_ping_at(
+            try_acquire_channel_ping_at(&ping_times, 77, now + CHANNEL_PING_COOLDOWN * 2,).await
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_channel_ping_cooldowns_share_a_channel_timestamp_and_refresh_it() {
+        let ping_times = Mutex::new(HashMap::new());
+        let now = Instant::now();
+        let thirty_minutes = Duration::from_secs(30 * 60);
+
+        assert!(
+            try_acquire_channel_ping_with_cooldown_at(&ping_times, 77, thirty_minutes, now,).await
+        );
+        assert!(
+            !try_acquire_channel_ping_with_cooldown_at(
                 &ping_times,
                 77,
-                now + CHANNEL_PING_COOLDOWN + Duration::from_secs(1),
+                thirty_minutes,
+                now + thirty_minutes - Duration::from_secs(1),
+            )
+            .await
+        );
+        assert!(
+            try_acquire_channel_ping_with_cooldown_at(&ping_times, 78, thirty_minutes, now,).await
+        );
+        assert!(
+            try_acquire_channel_ping_with_cooldown_at(
+                &ping_times,
+                77,
+                thirty_minutes,
+                now + thirty_minutes,
+            )
+            .await
+        );
+        assert!(
+            !try_acquire_channel_ping_with_cooldown_at(
+                &ping_times,
+                77,
+                thirty_minutes,
+                now + thirty_minutes + thirty_minutes - Duration::from_secs(1),
+            )
+            .await
+        );
+        assert!(
+            try_acquire_channel_ping_with_cooldown_at(
+                &ping_times,
+                77,
+                thirty_minutes,
+                now + thirty_minutes * 2,
             )
             .await
         );
@@ -838,6 +960,7 @@ mod tests {
                 ping_type: Some(PingType::Role {
                     role_id: 987_654_321_098_765_432,
                     max_ping_delay_minutes: Some(15),
+                    ping_cooldown_minutes: Some(30),
                 }),
             },
         };
@@ -853,6 +976,10 @@ mod tests {
             serialized_value["action"]["ping_type"]["Role"]["max_ping_delay_minutes"],
             serde_json::json!(15)
         );
+        assert_eq!(
+            serialized_value["action"]["ping_type"]["Role"]["ping_cooldown_minutes"],
+            serde_json::json!(30)
+        );
         let round_tripped: Subscription =
             serde_json::from_str(&serialized).expect("deserialize role subscription");
         assert_eq!(round_tripped, subscription);
@@ -862,12 +989,22 @@ mod tests {
                 r#"{"Here":{"max_ping_delay_minutes":5}}"#,
                 Some(PingType::Here {
                     max_ping_delay_minutes: Some(5),
+                    ping_cooldown_minutes: None,
                 }),
             ),
             (
                 r#"{"Everyone":{"max_ping_delay_minutes":null}}"#,
                 Some(PingType::Everyone {
                     max_ping_delay_minutes: None,
+                    ping_cooldown_minutes: None,
+                }),
+            ),
+            (
+                r#"{"Role":{"role_id":987654321098765432,"max_ping_delay_minutes":15}}"#,
+                Some(PingType::Role {
+                    role_id: 987_654_321_098_765_432,
+                    max_ping_delay_minutes: Some(15),
+                    ping_cooldown_minutes: None,
                 }),
             ),
             ("null", None),
@@ -877,6 +1014,23 @@ mod tests {
             ))
             .expect("deserialize existing subscription JSON");
             assert_eq!(legacy.action.ping_type, expected_ping_type);
+            if let Some(ping_type) = legacy.action.ping_type.as_ref() {
+                assert_eq!(
+                    ping_type.ping_cooldown_in_minutes(),
+                    DEFAULT_CHANNEL_PING_COOLDOWN_MINUTES
+                );
+                assert!(
+                    serde_json::to_value(&legacy).expect("serialize legacy subscription")["action"]
+                        ["ping_type"]
+                        .as_object()
+                        .expect("legacy ping type")
+                        .values()
+                        .next()
+                        .expect("legacy ping variant")
+                        .get("ping_cooldown_minutes")
+                        .is_none()
+                );
+            }
         }
     }
 
@@ -889,6 +1043,7 @@ mod tests {
                 channel_id: "123456789".to_string(),
                 ping_type: Some(PingType::Here {
                     max_ping_delay_minutes: None,
+                    ping_cooldown_minutes: None,
                 }),
             },
             root_filter: FilterNode::And(vec![
