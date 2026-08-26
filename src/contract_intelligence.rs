@@ -1,5 +1,15 @@
 use crate::config::{System, SystemRange};
 use crate::discord_bot::SHIP_GROUP_PRIORITY;
+use crate::esi_cache::EsiLimiterStore;
+// Re-exported at their previous paths and visibilities: these helpers and
+// types moved to the feed-agnostic `esi_cache` module so a second feed can
+// reuse them without depending on `contract_intelligence`. See
+// `src/esi_cache.rs` for the module doc.
+pub(crate) use crate::esi_cache::{
+    cache_metadata, cache_metadata_at, esi_limiter_deadline_at, merge_cache_metadata,
+    rate_limit_pacing_deadline, CurrentLegacyErrorLimit,
+};
+pub use crate::esi_cache::{CacheMetadata, EsiError, EsiResponse};
 use crate::feed::{FeedHealthSnapshot, FeedHealthTelemetry};
 use crate::location_evidence::{
     lock_location, LocationEvidence, LocationEvidenceClass, LocationEvidenceService,
@@ -15,7 +25,7 @@ use crate::structure_resolver::{
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rand::Rng;
-use reqwest::header::{HeaderMap, ETAG, EXPIRES, IF_NONE_MATCH, LAST_MODIFIED, RETRY_AFTER};
+use reqwest::header::IF_NONE_MATCH;
 use reqwest::{Client, StatusCode};
 use serde::de::{DeserializeOwned, Error as DeError};
 use serde::{Deserialize, Serialize};
@@ -929,119 +939,6 @@ pub struct PublicContractItem {
     pub time_efficiency: Option<i64>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct CacheMetadata {
-    pub etag: Option<String>,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub last_modified: Option<DateTime<Utc>>,
-    pub expected_pages: Option<u32>,
-    pub error_limit_remain: Option<i64>,
-    pub error_limit_reset: Option<i64>,
-    pub rate_limit_group: Option<String>,
-    pub rate_limit_limit: Option<String>,
-    pub rate_limit_remaining: Option<i64>,
-    pub rate_limit_used: Option<i64>,
-    pub retry_after: Option<DateTime<Utc>>,
-}
-
-impl CacheMetadata {
-    pub fn cached_for_seconds(seconds: i64) -> Self {
-        Self {
-            etag: None,
-            expires_at: Some(Utc::now() + ChronoDuration::seconds(seconds)),
-            last_modified: None,
-            expected_pages: None,
-            error_limit_remain: None,
-            error_limit_reset: None,
-            rate_limit_group: None,
-            rate_limit_limit: None,
-            rate_limit_remaining: None,
-            rate_limit_used: None,
-            retry_after: None,
-        }
-    }
-
-    pub fn page_cached_for_seconds(expected_pages: u32, seconds: i64) -> Self {
-        Self {
-            expected_pages: Some(expected_pages),
-            ..Self::cached_for_seconds(seconds)
-        }
-    }
-
-    fn is_fresh(&self) -> bool {
-        self.expires_at
-            .map(|expires_at| expires_at > Utc::now())
-            .unwrap_or(false)
-    }
-
-    fn retry_is_active(&self) -> bool {
-        self.retry_after
-            .map(|retry_after| retry_after > Utc::now())
-            .unwrap_or(false)
-    }
-
-    fn collection_pause_until_at(&self, observed_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        self.retry_after.or_else(|| {
-            let reset_seconds = if self.error_limit_remain.unwrap_or(1) <= 0 {
-                self.error_limit_reset
-            } else if self.rate_limit_remaining.unwrap_or(1) <= 0 {
-                self.rate_limit_limit
-                    .as_deref()
-                    .and_then(rate_limit_window_seconds)
-            } else {
-                None
-            };
-            reset_seconds.map(|seconds| observed_at + ChronoDuration::seconds(seconds))
-        })
-    }
-
-    fn collection_pacing_until(&self, observed_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        rate_limit_pacing_deadline(
-            self.rate_limit_limit.as_deref()?,
-            self.rate_limit_remaining?,
-            observed_at,
-        )
-    }
-}
-
-pub(crate) fn esi_limiter_deadline_at(
-    metadata: &CacheMetadata,
-    observed_at: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
-    [
-        metadata.collection_pause_until_at(observed_at),
-        metadata.collection_pacing_until(observed_at),
-    ]
-    .into_iter()
-    .flatten()
-    .max()
-}
-
-#[derive(Clone, Debug)]
-pub struct EsiResponse<T> {
-    pub value: Option<T>,
-    pub metadata: CacheMetadata,
-    pub not_modified: bool,
-}
-
-impl<T> EsiResponse<T> {
-    pub fn fresh(value: T, metadata: CacheMetadata) -> Self {
-        Self {
-            value: Some(value),
-            metadata,
-            not_modified: false,
-        }
-    }
-
-    pub fn not_modified(metadata: CacheMetadata) -> Self {
-        Self {
-            value: None,
-            metadata,
-            not_modified: true,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub enum ContractItemProbe {
     Available(EsiResponse<Vec<PublicContractItem>>),
@@ -1098,58 +995,6 @@ impl SolarSystemPosition {
         (dx * dx + dy * dy + dz * dz).sqrt() / METERS_PER_LIGHT_YEAR
     }
 }
-
-#[derive(Clone, Debug)]
-pub struct EsiError {
-    message: String,
-    status: Option<StatusCode>,
-    retry_after: Option<DateTime<Utc>>,
-    metadata: CacheMetadata,
-}
-
-impl EsiError {
-    pub fn retryable(message: impl Into<String>, retry_after: Option<DateTime<Utc>>) -> Self {
-        Self {
-            message: message.into(),
-            status: None,
-            retry_after,
-            metadata: CacheMetadata {
-                retry_after,
-                ..CacheMetadata::cached_for_seconds(0)
-            },
-        }
-    }
-
-    fn from_metadata(
-        message: impl Into<String>,
-        status: Option<StatusCode>,
-        metadata: CacheMetadata,
-    ) -> Self {
-        Self {
-            message: message.into(),
-            status,
-            retry_after: metadata.retry_after,
-            metadata,
-        }
-    }
-
-    fn is_not_found(&self) -> bool {
-        self.status == Some(StatusCode::NOT_FOUND)
-    }
-
-    fn is_error_charged(&self) -> bool {
-        self.status
-            .is_some_and(|status| status.is_client_error() || status.is_server_error())
-    }
-}
-
-impl Display for EsiError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.message)
-    }
-}
-
-impl std::error::Error for EsiError {}
 
 #[async_trait]
 pub trait PublicContractEsi: Send + Sync {
@@ -2434,118 +2279,6 @@ impl PublicContractEsi for HttpPublicContractEsi {
     }
 }
 
-pub(crate) fn cache_metadata(headers: &HeaderMap) -> CacheMetadata {
-    cache_metadata_at(headers, Utc::now())
-}
-
-pub(crate) fn cache_metadata_at(headers: &HeaderMap, observed_at: DateTime<Utc>) -> CacheMetadata {
-    let mut metadata = CacheMetadata {
-        etag: headers
-            .get(ETAG)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned),
-        expires_at: headers
-            .get(EXPIRES)
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_http_time),
-        last_modified: headers
-            .get(LAST_MODIFIED)
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_http_time),
-        expected_pages: header_number(headers, "x-pages").and_then(|value| value.try_into().ok()),
-        error_limit_remain: header_number(headers, "x-esi-error-limit-remain"),
-        error_limit_reset: header_number(headers, "x-esi-error-limit-reset"),
-        rate_limit_group: headers
-            .get("x-ratelimit-group")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned),
-        rate_limit_limit: headers
-            .get("x-ratelimit-limit")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned),
-        rate_limit_remaining: header_number(headers, "x-ratelimit-remaining"),
-        rate_limit_used: header_number(headers, "x-ratelimit-used"),
-        retry_after: headers
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| parse_retry_after_at(value, observed_at)),
-    };
-    if let Some(seconds) = headers
-        .get("cache-control")
-        .and_then(|value| value.to_str().ok())
-        .and_then(cache_max_age)
-    {
-        metadata.expires_at = Some(observed_at + ChronoDuration::seconds(seconds));
-    }
-    if metadata.retry_after.is_none() && metadata.error_limit_remain.unwrap_or(1) <= 0 {
-        metadata.retry_after = metadata
-            .error_limit_reset
-            .map(|seconds| observed_at + ChronoDuration::seconds(seconds));
-    }
-    metadata
-}
-
-fn header_number(headers: &HeaderMap, name: &str) -> Option<i64> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
-}
-
-fn parse_http_time(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc2822(value)
-        .ok()
-        .map(|time| time.with_timezone(&Utc))
-}
-
-fn parse_retry_after_at(value: &str, observed_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    value
-        .parse::<i64>()
-        .ok()
-        .map(|seconds| observed_at + ChronoDuration::seconds(seconds))
-        .or_else(|| parse_http_time(value))
-}
-
-fn cache_max_age(value: &str) -> Option<i64> {
-    value.split(',').map(str::trim).find_map(|directive| {
-        directive
-            .strip_prefix("max-age=")
-            .and_then(|seconds| seconds.parse().ok())
-    })
-}
-
-fn rate_limit_window_seconds(value: &str) -> Option<i64> {
-    rate_limit_capacity_and_window_seconds(value).map(|(_, window)| window)
-}
-
-fn rate_limit_capacity_and_window_seconds(value: &str) -> Option<(i64, i64)> {
-    let (limit, window) = value.split_once('/')?;
-    let limit = limit.parse::<i64>().ok()?;
-    let (number, unit) = window.split_at(window.len().checked_sub(1)?);
-    let count = number.parse::<i64>().ok()?;
-    let window_seconds = match unit {
-        "s" => Some(count),
-        "m" => count.checked_mul(60),
-        "h" => count.checked_mul(60 * 60),
-        "d" => count.checked_mul(60 * 60 * 24),
-        _ => None,
-    }?;
-    (limit > 0 && window_seconds > 0).then_some((limit, window_seconds))
-}
-
-fn rate_limit_pacing_deadline(
-    rate_limit: &str,
-    remaining: i64,
-    observed_at: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
-    let (limit, window_seconds) = rate_limit_capacity_and_window_seconds(rate_limit)?;
-    if remaining < 0 || remaining.saturating_mul(10) > limit {
-        return None;
-    }
-    let spacing_seconds = (window_seconds + remaining.max(1) - 1) / remaining.max(1);
-    Some(observed_at + ChronoDuration::seconds(spacing_seconds.max(1)))
-}
-
 #[derive(Clone)]
 pub struct ContractCollectionStore {
     pool: PgPool,
@@ -2567,12 +2300,6 @@ enum EsiRequestAdmission {
     WaitUntil(DateTime<Utc>),
     PausedUntil(DateTime<Utc>),
     ErrorReserve(DateTime<Utc>),
-}
-
-#[derive(Clone, Copy)]
-struct CurrentLegacyErrorLimit {
-    remaining: i64,
-    reset_at: DateTime<Utc>,
 }
 
 pub type ContractStoreHandle = Arc<RwLock<Option<Arc<ContractCollectionStore>>>>;
@@ -8728,6 +8455,33 @@ ON CONFLICT (limiter_scope) DO UPDATE SET
                 .await?;
         }
         Ok(())
+    }
+}
+
+/// Exposes the persisted ESI limiter row through the feed-agnostic
+/// `EsiLimiterStore` seam (see `src/esi_cache.rs`), so a second feed can
+/// hold a `dyn EsiLimiterStore` alongside its own store without seeing
+/// `ContractCollectionStore`'s other methods. Delegates to the existing
+/// inherent methods above, which own the SQL.
+#[async_trait]
+impl EsiLimiterStore for ContractCollectionStore {
+    async fn active_esi_limiter_deadline(&self) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        self.active_esi_limiter_deadline().await
+    }
+
+    async fn current_legacy_error_limit(
+        &self,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<CurrentLegacyErrorLimit>, sqlx::Error> {
+        self.current_legacy_error_limit(observed_at).await
+    }
+
+    async fn record_esi_limiter_at(
+        &self,
+        metadata: &CacheMetadata,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        self.record_esi_limiter_at(metadata, observed_at).await
     }
 }
 
@@ -15139,31 +14893,6 @@ fn sanitize_contract_visible_text(value: &str, preserve_name_punctuation: bool) 
         }
     }
     sanitized.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-pub(crate) fn merge_cache_metadata(
-    cached: &CacheMetadata,
-    response: CacheMetadata,
-) -> CacheMetadata {
-    CacheMetadata {
-        etag: response.etag.or_else(|| cached.etag.clone()),
-        expires_at: response.expires_at.or(cached.expires_at),
-        last_modified: response.last_modified.or(cached.last_modified),
-        expected_pages: response.expected_pages.or(cached.expected_pages),
-        error_limit_remain: response.error_limit_remain.or(cached.error_limit_remain),
-        error_limit_reset: response.error_limit_reset.or(cached.error_limit_reset),
-        rate_limit_group: response
-            .rate_limit_group
-            .or_else(|| cached.rate_limit_group.clone()),
-        rate_limit_limit: response
-            .rate_limit_limit
-            .or_else(|| cached.rate_limit_limit.clone()),
-        rate_limit_remaining: response
-            .rate_limit_remaining
-            .or(cached.rate_limit_remaining),
-        rate_limit_used: response.rate_limit_used.or(cached.rate_limit_used),
-        retry_after: response.retry_after.or(cached.retry_after),
-    }
 }
 
 fn content_hash<T: Serialize>(value: &T) -> Result<String, ContractCollectionError> {
