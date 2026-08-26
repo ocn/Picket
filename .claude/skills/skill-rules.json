@@ -117,11 +117,12 @@
             "type": "domain",
             "enforcement": "suggest",
             "priority": "high",
-            "description": "EVE ESI domain patterns for contracts, caching, authentication, structures, shared rate limits, and killmail data",
+            "description": "EVE ESI and zKillboard feed domain patterns for contracts, caching, authentication, structures, shared rate limits, and killmail data",
             "promptTriggers": {
                 "keywords": [
                     "zkillboard",
                     "zkb",
+                    "r2z2",
                     "killmail",
                     "killboard",
                     "public contract",
@@ -137,8 +138,8 @@
                 ],
                 "intentPatterns": [
                     "\\b(esi|eve online|eve api)\\b",
-                    "\\b(fetch|get|load|query)\\b.*?\\b(esi|eve|killmail|zkillboard|redisq)\\b",
-                    "\\b(zkillboard|zkb|redisq)\\b.*?\\b(data|feed|killmail)\\b",
+                    "\\b(fetch|get|load|query)\\b.*?\\b(esi|eve|killmail|zkillboard|r2z2|redisq)\\b",
+                    "\\b(zkillboard|zkb|r2z2|redisq)\\b.*?\\b(data|feed|killmail|sequence|checkpoint)\\b",
                     "\\b(eve|esi)\\b.*?\\b(etag|304|conditional|rate limit|error limit|jwks|jwt|sso|single sign-on|pacing|reserve|retry|header)\\b",
                     "\\b(etag|304|conditional|rate limit|error limit|jwks|jwt|sso|single sign-on)\\b.*?\\b(eve|esi)\\b",
                     "\\b(eve|esi)\\b.*?\\b(character|corporation|alliance|solar system|region|ship type|type id|group id|structure)\\b.*?\\b(id|info|lookup|resolve|resolution)\\b",
