@@ -253,12 +253,28 @@ fn all_campaigns_filter() -> SovFilter {
 }
 
 async fn subscribe(store: &SovStore, name: &str, filter: SovFilter, role_id: Option<u64>) {
+    subscribe_with_options(store, name, filter, role_id, serde_json::json!({})).await
+}
+
+/// Like [`subscribe`] but with an explicit `options` document, used by the
+/// T-minus mark tests to configure custom or disabled marks
+/// (`tminus_marks_minutes`). Plain `subscribe` always persists `{}` --
+/// exactly what every subscription stored before ticket 03 landed has --
+/// so it doubles as the "no stored marks" fixture for the default-marks
+/// tests.
+async fn subscribe_with_options(
+    store: &SovStore,
+    name: &str,
+    filter: SovFilter,
+    role_id: Option<u64>,
+    options: serde_json::Value,
+) {
     let subscription = SovSubscription {
         guild_id: 1,
         channel_id: 2,
         name: name.to_string(),
         filter,
-        options: serde_json::json!({}),
+        options,
         role_id,
     };
     store
@@ -1028,7 +1044,11 @@ async fn sov_runtime_recovers_the_shared_store_after_postgres_becomes_available(
         .is_none());
 
     database.create().await;
-    let store = tokio::time::timeout(StdDuration::from_secs(2), async {
+    // Widened from 2s (ticket 14: observed flaky under heavy external
+    // load with `Elapsed`, passing 3/3 in isolation). The 10ms poll
+    // interval is unchanged; only the outer real-time budget grew, so a
+    // healthy reconnect still returns almost immediately.
+    let store = tokio::time::timeout(StdDuration::from_secs(30), async {
         loop {
             if let Some(store) = killbot_rust::sov_feed::available_sov_store(&store_handle).await {
                 return store;
@@ -1056,5 +1076,808 @@ async fn sov_runtime_recovers_the_shared_store_after_postgres_becomes_available(
         .await
         .expect_err("background sov runtime is cancelled")
         .is_cancelled());
+    database.destroy().await;
+}
+
+// --- T-minus alert stage tests (ticket 03) ---
+//
+// `evaluate_stage_cycle` is the ESI-free seam these tests exercise: it
+// checks configured T-minus marks against persisted campaigns and the
+// controlled clock alone, independent of `collect_cycle`'s sixty-second
+// ESI poll.
+
+#[tokio::test]
+async fn a_campaign_across_virtual_time_gets_appeared_then_each_tminus_mark_once_and_nothing_after_start(
+) {
+    // Simulates one campaign across virtual time (spec acceptance test
+    // list): `appeared` fires once, `T-120` fires once, `T-30` fires
+    // once, and nothing fires once the campaign has started. Uses the
+    // default marks (`subscribe` persists `options == {}`).
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let new_campaign = campaign(
+        1,
+        30_005_174,
+        99_006_751,
+        observed_at + ChronoDuration::minutes(125),
+    );
+
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![new_campaign.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    clock.advance(ChronoDuration::seconds(10));
+    collector
+        .collect_cycle()
+        .await
+        .expect("campaign appears within twelve hours");
+    assert_eq!(delivery.sent_count(), 1);
+    assert_eq!(
+        store
+            .count_deliveries_for(new_campaign.campaign_id, SovAlertStage::Appeared)
+            .await
+            .expect("count appeared deliveries"),
+        1
+    );
+
+    // Too early for T-120: remaining is still ~124m50s.
+    let too_early = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("stage evaluation before T-120 is due");
+    assert_eq!(too_early.tminus_prepared, 0);
+    assert_eq!(delivery.sent_count(), 1);
+
+    // Advance to exactly T-120.
+    clock.advance(ChronoDuration::minutes(5) - ChronoDuration::seconds(10));
+    let at_t120 = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("T-120 mark is due");
+    assert_eq!(at_t120.tminus_prepared, 1);
+    assert_eq!(delivery.sent_count(), 2);
+    assert_eq!(
+        store
+            .count_deliveries_for(new_campaign.campaign_id, SovAlertStage::TMinus(120))
+            .await
+            .expect("count T-120 deliveries"),
+        1
+    );
+
+    // Advance to exactly T-30; calling twice in a row must not double-post.
+    clock.advance(ChronoDuration::minutes(90));
+    let at_t30 = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("T-30 mark is due");
+    assert_eq!(at_t30.tminus_prepared, 1);
+    let repeat = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("T-30 already fired");
+    assert_eq!(repeat.tminus_prepared, 0);
+    assert_eq!(delivery.sent_count(), 3);
+    assert_eq!(
+        store
+            .count_deliveries_for(new_campaign.campaign_id, SovAlertStage::TMinus(30))
+            .await
+            .expect("count T-30 deliveries"),
+        1
+    );
+
+    // Advance past the start time: no further marks.
+    clock.advance(ChronoDuration::minutes(31));
+    let after_start = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("campaign has already started");
+    assert_eq!(after_start.tminus_prepared, 0);
+    assert_eq!(delivery.sent_count(), 3);
+
+    let sent = delivery.sent();
+    assert!(sent
+        .iter()
+        .any(|d| d.stage == "appeared" && d.message.footer == "Appeared"));
+    assert!(sent
+        .iter()
+        .any(|d| d.stage == "tminus:120" && d.message.footer == "T-120m"));
+    assert!(sent
+        .iter()
+        .any(|d| d.stage == "tminus:30" && d.message.footer == "T-30m"));
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn both_tminus_marks_fire_in_one_pass_after_a_gap_skips_the_first_mark() {
+    // Simulates downtime: the stage-evaluation pass never ran while the
+    // campaign passed through T-120, so the next pass must fire both
+    // T-120 and T-30 together, each once (spec: "When two marks are due
+    // in the same pass ... both fire in that pass, each once").
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let new_campaign = campaign(
+        1,
+        30_005_174,
+        99_006_751,
+        observed_at + ChronoDuration::minutes(20),
+    );
+
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![new_campaign.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    clock.advance(ChronoDuration::seconds(10));
+    collector.collect_cycle().await.expect("campaign appears");
+
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("both marks are due at once");
+    assert_eq!(report.tminus_prepared, 2);
+    let sent = delivery.sent();
+    assert!(sent.iter().any(|d| d.stage == "tminus:120"));
+    assert!(sent.iter().any(|d| d.stage == "tminus:30"));
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn tminus_marks_fire_for_a_baseline_campaign_that_never_got_appeared() {
+    // Sov Baseline campaigns produce no `appeared` alert, but must still
+    // receive T-minus marks (spec: "Baseline campaigns get marks even
+    // though they never got appeared").
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let baseline_campaign = campaign(
+        1,
+        30_005_174,
+        99_006_751,
+        observed_at + ChronoDuration::minutes(20),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![baseline_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline cycle establishes the campaign");
+    assert!(store
+        .campaign_is_baseline(baseline_campaign.campaign_id)
+        .await
+        .expect("read baseline flag"));
+    assert_eq!(
+        store
+            .count_deliveries_for(baseline_campaign.campaign_id, SovAlertStage::Appeared)
+            .await
+            .expect("count appeared deliveries"),
+        0
+    );
+
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("marks fire for a baseline campaign");
+    assert_eq!(report.tminus_prepared, 2);
+    assert_eq!(
+        store
+            .count_deliveries_for(baseline_campaign.campaign_id, SovAlertStage::TMinus(120))
+            .await
+            .expect("count T-120 deliveries"),
+        1
+    );
+    assert_eq!(
+        store
+            .count_deliveries_for(baseline_campaign.campaign_id, SovAlertStage::TMinus(30))
+            .await
+            .expect("count T-30 deliveries"),
+        1
+    );
+    assert_eq!(
+        store
+            .count_deliveries_for(baseline_campaign.campaign_id, SovAlertStage::Appeared)
+            .await
+            .expect("appeared still never fires for a baseline campaign"),
+        0
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_tminus_mark_does_not_duplicate_across_a_simulated_restart() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let baseline_campaign = campaign(
+        1,
+        30_005_174,
+        99_006_751,
+        observed_at + ChronoDuration::minutes(100),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![baseline_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let failing_delivery = Arc::new(FakeSovDelivery::new(true));
+    let clock = VirtualSovClock::new(observed_at);
+    let first_collector = collector(
+        store.clone(),
+        limiter.clone(),
+        esi,
+        failing_delivery.clone(),
+        clock.clone(),
+    );
+
+    first_collector
+        .collect_cycle()
+        .await
+        .expect("baseline cycle establishes the campaign");
+    let report = first_collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("T-120 is prepared and its send fails transiently");
+    assert_eq!(report.tminus_prepared, 1);
+    assert_eq!(
+        store
+            .delivery_status_by_subject(baseline_campaign.campaign_id, SovAlertStage::TMinus(120))
+            .await
+            .expect("read delivery status"),
+        "prepared"
+    );
+
+    // Before the lease expires, a fresh collector (simulating a
+    // restarted process) must not re-claim the still-leased delivery.
+    let still_leased_esi = FakeSovereigntyEsi::new(vec![]);
+    let succeeding_delivery = Arc::new(FakeSovDelivery::new(false));
+    let second_collector = collector(
+        store.clone(),
+        limiter,
+        still_leased_esi,
+        succeeding_delivery.clone(),
+        clock.clone(),
+    );
+    second_collector
+        .deliver_claimable_for_test(clock.now())
+        .await
+        .expect("unexpired lease is left alone");
+    assert_eq!(succeeding_delivery.attempt_count(), 0);
+
+    // After the lease expires (restart-safe recovery window), the next
+    // collector reclaims the prepared row and sends it exactly once.
+    clock.advance(ChronoDuration::minutes(3));
+    second_collector
+        .deliver_claimable_for_test(clock.now())
+        .await
+        .expect("expired lease is reclaimed");
+    assert_eq!(succeeding_delivery.sent_count(), 1);
+    assert_eq!(
+        store
+            .delivery_status_by_subject(baseline_campaign.campaign_id, SovAlertStage::TMinus(120))
+            .await
+            .expect("read delivery status"),
+        "sent"
+    );
+    assert_eq!(
+        store
+            .count_deliveries_for(baseline_campaign.campaign_id, SovAlertStage::TMinus(120))
+            .await
+            .expect("no duplicate delivery row exists"),
+        1
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn custom_tminus_marks_replace_the_default_for_a_subscription() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe_with_options(
+        &store,
+        "custom-marks",
+        all_campaigns_filter(),
+        None,
+        serde_json::json!({"tminus_marks_minutes": [45]}),
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let baseline_campaign = campaign(
+        1,
+        30_005_174,
+        99_006_751,
+        observed_at + ChronoDuration::minutes(40),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![baseline_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("custom T-45 mark is due");
+    assert_eq!(report.tminus_prepared, 1);
+    assert_eq!(
+        store
+            .count_deliveries_for(baseline_campaign.campaign_id, SovAlertStage::TMinus(45))
+            .await
+            .expect("count T-45 deliveries"),
+        1
+    );
+    assert_eq!(
+        store
+            .count_deliveries_for(baseline_campaign.campaign_id, SovAlertStage::TMinus(120))
+            .await
+            .expect("default T-120 must not fire for a custom-marks subscription"),
+        0
+    );
+    assert_eq!(
+        store
+            .count_deliveries_for(baseline_campaign.campaign_id, SovAlertStage::TMinus(30))
+            .await
+            .expect("default T-30 must not fire for a custom-marks subscription"),
+        0
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn an_empty_tminus_marks_option_disables_marks_for_a_subscription() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe_with_options(
+        &store,
+        "no-marks",
+        all_campaigns_filter(),
+        None,
+        serde_json::json!({"tminus_marks_minutes": []}),
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let baseline_campaign = campaign(
+        1,
+        30_005_174,
+        99_006_751,
+        observed_at + ChronoDuration::minutes(10),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![baseline_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("marks are disabled for this subscription");
+    assert_eq!(report.tminus_prepared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_subscription_with_no_stored_marks_option_uses_the_default() {
+    // Every subscription persisted before ticket 03 landed has
+    // `options == {}` (no `tminus_marks_minutes` key at all); `subscribe`
+    // persists exactly that, so it doubles as the pre-ticket fixture
+    // (spec: "Existing subscriptions with no stored marks behave as
+    // default [120, 30]").
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let baseline_campaign = campaign(
+        1,
+        30_005_174,
+        99_006_751,
+        observed_at + ChronoDuration::minutes(120),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![baseline_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("default T-120 mark is due");
+    assert_eq!(report.tminus_prepared, 1);
+    assert_eq!(
+        store
+            .count_deliveries_for(baseline_campaign.campaign_id, SovAlertStage::TMinus(120))
+            .await
+            .expect("count T-120 deliveries"),
+        1
+    );
+    assert_eq!(
+        store
+            .count_deliveries_for(baseline_campaign.campaign_id, SovAlertStage::TMinus(30))
+            .await
+            .expect("T-30 is not yet due"),
+        0
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn an_ended_campaign_never_gets_a_tminus_mark() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let ended_campaign = campaign(
+        1,
+        30_005_174,
+        99_006_751,
+        observed_at + ChronoDuration::minutes(10),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![ended_campaign.clone()],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline cycle establishes the campaign");
+    clock.advance(ChronoDuration::seconds(10));
+    collector
+        .collect_cycle()
+        .await
+        .expect("campaign vanishes from the listing and is marked ended");
+    assert!(store
+        .campaign_ended_at(ended_campaign.campaign_id)
+        .await
+        .expect("read ended_at")
+        .is_some());
+
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("ended campaign is skipped");
+    assert_eq!(report.tminus_prepared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+
+    database.destroy().await;
+}
+
+// --- Fix round tests (ticket 03 review findings 1, 2, 4) ---
+
+#[tokio::test]
+async fn evaluate_stage_cycle_never_panics_on_an_out_of_range_mark_stored_directly_in_options() {
+    // Review finding 1: `/sov_subscribe` rejects marks above the ceiling,
+    // but `evaluate_stage_cycle` must not trust that every route into
+    // `options` went through the command's validation (a future
+    // migration, a direct database edit, ...). An ordinary huge `i64`
+    // used to panic `ChronoDuration::minutes`; it must now simply never
+    // be due.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe_with_options(
+        &store,
+        "bypassed-marks",
+        all_campaigns_filter(),
+        None,
+        serde_json::json!({"tminus_marks_minutes": [9_999_999_999_999_999i64, 30]}),
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let baseline_campaign = campaign(
+        1,
+        30_005_174,
+        99_006_751,
+        observed_at + ChronoDuration::minutes(20),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![baseline_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    // Must return Ok (no panic) and only the well-formed 30-minute mark
+    // fires; the absurd value never does.
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("an out-of-range mark never panics evaluate_stage_cycle");
+    assert_eq!(report.tminus_prepared, 1);
+    assert_eq!(
+        store
+            .count_deliveries_for(baseline_campaign.campaign_id, SovAlertStage::TMinus(30))
+            .await
+            .expect("count T-30 deliveries"),
+        1
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn subscription_lookup_returns_the_stored_row_and_none_when_absent() {
+    // Covers the new `SovStore::subscription` lookup (review finding 2's
+    // plumbing): `/sov_subscribe` uses this to read a previously-stored
+    // `options` document before merging in a re-subscription's changes.
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+
+    assert!(store
+        .subscription(1, 2, "does-not-exist")
+        .await
+        .expect("lookup a subscription that was never created")
+        .is_none());
+
+    subscribe_with_options(
+        &store,
+        "watch-all",
+        all_campaigns_filter(),
+        Some(555),
+        serde_json::json!({"tminus_marks_minutes": [90]}),
+    )
+    .await;
+
+    let found = store
+        .subscription(1, 2, "watch-all")
+        .await
+        .expect("lookup an existing subscription")
+        .expect("the subscription exists");
+    assert_eq!(found.name, "watch-all");
+    assert_eq!(found.role_id, Some(555));
+    assert_eq!(
+        found.options,
+        serde_json::json!({"tminus_marks_minutes": [90]})
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn re_persisting_a_subscription_with_the_previously_read_options_preserves_custom_marks() {
+    // Review finding 2, at the persistence seam `/sov_subscribe` relies
+    // on: subscribe with custom marks, then perform the exact sequence
+    // the command performs when a later `/sov_subscribe` omits
+    // `tminus_marks` -- look the row up, keep its `options` verbatim, and
+    // upsert again (here with a changed filter, standing in for "only a
+    // filter change") -- and prove the marks survive the round trip
+    // through JSONB rather than being silently reset to the default. The
+    // pure branch that decides *whether* to keep or replace `options`
+    // (`SovSubscribeCommand::merge_options`) is unit-tested directly in
+    // `src/commands/sov_subscribe.rs`; this proves the database side of
+    // that contract.
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+
+    subscribe_with_options(
+        &store,
+        "watch-all",
+        all_campaigns_filter(),
+        None,
+        serde_json::json!({"tminus_marks_minutes": [90]}),
+    )
+    .await;
+
+    // Simulate `/sov_subscribe` re-run without `tminus_marks`: read the
+    // existing row, keep its `options`, apply only the filter change.
+    let existing = store
+        .subscription(1, 2, "watch-all")
+        .await
+        .expect("lookup before re-subscribing")
+        .expect("subscription exists");
+    let changed_filter = SovFilter {
+        root: SovFilterNode::Condition(SovFilterCondition::System(vec![30_004_737])),
+    };
+    subscribe_with_options(
+        &store,
+        "watch-all",
+        changed_filter.clone(),
+        None,
+        existing.options.clone(),
+    )
+    .await;
+
+    let after = store
+        .subscription(1, 2, "watch-all")
+        .await
+        .expect("lookup after re-subscribing")
+        .expect("subscription still exists");
+    assert_eq!(
+        after.options,
+        serde_json::json!({"tminus_marks_minutes": [90]}),
+        "custom marks must survive a re-subscription that did not touch them"
+    );
+    assert_eq!(after.filter, changed_filter, "the filter change did apply");
+
+    // And an explicit new value still replaces whatever was stored.
+    subscribe_with_options(
+        &store,
+        "watch-all",
+        changed_filter,
+        None,
+        serde_json::json!({"tminus_marks_minutes": [120, 30]}),
+    )
+    .await;
+    let replaced = store
+        .subscription(1, 2, "watch-all")
+        .await
+        .expect("lookup after an explicit marks change")
+        .expect("subscription still exists");
+    assert_eq!(
+        replaced.options,
+        serde_json::json!({"tminus_marks_minutes": [120, 30]})
+    );
+
+    database.destroy().await;
+}
+
+// --- Second fix round test (ticket 03 review: VulnerableWithin hours ceiling) ---
+
+#[tokio::test]
+async fn a_filter_with_out_of_range_vulnerable_within_hours_never_panics_either_cycle_and_later_subscriptions_still_fire(
+) {
+    // Twin of the T-minus marks blocker: `VulnerableWithin { hours }`
+    // stored directly in the filter jsonb -- bypassing
+    // `/sov_subscribe`'s `validate()`, e.g. a row written before the
+    // ceiling existed, or by hand -- must not panic `collect_cycle` or
+    // `evaluate_stage_cycle`, and must not starve subscriptions ordered
+    // after the poisoned one in the same pass.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+
+    // Sorts before "z-healthy" below, so the loop reaches the poisoned
+    // subscription first in every pass -- proving a later subscription
+    // still gets evaluated rather than the whole cycle aborting.
+    subscribe(
+        &store,
+        "a-poisoned",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::VulnerableWithin { hours: 6 }),
+        },
+        None,
+    )
+    .await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to poison the stored filter directly");
+    sqlx::query("UPDATE sov_subscriptions SET filter = $1 WHERE name = 'a-poisoned'")
+        .bind(serde_json::json!({
+            "root": {"condition": {"vulnerable_within": {"hours": 9_999_999_999_999_999i64}}}
+        }))
+        .execute(&pool)
+        .await
+        .expect("poison the stored filter directly, bypassing validate()");
+    pool.close().await;
+
+    subscribe(&store, "z-healthy", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let new_campaign = campaign(
+        1,
+        30_005_174,
+        99_006_751,
+        observed_at + ChronoDuration::minutes(20),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![new_campaign.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    clock.advance(ChronoDuration::seconds(10));
+    let report = collector
+        .collect_cycle()
+        .await
+        .expect("collect_cycle returns Ok despite the poisoned subscription's overflowing filter");
+    // The healthy subscription, ordered after the poisoned one, still
+    // gets its `appeared` alert.
+    assert_eq!(report.alerts_prepared, 1);
+    assert_eq!(
+        store
+            .count_deliveries_for(new_campaign.campaign_id, SovAlertStage::Appeared)
+            .await
+            .expect("count appeared deliveries"),
+        1
+    );
+
+    let stage_report = collector.evaluate_stage_cycle().await.expect(
+        "evaluate_stage_cycle returns Ok despite the poisoned subscription's overflowing filter",
+    );
+    // Default marks (T-120 and T-30) both due for the healthy
+    // subscription; the poisoned subscription contributes nothing.
+    assert_eq!(stage_report.tminus_prepared, 2);
+    assert_eq!(
+        store
+            .count_deliveries_for(new_campaign.campaign_id, SovAlertStage::TMinus(120))
+            .await
+            .expect("count T-120 deliveries"),
+        1
+    );
+    assert_eq!(
+        store
+            .count_deliveries_for(new_campaign.campaign_id, SovAlertStage::TMinus(30))
+            .await
+            .expect("count T-30 deliveries"),
+        1
+    );
+
     database.destroy().await;
 }
