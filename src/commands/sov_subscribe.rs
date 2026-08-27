@@ -24,6 +24,12 @@ struct SovSubscriptionDocuments<'a> {
     region_id: Option<i64>,
     defender_alliance_id: Option<i64>,
     max_jumps: Option<i64>,
+    /// Convenience: whether the `Reachable` leaf composed from `max_jumps`
+    /// allows frigate-sized wormhole connections on its route (ticket 05,
+    /// spec "`/sov_subscribe` gains an `allow_frigate_holes` boolean
+    /// convenience option"). Meaningless without `max_jumps` -- validated
+    /// in `subscription_from_documents`.
+    allow_frigate_holes: Option<bool>,
     role_id: Option<u64>,
     /// Raw `tminus_marks` command option: a comma-separated list of
     /// minutes, or an empty string to disable marks. `None` when the
@@ -64,6 +70,12 @@ impl SovSubscribeCommand {
             None => None,
             _ => return Err("max_jumps must be an integer option".to_string()),
         };
+        let allow_frigate_holes =
+            match get_option_value(&command.data.options, "allow_frigate_holes") {
+                Some(CommandDataOptionValue::Boolean(value)) => Some(*value),
+                None => None,
+                _ => return Err("allow_frigate_holes must be a boolean option".to_string()),
+            };
         let role_id = match get_option_value(&command.data.options, "role") {
             Some(CommandDataOptionValue::Role(role)) => Some(role.id.0),
             None => None,
@@ -83,6 +95,7 @@ impl SovSubscribeCommand {
                 region_id,
                 defender_alliance_id,
                 max_jumps,
+                allow_frigate_holes,
                 role_id,
                 tminus_marks,
             },
@@ -110,7 +123,10 @@ impl SovSubscribeCommand {
         if let Some(max_jumps) = documents.max_jumps {
             extra.push(SovFilterNode::Condition(SovFilterCondition::Reachable {
                 max_jumps,
+                allow_frigate_holes: documents.allow_frigate_holes.unwrap_or(false),
             }));
+        } else if documents.allow_frigate_holes.is_some() {
+            return Err("allow_frigate_holes requires max_jumps to also be set".to_string());
         }
         if !extra.is_empty() {
             extra.insert(0, filter.root);
@@ -203,6 +219,12 @@ impl Command for SovSubscribeCommand {
                     .kind(CommandOptionType::Integer)
                     .min_int_value(1)
                     .max_int_value(SOV_REACHABLE_MAX_JUMPS)
+            })
+            .create_option(|option| {
+                option
+                    .name("allow_frigate_holes")
+                    .description("With max_jumps: allow frigate-sized wormholes on the route.")
+                    .kind(CommandOptionType::Boolean)
             })
             .create_option(|option| {
                 option
@@ -300,6 +322,7 @@ mod tests {
                 region_id: None,
                 defender_alliance_id: None,
                 max_jumps: None,
+                allow_frigate_holes: None,
                 role_id: None,
                 tminus_marks: None,
             },
@@ -322,6 +345,7 @@ mod tests {
                 region_id: Some(10_000_060),
                 defender_alliance_id: Some(99_000_001),
                 max_jumps: None,
+                allow_frigate_holes: None,
                 role_id: Some(555),
                 tminus_marks: None,
             },
@@ -356,6 +380,7 @@ mod tests {
                 region_id: None,
                 defender_alliance_id: None,
                 max_jumps: Some(11),
+                allow_frigate_holes: None,
                 role_id: None,
                 tminus_marks: None,
             },
@@ -366,11 +391,64 @@ mod tests {
                 assert_eq!(nodes.len(), 2);
                 assert!(matches!(
                     nodes[1],
-                    SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 11 })
+                    SovFilterNode::Condition(SovFilterCondition::Reachable {
+                        max_jumps: 11,
+                        allow_frigate_holes: false,
+                    })
                 ));
             }
             other => panic!("expected an And node, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sov_subscribe_composes_allow_frigate_holes_onto_the_reachable_condition() {
+        let subscription = SovSubscribeCommand::subscription_from_documents(
+            42,
+            77,
+            SovSubscriptionDocuments {
+                name: "frigate-holes-front",
+                filter: FILTER,
+                region_id: None,
+                defender_alliance_id: None,
+                max_jumps: Some(6),
+                allow_frigate_holes: Some(true),
+                role_id: None,
+                tminus_marks: None,
+            },
+        )
+        .expect("valid document with max_jumps and allow_frigate_holes");
+        match subscription.filter.root {
+            SovFilterNode::And(nodes) => {
+                assert!(matches!(
+                    nodes[1],
+                    SovFilterNode::Condition(SovFilterCondition::Reachable {
+                        max_jumps: 6,
+                        allow_frigate_holes: true,
+                    })
+                ));
+            }
+            other => panic!("expected an And node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sov_subscribe_rejects_allow_frigate_holes_without_max_jumps() {
+        assert!(SovSubscribeCommand::subscription_from_documents(
+            42,
+            77,
+            SovSubscriptionDocuments {
+                name: "orphan-frigate-flag",
+                filter: FILTER,
+                region_id: None,
+                defender_alliance_id: None,
+                max_jumps: None,
+                allow_frigate_holes: Some(true),
+                role_id: None,
+                tminus_marks: None,
+            },
+        )
+        .is_err());
     }
 
     #[test]
@@ -385,6 +463,7 @@ mod tests {
                     region_id: None,
                     defender_alliance_id: None,
                     max_jumps: Some(max_jumps),
+                    allow_frigate_holes: None,
                     role_id: None,
                     tminus_marks: None,
                 },
@@ -410,6 +489,7 @@ mod tests {
                     region_id: None,
                     defender_alliance_id: None,
                     max_jumps: None,
+                    allow_frigate_holes: None,
                     role_id: None,
                     tminus_marks: None,
                 },
@@ -429,6 +509,7 @@ mod tests {
                 region_id: None,
                 defender_alliance_id: None,
                 max_jumps: None,
+                allow_frigate_holes: None,
                 role_id: None,
                 tminus_marks: Some("120, 45, 120"),
             },
@@ -451,6 +532,7 @@ mod tests {
                 region_id: None,
                 defender_alliance_id: None,
                 max_jumps: None,
+                allow_frigate_holes: None,
                 role_id: None,
                 tminus_marks: Some(""),
             },
@@ -473,6 +555,7 @@ mod tests {
                 region_id: None,
                 defender_alliance_id: None,
                 max_jumps: None,
+                allow_frigate_holes: None,
                 role_id: None,
                 tminus_marks: None,
             },
@@ -493,6 +576,7 @@ mod tests {
                     region_id: None,
                     defender_alliance_id: None,
                     max_jumps: None,
+                    allow_frigate_holes: None,
                     role_id: None,
                     tminus_marks: Some(raw),
                 },

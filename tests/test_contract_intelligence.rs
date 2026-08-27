@@ -18012,7 +18012,7 @@ async fn contract_migrations_apply_to_clean_and_already_current_databases() {
     // (`migrations/20260826000000_add_sov_campaign_feed.sql`), which the
     // shared `MIGRATOR` covers along with every other file under
     // `migrations/`.
-    assert_eq!(current_migration_count, 27);
+    assert_eq!(current_migration_count, 28);
     assert_eq!(
         current_store
             .storage_counts()
@@ -31677,6 +31677,113 @@ async fn sov_esi_progress_health_check_is_independent_of_contract_esi_progress()
 }
 
 #[tokio::test]
+async fn sov_chain_health_snapshot_stays_healthy_when_never_configured_or_fetched() {
+    // Ticket 05: the Wanderer chain feature is optional within the
+    // already-optional sov feed, and even when configured it may not have
+    // completed a first successful fetch yet. Neither state is an anomaly
+    // (spec: "never Critical merely because the feature is disabled") --
+    // mirrors `sov_esi_progress_check_is_healthy_when_never_reported`
+    // above for the campaign feed's own progress signal.
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to the sov chain health-evidence database");
+    let now = database.now().await;
+    let started_at = now - chrono::Duration::minutes(31);
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $2)",
+    )
+    .bind(now)
+    .bind(started_at)
+    .execute(&pool)
+    .await
+    .expect("seed current heartbeat with an expired ESI startup grace");
+    // Every other progress signal is seeded current, mirroring
+    // `sov_esi_progress_check_is_healthy_when_never_reported` above, so
+    // the overall snapshot status isolates exactly the chain check's own
+    // neutrality rather than picking up an unrelated Critical from a
+    // deliberately-expired startup grace on signals this test does not
+    // care about.
+    sqlx::query("INSERT INTO regional_collection_metadata (region_id, baseline_at, complete_observations, last_complete_at) VALUES (10000002, $1, 1, $1)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed current regional progress");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('contracts/public/10000002/page/1', $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("persist current contract ESI progress evidence");
+
+    // No rows in `sov_chain_snapshots` at all: the chain feature was
+    // never configured (or has not yet completed a first fetch).
+    let snapshot = HealthCycle::new(store, clock)
+        .run_once()
+        .await
+        .expect("evaluate health with no chain snapshot evidence at all");
+    assert_eq!(snapshot.status, HealthStatus::Healthy);
+    assert!(snapshot
+        .checks
+        .iter()
+        .any(|check| check.key == "sov_chain_progress" && check.status == HealthStatus::Healthy));
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn sov_chain_progress_health_check_degrades_once_stale_evidence_exists() {
+    // Regression-shaped twin of `sov_esi_progress_check_degrades_once_stale_evidence_exists`:
+    // once a chain snapshot has been fetched at least once, evidence
+    // older than `SOV_CHAIN_STALE_AFTER` (ten minutes) degrades the
+    // check rather than staying neutral.
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to the sov chain health-evidence database");
+    let now = database.now().await;
+    let started_at = now - chrono::Duration::minutes(31);
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $2)",
+    )
+    .bind(now)
+    .bind(started_at)
+    .execute(&pool)
+    .await
+    .expect("seed current heartbeat with an expired ESI startup grace");
+    let stale_fetched_at = now - chrono::Duration::minutes(15);
+    sqlx::query(
+        "INSERT INTO sov_chain_snapshots (fetched_at, systems, connections) VALUES ($1, '[]'::jsonb, '[]'::jsonb)",
+    )
+    .bind(stale_fetched_at)
+    .execute(&pool)
+    .await
+    .expect("persist a stale chain snapshot");
+
+    let snapshot = HealthCycle::new(store, clock)
+        .run_once()
+        .await
+        .expect("evaluate health with stale chain evidence");
+    assert!(snapshot
+        .checks
+        .iter()
+        .any(|check| check.key == "sov_chain_progress" && check.status == HealthStatus::Degraded));
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn health_cycle_caps_regional_evidence_and_reports_the_omitted_region_count() {
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
@@ -32485,7 +32592,7 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
     // (`migrations/20260826000000_add_sov_campaign_feed.sql`), which the
     // shared `MIGRATOR` covers along with every other file under
     // `migrations/`.
-    assert_eq!(clean_migration_count, 27);
+    assert_eq!(clean_migration_count, 28);
     let clean_pacing_column_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'esi_collection_limiter_state' AND column_name = 'next_request_at')",
     )

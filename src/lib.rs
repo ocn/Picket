@@ -61,12 +61,17 @@ impl TypeMapKey for SovStoreContainer {
     type Value = sov_feed::SovStoreHandle;
 }
 
-/// Shared handle to the sov feed's stargate reachability source (ticket
-/// 04): populated once at start-up (see [`sov_reachability_source`]) and
-/// read by the collector loops and `/sov_timers` alike. Unlike
-/// [`SovStoreContainer`] this never changes after start-up -- there is no
-/// live reload of `config/stargates.json` -- so it needs no interior
-/// mutability of its own.
+/// Shared handle to the sov feed's reachability source (ticket 04's
+/// stargate-only `StaticSovReachability`, or ticket 05's
+/// `DynamicChainSovReachability` when Wanderer chain data is configured):
+/// populated once at start-up (see [`sov_reachability_source`]) and read
+/// by the collector loops and `/sov_timers` alike. Unlike
+/// [`SovStoreContainer`] the *container slot itself* never changes after
+/// start-up -- there is no live reload of `config/stargates.json`, and
+/// this `Arc` is never replaced -- so the slot needs no interior
+/// mutability of its own; `DynamicChainSovReachability`, when present,
+/// owns its *own* interior mutability for the routes it serves through
+/// this same unchanging `Arc<dyn SovReachabilitySource>`.
 pub struct SovReachabilityContainer;
 
 impl TypeMapKey for SovReachabilityContainer {
@@ -81,6 +86,10 @@ const SOV_COLLECTION_INTERVAL: Duration = Duration::from_secs(60);
 /// `SOV_COLLECTION_INTERVAL` because it makes no ESI request (ticket 03:
 /// "A stage-evaluation pass runs at least every thirty seconds").
 const SOV_STAGE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Wanderer chain poll cadence (spec "Sources and cadence": "The Wanderer
+/// chain is polled every two minutes (systems and connections)").
+const SOV_CHAIN_POLL_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Default reachability origin: Turnur (spec "Reachability": "Single
 /// origin: Turnur (configurable by environment)").
@@ -108,9 +117,25 @@ fn sov_home_system_id() -> i64 {
 /// carried over from ticket 02's ADR 0002 discussion). Pure CPU/local-disk
 /// work over a few thousand systems, so this runs synchronously before the
 /// Discord client is built without risking any startup delay.
-fn sov_reachability_source(enabled: bool) -> Arc<dyn sov_feed::SovReachabilitySource> {
+///
+/// When `wanderer_configured` is also true (ticket 05: all three
+/// `WANDERER_*` variables set), a successfully-loaded graph additionally
+/// produces a [`sov_feed::DynamicChainSovReachability`], returned
+/// separately so the composition root can hand it to the chain poll loop
+/// for [`sov_feed::DynamicChainSovReachability::recompute`] calls -- the
+/// trait object alone (`Arc<dyn SovReachabilitySource>`) cannot expose
+/// that concrete method. Until the first successful chain fetch, it
+/// behaves exactly like the stargate-only case (spec: "otherwise
+/// reachability stays stargate-only").
+fn sov_reachability_source(
+    enabled: bool,
+    wanderer_configured: bool,
+) -> (
+    Arc<dyn sov_feed::SovReachabilitySource>,
+    Option<Arc<sov_feed::DynamicChainSovReachability>>,
+) {
     if !enabled {
-        return Arc::new(sov_feed::StaticSovReachability(None));
+        return (Arc::new(sov_feed::StaticSovReachability(None)), None);
     }
     let home_system_id = sov_home_system_id();
     let path = std::path::Path::new(sov_feed::DEFAULT_STARGATE_GRAPH_PATH);
@@ -123,15 +148,26 @@ fn sov_reachability_source(enabled: bool) -> Arc<dyn sov_feed::SovReachabilitySo
                 graph.system_count(),
                 graph.edge_count()
             );
-            let reachability = sov_feed::Reachability::compute(&graph, home_system_id, &[]);
-            Arc::new(sov_feed::StaticSovReachability(Some(reachability)))
+            if wanderer_configured {
+                let dynamic = Arc::new(sov_feed::DynamicChainSovReachability::new(
+                    graph,
+                    home_system_id,
+                ));
+                (dynamic.clone(), Some(dynamic))
+            } else {
+                let reachability = sov_feed::Reachability::compute(&graph, home_system_id, &[]);
+                (
+                    Arc::new(sov_feed::StaticSovReachability(Some(reachability))),
+                    None,
+                )
+            }
         }
         Err(error) => {
             error!(
                 "Sov reachability disabled: could not load {}: {error}. The sov feed runs without reachability: Reachable filter leaves never match and /sov_timers reports the graph as unavailable.",
                 path.display()
             );
-            Arc::new(sov_feed::StaticSovReachability(None))
+            (Arc::new(sov_feed::StaticSovReachability(None)), None)
         }
     }
 }
@@ -316,7 +352,18 @@ pub async fn run() {
     // background retry loop. A missing or malformed
     // `config/stargates.json` degrades to "graph unavailable" rather than
     // failing start-up (see `sov_reachability_source`'s doc comment).
-    let sov_reachability = sov_reachability_source(contract_runtime.is_some());
+    //
+    // Wanderer chain reachability (ticket 05) is nested inside the sov
+    // feed's own optionality: it only ever activates when the sov feed
+    // itself is enabled (`contract_runtime.is_some()`) *and* all three
+    // `WANDERER_*` variables are set; otherwise reachability stays
+    // stargate-only, exactly ticket 04's behaviour.
+    let wanderer_config = contract_runtime
+        .is_some()
+        .then(sov_feed::WandererConfig::from_environment)
+        .flatten();
+    let (sov_reachability, dynamic_chain_reachability) =
+        sov_reachability_source(contract_runtime.is_some(), wanderer_config.is_some());
 
     // --- Start Discord Bot ---
     let discord_token = app_config.discord_bot_token.clone();
@@ -395,6 +442,44 @@ pub async fn run() {
         }
     } else {
         info!("Sov campaign feed disabled: CONTRACT_DATABASE_URL is not configured");
+    }
+
+    // Wanderer chain reachability poll loop (ticket 05): only spawned
+    // when both the sov feed's database and all three `WANDERER_*`
+    // variables are configured. Independent of every other sov loop --
+    // it never touches `sov_store_handle` (owned by the campaign
+    // collection loop) -- so a stall here cannot affect campaign polling,
+    // T-minus evaluation, or command handling, and vice versa.
+    if let (Some((database_url, _)), Some(wanderer_config), Some(dynamic_chain)) = (
+        &contract_runtime,
+        wanderer_config.as_ref(),
+        dynamic_chain_reachability.as_ref(),
+    ) {
+        let timeout = Duration::from_secs(app_config.esi_http_timeout_secs);
+        match sov_feed::WandererClient::new(wanderer_config, timeout) {
+            Ok(client) => {
+                let client = Arc::new(client);
+                // One-shot start-up probe (spec: "the client probes the
+                // SSE stream once ... without depending on it"); never
+                // awaited by the poll loop below.
+                tokio::spawn({
+                    let client = client.clone();
+                    async move {
+                        sov_feed::log_sse_probe_result(&client, Duration::from_secs(5)).await;
+                    }
+                });
+                let chain_source: Arc<dyn sov_feed::WandererChainSource> = client;
+                spawn_sov_chain_loop(
+                    database_url.clone(),
+                    SOV_CHAIN_POLL_INTERVAL,
+                    chain_source,
+                    dynamic_chain.clone(),
+                );
+            }
+            Err(error) => {
+                warn!("Wanderer chain reachability disabled: HTTP client initialization failed: {error}");
+            }
+        }
     }
 
     if let Some((database_url, store_handle)) = contract_runtime {
@@ -752,6 +837,71 @@ async fn run_sov_stage_loop(
                 Err(error) => warn!("sov stage evaluation database unavailable: {error}"),
             },
             Err(error) => warn!("sov stage evaluation migrations unavailable: {error}"),
+        }
+    }
+}
+
+/// Spawns the Wanderer chain reachability poll loop (ticket 05). Mirrors
+/// `spawn_sov_stage_loop`: fixed cadence via `interval_at` +
+/// `MissedTickBehavior::Skip` (no exponential backoff -- Wanderer errors
+/// are not coordinated through the shared ESI limiter, so there is no
+/// shared pause state to honour, and the spec's cadence is a fixed "every
+/// two minutes" regardless of recent errors), reconnects every tick
+/// (self-healing, idempotent migrations), and never touches
+/// `sov_store_handle` or ESI, so a stall here cannot affect campaign
+/// polling, T-minus evaluation, or command handling.
+fn spawn_sov_chain_loop(
+    database_url: String,
+    interval: Duration,
+    source: Arc<dyn sov_feed::WandererChainSource>,
+    reachability: Arc<sov_feed::DynamicChainSovReachability>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_sov_chain_loop(
+        database_url,
+        interval,
+        source,
+        reachability,
+    ))
+}
+
+async fn run_sov_chain_loop(
+    database_url: String,
+    interval: Duration,
+    source: Arc<dyn sov_feed::WandererChainSource>,
+    reachability: Arc<sov_feed::DynamicChainSovReachability>,
+) {
+    let mut cadence = tokio::time::interval_at(tokio::time::Instant::now(), interval);
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        cadence.tick().await;
+        match contract_intelligence::ContractCollectionStore::connect(&database_url).await {
+            Ok(_limiter_store) => match sov_feed::SovStore::connect(&database_url).await {
+                Ok(store) => {
+                    let collector = sov_feed::SovChainCollector::new(
+                        store,
+                        source.clone(),
+                        reachability.clone(),
+                    );
+                    match run_sov_cycle_isolated(async move { collector.collect_cycle().await })
+                        .await
+                    {
+                        Ok(report) => {
+                            if report.recomputed {
+                                info!("sov chain reachability recomputed: topology changed");
+                            }
+                        }
+                        // The Wanderer error/code/body summary is already
+                        // folded into `error`'s `Display` impl (spec: "warn!
+                        // with the Wanderer error code/body summary"); the
+                        // last good snapshot and the last computed routes
+                        // are untouched (see `SovChainCollector::collect_cycle`'s
+                        // doc comment).
+                        Err(error) => warn!("sov chain collection cycle failed: {error}"),
+                    }
+                }
+                Err(error) => warn!("sov chain feed database unavailable: {error}"),
+            },
+            Err(error) => warn!("sov chain feed migrations unavailable: {error}"),
         }
     }
 }

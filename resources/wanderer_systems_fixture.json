@@ -1,0 +1,71 @@
+{
+  "data": {
+    "systems": [
+      {
+        "id": "5f1b1b1a-0001-4f1a-9c1a-000000000001",
+        "map_id": "5f1b1b1a-0000-4f1a-9c1a-000000000000",
+        "solar_system_id": 30002086,
+        "name": "Turnur",
+        "original_name": "Turnur",
+        "custom_name": null,
+        "temporary_name": null,
+        "tag": null,
+        "labels": "",
+        "locked": false,
+        "visible": true,
+        "status": 8,
+        "position_x": 100,
+        "position_y": 100
+      },
+      {
+        "id": "5f1b1b1a-0001-4f1a-9c1a-000000000002",
+        "map_id": "5f1b1b1a-0000-4f1a-9c1a-000000000000",
+        "solar_system_id": 31000005,
+        "name": "J123456",
+        "original_name": "J123456",
+        "custom_name": "Home Hole",
+        "temporary_name": null,
+        "tag": "A",
+        "labels": "",
+        "locked": false,
+        "visible": true,
+        "status": 1,
+        "position_x": 250,
+        "position_y": 100
+      },
+      {
+        "id": "5f1b1b1a-0001-4f1a-9c1a-000000000003",
+        "map_id": "5f1b1b1a-0000-4f1a-9c1a-000000000000",
+        "solar_system_id": 31000006,
+        "name": "J234567",
+        "original_name": "J234567",
+        "custom_name": null,
+        "temporary_name": null,
+        "tag": null,
+        "labels": "",
+        "locked": false,
+        "visible": true,
+        "status": 0,
+        "position_x": 400,
+        "position_y": 100
+      },
+      {
+        "id": "5f1b1b1a-0001-4f1a-9c1a-000000000004",
+        "map_id": "5f1b1b1a-0000-4f1a-9c1a-000000000000",
+        "solar_system_id": 30004737,
+        "name": "Jita",
+        "original_name": "Jita",
+        "custom_name": null,
+        "temporary_name": null,
+        "tag": null,
+        "labels": "",
+        "locked": false,
+        "visible": true,
+        "status": 5,
+        "position_x": 550,
+        "position_y": 100
+      }
+    ],
+    "connections": []
+  }
+}

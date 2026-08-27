@@ -66,10 +66,18 @@ pub trait SovTickerResolver: Send + Sync {
 /// Per-campaign reachability facts for the `Reachable` filter leaf and
 /// embed rendering (ticket 04, spec "Reachability" and "Embed"): jumps
 /// from the configured home system and the system-ID route, home first.
+/// `via_chain` and `path_risk` are ticket 05 additions: `via_chain` is
+/// `true` when the chosen route crosses at least one Wanderer chain
+/// connection (wormhole, gate, or bridge) rather than pure static
+/// stargates; `path_risk` is `Some` exactly when the route crosses at
+/// least one *wormhole* connection, since gate/bridge jumps carry no risk
+/// (spec "Embed": the Path Risk line is "omitted for gate-only routes").
 #[derive(Clone, Debug, PartialEq)]
 pub struct SovReachabilityInfo {
     pub jumps: i64,
     pub route: Vec<i64>,
+    pub via_chain: bool,
+    pub path_risk: Option<crate::sov_feed::chain::PathRisk>,
 }
 
 /// Reachability lookup for the `Reachable` filter leaf and embed
@@ -79,9 +87,31 @@ pub struct SovReachabilityInfo {
 /// "Reachable never matches", never a startup failure);
 /// [`SovReachabilitySource::graph_available`] distinguishes the two so
 /// `/sov_timers` can say "unreachable" vs "graph unavailable".
+/// `allow_frigate_holes` selects which of the two cached BFS results
+/// (spec "Reachability": "Two BFS results are cached per chain snapshot")
+/// a lookup uses; implementations that have no notion of frigate holes
+/// (stargates only) ignore it.
 pub trait SovReachabilitySource: Send + Sync {
-    fn reachable(&self, solar_system_id: i64) -> Option<SovReachabilityInfo>;
+    fn reachable(
+        &self,
+        solar_system_id: i64,
+        allow_frigate_holes: bool,
+    ) -> Option<SovReachabilityInfo>;
     fn graph_available(&self) -> bool;
+
+    /// Whether a Wanderer chain feed is configured and, if so, how fresh
+    /// its most recent successful fetch is (ticket 05, spec "On Wanderer
+    /// errors ... the last good snapshot is kept and marked stale after
+    /// ten minutes; stale state is visible ... in `/sov_timers`"). Default
+    /// implementation covers every reachability source with no chain
+    /// concept at all (`StaticSovReachability`, every test fake that
+    /// predates this ticket) without requiring any change to them.
+    fn chain_status(
+        &self,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> crate::sov_feed::chain::SovChainStatus {
+        crate::sov_feed::chain::SovChainStatus::NotConfigured
+    }
 }
 
 /// Adapts a computed [`crate::sov_feed::graph::Reachability`] (or its
@@ -89,15 +119,26 @@ pub trait SovReachabilitySource: Send + Sync {
 /// unavailable" state the composition root (`src/lib.rs`) falls back to
 /// when `config/stargates.json` is missing or malformed at start-up, or
 /// when the sov feed is disabled entirely; it is also the default used by
-/// every existing test that does not care about reachability.
+/// every existing test that does not care about reachability. Stargates
+/// only -- no chain, so `via_chain` is always `false` and `path_risk`
+/// always `None`; `allow_frigate_holes` has no effect here.
 pub struct StaticSovReachability(pub Option<crate::sov_feed::graph::Reachability>);
 
 impl SovReachabilitySource for StaticSovReachability {
-    fn reachable(&self, solar_system_id: i64) -> Option<SovReachabilityInfo> {
+    fn reachable(
+        &self,
+        solar_system_id: i64,
+        _allow_frigate_holes: bool,
+    ) -> Option<SovReachabilityInfo> {
         let reachability = self.0.as_ref()?;
         let jumps = reachability.jumps(solar_system_id)?;
         let route = reachability.path(solar_system_id)?;
-        Some(SovReachabilityInfo { jumps, route })
+        Some(SovReachabilityInfo {
+            jumps,
+            route,
+            via_chain: false,
+            path_risk: None,
+        })
     }
 
     fn graph_available(&self) -> bool {
@@ -307,9 +348,9 @@ impl SovCollector {
             let subscriptions = self.store.subscriptions().await.map_err(store_error)?;
             let region_of =
                 |system_id: i64| self.directory.resolve(system_id).map(|info| info.region_id);
-            let reachable_jumps = |system_id: i64| {
+            let reachable_jumps = |system_id: i64, allow_frigate_holes: bool| {
                 self.reachability
-                    .reachable(system_id)
+                    .reachable(system_id, allow_frigate_holes)
                     .map(|info| info.jumps)
             };
             for campaign in &campaigns {
@@ -347,7 +388,11 @@ impl SovCollector {
                             continue;
                         }
                         let message = self
-                            .render_stage_message(campaign, SovAlertStage::TMinus(minutes))
+                            .render_stage_message(
+                                campaign,
+                                SovAlertStage::TMinus(minutes),
+                                subscription.filter.root.allows_frigate_holes_anywhere(),
+                            )
                             .await;
                         let freshly_prepared = self
                             .store
@@ -428,9 +473,9 @@ impl SovCollector {
             let subscriptions = self.store.subscriptions().await.map_err(store_error)?;
             let region_of =
                 |system_id: i64| self.directory.resolve(system_id).map(|info| info.region_id);
-            let reachable_jumps = |system_id: i64| {
+            let reachable_jumps = |system_id: i64, allow_frigate_holes: bool| {
                 self.reachability
-                    .reachable(system_id)
+                    .reachable(system_id, allow_frigate_holes)
                     .map(|info| info.jumps)
             };
             for campaign in &alert_candidates {
@@ -442,7 +487,11 @@ impl SovCollector {
                         &reachable_jumps,
                     ) {
                         let message = self
-                            .render_stage_message(campaign, SovAlertStage::Appeared)
+                            .render_stage_message(
+                                campaign,
+                                SovAlertStage::Appeared,
+                                subscription.filter.root.allows_frigate_holes_anywhere(),
+                            )
                             .await;
                         let freshly_prepared = self
                             .store
@@ -482,6 +531,7 @@ impl SovCollector {
         &self,
         campaign: &SovCampaign,
         stage: SovAlertStage,
+        allow_frigate_holes: bool,
     ) -> SovNotificationMessage {
         let system_info = self.directory.resolve(campaign.solar_system_id);
         let (system_name, region_name) = system_info
@@ -520,8 +570,13 @@ impl SovCollector {
         // and route summary ... omitted for gate-only routes" -- and, by
         // the same "presentation, not a filter" spirit, omitted entirely
         // rather than shown as a placeholder for an unreachable system or
-        // an unavailable graph, ticket 04).
-        if let Some(info) = self.reachability.reachable(campaign.solar_system_id) {
+        // an unavailable graph, ticket 04). `allow_frigate_holes` picks
+        // which of the subscription's two cached routes to show (ticket
+        // 05); see `SovFilterNode::allows_frigate_holes_anywhere`.
+        if let Some(info) = self
+            .reachability
+            .reachable(campaign.solar_system_id, allow_frigate_holes)
+        {
             fields.push(SovEmbedField {
                 name: "Reachability".to_string(),
                 value: format!(
@@ -532,6 +587,18 @@ impl SovCollector {
                 ),
                 inline: false,
             });
+            // Path Risk (ticket 05, spec "Embed"): one line, only when the
+            // chosen route crosses at least one wormhole -- `path_risk` is
+            // `None` by construction for a gate-only route (see
+            // `SovReachabilityInfo`'s doc comment), so this needs no
+            // separate "is it gate-only" check.
+            if let Some(risk) = &info.path_risk {
+                fields.push(SovEmbedField {
+                    name: "Path Risk".to_string(),
+                    value: format!("worst hole: {}", risk.describe()),
+                    inline: true,
+                });
+            }
         }
 
         if let (Some(defender_score), Some(attackers_score)) =

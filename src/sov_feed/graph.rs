@@ -12,11 +12,11 @@
 //! Nothing in this module touches the network or a database: loading the
 //! file is the only IO, isolated in [`load_stargate_graph_file`] so the
 //! BFS itself stays unit-testable without a filesystem. `Reachability`'s
-//! `extra_edges` parameter is unused by every caller today (this ticket
-//! implements stargates only), but its shape is what ticket 05 needs to
-//! widen the graph with Wanderer chain connections without reshaping this
-//! API: a caller merges its own edges in and calls `compute` again, no
-//! change required here.
+//! `extra_edges` parameter went unused by every caller in ticket 04
+//! (stargates only); ticket 05's `crate::sov_feed::chain::DynamicChainSovReachability`
+//! is exactly the caller this shape was designed for -- it merges the
+//! current Wanderer chain's traversable connections in and calls
+//! `compute` again, with no change required to this module at all.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -126,6 +126,19 @@ impl StargateGraph {
             .get(&system)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// Whether a real stargate connects `a` and `b` directly (order
+    /// doesn't matter -- the graph is undirected). Used by
+    /// `crate::sov_feed::chain::build_chain_graph_variant` (ticket 05) so
+    /// a Wanderer connection that merely duplicates an already-real
+    /// stargate (a map operator manually tracking a normal gate route)
+    /// does not get counted as a chain-provenance edge: the stargate
+    /// already provides that jump, so the BFS's choice of which parallel
+    /// edge it "used" would otherwise be an implementation detail leaking
+    /// into `via_chain`.
+    pub fn has_edge(&self, a: i64, b: i64) -> bool {
+        self.neighbors(a).contains(&b)
     }
 }
 
@@ -299,6 +312,15 @@ mod tests {
         assert_eq!(graph.edge_count(), 1);
         let reachability = Reachability::compute(&graph, 2, &[]);
         assert_eq!(reachability.jumps(1), Some(1));
+    }
+
+    #[test]
+    fn has_edge_is_order_independent_and_false_for_a_missing_edge() {
+        let graph = StargateGraph::from_edges("test", &[(1, 2)]);
+        assert!(graph.has_edge(1, 2));
+        assert!(graph.has_edge(2, 1));
+        assert!(!graph.has_edge(1, 3));
+        assert!(!graph.has_edge(3, 4));
     }
 
     #[test]

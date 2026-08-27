@@ -21,10 +21,12 @@
 //! `.scratch/esi-intel-feeds/issues/02-sov-campaign-appeared-alert-end-to-end.md`).
 
 use crate::esi_cache::CacheMetadata;
+use crate::sov_feed::chain::ChainSnapshot;
 use crate::sov_feed::model::{
     PreparedSovDelivery, SovAlertStage, SovCampaign, SovDeliveryError, SovFilter,
     SovNotificationMessage, SovSubscription,
 };
+use crate::sov_feed::wanderer::{WandererConnection, WandererSystem};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rand::Rng;
 use sqlx::postgres::{PgPoolOptions, PgRow};
@@ -157,6 +159,69 @@ impl SovStore {
         .bind(metadata.error_limit_remain)
         .bind(metadata.error_limit_reset)
         .bind(metadata.retry_after)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // --- Chain snapshots (ticket 05) ---
+
+    /// Persists a freshly-fetched Wanderer chain observation. Returns its
+    /// row ID (unused by any caller today, but a natural companion to
+    /// `upsert_campaign`'s return shape and useful for future debugging
+    /// queries).
+    pub async fn insert_chain_snapshot(
+        &self,
+        snapshot: &ChainSnapshot,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "INSERT INTO sov_chain_snapshots (fetched_at, systems, connections) VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(snapshot.fetched_at)
+        .bind(serde_json::to_value(&snapshot.systems).map_err(json_to_sqlx)?)
+        .bind(serde_json::to_value(&snapshot.connections).map_err(json_to_sqlx)?)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// The most recently fetched chain snapshot, or `None` before the
+    /// first successful fetch. Used by the poll loop to diff the newly
+    /// fetched connection list against what was persisted last cycle
+    /// (`connection_topology_changed`) before inserting the new snapshot.
+    pub async fn latest_chain_snapshot(&self) -> Result<Option<ChainSnapshot>, sqlx::Error> {
+        sqlx::query(
+            "SELECT fetched_at, systems, connections FROM sov_chain_snapshots ORDER BY fetched_at DESC, id DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .map(chain_snapshot_from_row)
+        .transpose()
+    }
+
+    /// `max(fetched_at)` across every persisted snapshot -- the sov chain
+    /// feed's health-check and `/sov_timers` staleness signal doubles as
+    /// "last successful fetch" because a row only ever exists after a
+    /// successful fetch (see the migration's doc comment).
+    pub async fn chain_progress_at(&self) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        sqlx::query_scalar("SELECT max(fetched_at) FROM sov_chain_snapshots")
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    /// Bounded retention (spec: "Retain a bounded history ... decide and
+    /// document" -- this feed keeps the last 24 hours, always preserving
+    /// at least the single newest row regardless of its age, so a long
+    /// Wanderer outage followed by recovery never leaves the table
+    /// briefly empty). Called by the poll loop after every successful
+    /// insert.
+    pub async fn prune_chain_snapshots(
+        &self,
+        older_than: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "DELETE FROM sov_chain_snapshots WHERE fetched_at < $1 AND id <> (SELECT id FROM sov_chain_snapshots ORDER BY fetched_at DESC, id DESC LIMIT 1)",
+        )
+        .bind(older_than)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -550,6 +615,16 @@ impl SovStore {
         .fetch_one(&self.pool)
         .await
     }
+}
+
+fn chain_snapshot_from_row(row: PgRow) -> Result<ChainSnapshot, sqlx::Error> {
+    Ok(ChainSnapshot {
+        systems: serde_json::from_value::<Vec<WandererSystem>>(row.get("systems"))
+            .map_err(json_to_sqlx)?,
+        connections: serde_json::from_value::<Vec<WandererConnection>>(row.get("connections"))
+            .map_err(json_to_sqlx)?,
+        fetched_at: row.get("fetched_at"),
+    })
 }
 
 fn sov_campaign_from_row(row: PgRow) -> Result<SovCampaign, sqlx::Error> {
