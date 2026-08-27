@@ -22,12 +22,19 @@
 //! delay the gateway connection or the killmail pipeline, and self-heals
 //! once Postgres recovers.
 
+pub mod chain;
 pub mod collector;
 pub mod esi;
 pub mod graph;
 pub mod model;
 pub mod store;
+pub mod wanderer;
 
+pub use chain::{
+    connection_topology_changed, log_sse_probe_result, ChainSnapshot, DynamicChainSovReachability,
+    PathRisk, SovChainCollectionError, SovChainCollectionReport, SovChainCollector, SovChainStatus,
+    SOV_CHAIN_STALE_AFTER,
+};
 pub use collector::{
     SovClock, SovCollectionError, SovCollectionReport, SovCollector, SovReachabilityInfo,
     SovReachabilitySource, SovStageEvaluationReport, SovSystemDirectory, SovSystemInfo,
@@ -47,4 +54,9 @@ pub use model::{
 };
 pub use store::{
     available_sov_store, new_sov_store_handle, SovStore, SovStoreHandle, SOV_CAMPAIGNS_RESOURCE_KEY,
+};
+pub use wanderer::{
+    WandererChainSource, WandererClient, WandererConfig, WandererConnection,
+    WandererConnectionType, WandererError, WandererMassStatus, WandererShipSizeType,
+    WandererSseProbeResult, WandererSystem, WandererSystemStatus, WandererTimeStatus,
 };

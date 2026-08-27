@@ -1,0 +1,49 @@
+{
+  "data": [
+    {
+      "id": "6a2c2c2a-0002-4f1a-9c1a-000000000001",
+      "map_id": "5f1b1b1a-0000-4f1a-9c1a-000000000000",
+      "solar_system_source": 30002086,
+      "solar_system_target": 31000005,
+      "type": 0,
+      "mass_status": 2,
+      "time_status": 0,
+      "ship_size_type": 2,
+      "wormhole_type": "K162",
+      "locked": false
+    },
+    {
+      "id": "6a2c2c2a-0002-4f1a-9c1a-000000000002",
+      "map_id": "5f1b1b1a-0000-4f1a-9c1a-000000000000",
+      "solar_system_source": 31000005,
+      "solar_system_target": 31000006,
+      "type": 0,
+      "mass_status": 0,
+      "time_status": 2,
+      "ship_size_type": 1,
+      "wormhole_type": "N062",
+      "locked": false
+    },
+    {
+      "id": "6a2c2c2a-0002-4f1a-9c1a-000000000003",
+      "map_id": "5f1b1b1a-0000-4f1a-9c1a-000000000000",
+      "solar_system_source": 31000006,
+      "solar_system_target": 30004737,
+      "type": 0,
+      "mass_status": 0,
+      "time_status": 0,
+      "ship_size_type": 0,
+      "wormhole_type": "E545",
+      "locked": false
+    },
+    {
+      "id": "6a2c2c2a-0002-4f1a-9c1a-000000000004",
+      "map_id": "5f1b1b1a-0000-4f1a-9c1a-000000000000",
+      "solar_system_source": 30002086,
+      "solar_system_target": 30004737,
+      "type": 1,
+      "wormhole_type": null,
+      "locked": true
+    }
+  ]
+}

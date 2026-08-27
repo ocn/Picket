@@ -182,7 +182,20 @@ async fn render_for_channel(
     let tickers = DiscordSovTickerResolver::new(app_state.clone());
     let observed_at = Utc::now();
     let region_of = |system_id: i64| directory.resolve(system_id).map(|info| info.region_id);
-    let reachable_jumps = |system_id: i64| reachability.reachable(system_id).map(|info| info.jumps);
+    // One route per channel entry, not per subscription (a campaign may
+    // match several of the channel's subscriptions): if any of them
+    // allows frigate holes, show the frigate-inclusive route (ticket 05,
+    // see `SovFilterNode::allows_frigate_holes_anywhere`'s doc comment for
+    // the same "more permissive is the conservative display choice"
+    // reasoning applied per-subscription in the alert embed).
+    let allow_frigate_holes = subscriptions
+        .iter()
+        .any(|subscription| subscription.filter.root.allows_frigate_holes_anywhere());
+    let reachable_jumps = |system_id: i64, allow_frigate_holes: bool| {
+        reachability
+            .reachable(system_id, allow_frigate_holes)
+            .map(|info| info.jumps)
+    };
 
     let mut matched: Vec<_> = campaigns
         .into_iter()
@@ -217,7 +230,8 @@ async fn render_for_channel(
                 .unwrap_or_else(|| "Unknown".to_string()),
             None => "Unknown".to_string(),
         };
-        let jumps_text = match reachability.reachable(campaign.solar_system_id) {
+        let jumps_text = match reachability.reachable(campaign.solar_system_id, allow_frigate_holes)
+        {
             Some(info) => format!(
                 "{} jump{}",
                 info.jumps,
@@ -235,7 +249,31 @@ async fn render_for_channel(
         });
     }
 
-    render_sov_timers(&entries)
+    let board = render_sov_timers(&entries);
+    match chain_status_line(reachability.chain_status(observed_at)) {
+        Some(line) => format!("{line}\n{board}"),
+        None => board,
+    }
+}
+
+/// Renders one status line describing the Wanderer chain feed's
+/// freshness, or `None` when it needs no callout (spec: "stale state is
+/// visible ... in `/sov_timers`", worked examples "chain: stale since
+/// <t>" / "chain: not configured"). Silent (no line) once the chain is
+/// fresh, and also silent while it is merely `Pending` its first fetch
+/// (indistinguishable from "not configured" to a channel operator within
+/// the first couple of poll cycles after start-up; the `sov_chain_progress`
+/// health check is the authoritative signal for that narrower window).
+fn chain_status_line(status: crate::sov_feed::SovChainStatus) -> Option<String> {
+    use crate::sov_feed::SovChainStatus;
+    match status {
+        SovChainStatus::NotConfigured => Some("chain: not configured".to_string()),
+        SovChainStatus::Pending | SovChainStatus::Fresh => None,
+        SovChainStatus::Stale { since } => Some(format!(
+            "chain: stale since {}",
+            since.format("%Y-%m-%d %H:%M:%S UTC")
+        )),
+    }
 }
 
 #[cfg(test)]

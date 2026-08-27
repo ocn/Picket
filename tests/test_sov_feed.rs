@@ -18,10 +18,13 @@ use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use killbot_rust::contract_intelligence::ContractCollectionStore;
 use killbot_rust::esi_cache::{CacheMetadata, EsiError, EsiResponse};
 use killbot_rust::sov_feed::{
-    PreparedSovDelivery, SovAlertStage, SovCampaign, SovClock, SovCollector, SovDelivery,
-    SovDeliveryError, SovFilter, SovFilterCondition, SovFilterNode, SovReachabilityInfo,
-    SovReachabilitySource, SovStore, SovSubscription, SovSystemDirectory, SovSystemInfo,
-    SovTickerResolver, SovereigntyEsi, StaticSovReachability,
+    DynamicChainSovReachability, PreparedSovDelivery, SovAlertStage, SovCampaign,
+    SovChainCollector, SovChainStatus, SovClock, SovCollector, SovDelivery, SovDeliveryError,
+    SovFilter, SovFilterCondition, SovFilterNode, SovReachabilityInfo, SovReachabilitySource,
+    SovStore, SovSubscription, SovSystemDirectory, SovSystemInfo, SovTickerResolver,
+    SovereigntyEsi, StargateGraph, StargateGraphFile, StaticSovReachability, WandererChainSource,
+    WandererConnection, WandererConnectionType, WandererError, WandererMassStatus,
+    WandererShipSizeType, WandererSystem, WandererTimeStatus,
 };
 use killbot_rust::spawn_sov_collection_loop;
 use sqlx::Row;
@@ -191,11 +194,22 @@ impl FakeSovReachability {
         }
     }
 
-    /// A graph is available; only the given systems are reachable.
+    /// A graph is available; only the given systems are reachable, purely
+    /// over stargates (`via_chain: false`, `path_risk: None`).
     fn with(pairs: Vec<(i64, i64, Vec<i64>)>) -> Self {
         let info = pairs
             .into_iter()
-            .map(|(system_id, jumps, route)| (system_id, SovReachabilityInfo { jumps, route }))
+            .map(|(system_id, jumps, route)| {
+                (
+                    system_id,
+                    SovReachabilityInfo {
+                        jumps,
+                        route,
+                        via_chain: false,
+                        path_risk: None,
+                    },
+                )
+            })
             .collect();
         Self {
             info,
@@ -205,7 +219,11 @@ impl FakeSovReachability {
 }
 
 impl SovReachabilitySource for FakeSovReachability {
-    fn reachable(&self, solar_system_id: i64) -> Option<SovReachabilityInfo> {
+    fn reachable(
+        &self,
+        solar_system_id: i64,
+        _allow_frigate_holes: bool,
+    ) -> Option<SovReachabilityInfo> {
         self.info.get(&solar_system_id).cloned()
     }
 
@@ -1966,7 +1984,10 @@ async fn reachable_subscription_posts_only_the_reachable_campaign_and_the_embed_
         &store,
         "roamers",
         SovFilter {
-            root: SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 11 }),
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 11,
+                allow_frigate_holes: false,
+            }),
         },
         None,
     )
@@ -2052,7 +2073,10 @@ async fn reachable_composes_with_defender_via_and() {
         "reachable-defender",
         SovFilter {
             root: SovFilterNode::And(vec![
-                SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 11 }),
+                SovFilterNode::Condition(SovFilterCondition::Reachable {
+                    max_jumps: 11,
+                    allow_frigate_holes: false,
+                }),
                 SovFilterNode::Condition(SovFilterCondition::Defender {
                     alliance_ids: vec![99_006_751],
                 }),
@@ -2135,7 +2159,10 @@ async fn graph_unavailable_makes_reachable_never_match_but_other_subscriptions_s
         &store,
         "reachable-sub",
         SovFilter {
-            root: SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 11 }),
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 11,
+                allow_frigate_holes: false,
+            }),
         },
         None,
     )
@@ -2189,6 +2216,603 @@ async fn graph_unavailable_makes_reachable_never_match_but_other_subscriptions_s
             .expect("count deliveries"),
         1
     );
+
+    database.destroy().await;
+}
+
+// --- Wanderer chain reachability (ticket 05) ---
+//
+// `FakeWandererChainSource` mirrors `FakeSovereigntyEsi`'s scripted-queue
+// shape: connections responses are scripted per cycle (repeating the last
+// once exhausted); systems are returned fixed since no test here reads
+// system facts back (`WandererSystem` is retained on `ChainSnapshot` for
+// forward compatibility only -- ticket 05's own acceptance criteria).
+// `synthetic_stargate_graph` builds a `StargateGraph` from a plain edge
+// list via the public `StargateGraphFile` shape, since
+// `StargateGraph::from_edges` is a `#[cfg(test)]`-only helper invisible to
+// this external integration-test crate.
+
+struct FakeWandererChainSource {
+    connection_responses: Vec<Result<Vec<WandererConnection>, WandererError>>,
+    cursor: Mutex<usize>,
+}
+
+impl FakeWandererChainSource {
+    fn new(connection_responses: Vec<Result<Vec<WandererConnection>, WandererError>>) -> Self {
+        Self {
+            connection_responses,
+            cursor: Mutex::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl WandererChainSource for FakeWandererChainSource {
+    async fn fetch_systems(&self) -> Result<Vec<WandererSystem>, WandererError> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch_connections(&self) -> Result<Vec<WandererConnection>, WandererError> {
+        assert!(
+            !self.connection_responses.is_empty(),
+            "fake wanderer chain source was called but has no scripted responses"
+        );
+        let mut cursor = self.cursor.lock().unwrap();
+        let index = (*cursor).min(self.connection_responses.len() - 1);
+        *cursor += 1;
+        self.connection_responses[index].clone()
+    }
+}
+
+fn synthetic_stargate_graph(edges: &[(i64, i64)]) -> StargateGraph {
+    let mut adjacency: std::collections::BTreeMap<i64, Vec<i64>> =
+        std::collections::BTreeMap::new();
+    for &(a, b) in edges {
+        adjacency.entry(a).or_default().push(b);
+        adjacency.entry(b).or_default().push(a);
+    }
+    StargateGraph::from_file(StargateGraphFile {
+        sde_version: "test".to_string(),
+        source_last_modified: None,
+        generated_at: Utc::now(),
+        system_count: adjacency.len(),
+        edge_count: edges.len(),
+        adjacency,
+    })
+}
+
+fn wormhole(
+    source: i64,
+    target: i64,
+    mass_status: WandererMassStatus,
+    time_status: WandererTimeStatus,
+    ship_size_type: WandererShipSizeType,
+) -> WandererConnection {
+    WandererConnection {
+        solar_system_source: source,
+        solar_system_target: target,
+        id: None,
+        map_id: None,
+        connection_type: WandererConnectionType::Wormhole,
+        mass_status,
+        time_status,
+        ship_size_type,
+        wormhole_type: None,
+        locked: false,
+    }
+}
+
+#[tokio::test]
+async fn chain_collect_cycle_persists_a_snapshot_and_a_shortcut_beats_the_gate_route() {
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    // Home (1) to system 6 is 5 gate jumps without any chain data.
+    let graph = synthetic_stargate_graph(&[(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]);
+    let dynamic = Arc::new(DynamicChainSovReachability::new(graph, 1));
+    assert_eq!(dynamic.reachable(6, false).unwrap().jumps, 5);
+
+    let source = FakeWandererChainSource::new(vec![Ok(vec![wormhole(
+        1,
+        6,
+        WandererMassStatus::Normal,
+        WandererTimeStatus::Normal,
+        WandererShipSizeType::Medium,
+    )])]);
+    let clock = VirtualSovClock::new(Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap());
+    let collector = SovChainCollector::new(store.clone(), Arc::new(source), dynamic.clone())
+        .with_clock(clock.clone());
+
+    let report = collector.collect_cycle().await.expect("first chain cycle");
+    assert!(report.topology_changed);
+    assert!(report.recomputed);
+
+    let info = dynamic
+        .reachable(6, false)
+        .expect("reachable via the chain shortcut");
+    assert_eq!(info.jumps, 1);
+    assert!(info.via_chain);
+
+    let latest = store
+        .latest_chain_snapshot()
+        .await
+        .expect("load latest snapshot")
+        .expect("a snapshot exists after a successful fetch");
+    assert_eq!(latest.connections.len(), 1);
+    assert_eq!(latest.fetched_at, clock.now());
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn chain_collect_cycle_excludes_a_critical_mass_hole_from_every_route() {
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    let graph = synthetic_stargate_graph(&[(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]);
+    let dynamic = Arc::new(DynamicChainSovReachability::new(graph, 1));
+
+    let source = FakeWandererChainSource::new(vec![Ok(vec![wormhole(
+        1,
+        6,
+        WandererMassStatus::Critical,
+        WandererTimeStatus::Normal,
+        WandererShipSizeType::Medium,
+    )])]);
+    let clock = VirtualSovClock::new(Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap());
+    let collector =
+        SovChainCollector::new(store.clone(), Arc::new(source), dynamic.clone()).with_clock(clock);
+    collector
+        .collect_cycle()
+        .await
+        .expect("chain cycle with a critical-mass hole");
+
+    let info = dynamic
+        .reachable(6, false)
+        .expect("still reachable by gate");
+    assert_eq!(info.jumps, 5);
+    assert!(!info.via_chain);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn chain_collect_cycle_recomputes_when_an_existing_holes_mass_status_degrades_to_critical() {
+    // Reviewer finding: a mass change on an *existing* edge (no edge
+    // added or removed) must still trigger a recompute, and the hole
+    // must stop being traversable in the freshly recomputed variants.
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    let graph = synthetic_stargate_graph(&[(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]);
+    let dynamic = Arc::new(DynamicChainSovReachability::new(graph, 1));
+
+    let source = FakeWandererChainSource::new(vec![
+        Ok(vec![wormhole(
+            1,
+            6,
+            WandererMassStatus::Normal,
+            WandererTimeStatus::Normal,
+            WandererShipSizeType::Medium,
+        )]),
+        Ok(vec![wormhole(
+            1,
+            6,
+            WandererMassStatus::Critical,
+            WandererTimeStatus::Normal,
+            WandererShipSizeType::Medium,
+        )]),
+    ]);
+    let clock = VirtualSovClock::new(Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap());
+    let collector = SovChainCollector::new(store.clone(), Arc::new(source), dynamic.clone())
+        .with_clock(clock.clone());
+
+    let first_report = collector.collect_cycle().await.expect("first chain cycle");
+    assert!(first_report.recomputed);
+    let via_shortcut = dynamic
+        .reachable(6, false)
+        .expect("reachable via the chain shortcut");
+    assert_eq!(via_shortcut.jumps, 1);
+    assert!(via_shortcut.via_chain);
+
+    clock.advance(ChronoDuration::minutes(2));
+    let second_report = collector
+        .collect_cycle()
+        .await
+        .expect("second chain cycle, same edge now critical");
+    assert!(
+        second_report.recomputed,
+        "an attribute-only change on an existing edge must still trigger a recompute"
+    );
+    let after_critical = dynamic
+        .reachable(6, false)
+        .expect("still reachable by gate once the hole goes critical");
+    assert_eq!(after_critical.jumps, 5);
+    assert!(!after_critical.via_chain);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn chain_collect_cycle_excludes_frigate_hole_by_default_and_includes_it_when_allowed() {
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    let graph = synthetic_stargate_graph(&[(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]);
+    let dynamic = Arc::new(DynamicChainSovReachability::new(graph, 1));
+
+    let source = FakeWandererChainSource::new(vec![Ok(vec![wormhole(
+        1,
+        6,
+        WandererMassStatus::Normal,
+        WandererTimeStatus::Normal,
+        WandererShipSizeType::Frigate,
+    )])]);
+    let clock = VirtualSovClock::new(Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap());
+    let collector =
+        SovChainCollector::new(store.clone(), Arc::new(source), dynamic.clone()).with_clock(clock);
+    collector
+        .collect_cycle()
+        .await
+        .expect("chain cycle with a frigate-only hole");
+
+    let without_frigate = dynamic
+        .reachable(6, false)
+        .expect("gate route still exists");
+    assert_eq!(without_frigate.jumps, 5);
+    assert!(!without_frigate.via_chain);
+
+    let with_frigate = dynamic
+        .reachable(6, true)
+        .expect("chain route counted when frigate holes are allowed");
+    assert_eq!(with_frigate.jumps, 1);
+    assert!(with_frigate.via_chain);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn chain_collect_cycle_keeps_the_last_snapshot_and_errors_on_a_wanderer_failure() {
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    let graph = synthetic_stargate_graph(&[]);
+    let dynamic = Arc::new(DynamicChainSovReachability::new(graph, 1));
+
+    let source = FakeWandererChainSource::new(vec![
+        Ok(vec![wormhole(
+            1,
+            2,
+            WandererMassStatus::Normal,
+            WandererTimeStatus::Normal,
+            WandererShipSizeType::Medium,
+        )]),
+        Err(WandererError::Status {
+            status: 503,
+            body_summary: "maintenance".to_string(),
+        }),
+    ]);
+    let clock = VirtualSovClock::new(Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap());
+    let collector = SovChainCollector::new(store.clone(), Arc::new(source), dynamic.clone())
+        .with_clock(clock.clone());
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("first cycle succeeds");
+    let before = dynamic
+        .reachable(2, false)
+        .expect("reachable after the first successful fetch");
+    let first_fetched_at = clock.now();
+
+    clock.advance(ChronoDuration::minutes(2));
+    let result = collector.collect_cycle().await;
+    assert!(
+        result.is_err(),
+        "a Wanderer error must surface as Err, never a panic"
+    );
+
+    let after = dynamic
+        .reachable(2, false)
+        .expect("still reachable via the retained last-good snapshot");
+    assert_eq!(
+        before, after,
+        "a failed fetch must not change reachability at all"
+    );
+
+    let latest = store
+        .latest_chain_snapshot()
+        .await
+        .expect("load latest snapshot")
+        .expect("the earlier successful snapshot is still the latest one");
+    assert_eq!(
+        latest.fetched_at, first_fetched_at,
+        "a failed fetch must not persist a new snapshot row"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn chain_status_reports_stale_after_ten_minutes_and_reachability_keeps_the_last_good_snapshot(
+) {
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    let graph = synthetic_stargate_graph(&[]);
+    let dynamic = Arc::new(DynamicChainSovReachability::new(graph, 1));
+
+    let source = FakeWandererChainSource::new(vec![Ok(vec![wormhole(
+        1,
+        2,
+        WandererMassStatus::Normal,
+        WandererTimeStatus::Normal,
+        WandererShipSizeType::Medium,
+    )])]);
+    let start = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let clock = VirtualSovClock::new(start);
+    let collector = SovChainCollector::new(store.clone(), Arc::new(source), dynamic.clone())
+        .with_clock(clock.clone());
+    collector
+        .collect_cycle()
+        .await
+        .expect("first successful chain cycle");
+
+    assert_eq!(
+        dynamic
+            .reachable(2, false)
+            .expect("route from the first fetch")
+            .jumps,
+        1
+    );
+    assert_eq!(dynamic.chain_status(clock.now()), SovChainStatus::Fresh);
+
+    // `chain_status` takes `now` explicitly (no wall-clock read inside
+    // `DynamicChainSovReachability`) precisely so this assertion can
+    // advance the same virtual clock the fetch used, rather than sleeping
+    // for real or reading the real wall clock (ticket 14 lesson: no
+    // wall-clock-timing-dependent tests).
+    clock.advance(ChronoDuration::minutes(11));
+    match dynamic.chain_status(clock.now()) {
+        SovChainStatus::Stale { since } => assert_eq!(since, start),
+        other => panic!("expected Stale, got {other:?}"),
+    }
+    // Reachability itself is untouched by a stale status: the last good
+    // (recomputed) snapshot keeps serving routes regardless.
+    assert_eq!(
+        dynamic
+            .reachable(2, false)
+            .expect("still serving the last good snapshot")
+            .jumps,
+        1
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn eol_hole_path_risk_appears_in_the_delivered_sov_campaign_embed() {
+    let database = TemporaryDatabase::new().await;
+    let (sov_store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &sov_store,
+        "roamers",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 11,
+                allow_frigate_holes: false,
+            }),
+        },
+        None,
+    )
+    .await;
+
+    // No stargate edge at all between these two systems: the only route
+    // is the wormhole fetched below, so the embed's Path Risk line comes
+    // entirely from the chain.
+    let graph = synthetic_stargate_graph(&[]);
+    let dynamic = Arc::new(DynamicChainSovReachability::new(graph, 30_005_174));
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let chain_source = FakeWandererChainSource::new(vec![Ok(vec![wormhole(
+        30_005_174,
+        30_004_737,
+        WandererMassStatus::Depleted,
+        WandererTimeStatus::Eol4Hours,
+        WandererShipSizeType::Medium,
+    )])]);
+    let chain_clock = VirtualSovClock::new(observed_at);
+    let chain_collector =
+        SovChainCollector::new(sov_store.clone(), Arc::new(chain_source), dynamic.clone())
+            .with_clock(chain_clock);
+    chain_collector
+        .collect_cycle()
+        .await
+        .expect("chain fetch establishes the EOL wormhole route");
+
+    let reachable_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(2),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![reachable_campaign.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let campaign_clock = VirtualSovClock::new(observed_at);
+    let reachability: Arc<dyn SovReachabilitySource> = dynamic;
+    let collector = collector_with_reachability(
+        sov_store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        campaign_clock.clone(),
+        reachability,
+    );
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    campaign_clock.advance(ChronoDuration::seconds(10));
+    let report = collector.collect_cycle().await.expect("second cycle");
+
+    assert_eq!(report.alerts_prepared, 1);
+    let sent = delivery.sent();
+    assert_eq!(sent.len(), 1);
+    let risk_field = sent[0]
+        .message
+        .fields
+        .iter()
+        .find(|field| field.name == "Path Risk")
+        .expect("embed carries a Path Risk field for a route crossing a wormhole");
+    assert_eq!(risk_field.value, "worst hole: EOL <4h, mass <50%");
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn gate_only_route_has_no_path_risk_line_in_the_delivered_embed() {
+    let database = TemporaryDatabase::new().await;
+    let (sov_store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &sov_store,
+        "roamers",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 11,
+                allow_frigate_holes: false,
+            }),
+        },
+        None,
+    )
+    .await;
+
+    // A direct stargate edge; the chain fetch this cycle has no
+    // connections at all, so the resulting route is pure gates.
+    let graph = synthetic_stargate_graph(&[(30_005_174, 30_004_737)]);
+    let dynamic = Arc::new(DynamicChainSovReachability::new(graph, 30_005_174));
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let chain_source = FakeWandererChainSource::new(vec![Ok(Vec::new())]);
+    let chain_clock = VirtualSovClock::new(observed_at);
+    let chain_collector =
+        SovChainCollector::new(sov_store.clone(), Arc::new(chain_source), dynamic.clone())
+            .with_clock(chain_clock);
+    chain_collector
+        .collect_cycle()
+        .await
+        .expect("chain fetch with an empty connection list");
+
+    let reachable_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(2),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![reachable_campaign.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let campaign_clock = VirtualSovClock::new(observed_at);
+    let reachability: Arc<dyn SovReachabilitySource> = dynamic;
+    let collector = collector_with_reachability(
+        sov_store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        campaign_clock.clone(),
+        reachability,
+    );
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    campaign_clock.advance(ChronoDuration::seconds(10));
+    let report = collector.collect_cycle().await.expect("second cycle");
+
+    assert_eq!(report.alerts_prepared, 1);
+    let sent = delivery.sent();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0]
+        .message
+        .fields
+        .iter()
+        .any(|field| field.name == "Reachability"));
+    assert!(
+        !sent[0]
+            .message
+            .fields
+            .iter()
+            .any(|field| field.name == "Path Risk"),
+        "a gate-only route must never carry a Path Risk line"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_subscription_without_reachable_is_unaffected_by_dynamic_chain_reachability() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "defender-only",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Defender {
+                alliance_ids: vec![99_006_751],
+            }),
+        },
+        None,
+    )
+    .await;
+
+    let graph = synthetic_stargate_graph(&[]);
+    let dynamic: Arc<dyn SovReachabilitySource> =
+        Arc::new(DynamicChainSovReachability::new(graph, 1));
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let unreachable_campaign = campaign(
+        1,
+        30_009_999,
+        99_006_751,
+        observed_at + ChronoDuration::hours(2),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![unreachable_campaign.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        dynamic,
+    );
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    clock.advance(ChronoDuration::seconds(10));
+    let report = collector.collect_cycle().await.expect("second cycle");
+
+    // A `Defender`-only subscription never looks at reachability at all;
+    // swapping `StaticSovReachability` for `DynamicChainSovReachability`
+    // must not change that.
+    assert_eq!(report.alerts_prepared, 1);
+    assert_eq!(delivery.sent_count(), 1);
+    assert_eq!(delivery.sent()[0].subscription_name, "defender-only");
 
     database.destroy().await;
 }

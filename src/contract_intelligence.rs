@@ -2335,6 +2335,7 @@ struct HealthInputs {
     regional_progress: Vec<(i64, Option<DateTime<Utc>>)>,
     esi_progress_at: Option<DateTime<Utc>>,
     sov_esi_progress_at: Option<DateTime<Utc>>,
+    sov_chain_progress_at: Option<DateTime<Utc>>,
     esi_pause_until: Option<DateTime<Utc>>,
     due_backlog_count: i64,
     oldest_due_backlog_at: Option<DateTime<Utc>>,
@@ -2392,6 +2393,10 @@ impl HealthCycle {
             inputs.sov_esi_progress_at,
             observed_at,
             &self.thresholds,
+        ));
+        checks.push(sov_chain_progress_health_check(
+            inputs.sov_chain_progress_at,
+            observed_at,
         ));
         checks.push(permanent_delivery_health_check(
             "permanent_delivery_failure",
@@ -2703,6 +2708,53 @@ fn sov_esi_progress_health_check(
         thresholds.esi_progress_critical,
         "sov campaign ESI progress",
     )
+}
+
+/// Wanderer chain reachability's health signal (ticket 05, spec: "stale
+/// state is visible in the health snapshot ... never Critical merely
+/// because the feature is disabled"). `sov_chain_progress_at` is
+/// `max(fetched_at)` across `sov_chain_snapshots` -- `None` covers both
+/// "the chain feature is not configured at all" and "configured, but no
+/// successful fetch has completed yet", neither of which is an anomaly
+/// worth degrading the Runtime Health Snapshot for (mirrors
+/// `sov_esi_progress_health_check`'s "never started" neutrality). Once
+/// evidence exists, staleness beyond `crate::sov_feed::SOV_CHAIN_STALE_AFTER`
+/// degrades the check; there is deliberately no Critical tier here at
+/// all (unlike `sov_esi_progress`, which shares its thresholds with the
+/// always-running contract collector) -- a Wanderer outage degrades the
+/// board shown by `/sov_timers`, it does not represent a component the
+/// watchdog should escalate on the same footing as a stalled killmail
+/// pipeline.
+fn sov_chain_progress_health_check(
+    sov_chain_progress_at: Option<DateTime<Utc>>,
+    observed_at: DateTime<Utc>,
+) -> HealthCheck {
+    let Some(progress_at) = sov_chain_progress_at else {
+        return HealthCheck {
+            key: "sov_chain_progress".to_string(),
+            status: HealthStatus::Healthy,
+            observed_at,
+            evidence:
+                "no wanderer chain snapshot fetched yet (feature not configured or not started)"
+                    .to_string(),
+            consecutive_failures: 0,
+        };
+    };
+    let age = observed_at
+        .signed_duration_since(progress_at)
+        .max(ChronoDuration::zero());
+    let status = if age >= crate::sov_feed::SOV_CHAIN_STALE_AFTER {
+        HealthStatus::Degraded
+    } else {
+        HealthStatus::Healthy
+    };
+    HealthCheck {
+        key: "sov_chain_progress".to_string(),
+        status,
+        observed_at,
+        evidence: format!("wanderer chain snapshot is {}s old", age.num_seconds()),
+        consecutive_failures: 0,
+    }
 }
 
 fn progress_health_check(
@@ -5364,6 +5416,18 @@ impl ContractCollectionStore {
         )
         .fetch_one(&self.pool)
         .await?;
+        // Wanderer chain reachability progress (ticket 05): a row only
+        // ever exists after a successful fetch (see the
+        // `sov_chain_snapshots` migration's doc comment), so `max(fetched_at)`
+        // is exactly "last successful fetch" -- `None` when the feature is
+        // unconfigured or has never completed a fetch, handled the same
+        // "neutral, not degraded" way as `sov_esi_progress_at` above by
+        // `sov_chain_progress_health_check`.
+        let sov_chain_progress_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT max(fetched_at) FROM sov_chain_snapshots",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         let esi_pause_until = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
             "SELECT pause_until FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
         )
@@ -5427,6 +5491,7 @@ impl ContractCollectionStore {
             regional_progress,
             esi_progress_at,
             sov_esi_progress_at,
+            sov_chain_progress_at,
             esi_pause_until,
             due_backlog_count,
             oldest_due_backlog_at,
