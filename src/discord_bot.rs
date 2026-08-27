@@ -16,6 +16,7 @@ use crate::presentation::{
     LocationSystem,
 };
 use crate::processor::{AttackerKey, Color, NamedFilterResult};
+use crate::sov_feed;
 use chrono::{DateTime, FixedOffset, Utc};
 use serde_json::Value;
 use serenity::async_trait;
@@ -692,6 +693,142 @@ pub fn contract_notification_embed(message: &ContractNotificationMessage) -> Cre
         embed.timestamp(timestamp.to_rfc3339());
     }
     embed
+}
+
+/// Renders one sov campaign notification (spec "Embed": title, fields,
+/// footer naming the stage). Mirrors `contract_notification_embed`.
+pub fn sov_campaign_embed(message: &sov_feed::SovNotificationMessage) -> CreateEmbed {
+    let mut embed = CreateEmbed::default();
+    embed.title(&message.title);
+    for field in &message.fields {
+        embed.field(&field.name, &field.value, field.inline);
+    }
+    embed.footer(|builder| builder.text(&message.footer));
+    embed
+}
+
+pub struct DiscordSovDelivery {
+    http: Arc<Http>,
+}
+
+impl DiscordSovDelivery {
+    pub fn new(http: Arc<Http>) -> Self {
+        Self { http }
+    }
+}
+
+#[async_trait]
+impl sov_feed::SovDelivery for DiscordSovDelivery {
+    async fn send(
+        &self,
+        delivery: sov_feed::PreparedSovDelivery,
+    ) -> Result<String, sov_feed::SovDeliveryError> {
+        let message = ChannelId(delivery.channel_id)
+            .send_message(&self.http, |builder| {
+                if let Some(role_id) = delivery.role_id {
+                    builder.content(format!("<@&{role_id}>"));
+                }
+                builder.allowed_mentions(|mentions| {
+                    let mentions = mentions.empty_parse();
+                    match delivery.role_id {
+                        Some(role_id) => mentions.roles([role_id]),
+                        None => mentions,
+                    }
+                });
+                builder.set_embed(sov_campaign_embed(&delivery.message));
+                builder
+                    .0
+                    .insert("nonce", Value::String(delivery.nonce.clone()));
+                builder
+                    .0
+                    .insert("enforce_nonce", Value::Bool(delivery.enforce_nonce));
+                builder
+            })
+            .await
+            .map_err(sov_delivery_error)?;
+        Ok(message.id.to_string())
+    }
+}
+
+/// Classifies a Serenity send failure as transient or permanent, reusing
+/// the same Discord HTTP status/JSON-code judgment as the contract feed's
+/// `contract_delivery_error` (`is_temporary_discord_delivery_code`,
+/// `is_permanent_discord_delivery_code`): 429/5xx and the known-temporary
+/// codes retry; 401/403/404/405 and the known-permanent codes (channel or
+/// message gone, missing permissions, and similar) never retry (review
+/// finding 3).
+fn sov_delivery_error(error: serenity::Error) -> sov_feed::SovDeliveryError {
+    let message = error.to_string();
+    if let serenity::Error::Http(http_error) = &error {
+        if let serenity::http::error::Error::UnsuccessfulRequest(response) = &**http_error {
+            let status = response.status_code.as_u16();
+            let code = response.error.code;
+            let detail = format!(
+                "Discord HTTP {status}, JSON code {code}: {}",
+                response.error.message
+            );
+            if status == 429 || status >= 500 || is_temporary_discord_delivery_code(code) {
+                return sov_feed::SovDeliveryError::transient(detail);
+            }
+            if matches!(status, 401 | 403 | 404 | 405) || is_permanent_discord_delivery_code(code) {
+                return sov_feed::SovDeliveryError::permanent(detail);
+            }
+            // Ambiguous Discord outcomes retry rather than give up
+            // permanently: this feed has no repair/edit path to revisit a
+            // permanently-abandoned delivery later, unlike the contract
+            // feed's `Ambiguous` tier.
+            return sov_feed::SovDeliveryError::transient(detail);
+        }
+    }
+    sov_feed::SovDeliveryError::transient(message)
+}
+
+/// Synchronous system/region lookups for the sov feed, backed by the
+/// killfeed's `config/systems.json` cache. No ESI fallback: sov campaigns
+/// only ever reference known k-space systems already present in that
+/// cache.
+pub struct DiscordSovSystemDirectory {
+    app_state: Arc<AppState>,
+}
+
+impl DiscordSovSystemDirectory {
+    pub fn new(app_state: Arc<AppState>) -> Self {
+        Self { app_state }
+    }
+}
+
+impl sov_feed::SovSystemDirectory for DiscordSovSystemDirectory {
+    fn resolve(&self, solar_system_id: i64) -> Option<sov_feed::SovSystemInfo> {
+        let system_id = u32::try_from(solar_system_id).ok()?;
+        let systems = self.app_state.systems.read().unwrap();
+        systems
+            .get(&system_id)
+            .map(|system| sov_feed::SovSystemInfo {
+                name: system.name.clone(),
+                region_name: system.region.clone(),
+                region_id: system.region_id as i64,
+            })
+    }
+}
+
+/// Alliance ticker lookup for the sov feed's defender ticker, reusing the
+/// killfeed's tickers cache with an ESI fallback.
+pub struct DiscordSovTickerResolver {
+    app_state: Arc<AppState>,
+}
+
+impl DiscordSovTickerResolver {
+    pub fn new(app_state: Arc<AppState>) -> Self {
+        Self { app_state }
+    }
+}
+
+#[async_trait]
+impl sov_feed::SovTickerResolver for DiscordSovTickerResolver {
+    async fn alliance_ticker(&self, alliance_id: i64) -> Option<String> {
+        let id = u64::try_from(alliance_id).ok()?;
+        get_ticker(&self.app_state, id, true).await
+    }
 }
 
 pub struct CommandMap;
@@ -2344,7 +2481,11 @@ async fn compute_fleet_composition(
 }
 
 /// Get ticker for an entity (alliance or corporation)
-async fn get_ticker(app_state: &Arc<AppState>, id: u64, is_alliance: bool) -> Option<String> {
+pub(crate) async fn get_ticker(
+    app_state: &Arc<AppState>,
+    id: u64,
+    is_alliance: bool,
+) -> Option<String> {
     // Check tickers cache first
     {
         let tickers = app_state.tickers.read().unwrap();

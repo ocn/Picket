@@ -331,28 +331,28 @@ pub(crate) fn merge_cache_metadata(
 
 /// A snapshot of the persisted legacy ESI error-limit row, as last observed.
 #[derive(Clone, Copy)]
-pub(crate) struct CurrentLegacyErrorLimit {
-    pub(crate) remaining: i64,
-    pub(crate) reset_at: DateTime<Utc>,
+pub struct CurrentLegacyErrorLimit {
+    pub remaining: i64,
+    pub reset_at: DateTime<Utc>,
 }
 
-/// Crate-visible access to a feed's persisted ESI limiter row.
+/// Access to a feed's persisted ESI limiter row.
 ///
 /// The legacy `x-esi-error-limit-*` allowance is global per application
 /// (ADR 0004), so every feed's collector coordinates through the same
 /// persisted row rather than tracking its own error budget. A feed holds a
 /// `dyn EsiLimiterStore` (or is generic over it) to read and record that
 /// row without seeing the rest of the underlying store's persistence
-/// surface.
-// This ticket only prepares the seam: `ContractCollectionStore` implements
-// it below (see `src/contract_intelligence.rs`), but no feed holds a
-// `dyn EsiLimiterStore` / is generic over it yet, so plain `cargo check`
-// (which excludes `#[cfg(test)]`) sees it as unused. The sov timer and
-// watchlist feeds are the intended consumers; remove this allow once one
-// of them lands.
-#[allow(dead_code)]
+/// surface. `ContractCollectionStore` implements it (see
+/// `src/contract_intelligence.rs`); the sov campaign feed's collector is
+/// the first consumer (`src/sov_feed/collector.rs`), obtaining the trait
+/// object at composition-root wiring time in `src/lib.rs` rather than
+/// depending on `contract_intelligence` directly. `pub` (not `pub(crate)`)
+/// because `SovCollector::new` names `Arc<dyn EsiLimiterStore>` in its
+/// public signature and integration tests outside this crate construct
+/// collectors directly.
 #[async_trait]
-pub(crate) trait EsiLimiterStore: Send + Sync {
+pub trait EsiLimiterStore: Send + Sync {
     /// The deadline, if any, until which requests should be paused.
     async fn active_esi_limiter_deadline(&self) -> Result<Option<DateTime<Utc>>, sqlx::Error>;
 

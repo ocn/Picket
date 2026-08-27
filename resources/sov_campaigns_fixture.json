@@ -1,0 +1,68 @@
+[
+  {
+    "attackers_score": 0.4,
+    "campaign_id": 112007,
+    "constellation_id": 20000757,
+    "defender_id": 99006751,
+    "defender_score": 0.6,
+    "event_type": "ihub_defense",
+    "solar_system_id": 30005174,
+    "start_time": "2026-08-27T00:27:42Z",
+    "structure_id": 1053511343965
+  },
+  {
+    "attackers_score": 0.4,
+    "campaign_id": 112008,
+    "constellation_id": 20000693,
+    "defender_id": 99012982,
+    "defender_score": 0.6,
+    "event_type": "ihub_defense",
+    "solar_system_id": 30004737,
+    "start_time": "2026-08-27T03:53:09Z",
+    "structure_id": 1055296006160
+  },
+  {
+    "attackers_score": 0.4,
+    "campaign_id": 112009,
+    "constellation_id": 20000420,
+    "defender_id": 99008788,
+    "defender_score": 0.6,
+    "event_type": "ihub_defense",
+    "solar_system_id": 30002861,
+    "start_time": "2026-08-28T03:18:21Z",
+    "structure_id": 1055284949516
+  },
+  {
+    "attackers_score": 0.4,
+    "campaign_id": 112010,
+    "constellation_id": 20000758,
+    "defender_id": 99012328,
+    "defender_score": 0.6,
+    "event_type": "ihub_defense",
+    "solar_system_id": 30005184,
+    "start_time": "2026-08-27T17:40:56Z",
+    "structure_id": 1053374002233
+  },
+  {
+    "attackers_score": 0.4,
+    "campaign_id": 112011,
+    "constellation_id": 20000758,
+    "defender_id": 99012328,
+    "defender_score": 0.6,
+    "event_type": "ihub_defense",
+    "solar_system_id": 30005183,
+    "start_time": "2026-08-27T19:03:51Z",
+    "structure_id": 1053374001177
+  },
+  {
+    "attackers_score": 0.4,
+    "campaign_id": 112012,
+    "constellation_id": 20000758,
+    "defender_id": 99012328,
+    "defender_score": 0.6,
+    "event_type": "ihub_defense",
+    "solar_system_id": 30005180,
+    "start_time": "2026-08-27T17:01:31Z",
+    "structure_id": 1053366770930
+  }
+]

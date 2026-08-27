@@ -18,12 +18,15 @@ pub mod models;
 pub mod pipeline;
 pub mod presentation;
 pub mod processor;
+pub mod sov_feed;
 pub mod structure_resolver;
 
 use crate::commands::contract_subscribe::ContractSubscribeCommand;
 use crate::commands::contract_unsubscribe::ContractUnsubscribeCommand;
 use crate::commands::find_unsubscribed::FindUnsubscribedChannelsCommand;
 use crate::commands::health::HealthCommand;
+use crate::commands::sov_subscribe::SovSubscribeCommand;
+use crate::commands::sov_unsubscribe::SovUnsubscribeCommand;
 use commands::diag::DiagCommand;
 use commands::subscribe::SubscribeCommand;
 use commands::sync_clear::SyncClearCommand;
@@ -50,6 +53,16 @@ pub struct ContractStoreContainer;
 impl TypeMapKey for ContractStoreContainer {
     type Value = contract_intelligence::ContractStoreHandle;
 }
+
+pub struct SovStoreContainer;
+
+impl TypeMapKey for SovStoreContainer {
+    type Value = sov_feed::SovStoreHandle;
+}
+
+/// Fixed sov campaign collection cadence (spec "Sources and cadence":
+/// "Sovereignty campaigns are polled every sixty seconds").
+const SOV_COLLECTION_INTERVAL: Duration = Duration::from_secs(60);
 
 fn generate_queue_id() -> String {
     rand::thread_rng()
@@ -190,6 +203,12 @@ pub async fn run() {
         contract_unsubscribe_command,
     );
 
+    let sov_subscribe_command = Box::new(SovSubscribeCommand);
+    command_map.insert(sov_subscribe_command.name(), sov_subscribe_command);
+
+    let sov_unsubscribe_command = Box::new(SovUnsubscribeCommand);
+    command_map.insert(sov_unsubscribe_command.name(), sov_unsubscribe_command);
+
     let command_map_arc = Arc::new(command_map);
 
     let contract_runtime = match std::env::var("CONTRACT_DATABASE_URL") {
@@ -204,6 +223,16 @@ pub async fn run() {
     };
     let feed_health_telemetry = Arc::new(feed::FeedHealthTelemetry::new());
     let r2z2_health_enabled = app_config.killmail_feed_provider == FeedProvider::R2z2;
+
+    // Sov campaign feed: same optionality as the contract runtime (spec
+    // "Persistence and process model"). Nothing here touches Postgres: the
+    // handle starts empty and `spawn_sov_collection_loop` (below, after the
+    // Discord client exists) connects and applies migrations from inside
+    // its own retry loop, so a briefly-unavailable Postgres at boot can
+    // never delay the gateway connect or the killmail pipeline (review
+    // finding 1 on
+    // `.scratch/esi-intel-feeds/issues/02-sov-campaign-appeared-alert-end-to-end.md`).
+    let sov_store_handle = sov_feed::new_sov_store_handle();
 
     // --- Start Discord Bot ---
     let discord_token = app_config.discord_bot_token.clone();
@@ -225,9 +254,43 @@ pub async fn run() {
         if let Some((_, store_handle)) = &contract_runtime {
             data.insert::<ContractStoreContainer>(store_handle.clone());
         }
+        if contract_runtime.is_some() {
+            data.insert::<SovStoreContainer>(sov_store_handle.clone());
+        }
     }
 
     let http_client = client.cache_and_http.http.clone();
+
+    if let Some((database_url, _)) = &contract_runtime {
+        let timeout = Duration::from_secs(app_config.esi_http_timeout_secs);
+        match sov_feed::HttpSovereigntyEsi::new(timeout) {
+            Ok(esi) => {
+                let esi: Arc<dyn sov_feed::SovereigntyEsi> = Arc::new(esi);
+                let delivery: Arc<dyn sov_feed::SovDelivery> =
+                    Arc::new(discord_bot::DiscordSovDelivery::new(http_client.clone()));
+                let directory: Arc<dyn sov_feed::SovSystemDirectory> = Arc::new(
+                    discord_bot::DiscordSovSystemDirectory::new(app_state.clone()),
+                );
+                let tickers: Arc<dyn sov_feed::SovTickerResolver> = Arc::new(
+                    discord_bot::DiscordSovTickerResolver::new(app_state.clone()),
+                );
+                spawn_sov_collection_loop(
+                    database_url.clone(),
+                    sov_store_handle,
+                    SOV_COLLECTION_INTERVAL,
+                    esi,
+                    delivery,
+                    directory,
+                    tickers,
+                );
+            }
+            Err(error) => {
+                warn!("Sov campaign feed disabled: HTTP client initialization failed: {error}");
+            }
+        }
+    } else {
+        info!("Sov campaign feed disabled: CONTRACT_DATABASE_URL is not configured");
+    }
 
     if let Some((database_url, store_handle)) = contract_runtime {
         let interval = std::env::var("CONTRACT_COLLECTION_INTERVAL_SECS")
@@ -395,4 +458,117 @@ pub async fn run() {
         feed_health_telemetry,
     )
     .await;
+}
+
+/// Spawns the sov campaign feed's independent collection loop. Generic
+/// over the sov feed's trait objects (not concrete Discord types) so tests
+/// can inject fakes, mirroring
+/// `contract_intelligence::spawn_contract_collection_loop_with_notifications`.
+/// Never awaited on the path to starting the Discord client: this function
+/// itself does not connect to Postgres, it only spawns a task that does
+/// (review finding 1 on
+/// `.scratch/esi-intel-feeds/issues/02-sov-campaign-appeared-alert-end-to-end.md`).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_sov_collection_loop(
+    database_url: String,
+    store_handle: sov_feed::SovStoreHandle,
+    interval: Duration,
+    esi: Arc<dyn sov_feed::SovereigntyEsi>,
+    delivery: Arc<dyn sov_feed::SovDelivery>,
+    directory: Arc<dyn sov_feed::SovSystemDirectory>,
+    tickers: Arc<dyn sov_feed::SovTickerResolver>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_sov_collection_loop(
+        database_url,
+        store_handle,
+        interval,
+        esi,
+        delivery,
+        directory,
+        tickers,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_sov_collection_loop(
+    database_url: String,
+    store_handle: sov_feed::SovStoreHandle,
+    interval: Duration,
+    esi: Arc<dyn sov_feed::SovereigntyEsi>,
+    delivery: Arc<dyn sov_feed::SovDelivery>,
+    directory: Arc<dyn sov_feed::SovSystemDirectory>,
+    tickers: Arc<dyn sov_feed::SovTickerResolver>,
+) {
+    let mut consecutive_failures = 0_u32;
+    loop {
+        let mut delay = interval;
+        // Reconnect every iteration, like the contract feed's own loop
+        // (`run_contract_collection_loop_with_notifications_and_region_concurrency`):
+        // this both re-applies migrations idempotently (harmless; sqlx's
+        // migration lock serializes concurrent runs) and lets the loop
+        // self-heal after Postgres was briefly unavailable, without any
+        // separate reconnect path.
+        match contract_intelligence::ContractCollectionStore::connect(&database_url).await {
+            Ok(limiter_store) => match sov_feed::SovStore::connect(&database_url).await {
+                Ok(store) => {
+                    let store = Arc::new(store);
+                    *store_handle.write().await = Some(store.clone());
+                    let collector = sov_feed::SovCollector::new(
+                        (*store).clone(),
+                        esi.clone(),
+                        Arc::new(limiter_store),
+                        delivery.clone(),
+                        directory.clone(),
+                        tickers.clone(),
+                    );
+                    match collector.collect_cycle().await {
+                        Ok(report) => {
+                            if let Some(paused_until) = report.paused_until {
+                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                delay = contract_intelligence::collection_retry_delay(
+                                    interval,
+                                    Some(paused_until),
+                                    consecutive_failures,
+                                );
+                            } else {
+                                consecutive_failures = 0;
+                            }
+                        }
+                        Err(error) => {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            delay = contract_intelligence::collection_retry_delay(
+                                interval,
+                                None,
+                                consecutive_failures,
+                            );
+                            warn!("sov campaign collection paused after failure: {error}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    delay = contract_intelligence::collection_retry_delay(
+                        interval,
+                        None,
+                        consecutive_failures,
+                    );
+                    *store_handle.write().await = None;
+                    warn!(
+                        "sov campaign feed database unavailable; retrying without an in-memory fallback: {error}"
+                    );
+                }
+            },
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                delay = contract_intelligence::collection_retry_delay(
+                    interval,
+                    None,
+                    consecutive_failures,
+                );
+                *store_handle.write().await = None;
+                warn!("sov campaign feed migrations unavailable; retrying: {error}");
+            }
+        }
+        tokio::time::sleep(delay).await;
+    }
 }

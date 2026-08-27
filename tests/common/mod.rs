@@ -4,9 +4,12 @@ use killbot_rust::config::{load_app_config, AppConfig, AppState, Subscription, S
 use killbot_rust::models::ZkData;
 use moka::future::Cache;
 use serenity::model::id::GuildId;
+use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use url::Url;
 
 /// Discord channel ID for test embeds
 pub const TEST_CHANNEL_ID: u64 = 1115807643748012072;
@@ -150,4 +153,76 @@ pub fn init_tracing() {
         .with_test_writer()
         .try_init()
         .ok();
+}
+
+static TEMPORARY_DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// A throwaway PostgreSQL database, created against `CONTRACT_TEST_DATABASE_URL`
+/// and dropped in `destroy()`. Generic across feeds (contract, sov, ...): each
+/// test file connects its own store type(s) against `url` and is responsible
+/// for running whatever migrator applies its schema.
+///
+/// `tests/test_contract_intelligence.rs` keeps its own private copy of this
+/// helper (with a `store()` convenience bound to `ContractCollectionStore`);
+/// this generic version exists for other integration test binaries so they
+/// do not need to depend on `contract_intelligence` merely to provision a
+/// database.
+#[allow(dead_code)]
+pub struct TemporaryDatabase {
+    admin_url: String,
+    database_name: String,
+    pub url: String,
+}
+
+#[allow(dead_code)]
+impl TemporaryDatabase {
+    pub async fn new() -> Self {
+        let database = Self::unavailable();
+        database.create().await;
+        database
+    }
+
+    pub fn unavailable() -> Self {
+        let admin_url = std::env::var("CONTRACT_TEST_DATABASE_URL").expect(
+            "CONTRACT_TEST_DATABASE_URL must point to a PostgreSQL instance for integration tests (for example postgres://killbot_contracts:killbot_contracts@127.0.0.1:5433/killbot_contracts)",
+        );
+        let sequence = TEMPORARY_DATABASE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let database_name = format!("killbot_test_{}_{}", std::process::id(), sequence);
+        let mut url = Url::parse(&admin_url).expect("valid CONTRACT_TEST_DATABASE_URL");
+        url.set_path(&format!("/{database_name}"));
+        Self {
+            admin_url,
+            database_name,
+            url: url.to_string(),
+        }
+    }
+
+    pub async fn create(&self) {
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&self.admin_url)
+            .await
+            .expect("connect to test PostgreSQL");
+        sqlx::query(&format!("CREATE DATABASE {}", self.database_name))
+            .execute(&admin)
+            .await
+            .expect("create temporary test database");
+        admin.close().await;
+    }
+
+    pub async fn destroy(self) {
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&self.admin_url)
+            .await
+            .expect("reconnect to test PostgreSQL");
+        sqlx::query(&format!(
+            "DROP DATABASE {} WITH (FORCE)",
+            self.database_name
+        ))
+        .execute(&admin)
+        .await
+        .expect("drop temporary test database");
+        admin.close().await;
+    }
 }
