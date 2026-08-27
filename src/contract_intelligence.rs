@@ -2334,12 +2334,14 @@ struct HealthInputs {
     started_at: Option<DateTime<Utc>>,
     regional_progress: Vec<(i64, Option<DateTime<Utc>>)>,
     esi_progress_at: Option<DateTime<Utc>>,
+    sov_esi_progress_at: Option<DateTime<Utc>>,
     esi_pause_until: Option<DateTime<Utc>>,
     due_backlog_count: i64,
     oldest_due_backlog_at: Option<DateTime<Utc>>,
     prior_backlog_metric: Option<PersistedBacklogMetric>,
     oldest_prepared_delivery_at: Option<DateTime<Utc>>,
     permanent_delivery_failures: i64,
+    sov_permanent_delivery_failures: i64,
     r2z2_progress_at: Option<DateTime<Utc>>,
     feed_validation_at: Option<DateTime<Utc>>,
     feed_validation_failures: i32,
@@ -2386,9 +2388,24 @@ impl HealthCycle {
                 "oldest prepared delivery",
             ),
         ];
+        checks.push(progress_health_check(
+            "sov_esi_progress",
+            inputs.sov_esi_progress_at,
+            startup_at,
+            observed_at,
+            self.thresholds.esi_progress_degraded,
+            self.thresholds.esi_progress_critical,
+            "sov campaign ESI progress",
+        ));
         checks.push(permanent_delivery_health_check(
+            "permanent_delivery_failure",
             observed_at,
             inputs.permanent_delivery_failures,
+        ));
+        checks.push(permanent_delivery_health_check(
+            "sov_permanent_delivery_failure",
+            observed_at,
+            inputs.sov_permanent_delivery_failures,
         ));
         if let Some((enabled, status, error, updated_at)) = &inputs.structure_resolver {
             checks.push(structure_resolver_health_check(
@@ -2785,6 +2802,7 @@ fn feed_validation_health_check(
 }
 
 fn permanent_delivery_health_check(
+    key: &str,
     observed_at: DateTime<Utc>,
     permanent_delivery_failures: i64,
 ) -> HealthCheck {
@@ -2794,7 +2812,7 @@ fn permanent_delivery_health_check(
         HealthStatus::Healthy
     };
     HealthCheck {
-        key: "permanent_delivery_failure".to_string(),
+        key: key.to_string(),
         status,
         observed_at,
         evidence: if permanent_delivery_failures == 0 {
@@ -5290,6 +5308,26 @@ impl ContractCollectionStore {
         )
         .fetch_one(&self.pool)
         .await?;
+        // Sov campaign feed progress is a distinct signal from the
+        // contract feed's own ESI progress above: a stalled contract
+        // collector must not be masked by a healthy sov collector, and
+        // vice versa (review finding 4 on
+        // `.scratch/esi-intel-feeds/issues/02-sov-campaign-appeared-alert-end-to-end.md`).
+        // `sovereignty/campaigns` is the sov feed's own
+        // `esi_cache_metadata` resource key (`src/sov_feed/store.rs`).
+        let sov_esi_progress_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT max(updated_at) FROM esi_cache_metadata WHERE resource_key LIKE 'sovereignty/%'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        // Unresolved permanent sov delivery failures, mirroring
+        // `permanent_delivery_failures` below for the contract feed's own
+        // deliveries (review finding 3).
+        let sov_permanent_delivery_failures = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM sov_alert_deliveries WHERE status = 'failed' AND failure_kind = 'permanent'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         let esi_pause_until = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
             "SELECT pause_until FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
         )
@@ -5352,12 +5390,14 @@ impl ContractCollectionStore {
             started_at,
             regional_progress,
             esi_progress_at,
+            sov_esi_progress_at,
             esi_pause_until,
             due_backlog_count,
             oldest_due_backlog_at,
             prior_backlog_metric,
             oldest_prepared_delivery_at,
             permanent_delivery_failures,
+            sov_permanent_delivery_failures,
             r2z2_progress_at: r2z2_telemetry
                 .as_ref()
                 .and_then(|row| row.get::<Option<DateTime<Utc>>, _>("last_progress_at")),
