@@ -19,8 +19,9 @@ use killbot_rust::contract_intelligence::ContractCollectionStore;
 use killbot_rust::esi_cache::{CacheMetadata, EsiError, EsiResponse};
 use killbot_rust::sov_feed::{
     PreparedSovDelivery, SovAlertStage, SovCampaign, SovClock, SovCollector, SovDelivery,
-    SovDeliveryError, SovFilter, SovFilterCondition, SovFilterNode, SovStore, SovSubscription,
-    SovSystemDirectory, SovSystemInfo, SovTickerResolver, SovereigntyEsi,
+    SovDeliveryError, SovFilter, SovFilterCondition, SovFilterNode, SovReachabilityInfo,
+    SovReachabilitySource, SovStore, SovSubscription, SovSystemDirectory, SovSystemInfo,
+    SovTickerResolver, SovereigntyEsi, StaticSovReachability,
 };
 use killbot_rust::spawn_sov_collection_loop;
 use sqlx::Row;
@@ -172,6 +173,47 @@ impl SovSystemDirectory for FakeSovSystemDirectory {
     }
 }
 
+/// A small in-test reachability source (ticket 04): maps specific system
+/// IDs to jumps/route, or reports "graph unavailable" entirely. Mirrors
+/// `FakeSovSystemDirectory`'s shape.
+struct FakeSovReachability {
+    info: HashMap<i64, SovReachabilityInfo>,
+    available: bool,
+}
+
+impl FakeSovReachability {
+    /// No graph loaded at all: `Reachable` never matches, and `/sov_timers`
+    /// distinguishes this from "unreachable".
+    fn unavailable() -> Self {
+        Self {
+            info: HashMap::new(),
+            available: false,
+        }
+    }
+
+    /// A graph is available; only the given systems are reachable.
+    fn with(pairs: Vec<(i64, i64, Vec<i64>)>) -> Self {
+        let info = pairs
+            .into_iter()
+            .map(|(system_id, jumps, route)| (system_id, SovReachabilityInfo { jumps, route }))
+            .collect();
+        Self {
+            info,
+            available: true,
+        }
+    }
+}
+
+impl SovReachabilitySource for FakeSovReachability {
+    fn reachable(&self, solar_system_id: i64) -> Option<SovReachabilityInfo> {
+        self.info.get(&solar_system_id).cloned()
+    }
+
+    fn graph_available(&self) -> bool {
+        self.available
+    }
+}
+
 struct FakeSovTickerResolver;
 
 #[async_trait]
@@ -304,6 +346,28 @@ fn collector(
     delivery: Arc<FakeSovDelivery>,
     clock: Arc<VirtualSovClock>,
 ) -> SovCollector {
+    collector_with_reachability(
+        store,
+        limiter,
+        esi,
+        delivery,
+        clock,
+        Arc::new(StaticSovReachability(None)),
+    )
+}
+
+/// Like [`collector`] but with an injected reachability source, used by
+/// the `Reachable` filter leaf tests (ticket 04) to exercise the collector
+/// against a small in-test graph rather than the real
+/// `config/stargates.json`.
+fn collector_with_reachability(
+    store: SovStore,
+    limiter: Arc<ContractCollectionStore>,
+    esi: FakeSovereigntyEsi,
+    delivery: Arc<FakeSovDelivery>,
+    clock: Arc<VirtualSovClock>,
+    reachability: Arc<dyn SovReachabilitySource>,
+) -> SovCollector {
     SovCollector::new(
         store,
         Arc::new(esi),
@@ -311,6 +375,7 @@ fn collector(
         delivery,
         Arc::new(FakeSovSystemDirectory::new()),
         Arc::new(FakeSovTickerResolver),
+        reachability,
     )
     .with_clock(clock)
 }
@@ -1021,6 +1086,7 @@ async fn sov_runtime_recovers_the_shared_store_after_postgres_becomes_available(
     let directory: Arc<dyn SovSystemDirectory> = Arc::new(FakeSovSystemDirectory::new());
     let tickers: Arc<dyn SovTickerResolver> = Arc::new(FakeSovTickerResolver);
 
+    let reachability: Arc<dyn SovReachabilitySource> = Arc::new(StaticSovReachability(None));
     let collection_task = spawn_sov_collection_loop(
         database.url.clone(),
         store_handle.clone(),
@@ -1029,6 +1095,7 @@ async fn sov_runtime_recovers_the_shared_store_after_postgres_becomes_available(
         delivery,
         directory,
         tickers,
+        reachability,
     );
 
     let (processing_started, processing_complete) = tokio::sync::oneshot::channel();
@@ -1876,6 +1943,250 @@ async fn a_filter_with_out_of_range_vulnerable_within_hours_never_panics_either_
             .count_deliveries_for(new_campaign.campaign_id, SovAlertStage::TMinus(30))
             .await
             .expect("count T-30 deliveries"),
+        1
+    );
+
+    database.destroy().await;
+}
+
+// --- Reachability tests (ticket 04) ---
+//
+// These inject a small in-test `FakeSovReachability` rather than reading
+// the real `config/stargates.json`, per the ticket's testing decisions:
+// the collector-cycle seam is exercised the same way as every other sov
+// feed test, only with a fake reachability source standing in for the
+// generated graph.
+
+#[tokio::test]
+async fn reachable_subscription_posts_only_the_reachable_campaign_and_the_embed_carries_the_route_line(
+) {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "roamers",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 11 }),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let reachable_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(2),
+    );
+    let unreachable_campaign = campaign(
+        2,
+        30_009_999,
+        99_006_751,
+        observed_at + ChronoDuration::hours(2),
+    );
+
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![reachable_campaign.clone(), unreachable_campaign.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability: Arc<dyn SovReachabilitySource> = Arc::new(FakeSovReachability::with(vec![(
+        30_004_737,
+        1,
+        vec![30_005_174, 30_004_737],
+    )]));
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability,
+    );
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    clock.advance(ChronoDuration::seconds(10));
+    let report = collector.collect_cycle().await.expect("second cycle");
+
+    // Both campaigns are candidates (within the twelve-hour window), but
+    // only the reachable one matches the subscription's Reachable leaf.
+    assert_eq!(report.newly_appeared, 2);
+    assert_eq!(report.alerts_prepared, 1);
+    assert_eq!(delivery.sent_count(), 1);
+    let sent = delivery.sent();
+    assert_eq!(sent[0].subject_id, reachable_campaign.campaign_id);
+    let reachability_field = sent[0]
+        .message
+        .fields
+        .iter()
+        .find(|field| field.name == "Reachability")
+        .expect("embed carries a Reachability field for the reachable campaign");
+    assert!(reachability_field.value.contains("1 jump"));
+    assert!(reachability_field.value.contains("Turnur"));
+    assert!(reachability_field.value.contains("Jita"));
+    assert_eq!(
+        store
+            .count_deliveries_for(unreachable_campaign.campaign_id, SovAlertStage::Appeared)
+            .await
+            .expect("count deliveries for the unreachable campaign"),
+        0
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn reachable_composes_with_defender_via_and() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "reachable-defender",
+        SovFilter {
+            root: SovFilterNode::And(vec![
+                SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 11 }),
+                SovFilterNode::Condition(SovFilterCondition::Defender {
+                    alliance_ids: vec![99_006_751],
+                }),
+            ]),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    // Reachable and the right defender: must post.
+    let matches_both = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(2),
+    );
+    // Reachable but the wrong defender: must not post.
+    let wrong_defender = campaign(
+        2,
+        30_004_737,
+        99_012_982,
+        observed_at + ChronoDuration::hours(2),
+    );
+    // Right defender but unreachable: must not post.
+    let unreachable = campaign(
+        3,
+        30_009_999,
+        99_006_751,
+        observed_at + ChronoDuration::hours(2),
+    );
+
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![
+                matches_both.clone(),
+                wrong_defender.clone(),
+                unreachable.clone(),
+            ],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability: Arc<dyn SovReachabilitySource> = Arc::new(FakeSovReachability::with(vec![(
+        30_004_737,
+        1,
+        vec![30_005_174, 30_004_737],
+    )]));
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability,
+    );
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    clock.advance(ChronoDuration::seconds(10));
+    let report = collector.collect_cycle().await.expect("second cycle");
+
+    assert_eq!(report.alerts_prepared, 1);
+    let sent = delivery.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].subject_id, matches_both.campaign_id);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn graph_unavailable_makes_reachable_never_match_but_other_subscriptions_still_fire() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "reachable-sub",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 11 }),
+        },
+        None,
+    )
+    .await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let new_campaign = campaign(
+        1,
+        30_005_174,
+        99_006_751,
+        observed_at + ChronoDuration::hours(2),
+    );
+
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![new_campaign.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability: Arc<dyn SovReachabilitySource> = Arc::new(FakeSovReachability::unavailable());
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability,
+    );
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    clock.advance(ChronoDuration::seconds(10));
+    let report = collector.collect_cycle().await.expect("second cycle");
+
+    // "reachable-sub" never matches without a loaded graph; "watch-all" is
+    // unaffected and still fires.
+    assert_eq!(report.alerts_prepared, 1);
+    let sent = delivery.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].subscription_name, "watch-all");
+    assert_eq!(
+        store
+            .count_deliveries_for(new_campaign.campaign_id, SovAlertStage::Appeared)
+            .await
+            .expect("count deliveries"),
         1
     );
 

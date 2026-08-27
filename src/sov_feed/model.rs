@@ -207,24 +207,30 @@ impl SovFilterNode {
     /// Evaluates the filter tree against one campaign's facts as of
     /// `observed_at`. `region_of` resolves a solar system ID to a region ID
     /// for the `Region` leaf; an unresolvable system never matches
-    /// `Region`. Passing a resolver instead of a precomputed map keeps this
-    /// pure and unit-testable while letting production supply a live
-    /// systems-cache lookup.
+    /// `Region`. `reachable_jumps` resolves a solar system ID to its jump
+    /// distance from the configured home system for the `Reachable` leaf
+    /// (ticket 04); `None` covers both "unreachable" and "no stargate
+    /// graph is loaded" -- either way `Reachable` never matches. Passing
+    /// resolvers instead of precomputed maps keeps this pure and
+    /// unit-testable while letting production supply live lookups.
     pub fn matches(
         &self,
         campaign: &SovCampaign,
         observed_at: DateTime<Utc>,
         region_of: &dyn Fn(i64) -> Option<i64>,
+        reachable_jumps: &dyn Fn(i64) -> Option<i64>,
     ) -> bool {
         match self {
-            Self::Condition(condition) => condition.matches(campaign, observed_at, region_of),
+            Self::Condition(condition) => {
+                condition.matches(campaign, observed_at, region_of, reachable_jumps)
+            }
             Self::And(nodes) => nodes
                 .iter()
-                .all(|node| node.matches(campaign, observed_at, region_of)),
+                .all(|node| node.matches(campaign, observed_at, region_of, reachable_jumps)),
             Self::Or(nodes) => nodes
                 .iter()
-                .any(|node| node.matches(campaign, observed_at, region_of)),
-            Self::Not(node) => !node.matches(campaign, observed_at, region_of),
+                .any(|node| node.matches(campaign, observed_at, region_of, reachable_jumps)),
+            Self::Not(node) => !node.matches(campaign, observed_at, region_of, reachable_jumps),
         }
     }
 }
@@ -238,18 +244,33 @@ impl SovFilterNode {
 /// `ChronoDuration::hours`).
 pub const SOV_VULNERABLE_WITHIN_MAX_HOURS: i64 = 24 * 30;
 
-/// Leaves of the sov filter grammar. Only the leaves this ticket needs are
-/// implemented; `Reachable` (ticket 04) and the watchlist-backed
-/// `Defender` variant (spec "sov feed's defender filter... reference the
-/// watchlist") are deliberately out of scope here.
+/// Upper bound on `Reachable { max_jumps }` (spec "Reachability": "Reachable
+/// means at most eleven jumps"; ticket 04: "capped at eleven and rejected
+/// above that at parse time"). The lower bound is 1: zero or negative
+/// jumps never means anything a subscriber would configure.
+pub const SOV_REACHABLE_MAX_JUMPS: i64 = 11;
+
+/// Leaves of the sov filter grammar. The watchlist-backed `Defender`
+/// variant (spec "sov feed's defender filter... reference the watchlist")
+/// is deliberately out of scope here.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SovFilterCondition {
-    VulnerableWithin { hours: i64 },
-    Defender { alliance_ids: Vec<i64> },
+    VulnerableWithin {
+        hours: i64,
+    },
+    Defender {
+        alliance_ids: Vec<i64>,
+    },
     Region(Vec<i64>),
     System(Vec<i64>),
     EventType(Vec<String>),
+    /// Matches when the campaign's system is reachable from the configured
+    /// home system in at most `max_jumps` stargate (and, later, chain)
+    /// jumps (spec "Sov timer subscription language"; ticket 04).
+    Reachable {
+        max_jumps: i64,
+    },
 }
 
 impl SovFilterCondition {
@@ -281,6 +302,17 @@ impl SovFilterCondition {
                 }
                 Ok(())
             }
+            Self::Reachable { max_jumps } => {
+                if *max_jumps < 1 {
+                    Err("reachable max_jumps must be at least 1".to_string())
+                } else if *max_jumps > SOV_REACHABLE_MAX_JUMPS {
+                    Err(format!(
+                        "reachable max_jumps cannot exceed {SOV_REACHABLE_MAX_JUMPS}, got {max_jumps}"
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -289,6 +321,7 @@ impl SovFilterCondition {
         campaign: &SovCampaign,
         observed_at: DateTime<Utc>,
         region_of: &dyn Fn(i64) -> Option<i64>,
+        reachable_jumps: &dyn Fn(i64) -> Option<i64>,
     ) -> bool {
         match self {
             Self::VulnerableWithin { hours } => {
@@ -315,6 +348,19 @@ impl SovFilterCondition {
                 .is_some_and(|region_id| ids.contains(&region_id)),
             Self::System(ids) => ids.contains(&campaign.solar_system_id),
             Self::EventType(kinds) => kinds.iter().any(|kind| kind == &campaign.event_type),
+            Self::Reachable { max_jumps } => {
+                // Defensive re-check (mirrors the T-minus/VulnerableWithin
+                // ceiling guards): `/sov_subscribe` already rejects
+                // `max_jumps` outside 1..=SOV_REACHABLE_MAX_JUMPS, but a
+                // value stored some other way must never match "always" or
+                // "never" by accident -- treat it as never-due, consistent
+                // with the "graph unavailable" case just below.
+                if *max_jumps < 1 || *max_jumps > SOV_REACHABLE_MAX_JUMPS {
+                    return false;
+                }
+                reachable_jumps(campaign.solar_system_id)
+                    .is_some_and(|jumps| jumps >= 0 && jumps <= *max_jumps)
+            }
         }
     }
 }
@@ -503,10 +549,10 @@ mod tests {
             observed_at + ChronoDuration::hours(5),
         );
         let node = SovFilterNode::Condition(SovFilterCondition::VulnerableWithin { hours: 6 });
-        assert!(node.matches(&campaign, observed_at, &|_| None));
+        assert!(node.matches(&campaign, observed_at, &|_| None, &|_| None));
 
         let node = SovFilterNode::Condition(SovFilterCondition::VulnerableWithin { hours: 4 });
-        assert!(!node.matches(&campaign, observed_at, &|_| None));
+        assert!(!node.matches(&campaign, observed_at, &|_| None, &|_| None));
     }
 
     #[test]
@@ -526,11 +572,11 @@ mod tests {
         let node = SovFilterNode::Condition(SovFilterCondition::VulnerableWithin {
             hours: 9_999_999_999_999_999,
         });
-        assert!(!node.matches(&campaign, observed_at, &|_| None));
+        assert!(!node.matches(&campaign, observed_at, &|_| None, &|_| None));
 
         let node =
             SovFilterNode::Condition(SovFilterCondition::VulnerableWithin { hours: i64::MAX });
-        assert!(!node.matches(&campaign, observed_at, &|_| None));
+        assert!(!node.matches(&campaign, observed_at, &|_| None, &|_| None));
     }
 
     #[test]
@@ -569,19 +615,19 @@ mod tests {
         let node = SovFilterNode::Condition(SovFilterCondition::Defender {
             alliance_ids: vec![99_000_001],
         });
-        assert!(node.matches(&campaign, observed_at, &|_| None));
+        assert!(node.matches(&campaign, observed_at, &|_| None, &|_| None));
 
         let node = SovFilterNode::Condition(SovFilterCondition::Defender {
             alliance_ids: vec![99_999_999],
         });
-        assert!(!node.matches(&campaign, observed_at, &|_| None));
+        assert!(!node.matches(&campaign, observed_at, &|_| None, &|_| None));
 
         let no_defender_campaign =
             make_campaign(1, "station_freeport", 30_000_001, None, observed_at);
         let node = SovFilterNode::Condition(SovFilterCondition::Defender {
             alliance_ids: vec![99_000_001],
         });
-        assert!(!node.matches(&no_defender_campaign, observed_at, &|_| None));
+        assert!(!node.matches(&no_defender_campaign, observed_at, &|_| None, &|_| None));
     }
 
     #[test]
@@ -591,14 +637,14 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(30_000_001, 10_000_060);
         let node = SovFilterNode::Condition(SovFilterCondition::Region(vec![10_000_060]));
-        assert!(node.matches(&campaign, observed_at, &region_of(&map)));
+        assert!(node.matches(&campaign, observed_at, &region_of(&map), &|_| None));
 
         let node = SovFilterNode::Condition(SovFilterCondition::Region(vec![10_000_061]));
-        assert!(!node.matches(&campaign, observed_at, &region_of(&map)));
+        assert!(!node.matches(&campaign, observed_at, &region_of(&map), &|_| None));
 
         // An unresolvable system never matches Region.
         let node = SovFilterNode::Condition(SovFilterCondition::Region(vec![10_000_060]));
-        assert!(!node.matches(&campaign, observed_at, &|_| None));
+        assert!(!node.matches(&campaign, observed_at, &|_| None, &|_| None));
     }
 
     #[test]
@@ -609,6 +655,7 @@ mod tests {
             SovFilterNode::Condition(SovFilterCondition::System(vec![30_000_001])).matches(
                 &campaign,
                 observed_at,
+                &|_| None,
                 &|_| None
             )
         );
@@ -616,18 +663,19 @@ mod tests {
             !SovFilterNode::Condition(SovFilterCondition::System(vec![30_000_002])).matches(
                 &campaign,
                 observed_at,
+                &|_| None,
                 &|_| None
             )
         );
         assert!(SovFilterNode::Condition(SovFilterCondition::EventType(vec![
             "ihub_defense".to_string()
         ]))
-        .matches(&campaign, observed_at, &|_| None));
+        .matches(&campaign, observed_at, &|_| None, &|_| None));
         assert!(
             !SovFilterNode::Condition(SovFilterCondition::EventType(vec![
                 "tcu_defense".to_string()
             ]))
-            .matches(&campaign, observed_at, &|_| None)
+            .matches(&campaign, observed_at, &|_| None, &|_| None)
         );
     }
 
@@ -641,7 +689,7 @@ mod tests {
                 "ihub_defense".to_string()
             ])),
         ]);
-        assert!(and_node.matches(&campaign, observed_at, &|_| None));
+        assert!(and_node.matches(&campaign, observed_at, &|_| None, &|_| None));
 
         let or_node = SovFilterNode::Or(vec![
             SovFilterNode::Condition(SovFilterCondition::System(vec![30_000_099])),
@@ -649,12 +697,117 @@ mod tests {
                 "ihub_defense".to_string()
             ])),
         ]);
-        assert!(or_node.matches(&campaign, observed_at, &|_| None));
+        assert!(or_node.matches(&campaign, observed_at, &|_| None, &|_| None));
 
         let not_node = SovFilterNode::Not(Box::new(SovFilterNode::Condition(
             SovFilterCondition::EventType(vec!["tcu_defense".to_string()]),
         )));
-        assert!(not_node.matches(&campaign, observed_at, &|_| None));
+        assert!(not_node.matches(&campaign, observed_at, &|_| None, &|_| None));
+    }
+
+    #[test]
+    fn reachable_matches_when_jumps_are_at_or_under_max_and_not_when_over() {
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+        let campaign = make_campaign(1, "ihub_defense", 30_000_001, Some(99_000_001), observed_at);
+        let reachable_jumps = |system_id: i64| -> Option<i64> {
+            if system_id == 30_000_001 {
+                Some(4)
+            } else {
+                None
+            }
+        };
+
+        let node = SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 4 });
+        assert!(node.matches(&campaign, observed_at, &|_| None, &reachable_jumps));
+
+        let node = SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 3 });
+        assert!(!node.matches(&campaign, observed_at, &|_| None, &reachable_jumps));
+
+        // A system with no reachability fact at all (unreachable, or no
+        // graph loaded) never matches.
+        let node = SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 11 });
+        assert!(!node.matches(&campaign, observed_at, &|_| None, &|_| None));
+    }
+
+    #[test]
+    fn reachable_never_matches_when_the_graph_is_unavailable() {
+        // Spec: a missing/malformed stargate graph degrades the feed to
+        // "Reachable never matches", not a startup failure.
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+        let campaign = make_campaign(1, "ihub_defense", 30_000_001, Some(99_000_001), observed_at);
+        let node = SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 11 });
+        assert!(!node.matches(&campaign, observed_at, &|_| None, &|_| None));
+    }
+
+    #[test]
+    fn reachable_composes_with_and_alongside_defender() {
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+        let campaign = make_campaign(1, "ihub_defense", 30_000_001, Some(99_000_001), observed_at);
+        let reachable_jumps = |_: i64| Some(2);
+        let node = SovFilterNode::And(vec![
+            SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 5 }),
+            SovFilterNode::Condition(SovFilterCondition::Defender {
+                alliance_ids: vec![99_000_001],
+            }),
+        ]);
+        assert!(node.matches(&campaign, observed_at, &|_| None, &reachable_jumps));
+
+        // Reachable alone fails once the max_jumps budget is too small,
+        // even though Defender still matches.
+        let node = SovFilterNode::And(vec![
+            SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 1 }),
+            SovFilterNode::Condition(SovFilterCondition::Defender {
+                alliance_ids: vec![99_000_001],
+            }),
+        ]);
+        assert!(!node.matches(&campaign, observed_at, &|_| None, &reachable_jumps));
+    }
+
+    #[test]
+    fn reachable_validate_accepts_one_through_eleven_and_rejects_zero_and_above_eleven() {
+        assert!(
+            SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 1 })
+                .validate()
+                .is_ok()
+        );
+        assert!(SovFilterNode::Condition(SovFilterCondition::Reachable {
+            max_jumps: SOV_REACHABLE_MAX_JUMPS,
+        })
+        .validate()
+        .is_ok());
+        assert!(
+            SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 0 })
+                .validate()
+                .is_err()
+        );
+        assert!(SovFilterNode::Condition(SovFilterCondition::Reachable {
+            max_jumps: SOV_REACHABLE_MAX_JUMPS + 1,
+        })
+        .validate()
+        .is_err());
+        assert!(
+            SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: -1 })
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reachable_matches_defensively_returns_false_for_an_out_of_range_max_jumps_bypassing_validate(
+    ) {
+        // Twin of the T-minus/VulnerableWithin ceiling guards: a value
+        // stored some other way (direct filter jsonb write) must never
+        // reach "always matches" or "always doesn't apply the budget".
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+        let campaign = make_campaign(1, "ihub_defense", 30_000_001, Some(99_000_001), observed_at);
+        let reachable_jumps = |_: i64| Some(2);
+        let node = SovFilterNode::Condition(SovFilterCondition::Reachable {
+            max_jumps: SOV_REACHABLE_MAX_JUMPS + 1,
+        });
+        assert!(!node.matches(&campaign, observed_at, &|_| None, &reachable_jumps));
+
+        let node = SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 0 });
+        assert!(!node.matches(&campaign, observed_at, &|_| None, &reachable_jumps));
     }
 
     #[test]
@@ -797,5 +950,28 @@ mod tests {
             role_id: None,
         };
         assert!(subscription.validate().is_err());
+    }
+
+    #[test]
+    fn readme_sov_subscribe_filter_examples_round_trip() {
+        // Pins the two `/sov_subscribe filter:` examples documented in
+        // README.md's "Sov timer subscription filter grammar" section: if
+        // either literal ever stops parsing or validating, this test
+        // catches it before the README goes stale.
+        let reachable_roaming_example = r#"{"root":{"and":[{"condition":{"vulnerable_within":{"hours":12}}},{"condition":{"reachable":{"max_jumps":8}}}]}}"#;
+        let parsed: SovFilter = serde_json::from_str(reachable_roaming_example)
+            .expect("README reachable-roaming example parses");
+        parsed
+            .validate()
+            .expect("README reachable-roaming example validates");
+        assert!(matches!(parsed.root, SovFilterNode::And(ref nodes) if nodes.len() == 2));
+
+        let jita_not_freeport_example = r#"{"root":{"and":[{"condition":{"system":[30000142]}},{"not":{"condition":{"event_type":["station_freeport"]}}}]}}"#;
+        let parsed: SovFilter = serde_json::from_str(jita_not_freeport_example)
+            .expect("README Jita-not-freeport example parses");
+        parsed
+            .validate()
+            .expect("README Jita-not-freeport example validates");
+        assert!(matches!(parsed.root, SovFilterNode::And(ref nodes) if nodes.len() == 2));
     }
 }

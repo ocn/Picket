@@ -3,7 +3,7 @@ use crate::commands::{get_option_value, Command};
 use crate::config::AppState;
 use crate::sov_feed::{
     available_sov_store, parse_tminus_marks_minutes, SovFilter, SovFilterCondition, SovFilterNode,
-    SovSubscription, SOV_TMINUS_MARKS_OPTION_KEY,
+    SovSubscription, SOV_REACHABLE_MAX_JUMPS, SOV_TMINUS_MARKS_OPTION_KEY,
 };
 use crate::SovStoreContainer;
 use serenity::async_trait;
@@ -23,6 +23,7 @@ struct SovSubscriptionDocuments<'a> {
     filter: &'a str,
     region_id: Option<i64>,
     defender_alliance_id: Option<i64>,
+    max_jumps: Option<i64>,
     role_id: Option<u64>,
     /// Raw `tminus_marks` command option: a comma-separated list of
     /// minutes, or an empty string to disable marks. `None` when the
@@ -58,6 +59,11 @@ impl SovSubscribeCommand {
                 None => None,
                 _ => return Err("defender_alliance_id must be an integer option".to_string()),
             };
+        let max_jumps = match get_option_value(&command.data.options, "max_jumps") {
+            Some(CommandDataOptionValue::Integer(value)) => Some(*value),
+            None => None,
+            _ => return Err("max_jumps must be an integer option".to_string()),
+        };
         let role_id = match get_option_value(&command.data.options, "role") {
             Some(CommandDataOptionValue::Role(role)) => Some(role.id.0),
             None => None,
@@ -76,6 +82,7 @@ impl SovSubscribeCommand {
                 filter,
                 region_id,
                 defender_alliance_id,
+                max_jumps,
                 role_id,
                 tminus_marks,
             },
@@ -98,6 +105,11 @@ impl SovSubscribeCommand {
         if let Some(alliance_id) = documents.defender_alliance_id {
             extra.push(SovFilterNode::Condition(SovFilterCondition::Defender {
                 alliance_ids: vec![alliance_id],
+            }));
+        }
+        if let Some(max_jumps) = documents.max_jumps {
+            extra.push(SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps,
             }));
         }
         if !extra.is_empty() {
@@ -183,6 +195,14 @@ impl Command for SovSubscribeCommand {
                     .name("defender_alliance_id")
                     .description("Convenience: also require this defending alliance ID.")
                     .kind(CommandOptionType::Integer)
+            })
+            .create_option(|option| {
+                option
+                    .name("max_jumps")
+                    .description("Convenience: also require reachable from home within this many jumps (1-11).")
+                    .kind(CommandOptionType::Integer)
+                    .min_int_value(1)
+                    .max_int_value(SOV_REACHABLE_MAX_JUMPS)
             })
             .create_option(|option| {
                 option
@@ -279,6 +299,7 @@ mod tests {
                 filter: FILTER,
                 region_id: None,
                 defender_alliance_id: None,
+                max_jumps: None,
                 role_id: None,
                 tminus_marks: None,
             },
@@ -300,6 +321,7 @@ mod tests {
                 filter: FILTER,
                 region_id: Some(10_000_060),
                 defender_alliance_id: Some(99_000_001),
+                max_jumps: None,
                 role_id: Some(555),
                 tminus_marks: None,
             },
@@ -324,6 +346,54 @@ mod tests {
     }
 
     #[test]
+    fn sov_subscribe_composes_max_jumps_as_a_reachable_condition() {
+        let subscription = SovSubscribeCommand::subscription_from_documents(
+            42,
+            77,
+            SovSubscriptionDocuments {
+                name: "reachable-front",
+                filter: FILTER,
+                region_id: None,
+                defender_alliance_id: None,
+                max_jumps: Some(11),
+                role_id: None,
+                tminus_marks: None,
+            },
+        )
+        .expect("valid document with max_jumps");
+        match subscription.filter.root {
+            SovFilterNode::And(nodes) => {
+                assert_eq!(nodes.len(), 2);
+                assert!(matches!(
+                    nodes[1],
+                    SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 11 })
+                ));
+            }
+            other => panic!("expected an And node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sov_subscribe_rejects_max_jumps_outside_one_through_eleven() {
+        for max_jumps in [0, SOV_REACHABLE_MAX_JUMPS + 1] {
+            assert!(SovSubscribeCommand::subscription_from_documents(
+                42,
+                77,
+                SovSubscriptionDocuments {
+                    name: "bad-max-jumps",
+                    filter: FILTER,
+                    region_id: None,
+                    defender_alliance_id: None,
+                    max_jumps: Some(max_jumps),
+                    role_id: None,
+                    tminus_marks: None,
+                },
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn sov_subscribe_rejects_invalid_documents() {
         for (name, filter) in [
             ("", FILTER),
@@ -339,6 +409,7 @@ mod tests {
                     filter,
                     region_id: None,
                     defender_alliance_id: None,
+                    max_jumps: None,
                     role_id: None,
                     tminus_marks: None,
                 },
@@ -357,6 +428,7 @@ mod tests {
                 filter: FILTER,
                 region_id: None,
                 defender_alliance_id: None,
+                max_jumps: None,
                 role_id: None,
                 tminus_marks: Some("120, 45, 120"),
             },
@@ -378,6 +450,7 @@ mod tests {
                 filter: FILTER,
                 region_id: None,
                 defender_alliance_id: None,
+                max_jumps: None,
                 role_id: None,
                 tminus_marks: Some(""),
             },
@@ -399,6 +472,7 @@ mod tests {
                 filter: FILTER,
                 region_id: None,
                 defender_alliance_id: None,
+                max_jumps: None,
                 role_id: None,
                 tminus_marks: None,
             },
@@ -418,6 +492,7 @@ mod tests {
                     filter: FILTER,
                     region_id: None,
                     defender_alliance_id: None,
+                    max_jumps: None,
                     role_id: None,
                     tminus_marks: Some(raw),
                 },

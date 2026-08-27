@@ -15,6 +15,7 @@ pub mod diag;
 pub mod find_unsubscribed;
 pub mod health;
 pub mod sov_subscribe;
+pub mod sov_timers;
 pub mod sov_unsubscribe;
 pub mod subscribe;
 pub mod sync_clear;

@@ -326,6 +326,26 @@ impl SovStore {
         .collect()
     }
 
+    /// All subscriptions configured for one channel, used by `/sov_timers`
+    /// to evaluate the live board against exactly this channel's filters
+    /// rather than every guild's.
+    pub async fn subscriptions_for_channel(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+    ) -> Result<Vec<SovSubscription>, sqlx::Error> {
+        sqlx::query(
+            "SELECT guild_id, channel_id, name, filter, options, role_id FROM sov_subscriptions WHERE guild_id = $1 AND channel_id = $2 ORDER BY name",
+        )
+        .bind(guild_id as i64)
+        .bind(channel_id as i64)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(sov_subscription_from_row)
+        .collect()
+    }
+
     /// Looks up one subscription by its primary key, or `None` when it
     /// does not exist yet. Used by `/sov_subscribe` to read a
     /// previously-stored `options` document before merging in this
