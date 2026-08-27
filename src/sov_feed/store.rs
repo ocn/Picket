@@ -174,6 +174,23 @@ impl SovStore {
         .collect())
     }
 
+    /// All non-ended campaigns with their full facts (baseline and
+    /// non-baseline alike), used by the stage-evaluation pass
+    /// (`SovCollector::evaluate_stage_cycle`) to check T-minus marks
+    /// purely against persisted state and the controlled clock, with no
+    /// ESI request (ticket 03: "Baseline campaigns get marks even though
+    /// they never got `appeared`").
+    pub async fn open_campaigns(&self) -> Result<Vec<SovCampaign>, sqlx::Error> {
+        sqlx::query(
+            "SELECT campaign_id, event_type, structure_id, solar_system_id, constellation_id, defender_id, defender_score, attackers_score, start_time FROM sov_campaigns WHERE ended_at IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(sov_campaign_from_row)
+        .collect()
+    }
+
     pub async fn baseline_established(&self) -> Result<bool, sqlx::Error> {
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sov_collector_baseline)")
             .fetch_one(&self.pool)
@@ -307,6 +324,30 @@ impl SovStore {
         .into_iter()
         .map(sov_subscription_from_row)
         .collect()
+    }
+
+    /// Looks up one subscription by its primary key, or `None` when it
+    /// does not exist yet. Used by `/sov_subscribe` to read a
+    /// previously-stored `options` document before merging in this
+    /// invocation's changes, so re-running the command without
+    /// `tminus_marks` preserves custom marks instead of resetting them to
+    /// the default (review finding 2 on ticket 03).
+    pub async fn subscription(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+        name: &str,
+    ) -> Result<Option<SovSubscription>, sqlx::Error> {
+        sqlx::query(
+            "SELECT guild_id, channel_id, name, filter, options, role_id FROM sov_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND name = $3",
+        )
+        .bind(guild_id as i64)
+        .bind(channel_id as i64)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(sov_subscription_from_row)
+        .transpose()
     }
 
     // --- Deliveries ---
@@ -489,6 +530,20 @@ impl SovStore {
         .fetch_one(&self.pool)
         .await
     }
+}
+
+fn sov_campaign_from_row(row: PgRow) -> Result<SovCampaign, sqlx::Error> {
+    Ok(SovCampaign {
+        campaign_id: row.get("campaign_id"),
+        event_type: row.get("event_type"),
+        structure_id: row.get("structure_id"),
+        solar_system_id: row.get("solar_system_id"),
+        constellation_id: row.get("constellation_id"),
+        defender_id: row.get("defender_id"),
+        defender_score: row.get("defender_score"),
+        attackers_score: row.get("attackers_score"),
+        start_time: row.get("start_time"),
+    })
 }
 
 fn sov_subscription_from_row(row: PgRow) -> Result<SovSubscription, sqlx::Error> {

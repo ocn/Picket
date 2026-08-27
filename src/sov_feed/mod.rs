@@ -28,14 +28,16 @@ pub mod model;
 pub mod store;
 
 pub use collector::{
-    SovClock, SovCollectionError, SovCollectionReport, SovCollector, SovSystemDirectory,
-    SovSystemInfo, SovTickerResolver, SystemSovClock,
+    SovClock, SovCollectionError, SovCollectionReport, SovCollector, SovStageEvaluationReport,
+    SovSystemDirectory, SovSystemInfo, SovTickerResolver, SystemSovClock,
 };
 pub use esi::{HttpSovereigntyEsi, SovereigntyEsi, SOV_COMPATIBILITY_DATE};
 pub use model::{
-    PreparedSovDelivery, SovAlertStage, SovCampaign, SovDelivery, SovDeliveryError, SovEmbedField,
-    SovFilter, SovFilterCondition, SovFilterNode, SovNotificationMessage, SovSubscription,
-    SOV_EVENT_TYPES,
+    effective_tminus_marks_minutes, parse_tminus_marks_minutes, PreparedSovDelivery, SovAlertStage,
+    SovCampaign, SovDelivery, SovDeliveryError, SovEmbedField, SovFilter, SovFilterCondition,
+    SovFilterNode, SovNotificationMessage, SovSubscription, SOV_DEFAULT_TMINUS_MARKS_MINUTES,
+    SOV_EVENT_TYPES, SOV_TMINUS_MARKS_MAX_COUNT, SOV_TMINUS_MARKS_OPTION_KEY,
+    SOV_TMINUS_MARK_MAX_MINUTES, SOV_VULNERABLE_WITHIN_MAX_HOURS,
 };
 pub use store::{
     available_sov_store, new_sov_store_handle, SovStore, SovStoreHandle, SOV_CAMPAIGNS_RESOURCE_KEY,

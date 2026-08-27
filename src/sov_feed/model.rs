@@ -41,25 +41,119 @@ pub const SOV_EVENT_TYPES: &[&str] = &[
 ];
 
 /// Alert Stage: one of the discrete, once-only reasons a Sov Campaign is
-/// announced (spec "Alert stages and dedup"). Only `Appeared` is
-/// implemented by this ticket; later tickets add T-minus and reachability
-/// stages here.
+/// announced (spec "Alert stages and dedup"). `Appeared` and `TMinus` are
+/// implemented; later tickets add reachability and timezone-window stages
+/// here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SovAlertStage {
     Appeared,
+    /// A configured T-minus mark, in minutes before the campaign's
+    /// `start_time` (spec "Alert stages and dedup": `tminus:<minutes>`).
+    TMinus(i64),
 }
 
 impl SovAlertStage {
-    pub fn as_str(self) -> &'static str {
+    /// The dedup-authority stage key stored in `sov_alert_deliveries.stage`
+    /// (part of its unique constraint together with subscription and
+    /// subject). Owned because `TMinus` formats its minutes into the key.
+    pub fn as_str(self) -> String {
         match self {
-            Self::Appeared => "appeared",
+            Self::Appeared => "appeared".to_string(),
+            Self::TMinus(minutes) => format!("tminus:{minutes}"),
         }
     }
 
-    pub fn footer_label(self) -> &'static str {
+    /// The embed footer text naming this stage (spec "Embed": "Footer
+    /// names the stage", example `T-120m`).
+    pub fn footer_label(self) -> String {
         match self {
-            Self::Appeared => "Appeared",
+            Self::Appeared => "Appeared".to_string(),
+            Self::TMinus(minutes) => format!("T-{minutes}m"),
         }
+    }
+}
+
+/// Per-subscription option key storing configured T-minus marks, in
+/// minutes before a campaign's `start_time` (spec "Sov timer subscription
+/// language": "T-minus marks in minutes (default 120 and 30)"). Absent
+/// entirely from a subscription's `options` document means "use the
+/// default"; present as an empty array means marks are disabled for that
+/// subscription.
+pub const SOV_TMINUS_MARKS_OPTION_KEY: &str = "tminus_marks_minutes";
+
+/// Default T-minus marks applied when a subscription's `options` has no
+/// `tminus_marks_minutes` key at all -- including every subscription
+/// persisted before this ticket landed, since `options` defaults to `{}`
+/// (spec: "default 120 and 30").
+pub const SOV_DEFAULT_TMINUS_MARKS_MINUTES: &[i64] = &[120, 30];
+
+/// Upper bound on a single T-minus mark, in minutes (30 days). Rejected at
+/// parse time so `/sov_subscribe` cannot store a value large enough to
+/// overflow `chrono::TimeDelta` construction; `evaluate_stage_cycle` also
+/// guards against an out-of-range value already persisted by some other
+/// route (review finding 1 on ticket 03: a huge `i64` panicked
+/// `ChronoDuration::minutes`).
+pub const SOV_TMINUS_MARK_MAX_MINUTES: i64 = 43_200;
+
+/// Upper bound on the number of distinct T-minus marks a subscription may
+/// configure (review finding 1/4 on ticket 03).
+pub const SOV_TMINUS_MARKS_MAX_COUNT: usize = 10;
+
+/// Parses the `/sov_subscribe` `tminus_marks` command option: a
+/// comma-separated list of T-minus marks in minutes. Each mark must parse
+/// as a positive integer no greater than [`SOV_TMINUS_MARK_MAX_MINUTES`];
+/// marks are deduplicated while preserving first-occurrence order, and at
+/// most [`SOV_TMINUS_MARKS_MAX_COUNT`] distinct marks are accepted. An
+/// empty (or all-whitespace) input parses to an empty list -- the explicit
+/// "disable marks" input, distinct from the option being omitted
+/// entirely.
+pub fn parse_tminus_marks_minutes(raw: &str) -> Result<Vec<i64>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut marks = Vec::new();
+    for part in trimmed.split(',') {
+        let part = part.trim();
+        let minutes: i64 = part
+            .parse()
+            .map_err(|_| format!("tminus mark is not an integer: '{part}'"))?;
+        if minutes <= 0 {
+            return Err(format!(
+                "tminus marks must be positive integers, got {minutes}"
+            ));
+        }
+        if minutes > SOV_TMINUS_MARK_MAX_MINUTES {
+            return Err(format!(
+                "tminus marks cannot exceed {SOV_TMINUS_MARK_MAX_MINUTES} minutes (30 days), got {minutes}"
+            ));
+        }
+        if seen.insert(minutes) {
+            marks.push(minutes);
+            if marks.len() > SOV_TMINUS_MARKS_MAX_COUNT {
+                return Err(format!(
+                    "tminus marks cannot configure more than {SOV_TMINUS_MARKS_MAX_COUNT} distinct values"
+                ));
+            }
+        }
+    }
+    Ok(marks)
+}
+
+/// The effective T-minus marks for a subscription's stored `options`
+/// document: the `tminus_marks_minutes` array when present (including an
+/// explicit empty array, which disables marks), or
+/// [`SOV_DEFAULT_TMINUS_MARKS_MINUTES`] when the key is absent. This
+/// covers subscriptions persisted before this ticket as well as any
+/// subscription created without the `tminus_marks` command option (spec:
+/// "Existing subscriptions with no stored marks behave as default").
+pub fn effective_tminus_marks_minutes(options: &serde_json::Value) -> Vec<i64> {
+    match options.get(SOV_TMINUS_MARKS_OPTION_KEY) {
+        Some(serde_json::Value::Array(values)) => {
+            values.iter().filter_map(|value| value.as_i64()).collect()
+        }
+        _ => SOV_DEFAULT_TMINUS_MARKS_MINUTES.to_vec(),
     }
 }
 
@@ -135,6 +229,15 @@ impl SovFilterNode {
     }
 }
 
+/// Upper bound on `VulnerableWithin { hours }`, in hours (30 days).
+/// Rejected at parse time so `/sov_subscribe` cannot store a value large
+/// enough to overflow `chrono::TimeDelta` construction; `matches` also
+/// guards against an out-of-range value already persisted by some other
+/// route (review finding on ticket 03, the `VulnerableWithin` twin of the
+/// T-minus marks blocker: an ordinary huge `i64` panicked
+/// `ChronoDuration::hours`).
+pub const SOV_VULNERABLE_WITHIN_MAX_HOURS: i64 = 24 * 30;
+
 /// Leaves of the sov filter grammar. Only the leaves this ticket needs are
 /// implemented; `Reachable` (ticket 04) and the watchlist-backed
 /// `Defender` variant (spec "sov feed's defender filter... reference the
@@ -155,6 +258,10 @@ impl SovFilterCondition {
             Self::VulnerableWithin { hours } => {
                 if *hours <= 0 {
                     Err("vulnerable_within hours must be positive".to_string())
+                } else if *hours > SOV_VULNERABLE_WITHIN_MAX_HOURS {
+                    Err(format!(
+                        "vulnerable_within hours cannot exceed {SOV_VULNERABLE_WITHIN_MAX_HOURS} hours (30 days), got {hours}"
+                    ))
                 } else {
                     Ok(())
                 }
@@ -185,7 +292,21 @@ impl SovFilterCondition {
     ) -> bool {
         match self {
             Self::VulnerableWithin { hours } => {
-                campaign.start_time <= observed_at + ChronoDuration::hours(*hours)
+                // Non-panicking construction (mirrors the T-minus marks
+                // fix): `/sov_subscribe` already rejects `hours` above
+                // `SOV_VULNERABLE_WITHIN_MAX_HOURS`, but a value stored
+                // some other way (direct filter jsonb write, a future
+                // migration) must never reach the panicking
+                // `ChronoDuration::hours`, nor overflow the
+                // `DateTime<Utc>` addition. Treat either overflow as
+                // "does not match", never as "always matches".
+                let Some(window) = ChronoDuration::try_hours(*hours) else {
+                    return false;
+                };
+                let Some(deadline) = observed_at.checked_add_signed(window) else {
+                    return false;
+                };
+                campaign.start_time <= deadline
             }
             Self::Defender { alliance_ids } => campaign
                 .defender_id
@@ -389,6 +510,59 @@ mod tests {
     }
 
     #[test]
+    fn vulnerable_within_never_panics_on_an_out_of_range_hours_value_and_never_matches() {
+        // Twin of the T-minus marks blocker: an ordinary huge i64 used to
+        // panic `ChronoDuration::hours`. Bypassing validate() (as a
+        // directly-written filter document could), matches() must return
+        // false rather than panic or "always match".
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+        let campaign = make_campaign(
+            1,
+            "ihub_defense",
+            30_000_001,
+            Some(99_000_001),
+            observed_at + ChronoDuration::hours(5),
+        );
+        let node = SovFilterNode::Condition(SovFilterCondition::VulnerableWithin {
+            hours: 9_999_999_999_999_999,
+        });
+        assert!(!node.matches(&campaign, observed_at, &|_| None));
+
+        let node =
+            SovFilterNode::Condition(SovFilterCondition::VulnerableWithin { hours: i64::MAX });
+        assert!(!node.matches(&campaign, observed_at, &|_| None));
+    }
+
+    #[test]
+    fn vulnerable_within_validate_rejects_hours_above_the_ceiling() {
+        assert!(
+            SovFilterNode::Condition(SovFilterCondition::VulnerableWithin {
+                hours: SOV_VULNERABLE_WITHIN_MAX_HOURS + 1,
+            })
+            .validate()
+            .is_err()
+        );
+        assert!(
+            SovFilterNode::Condition(SovFilterCondition::VulnerableWithin {
+                hours: 9_999_999_999_999_999,
+            })
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn vulnerable_within_validate_accepts_exactly_the_ceiling_value() {
+        assert!(
+            SovFilterNode::Condition(SovFilterCondition::VulnerableWithin {
+                hours: SOV_VULNERABLE_WITHIN_MAX_HOURS,
+            })
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn defender_matches_only_configured_alliance_ids() {
         let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
         let campaign = make_campaign(1, "ihub_defense", 30_000_001, Some(99_000_001), observed_at);
@@ -519,6 +693,95 @@ mod tests {
             ]),
         ]);
         assert!(node.validate().is_ok());
+    }
+
+    #[test]
+    fn parse_tminus_marks_minutes_parses_and_dedupes_preserving_order() {
+        assert_eq!(
+            parse_tminus_marks_minutes("120, 30, 120").unwrap(),
+            vec![120, 30]
+        );
+        assert_eq!(parse_tminus_marks_minutes("45").unwrap(), vec![45]);
+    }
+
+    #[test]
+    fn parse_tminus_marks_minutes_empty_or_whitespace_input_yields_an_empty_list() {
+        assert_eq!(parse_tminus_marks_minutes("").unwrap(), Vec::<i64>::new());
+        assert_eq!(
+            parse_tminus_marks_minutes("   ").unwrap(),
+            Vec::<i64>::new()
+        );
+    }
+
+    #[test]
+    fn parse_tminus_marks_minutes_rejects_non_positive_and_non_integer_values() {
+        assert!(parse_tminus_marks_minutes("0").is_err());
+        assert!(parse_tminus_marks_minutes("-5").is_err());
+        assert!(parse_tminus_marks_minutes("not-a-number").is_err());
+        assert!(parse_tminus_marks_minutes("120,abc").is_err());
+    }
+
+    #[test]
+    fn parse_tminus_marks_minutes_rejects_marks_above_the_ceiling() {
+        // Review finding 1: an ordinary huge i64 (e.g. a typo) must never
+        // reach `ChronoDuration::minutes`, which panics out of range.
+        assert!(parse_tminus_marks_minutes("9999999999999999").is_err());
+        assert!(
+            parse_tminus_marks_minutes(&(SOV_TMINUS_MARK_MAX_MINUTES + 1).to_string()).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_tminus_marks_minutes_accepts_exactly_the_ceiling_value() {
+        assert_eq!(
+            parse_tminus_marks_minutes(&SOV_TMINUS_MARK_MAX_MINUTES.to_string()).unwrap(),
+            vec![SOV_TMINUS_MARK_MAX_MINUTES]
+        );
+    }
+
+    #[test]
+    fn parse_tminus_marks_minutes_rejects_more_than_the_max_count() {
+        let too_many = (1..=(SOV_TMINUS_MARKS_MAX_COUNT as i64 + 1))
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_tminus_marks_minutes(&too_many).is_err());
+    }
+
+    #[test]
+    fn parse_tminus_marks_minutes_accepts_exactly_the_max_count() {
+        let exactly_max = (1..=(SOV_TMINUS_MARKS_MAX_COUNT as i64))
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            parse_tminus_marks_minutes(&exactly_max).unwrap().len(),
+            SOV_TMINUS_MARKS_MAX_COUNT
+        );
+    }
+
+    #[test]
+    fn effective_tminus_marks_minutes_defaults_when_the_key_is_absent() {
+        assert_eq!(
+            effective_tminus_marks_minutes(&serde_json::json!({})),
+            SOV_DEFAULT_TMINUS_MARKS_MINUTES.to_vec()
+        );
+        assert_eq!(
+            effective_tminus_marks_minutes(&serde_json::json!({"unrelated": true})),
+            SOV_DEFAULT_TMINUS_MARKS_MINUTES.to_vec()
+        );
+    }
+
+    #[test]
+    fn effective_tminus_marks_minutes_returns_stored_values_including_an_explicit_empty_list() {
+        assert_eq!(
+            effective_tminus_marks_minutes(&serde_json::json!({"tminus_marks_minutes": [60, 15]})),
+            vec![60, 15]
+        );
+        assert_eq!(
+            effective_tminus_marks_minutes(&serde_json::json!({"tminus_marks_minutes": []})),
+            Vec::<i64>::new()
+        );
     }
 
     #[test]

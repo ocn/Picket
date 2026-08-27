@@ -64,6 +64,11 @@ impl TypeMapKey for SovStoreContainer {
 /// "Sovereignty campaigns are polled every sixty seconds").
 const SOV_COLLECTION_INTERVAL: Duration = Duration::from_secs(60);
 
+/// T-minus stage-evaluation cadence: independent of, and cheaper than,
+/// `SOV_COLLECTION_INTERVAL` because it makes no ESI request (ticket 03:
+/// "A stage-evaluation pass runs at least every thirty seconds").
+const SOV_STAGE_INTERVAL: Duration = Duration::from_secs(30);
+
 fn generate_queue_id() -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -278,6 +283,24 @@ pub async fn run() {
                     database_url.clone(),
                     sov_store_handle,
                     SOV_COLLECTION_INTERVAL,
+                    esi.clone(),
+                    delivery.clone(),
+                    directory.clone(),
+                    tickers.clone(),
+                );
+                // T-minus stage evaluation (ticket 03): a separate,
+                // independently-reconnecting loop rather than a faster
+                // cadence inside `run_sov_collection_loop`, mirroring how
+                // `run_terminal_resolution_recovery_loop` and
+                // `run_proximity_reconciliation_loop` already run their
+                // own cadences alongside the contract feed's main
+                // collection loop. It never touches `sov_store_handle`
+                // (already owned by the collection loop above) or ESI, so
+                // a stall here cannot affect campaign polling or command
+                // handling.
+                spawn_sov_stage_loop(
+                    database_url.clone(),
+                    SOV_STAGE_INTERVAL,
                     esi,
                     delivery,
                     directory,
@@ -521,7 +544,9 @@ async fn run_sov_collection_loop(
                         directory.clone(),
                         tickers.clone(),
                     );
-                    match collector.collect_cycle().await {
+                    match run_sov_cycle_isolated(async move { collector.collect_cycle().await })
+                        .await
+                    {
                         Ok(report) => {
                             if let Some(paused_until) = report.paused_until {
                                 consecutive_failures = consecutive_failures.saturating_add(1);
@@ -570,5 +595,133 @@ async fn run_sov_collection_loop(
             }
         }
         tokio::time::sleep(delay).await;
+    }
+}
+
+/// Spawns the sov campaign feed's T-minus stage-evaluation loop (ticket
+/// 03). Runs independently of [`spawn_sov_collection_loop`] at a cheaper,
+/// more frequent cadence because `SovCollector::evaluate_stage_cycle`
+/// makes no ESI request; it only reads persisted campaigns and
+/// subscriptions against the clock. Mirrors
+/// `contract_intelligence::spawn_terminal_resolution_recovery_loop`:
+/// reconnects every tick (self-healing, idempotent migrations) and does
+/// not populate [`sov_feed::SovStoreHandle`], since the main collection
+/// loop above already owns that handle for command lookups.
+pub fn spawn_sov_stage_loop(
+    database_url: String,
+    interval: Duration,
+    esi: Arc<dyn sov_feed::SovereigntyEsi>,
+    delivery: Arc<dyn sov_feed::SovDelivery>,
+    directory: Arc<dyn sov_feed::SovSystemDirectory>,
+    tickers: Arc<dyn sov_feed::SovTickerResolver>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_sov_stage_loop(
+        database_url,
+        interval,
+        esi,
+        delivery,
+        directory,
+        tickers,
+    ))
+}
+
+async fn run_sov_stage_loop(
+    database_url: String,
+    interval: Duration,
+    esi: Arc<dyn sov_feed::SovereigntyEsi>,
+    delivery: Arc<dyn sov_feed::SovDelivery>,
+    directory: Arc<dyn sov_feed::SovSystemDirectory>,
+    tickers: Arc<dyn sov_feed::SovTickerResolver>,
+) {
+    let mut cadence = tokio::time::interval_at(tokio::time::Instant::now(), interval);
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        cadence.tick().await;
+        match contract_intelligence::ContractCollectionStore::connect(&database_url).await {
+            Ok(limiter_store) => match sov_feed::SovStore::connect(&database_url).await {
+                Ok(store) => {
+                    let collector = sov_feed::SovCollector::new(
+                        store,
+                        esi.clone(),
+                        Arc::new(limiter_store),
+                        delivery.clone(),
+                        directory.clone(),
+                        tickers.clone(),
+                    );
+                    if let Err(error) =
+                        run_sov_cycle_isolated(
+                            async move { collector.evaluate_stage_cycle().await },
+                        )
+                        .await
+                    {
+                        warn!("sov stage evaluation cycle failed: {error}");
+                    }
+                }
+                Err(error) => warn!("sov stage evaluation database unavailable: {error}"),
+            },
+            Err(error) => warn!("sov stage evaluation migrations unavailable: {error}"),
+        }
+    }
+}
+
+/// Runs one sov collector cycle (`collect_cycle` or
+/// `evaluate_stage_cycle`) in its own task so a panic inside it -- e.g.
+/// malformed persisted data reaching a panicking arithmetic operation --
+/// is caught and logged rather than silently killing the long-running
+/// loop that called it (review finding 1c on ticket 03: a panicking
+/// `evaluate_stage_cycle` used to take down `run_sov_stage_loop`
+/// permanently, with no tracing and no health signal, since that loop
+/// makes no ESI call for `sov_esi_progress` to ever notice). A panic or
+/// task cancellation is folded into `Err` alongside an ordinary cycle
+/// failure, so callers keep their existing success/failure branching
+/// unchanged; only a genuinely successful cycle returns `Ok`.
+async fn run_sov_cycle_isolated<F, T, E>(future: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, E>> + Send + 'static,
+    T: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    match tokio::spawn(future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(join_error) if join_error.is_panic() => {
+            error!("sov collector cycle panicked and was isolated: {join_error}");
+            Err(format!("panicked: {join_error}"))
+        }
+        Err(join_error) => Err(format!("cancelled: {join_error}")),
+    }
+}
+
+#[cfg(test)]
+mod sov_cycle_isolation_tests {
+    use super::run_sov_cycle_isolated;
+
+    #[tokio::test]
+    async fn a_panicking_cycle_future_is_caught_and_reported_as_an_error() {
+        // Review finding 1c: proves the wrapper itself survives a panic
+        // inside the wrapped future rather than propagating it to the
+        // caller (and, by construction via `tokio::spawn`, to whatever
+        // task awaits the wrapper) -- a cheap substitute for injecting a
+        // panicking fake collector cycle through the full loop.
+        let result: Result<(), String> = run_sov_cycle_isolated::<_, (), String>(async {
+            panic!("simulated collector panic");
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("panicked"));
+    }
+
+    #[tokio::test]
+    async fn a_successful_cycle_future_returns_its_value() {
+        let result: Result<u32, String> =
+            run_sov_cycle_isolated::<_, u32, String>(async { Ok(42_u32) }).await;
+        assert_eq!(result, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn a_failing_cycle_future_returns_its_error_message() {
+        let result: Result<(), String> =
+            run_sov_cycle_isolated(async { Err::<(), _>("boom".to_string()) }).await;
+        assert_eq!(result, Err("boom".to_string()));
     }
 }
