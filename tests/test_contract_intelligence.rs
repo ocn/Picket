@@ -31490,11 +31490,113 @@ async fn health_cycle_uses_public_contract_cache_for_esi_progress_and_excludes_u
 }
 
 #[tokio::test]
+async fn sov_health_snapshot_stays_healthy_when_sov_has_never_reported_progress() {
+    // Regression: a feed that has never reported progress (sov not
+    // enabled, or not yet through its first successful cycle) must not
+    // degrade the overall Runtime Health Snapshot. Only contract progress
+    // is seeded here; no `sovereignty/%` cache row exists at all.
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to the sov ESI health-evidence database");
+    let now = database.now().await;
+    let started_at = now - chrono::Duration::minutes(31);
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $2)",
+    )
+    .bind(now)
+    .bind(started_at)
+    .execute(&pool)
+    .await
+    .expect("seed current heartbeat with an expired ESI startup grace");
+    sqlx::query("INSERT INTO regional_collection_metadata (region_id, baseline_at, complete_observations, last_complete_at) VALUES (10000002, $1, 1, $1)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed current regional progress");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('contracts/public/10000002/page/1', $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("persist current contract ESI progress evidence");
+
+    let snapshot = HealthCycle::new(store, clock)
+        .run_once()
+        .await
+        .expect("evaluate health with no sov evidence at all");
+    assert_eq!(snapshot.status, HealthStatus::Healthy);
+    assert!(snapshot
+        .checks
+        .iter()
+        .any(|check| check.key == "sov_esi_progress" && check.status == HealthStatus::Healthy));
+    assert!(snapshot
+        .checks
+        .iter()
+        .any(|check| check.key == "esi_progress" && check.status == HealthStatus::Healthy));
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn sov_esi_progress_check_degrades_once_stale_evidence_exists() {
+    // Regression: once the sov feed has proven it runs (a `sovereignty/%`
+    // cache row exists), stale evidence must degrade the check like any
+    // other progress signal — "never started" and "started, then stalled"
+    // are different states with different correct statuses.
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to the sov ESI health-evidence database");
+    let now = database.now().await;
+    let started_at = now - chrono::Duration::minutes(31);
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $2)",
+    )
+    .bind(now)
+    .bind(started_at)
+    .execute(&pool)
+    .await
+    .expect("seed current heartbeat with an expired ESI startup grace");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('sovereignty/campaigns', $1)",
+    )
+    .bind(started_at)
+    .execute(&pool)
+    .await
+    .expect("persist stale sov ESI progress evidence");
+
+    let snapshot = HealthCycle::new(store, clock)
+        .run_once()
+        .await
+        .expect("evaluate health with stale sov evidence");
+    assert!(snapshot
+        .checks
+        .iter()
+        .any(|check| check.key == "sov_esi_progress" && check.status == HealthStatus::Critical));
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
 async fn sov_esi_progress_health_check_is_independent_of_contract_esi_progress() {
     // Regression for review finding 4: `esi_progress` (contract feed) and
     // `sov_esi_progress` (sov campaign feed) must be independent health
     // signals so a stalled collector on one feed is never masked by a
-    // healthy collector on the other.
+    // healthy collector on the other. Both directions use genuinely stale
+    // (not absent) evidence for the degraded side, since "never reported"
+    // is its own, separately-tested, neutral state.
     let database = TemporaryDatabase::new().await;
     let store = database.store().await;
     let pool = PgPoolOptions::new()
@@ -31514,7 +31616,7 @@ async fn sov_esi_progress_health_check_is_independent_of_contract_esi_progress()
     .await
     .expect("seed current heartbeat with an expired ESI startup grace");
 
-    // Contract progress is current; sov progress has no evidence at all.
+    // Contract progress is current; sov progress exists but is stale.
     sqlx::query(
         "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('contracts/public/10000002/page/1', $1)",
     )
@@ -31522,6 +31624,13 @@ async fn sov_esi_progress_health_check_is_independent_of_contract_esi_progress()
     .execute(&pool)
     .await
     .expect("persist current contract ESI progress evidence");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('sovereignty/campaigns', $1)",
+    )
+    .bind(started_at)
+    .execute(&pool)
+    .await
+    .expect("persist stale sov ESI progress evidence");
 
     let contract_advances = HealthCycle::new(store.clone(), clock.clone())
         .run_once()
@@ -31544,13 +31653,11 @@ async fn sov_esi_progress_health_check_is_independent_of_contract_esi_progress()
         .await
         .expect("make contract ESI evidence genuinely stale");
     clock.advance(chrono::Duration::seconds(1));
-    sqlx::query(
-        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('sovereignty/campaigns', $1)",
-    )
-    .bind(clock.now())
-    .execute(&pool)
-    .await
-    .expect("persist current sov ESI progress evidence");
+    sqlx::query("UPDATE esi_cache_metadata SET updated_at = $1 WHERE resource_key = 'sovereignty/campaigns'")
+        .bind(clock.now())
+        .execute(&pool)
+        .await
+        .expect("make sov ESI evidence current");
 
     let sov_advances = HealthCycle::new(store, clock.clone())
         .run_once()

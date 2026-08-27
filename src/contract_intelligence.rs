@@ -2388,14 +2388,10 @@ impl HealthCycle {
                 "oldest prepared delivery",
             ),
         ];
-        checks.push(progress_health_check(
-            "sov_esi_progress",
+        checks.push(sov_esi_progress_health_check(
             inputs.sov_esi_progress_at,
-            startup_at,
             observed_at,
-            self.thresholds.esi_progress_degraded,
-            self.thresholds.esi_progress_critical,
-            "sov campaign ESI progress",
+            &self.thresholds,
         ));
         checks.push(permanent_delivery_health_check(
             "permanent_delivery_failure",
@@ -2666,6 +2662,46 @@ fn esi_progress_health_check(
         thresholds.esi_progress_degraded,
         thresholds.esi_progress_critical,
         "ESI progress",
+    )
+}
+
+/// Unlike `esi_progress_health_check` (which falls back to `startup_at`
+/// when contract collection is always expected to be running), the sov
+/// campaign feed may legitimately never have run at all: it is optional
+/// (spec "Persistence and process model") and, even when enabled, has not
+/// necessarily completed its first successful cycle yet. `sov_esi_progress_at`
+/// is `None` in exactly that "never reported" state (the sov collector
+/// only ever upserts its cache row, never deletes it, so once evidence
+/// exists it persists — going stale is a genuine anomaly, but never having
+/// existed is not). A feed that has never reported progress must not
+/// degrade the Runtime Health Snapshot (ADR 0002); degraded/critical
+/// thresholds only apply once a first progress timestamp exists (review
+/// finding: `health_cycle_uses_public_contract_cache_for_esi_progress_and_excludes_unrelated_namespaces`
+/// and `health_cycle_persists_thresholds_recovers_after_restart_and_isolates_store_failure`
+/// regressed to Critical when this check treated "never started" the same
+/// as "started, then stalled").
+fn sov_esi_progress_health_check(
+    sov_esi_progress_at: Option<DateTime<Utc>>,
+    observed_at: DateTime<Utc>,
+    thresholds: &HealthThresholds,
+) -> HealthCheck {
+    let Some(progress_at) = sov_esi_progress_at else {
+        return HealthCheck {
+            key: "sov_esi_progress".to_string(),
+            status: HealthStatus::Healthy,
+            observed_at,
+            evidence: "no sov campaign ESI progress reported yet (feed not started or not enabled)"
+                .to_string(),
+            consecutive_failures: 0,
+        };
+    };
+    age_health_check(
+        "sov_esi_progress",
+        Some(progress_at),
+        observed_at,
+        thresholds.esi_progress_degraded,
+        thresholds.esi_progress_critical,
+        "sov campaign ESI progress",
     )
 }
 
