@@ -63,6 +63,48 @@ pub trait SovTickerResolver: Send + Sync {
     async fn alliance_ticker(&self, alliance_id: i64) -> Option<String>;
 }
 
+/// Per-campaign reachability facts for the `Reachable` filter leaf and
+/// embed rendering (ticket 04, spec "Reachability" and "Embed"): jumps
+/// from the configured home system and the system-ID route, home first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SovReachabilityInfo {
+    pub jumps: i64,
+    pub route: Vec<i64>,
+}
+
+/// Reachability lookup for the `Reachable` filter leaf and embed
+/// rendering. `reachable` returns `None` both when the system is
+/// unreachable within the loaded graph and when no graph is loaded at all
+/// (spec: a missing/malformed stargate file degrades the feed to
+/// "Reachable never matches", never a startup failure);
+/// [`SovReachabilitySource::graph_available`] distinguishes the two so
+/// `/sov_timers` can say "unreachable" vs "graph unavailable".
+pub trait SovReachabilitySource: Send + Sync {
+    fn reachable(&self, solar_system_id: i64) -> Option<SovReachabilityInfo>;
+    fn graph_available(&self) -> bool;
+}
+
+/// Adapts a computed [`crate::sov_feed::graph::Reachability`] (or its
+/// absence) into [`SovReachabilitySource`]. `None` is the "graph
+/// unavailable" state the composition root (`src/lib.rs`) falls back to
+/// when `config/stargates.json` is missing or malformed at start-up, or
+/// when the sov feed is disabled entirely; it is also the default used by
+/// every existing test that does not care about reachability.
+pub struct StaticSovReachability(pub Option<crate::sov_feed::graph::Reachability>);
+
+impl SovReachabilitySource for StaticSovReachability {
+    fn reachable(&self, solar_system_id: i64) -> Option<SovReachabilityInfo> {
+        let reachability = self.0.as_ref()?;
+        let jumps = reachability.jumps(solar_system_id)?;
+        let route = reachability.path(solar_system_id)?;
+        Some(SovReachabilityInfo { jumps, route })
+    }
+
+    fn graph_available(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
 #[derive(Debug)]
 pub enum SovCollectionError {
     Store(sqlx::Error),
@@ -144,10 +186,12 @@ pub struct SovCollector {
     delivery: Arc<dyn SovDelivery>,
     directory: Arc<dyn SovSystemDirectory>,
     tickers: Arc<dyn SovTickerResolver>,
+    reachability: Arc<dyn SovReachabilitySource>,
     clock: Arc<dyn SovClock>,
 }
 
 impl SovCollector {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: SovStore,
         esi: Arc<dyn crate::sov_feed::esi::SovereigntyEsi>,
@@ -155,6 +199,7 @@ impl SovCollector {
         delivery: Arc<dyn SovDelivery>,
         directory: Arc<dyn SovSystemDirectory>,
         tickers: Arc<dyn SovTickerResolver>,
+        reachability: Arc<dyn SovReachabilitySource>,
     ) -> Self {
         Self {
             store,
@@ -163,6 +208,7 @@ impl SovCollector {
             delivery,
             directory,
             tickers,
+            reachability,
             clock: Arc::new(SystemSovClock),
         }
     }
@@ -261,6 +307,11 @@ impl SovCollector {
             let subscriptions = self.store.subscriptions().await.map_err(store_error)?;
             let region_of =
                 |system_id: i64| self.directory.resolve(system_id).map(|info| info.region_id);
+            let reachable_jumps = |system_id: i64| {
+                self.reachability
+                    .reachable(system_id)
+                    .map(|info| info.jumps)
+            };
             for campaign in &campaigns {
                 // "start_time > now" (spec): a campaign that has already
                 // started never gets a T-minus mark.
@@ -269,11 +320,12 @@ impl SovCollector {
                 }
                 let remaining = campaign.start_time - observed_at;
                 for subscription in &subscriptions {
-                    if !subscription
-                        .filter
-                        .root
-                        .matches(campaign, observed_at, &region_of)
-                    {
+                    if !subscription.filter.root.matches(
+                        campaign,
+                        observed_at,
+                        &region_of,
+                        &reachable_jumps,
+                    ) {
                         continue;
                     }
                     // All due marks fire in this same pass (e.g. after
@@ -376,13 +428,19 @@ impl SovCollector {
             let subscriptions = self.store.subscriptions().await.map_err(store_error)?;
             let region_of =
                 |system_id: i64| self.directory.resolve(system_id).map(|info| info.region_id);
+            let reachable_jumps = |system_id: i64| {
+                self.reachability
+                    .reachable(system_id)
+                    .map(|info| info.jumps)
+            };
             for campaign in &alert_candidates {
                 for subscription in &subscriptions {
-                    if subscription
-                        .filter
-                        .root
-                        .matches(campaign, observed_at, &region_of)
-                    {
+                    if subscription.filter.root.matches(
+                        campaign,
+                        observed_at,
+                        &region_of,
+                        &reachable_jumps,
+                    ) {
                         let message = self
                             .render_stage_message(campaign, SovAlertStage::Appeared)
                             .await;
@@ -458,6 +516,24 @@ impl SovCollector {
             inline: false,
         }];
 
+        // Only present when the system is reachable (spec "Embed": "jumps
+        // and route summary ... omitted for gate-only routes" -- and, by
+        // the same "presentation, not a filter" spirit, omitted entirely
+        // rather than shown as a placeholder for an unreachable system or
+        // an unavailable graph, ticket 04).
+        if let Some(info) = self.reachability.reachable(campaign.solar_system_id) {
+            fields.push(SovEmbedField {
+                name: "Reachability".to_string(),
+                value: format!(
+                    "{} jump{} from home\n{}",
+                    info.jumps,
+                    if info.jumps == 1 { "" } else { "s" },
+                    self.route_summary(&info.route)
+                ),
+                inline: false,
+            });
+        }
+
         if let (Some(defender_score), Some(attackers_score)) =
             (campaign.defender_score, campaign.attackers_score)
         {
@@ -487,6 +563,33 @@ impl SovCollector {
             title,
             fields,
             footer: stage.footer_label(),
+        }
+    }
+
+    /// Renders a route (home-to-target system IDs, in travel order) as a
+    /// display string, resolving each ID to its system name and truncating
+    /// to eight systems with `…` (spec "Embed": "route summary truncated
+    /// to eight systems"). A system this directory cannot resolve falls
+    /// back to its raw ID rather than dropping it from the route.
+    const SOV_ROUTE_SUMMARY_MAX_SYSTEMS: usize = 8;
+
+    fn route_summary(&self, route: &[i64]) -> String {
+        let names: Vec<String> = route
+            .iter()
+            .map(|system_id| {
+                self.directory
+                    .resolve(*system_id)
+                    .map(|info| info.name)
+                    .unwrap_or_else(|| system_id.to_string())
+            })
+            .collect();
+        if names.len() > Self::SOV_ROUTE_SUMMARY_MAX_SYSTEMS {
+            format!(
+                "{} \u{2192} \u{2026}",
+                names[..Self::SOV_ROUTE_SUMMARY_MAX_SYSTEMS].join(" \u{2192} ")
+            )
+        } else {
+            names.join(" \u{2192} ")
         }
     }
 

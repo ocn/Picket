@@ -24,20 +24,26 @@
 
 pub mod collector;
 pub mod esi;
+pub mod graph;
 pub mod model;
 pub mod store;
 
 pub use collector::{
-    SovClock, SovCollectionError, SovCollectionReport, SovCollector, SovStageEvaluationReport,
-    SovSystemDirectory, SovSystemInfo, SovTickerResolver, SystemSovClock,
+    SovClock, SovCollectionError, SovCollectionReport, SovCollector, SovReachabilityInfo,
+    SovReachabilitySource, SovStageEvaluationReport, SovSystemDirectory, SovSystemInfo,
+    SovTickerResolver, StaticSovReachability, SystemSovClock,
 };
 pub use esi::{HttpSovereigntyEsi, SovereigntyEsi, SOV_COMPATIBILITY_DATE};
+pub use graph::{
+    load_stargate_graph_file, Reachability, StargateGraph, StargateGraphFile,
+    StargateGraphLoadError, DEFAULT_STARGATE_GRAPH_PATH,
+};
 pub use model::{
     effective_tminus_marks_minutes, parse_tminus_marks_minutes, PreparedSovDelivery, SovAlertStage,
     SovCampaign, SovDelivery, SovDeliveryError, SovEmbedField, SovFilter, SovFilterCondition,
     SovFilterNode, SovNotificationMessage, SovSubscription, SOV_DEFAULT_TMINUS_MARKS_MINUTES,
-    SOV_EVENT_TYPES, SOV_TMINUS_MARKS_MAX_COUNT, SOV_TMINUS_MARKS_OPTION_KEY,
-    SOV_TMINUS_MARK_MAX_MINUTES, SOV_VULNERABLE_WITHIN_MAX_HOURS,
+    SOV_EVENT_TYPES, SOV_REACHABLE_MAX_JUMPS, SOV_TMINUS_MARKS_MAX_COUNT,
+    SOV_TMINUS_MARKS_OPTION_KEY, SOV_TMINUS_MARK_MAX_MINUTES, SOV_VULNERABLE_WITHIN_MAX_HOURS,
 };
 pub use store::{
     available_sov_store, new_sov_store_handle, SovStore, SovStoreHandle, SOV_CAMPAIGNS_RESOURCE_KEY,

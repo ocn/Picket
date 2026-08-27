@@ -11,3 +11,6 @@ target/
 config-old/
 .claude/cache
 .claude/settings.local.json
+
+# Generated SDE stargate graph used by the sov timer feed (see README: Refreshing the stargate graph)
+!config/stargates.json

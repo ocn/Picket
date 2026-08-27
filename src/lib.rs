@@ -26,6 +26,7 @@ use crate::commands::contract_unsubscribe::ContractUnsubscribeCommand;
 use crate::commands::find_unsubscribed::FindUnsubscribedChannelsCommand;
 use crate::commands::health::HealthCommand;
 use crate::commands::sov_subscribe::SovSubscribeCommand;
+use crate::commands::sov_timers::SovTimersCommand;
 use crate::commands::sov_unsubscribe::SovUnsubscribeCommand;
 use commands::diag::DiagCommand;
 use commands::subscribe::SubscribeCommand;
@@ -60,6 +61,18 @@ impl TypeMapKey for SovStoreContainer {
     type Value = sov_feed::SovStoreHandle;
 }
 
+/// Shared handle to the sov feed's stargate reachability source (ticket
+/// 04): populated once at start-up (see [`sov_reachability_source`]) and
+/// read by the collector loops and `/sov_timers` alike. Unlike
+/// [`SovStoreContainer`] this never changes after start-up -- there is no
+/// live reload of `config/stargates.json` -- so it needs no interior
+/// mutability of its own.
+pub struct SovReachabilityContainer;
+
+impl TypeMapKey for SovReachabilityContainer {
+    type Value = Arc<dyn sov_feed::SovReachabilitySource>;
+}
+
 /// Fixed sov campaign collection cadence (spec "Sources and cadence":
 /// "Sovereignty campaigns are polled every sixty seconds").
 const SOV_COLLECTION_INTERVAL: Duration = Duration::from_secs(60);
@@ -68,6 +81,60 @@ const SOV_COLLECTION_INTERVAL: Duration = Duration::from_secs(60);
 /// `SOV_COLLECTION_INTERVAL` because it makes no ESI request (ticket 03:
 /// "A stage-evaluation pass runs at least every thirty seconds").
 const SOV_STAGE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Default reachability origin: Turnur (spec "Reachability": "Single
+/// origin: Turnur (configurable by environment)").
+const SOV_DEFAULT_HOME_SYSTEM_ID: i64 = 30_002_086;
+
+/// Reads `SOV_HOME_SYSTEM_ID`, falling back to Turnur when unset or not a
+/// valid integer. Never panics: a malformed override just logs a warning
+/// and keeps the default rather than taking down start-up.
+fn sov_home_system_id() -> i64 {
+    match std::env::var("SOV_HOME_SYSTEM_ID") {
+        Ok(value) => value.trim().parse::<i64>().unwrap_or_else(|_| {
+            warn!(
+                "SOV_HOME_SYSTEM_ID '{value}' is not a valid integer; using the default (Turnur, {SOV_DEFAULT_HOME_SYSTEM_ID})"
+            );
+            SOV_DEFAULT_HOME_SYSTEM_ID
+        }),
+        Err(_) => SOV_DEFAULT_HOME_SYSTEM_ID,
+    }
+}
+
+/// Loads `config/stargates.json` and computes reachability from the
+/// configured home system, or degrades to "graph unavailable" when the
+/// file is missing or malformed (spec: "fails loudly" means logged, never
+/// a process exit or a delay to Discord start-up -- review decisions
+/// carried over from ticket 02's ADR 0002 discussion). Pure CPU/local-disk
+/// work over a few thousand systems, so this runs synchronously before the
+/// Discord client is built without risking any startup delay.
+fn sov_reachability_source(enabled: bool) -> Arc<dyn sov_feed::SovReachabilitySource> {
+    if !enabled {
+        return Arc::new(sov_feed::StaticSovReachability(None));
+    }
+    let home_system_id = sov_home_system_id();
+    let path = std::path::Path::new(sov_feed::DEFAULT_STARGATE_GRAPH_PATH);
+    match sov_feed::load_stargate_graph_file(path) {
+        Ok(file) => {
+            let graph = sov_feed::StargateGraph::from_file(file);
+            info!(
+                "Loaded stargate graph: sde_version={}, systems={}, edges={}, home_system_id={home_system_id}",
+                graph.sde_version,
+                graph.system_count(),
+                graph.edge_count()
+            );
+            let reachability = sov_feed::Reachability::compute(&graph, home_system_id, &[]);
+            Arc::new(sov_feed::StaticSovReachability(Some(reachability)))
+        }
+        Err(error) => {
+            error!(
+                "Sov reachability disabled: could not load {}: {error}. The sov feed runs without reachability: Reachable filter leaves never match and /sov_timers reports the graph as unavailable.",
+                path.display()
+            );
+            Arc::new(sov_feed::StaticSovReachability(None))
+        }
+    }
+}
 
 fn generate_queue_id() -> String {
     rand::thread_rng()
@@ -214,6 +281,9 @@ pub async fn run() {
     let sov_unsubscribe_command = Box::new(SovUnsubscribeCommand);
     command_map.insert(sov_unsubscribe_command.name(), sov_unsubscribe_command);
 
+    let sov_timers_command = Box::new(SovTimersCommand);
+    command_map.insert(sov_timers_command.name(), sov_timers_command);
+
     let command_map_arc = Arc::new(command_map);
 
     let contract_runtime = match std::env::var("CONTRACT_DATABASE_URL") {
@@ -239,6 +309,15 @@ pub async fn run() {
     // `.scratch/esi-intel-feeds/issues/02-sov-campaign-appeared-alert-end-to-end.md`).
     let sov_store_handle = sov_feed::new_sov_store_handle();
 
+    // Stargate reachability graph (ticket 04): loaded synchronously here,
+    // before the Discord client exists, because it is pure local-disk and
+    // CPU work over a few thousand systems (milliseconds), never network
+    // IO -- so, unlike the sov store, there is no need to defer it to a
+    // background retry loop. A missing or malformed
+    // `config/stargates.json` degrades to "graph unavailable" rather than
+    // failing start-up (see `sov_reachability_source`'s doc comment).
+    let sov_reachability = sov_reachability_source(contract_runtime.is_some());
+
     // --- Start Discord Bot ---
     let discord_token = app_config.discord_bot_token.clone();
     let intents = GatewayIntents::non_privileged()
@@ -261,6 +340,7 @@ pub async fn run() {
         }
         if contract_runtime.is_some() {
             data.insert::<SovStoreContainer>(sov_store_handle.clone());
+            data.insert::<SovReachabilityContainer>(sov_reachability.clone());
         }
     }
 
@@ -287,6 +367,7 @@ pub async fn run() {
                     delivery.clone(),
                     directory.clone(),
                     tickers.clone(),
+                    sov_reachability.clone(),
                 );
                 // T-minus stage evaluation (ticket 03): a separate,
                 // independently-reconnecting loop rather than a faster
@@ -305,6 +386,7 @@ pub async fn run() {
                     delivery,
                     directory,
                     tickers,
+                    sov_reachability,
                 );
             }
             Err(error) => {
@@ -500,6 +582,7 @@ pub fn spawn_sov_collection_loop(
     delivery: Arc<dyn sov_feed::SovDelivery>,
     directory: Arc<dyn sov_feed::SovSystemDirectory>,
     tickers: Arc<dyn sov_feed::SovTickerResolver>,
+    reachability: Arc<dyn sov_feed::SovReachabilitySource>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_sov_collection_loop(
         database_url,
@@ -509,6 +592,7 @@ pub fn spawn_sov_collection_loop(
         delivery,
         directory,
         tickers,
+        reachability,
     ))
 }
 
@@ -521,6 +605,7 @@ async fn run_sov_collection_loop(
     delivery: Arc<dyn sov_feed::SovDelivery>,
     directory: Arc<dyn sov_feed::SovSystemDirectory>,
     tickers: Arc<dyn sov_feed::SovTickerResolver>,
+    reachability: Arc<dyn sov_feed::SovReachabilitySource>,
 ) {
     let mut consecutive_failures = 0_u32;
     loop {
@@ -543,6 +628,7 @@ async fn run_sov_collection_loop(
                         delivery.clone(),
                         directory.clone(),
                         tickers.clone(),
+                        reachability.clone(),
                     );
                     match run_sov_cycle_isolated(async move { collector.collect_cycle().await })
                         .await
@@ -607,6 +693,7 @@ async fn run_sov_collection_loop(
 /// reconnects every tick (self-healing, idempotent migrations) and does
 /// not populate [`sov_feed::SovStoreHandle`], since the main collection
 /// loop above already owns that handle for command lookups.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_sov_stage_loop(
     database_url: String,
     interval: Duration,
@@ -614,6 +701,7 @@ pub fn spawn_sov_stage_loop(
     delivery: Arc<dyn sov_feed::SovDelivery>,
     directory: Arc<dyn sov_feed::SovSystemDirectory>,
     tickers: Arc<dyn sov_feed::SovTickerResolver>,
+    reachability: Arc<dyn sov_feed::SovReachabilitySource>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_sov_stage_loop(
         database_url,
@@ -622,9 +710,11 @@ pub fn spawn_sov_stage_loop(
         delivery,
         directory,
         tickers,
+        reachability,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_sov_stage_loop(
     database_url: String,
     interval: Duration,
@@ -632,6 +722,7 @@ async fn run_sov_stage_loop(
     delivery: Arc<dyn sov_feed::SovDelivery>,
     directory: Arc<dyn sov_feed::SovSystemDirectory>,
     tickers: Arc<dyn sov_feed::SovTickerResolver>,
+    reachability: Arc<dyn sov_feed::SovReachabilitySource>,
 ) {
     let mut cadence = tokio::time::interval_at(tokio::time::Instant::now(), interval);
     cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -647,6 +738,7 @@ async fn run_sov_stage_loop(
                         delivery.clone(),
                         directory.clone(),
                         tickers.clone(),
+                        reachability.clone(),
                     );
                     if let Err(error) =
                         run_sov_cycle_isolated(
