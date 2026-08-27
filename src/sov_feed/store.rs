@@ -64,6 +64,38 @@ fn json_to_sqlx(error: serde_json::Error) -> sqlx::Error {
     sqlx::Error::Protocol(error.to_string())
 }
 
+/// The outcome of one [`SovStore::record_reachability_observation`] call
+/// (ticket 06; `pending_announcement` added in the fix round, finding 2).
+/// Only [`Self::Observed`] with `reachable && pending_announcement` is
+/// ever eligible to fire the `reachable` Alert Stage -- and the caller
+/// must check that on *every* pass while it holds, not only the pass that
+/// produced a fresh transition: a subscription like
+/// `And(Reachable, VulnerableWithin(12h))` may not have its full filter
+/// match until several passes after the `Reachable` leaf itself flipped,
+/// and the announcement must not be lost in the meantime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SovReachabilityTransition {
+    /// No prior row existed for this (subscription, campaign) pair: state
+    /// is now established at `reachable`, already marked announced (spec:
+    /// "reachable at first observation never fires", regardless of when
+    /// the full filter might later match).
+    Baseline { reachable: bool },
+    /// A prior row existed. `reachable`/`transition_sequence` are the
+    /// current persisted values after this observation.
+    /// `pending_announcement` is `true` exactly when `reachable` is
+    /// `true` and the `reachable:<transition_sequence>` alert for the
+    /// current true-streak has not yet been marked announced (see
+    /// [`SovStore::mark_reachability_announced`]) -- it stays `true`
+    /// across as many `Unchanged`-shaped observations as it takes for the
+    /// caller's full filter to match, not only on the observation that
+    /// caused the flip.
+    Observed {
+        reachable: bool,
+        transition_sequence: i64,
+        pending_announcement: bool,
+    },
+}
+
 #[derive(Clone)]
 pub struct SovStore {
     pool: PgPool,
@@ -313,13 +345,30 @@ impl SovStore {
         if campaign_ids.is_empty() {
             return Ok(());
         }
+        // One transaction (fix round finding 4): the `ended_at` update and
+        // the reachability-state prune are two facts about the same event
+        // ("this campaign just ended") and must become visible together,
+        // not as two independently-committed writes a concurrent reader
+        // could observe half-applied.
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "UPDATE sov_campaigns SET ended_at = $1 WHERE campaign_id = ANY($2) AND ended_at IS NULL",
         )
         .bind(observed_at)
         .bind(campaign_ids)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        // Reachability state may be pruned along with its campaign (ticket
+        // 06: "Ended campaigns are skipped and their state may be pruned
+        // with the campaign") -- `evaluate_stage_cycle` only ever reads
+        // `open_campaigns()`, so a state row surviving past its campaign's
+        // end would just be dead weight, never a correctness problem; this
+        // keeps the table from growing unbounded regardless.
+        sqlx::query("DELETE FROM sov_reachability_state WHERE campaign_id = ANY($1)")
+            .bind(campaign_ids)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -433,6 +482,192 @@ impl SovStore {
         .await?
         .map(sov_subscription_from_row)
         .transpose()
+    }
+
+    // --- Reachability transition state (ticket 06) ---
+
+    /// Records one subscription's observation of whether a campaign is
+    /// currently reachable (per that subscription's own `Reachable` leaf,
+    /// via `SovFilterNode::reachable_leaf_state` -- the caller must have
+    /// already checked `has_reachable_leaf` before calling this at all)
+    /// and reports what kind of transition, if any, this observation is.
+    ///
+    /// A `SELECT ... FOR UPDATE` inside an explicit transaction reads the
+    /// prior row (if any) before deciding how to write the new one, so the
+    /// "was this a false->true flip" decision and the persisted write are
+    /// atomic with respect to each other -- there is exactly one caller
+    /// today (`SovCollector::evaluate_stage_cycle`'s single loop), but this
+    /// keeps the state machine correct if that ever changes.
+    pub async fn record_reachability_observation(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+        subscription_name: &str,
+        campaign_id: i64,
+        reachable_now: bool,
+        observed_at: DateTime<Utc>,
+    ) -> Result<SovReachabilityTransition, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let existing = sqlx::query(
+            "SELECT reachable, transition_sequence, announced FROM sov_reachability_state WHERE guild_id = $1 AND channel_id = $2 AND subscription_name = $3 AND campaign_id = $4 FOR UPDATE",
+        )
+        .bind(guild_id as i64)
+        .bind(channel_id as i64)
+        .bind(subscription_name)
+        .bind(campaign_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let transition = match existing {
+            None => {
+                // First observation: establish the row, already
+                // `announced` -- "reachable at first observation never
+                // fires" (spec), regardless of when the full filter might
+                // later match.
+                sqlx::query(
+                    "INSERT INTO sov_reachability_state (guild_id, channel_id, subscription_name, campaign_id, reachable, since, transition_sequence, announced, updated_at) VALUES ($1,$2,$3,$4,$5,$6,0,TRUE,now())",
+                )
+                .bind(guild_id as i64)
+                .bind(channel_id as i64)
+                .bind(subscription_name)
+                .bind(campaign_id)
+                .bind(reachable_now)
+                .bind(observed_at)
+                .execute(&mut *tx)
+                .await?;
+                SovReachabilityTransition::Baseline {
+                    reachable: reachable_now,
+                }
+            }
+            Some(row) => {
+                let previous_reachable: bool = row.get("reachable");
+                let previous_sequence: i64 = row.get("transition_sequence");
+                let previous_announced: bool = row.get("announced");
+                if previous_reachable == reachable_now {
+                    // Unchanged: no write needed. `pending_announcement`
+                    // still reflects the stored `announced` flag, so a
+                    // caller whose full filter did not match on the pass
+                    // that produced the original transition keeps getting
+                    // a chance to fire on every later pass while it stays
+                    // reachable (fix round finding 2).
+                    SovReachabilityTransition::Observed {
+                        reachable: reachable_now,
+                        transition_sequence: previous_sequence,
+                        pending_announcement: reachable_now && !previous_announced,
+                    }
+                } else if reachable_now {
+                    // false -> true: a genuine transition. Saturating so a
+                    // pathologically long-lived campaign flapping forever
+                    // can never overflow (bounded, non-panicking
+                    // arithmetic, mirroring every other counter in this
+                    // feed). `announced` resets to FALSE: this fresh
+                    // true-streak has not been announced yet.
+                    let new_sequence = previous_sequence.saturating_add(1);
+                    sqlx::query(
+                        "UPDATE sov_reachability_state SET reachable = TRUE, since = $5, transition_sequence = $6, announced = FALSE, updated_at = now() WHERE guild_id = $1 AND channel_id = $2 AND subscription_name = $3 AND campaign_id = $4",
+                    )
+                    .bind(guild_id as i64)
+                    .bind(channel_id as i64)
+                    .bind(subscription_name)
+                    .bind(campaign_id)
+                    .bind(observed_at)
+                    .bind(new_sequence)
+                    .execute(&mut *tx)
+                    .await?;
+                    SovReachabilityTransition::Observed {
+                        reachable: true,
+                        transition_sequence: new_sequence,
+                        pending_announcement: true,
+                    }
+                } else {
+                    // true -> false: never fires an alert (no retraction
+                    // events), but re-arms the next false->true flip since
+                    // the sequence is left unchanged for now and only
+                    // bumped on the next reachable transition. `announced`
+                    // resets to TRUE: nothing is pending while unreachable
+                    // (whether or not the prior true-streak ever actually
+                    // fired), and the next false->true flip starts its own
+                    // fresh `announced = FALSE`.
+                    sqlx::query(
+                        "UPDATE sov_reachability_state SET reachable = FALSE, since = $5, announced = TRUE, updated_at = now() WHERE guild_id = $1 AND channel_id = $2 AND subscription_name = $3 AND campaign_id = $4",
+                    )
+                    .bind(guild_id as i64)
+                    .bind(channel_id as i64)
+                    .bind(subscription_name)
+                    .bind(campaign_id)
+                    .bind(observed_at)
+                    .execute(&mut *tx)
+                    .await?;
+                    SovReachabilityTransition::Observed {
+                        reachable: false,
+                        transition_sequence: previous_sequence,
+                        pending_announcement: false,
+                    }
+                }
+            }
+        };
+        tx.commit().await?;
+        Ok(transition)
+    }
+
+    /// Marks the current `reachable:<transition_sequence>` announcement as
+    /// done, so future passes stop re-attempting the full-filter check for
+    /// it (fix round finding 2). Keyed by `transition_sequence` as well as
+    /// the row's primary key so a call racing behind a newer transition
+    /// (already bumped the sequence again) can never mark the *new*
+    /// transition announced by mistake -- it simply matches zero rows.
+    /// Called once the caller has confirmed (via `prepare_delivery`,
+    /// whether freshly inserted or already existing from a prior attempt)
+    /// that a durable delivery row for this exact stage exists; the
+    /// delivery's own dedup/lease machinery takes it from there, so this
+    /// flag only needs to be "eventually true", not part of the delivery
+    /// dedup authority itself.
+    pub async fn mark_reachability_announced(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+        subscription_name: &str,
+        campaign_id: i64,
+        transition_sequence: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE sov_reachability_state SET announced = TRUE, updated_at = now() WHERE guild_id = $1 AND channel_id = $2 AND subscription_name = $3 AND campaign_id = $4 AND transition_sequence = $5",
+        )
+        .bind(guild_id as i64)
+        .bind(channel_id as i64)
+        .bind(subscription_name)
+        .bind(campaign_id)
+        .bind(transition_sequence)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub async fn reachability_state_for_test(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+        subscription_name: &str,
+        campaign_id: i64,
+    ) -> Result<Option<(bool, DateTime<Utc>, i64, bool)>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT reachable, since, transition_sequence, announced FROM sov_reachability_state WHERE guild_id = $1 AND channel_id = $2 AND subscription_name = $3 AND campaign_id = $4",
+        )
+        .bind(guild_id as i64)
+        .bind(channel_id as i64)
+        .bind(subscription_name)
+        .bind(campaign_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| {
+            (
+                row.get("reachable"),
+                row.get("since"),
+                row.get("transition_sequence"),
+                row.get("announced"),
+            )
+        }))
     }
 
     // --- Deliveries ---

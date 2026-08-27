@@ -50,25 +50,38 @@ pub enum SovAlertStage {
     /// A configured T-minus mark, in minutes before the campaign's
     /// `start_time` (spec "Alert stages and dedup": `tminus:<minutes>`).
     TMinus(i64),
+    /// An observed unreachable-to-reachable transition for one
+    /// subscription's `Reachable` leaf, keyed by the persisted transition
+    /// sequence number (spec "Alert stages and dedup": "the reachable
+    /// stage includes the transition sequence number", "it re-arms after
+    /// an observed unreachable interval"; ticket 06). The sequence comes
+    /// from `SovStore::record_reachability_observation`, never computed
+    /// here.
+    Reachable(i64),
 }
 
 impl SovAlertStage {
     /// The dedup-authority stage key stored in `sov_alert_deliveries.stage`
     /// (part of its unique constraint together with subscription and
-    /// subject). Owned because `TMinus` formats its minutes into the key.
+    /// subject). Owned because `TMinus`/`Reachable` format a number into
+    /// the key.
     pub fn as_str(self) -> String {
         match self {
             Self::Appeared => "appeared".to_string(),
             Self::TMinus(minutes) => format!("tminus:{minutes}"),
+            Self::Reachable(sequence) => format!("reachable:{sequence}"),
         }
     }
 
     /// The embed footer text naming this stage (spec "Embed": "Footer
-    /// names the stage", example `T-120m`).
+    /// names the stage", example `T-120m`; ticket 06: "the embed footer
+    /// reads 'now reachable'" -- the transition sequence is dedup
+    /// plumbing, not shown to the user).
     pub fn footer_label(self) -> String {
         match self {
             Self::Appeared => "Appeared".to_string(),
             Self::TMinus(minutes) => format!("T-{minutes}m"),
+            Self::Reachable(_) => "now reachable".to_string(),
         }
     }
 }
@@ -200,7 +213,23 @@ impl SovFilterNode {
                 }
                 Ok(())
             }
-            Self::Not(node) => node.validate_at(depth + 1, node_count),
+            Self::Not(node) => {
+                // Fix round finding 3: a `Reachable` leaf anywhere under a
+                // `Not` (any depth, including double negation) is
+                // rejected. `Not(Reachable)` would make
+                // `reachable_leaf_state` report `true` exactly when the
+                // campaign is physically *unreachable* -- no jumps, no
+                // route, no Path Risk to render -- so a genuine
+                // false-to-true flip of that inverted value would still
+                // try to fire a "now reachable" embed with nothing to
+                // show. `has_reachable_leaf` already recurses through the
+                // whole subtree (including further nested And/Or/Not), so
+                // this catches every depth in one check.
+                if node.has_reachable_leaf() {
+                    return Err("reachable cannot be negated".to_string());
+                }
+                node.validate_at(depth + 1, node_count)
+            }
         }
     }
 
@@ -263,6 +292,76 @@ impl SovFilterNode {
             }
             Self::Not(node) => node.allows_frigate_holes_anywhere(),
         }
+    }
+
+    /// Whether this filter tree contains a `Reachable` leaf anywhere
+    /// (ticket 06: "persist state per (subscription, campaign) ... for
+    /// subscriptions whose filter contains a Reachable leaf"). Callers
+    /// must check this before persisting or reading reachability
+    /// transition state for a subscription -- a subscription this returns
+    /// `false` for must never get a `sov_reachability_state` row at all.
+    pub fn has_reachable_leaf(&self) -> bool {
+        match self {
+            Self::Condition(SovFilterCondition::Reachable { .. }) => true,
+            Self::Condition(_) => false,
+            Self::And(nodes) | Self::Or(nodes) => nodes.iter().any(Self::has_reachable_leaf),
+            Self::Not(node) => node.has_reachable_leaf(),
+        }
+    }
+
+    /// The boolean value of this filter tree's `Reachable` leaf (or
+    /// leaves) alone, ignoring every other leaf type entirely (ticket 06:
+    /// "state tracking itself follows the Reachable leaf only" -- as
+    /// opposed to [`Self::matches`], which requires the *whole* filter to
+    /// hold, used to gate whether a transition actually fires an alert).
+    /// Returns `None` when the tree contains no `Reachable` leaf at all;
+    /// callers must check [`Self::has_reachable_leaf`] first and never
+    /// persist state for a subscription this returns `None` for.
+    ///
+    /// A non-`Reachable` leaf contributes nothing (`None`) to the
+    /// aggregation: `And`/`Or` fold their children treating a `None`
+    /// child as the identity element (`true` for `And`, `false` for `Or`)
+    /// so a single `Reachable` leaf nested alongside e.g. a `Region` leaf
+    /// still resolves to that leaf's own value, and a node whose children
+    /// are *all* `None` is itself `None`. A subscription combining two
+    /// different `Reachable` leaves (different `max_jumps`) via `Or`/`And`
+    /// is a corner case the spec does not resolve explicitly -- this
+    /// mirrors `allows_frigate_holes_anywhere`'s same disclaimer.
+    pub fn reachable_leaf_state(
+        &self,
+        campaign: &SovCampaign,
+        reachable_jumps: &dyn Fn(i64, bool) -> Option<i64>,
+    ) -> Option<bool> {
+        match self {
+            Self::Condition(condition) => condition.reachable_leaf_state(campaign, reachable_jumps),
+            Self::And(nodes) => nodes.iter().fold(None, |acc, node| {
+                combine_and(acc, node.reachable_leaf_state(campaign, reachable_jumps))
+            }),
+            Self::Or(nodes) => nodes.iter().fold(None, |acc, node| {
+                combine_or(acc, node.reachable_leaf_state(campaign, reachable_jumps))
+            }),
+            Self::Not(node) => node
+                .reachable_leaf_state(campaign, reachable_jumps)
+                .map(|value| !value),
+        }
+    }
+}
+
+/// `And` aggregation for [`SovFilterNode::reachable_leaf_state`]: `None`
+/// (no `Reachable` leaf on this side) is the identity element.
+fn combine_and(acc: Option<bool>, child: Option<bool>) -> Option<bool> {
+    match (acc, child) {
+        (None, other) | (other, None) => other,
+        (Some(a), Some(b)) => Some(a && b),
+    }
+}
+
+/// `Or` aggregation for [`SovFilterNode::reachable_leaf_state`]: `None`
+/// (no `Reachable` leaf on this side) is the identity element.
+fn combine_or(acc: Option<bool>, child: Option<bool>) -> Option<bool> {
+    match (acc, child) {
+        (None, other) | (other, None) => other,
+        (Some(a), Some(b)) => Some(a || b),
     }
 }
 
@@ -404,6 +503,38 @@ impl SovFilterCondition {
                 reachable_jumps(campaign.solar_system_id, *allow_frigate_holes)
                     .is_some_and(|jumps| jumps >= 0 && jumps <= *max_jumps)
             }
+        }
+    }
+
+    /// The `Reachable`-leaf-only counterpart of [`Self::matches`], used by
+    /// [`SovFilterNode::reachable_leaf_state`]: `Some(bool)` for a
+    /// `Reachable` leaf (with the same defensive out-of-range guard as
+    /// `matches`), `None` for every other leaf type (it contributes no
+    /// reachability fact).
+    fn reachable_leaf_state(
+        &self,
+        campaign: &SovCampaign,
+        reachable_jumps: &dyn Fn(i64, bool) -> Option<i64>,
+    ) -> Option<bool> {
+        match self {
+            Self::Reachable {
+                max_jumps,
+                allow_frigate_holes,
+            } => {
+                if *max_jumps < 1 || *max_jumps > SOV_REACHABLE_MAX_JUMPS {
+                    Some(false)
+                } else {
+                    Some(
+                        reachable_jumps(campaign.solar_system_id, *allow_frigate_holes)
+                            .is_some_and(|jumps| jumps >= 0 && jumps <= *max_jumps),
+                    )
+                }
+            }
+            Self::VulnerableWithin { .. }
+            | Self::Defender { .. }
+            | Self::Region(_)
+            | Self::System(_)
+            | Self::EventType(_) => None,
         }
     }
 }
@@ -1133,5 +1264,211 @@ mod tests {
             .validate()
             .expect("README Jita-not-freeport example validates");
         assert!(matches!(parsed.root, SovFilterNode::And(ref nodes) if nodes.len() == 2));
+    }
+
+    // --- SovAlertStage::Reachable / has_reachable_leaf / reachable_leaf_state (ticket 06) ---
+
+    #[test]
+    fn reachable_stage_key_and_footer_are_formatted_from_the_sequence() {
+        assert_eq!(SovAlertStage::Reachable(1).as_str(), "reachable:1");
+        assert_eq!(SovAlertStage::Reachable(42).as_str(), "reachable:42");
+        // Distinct sequences produce distinct keys, so
+        // `sov_alert_deliveries`'s unique constraint re-arms per
+        // transition rather than deduping every reachable alert for a
+        // campaign together.
+        assert_ne!(
+            SovAlertStage::Reachable(1).as_str(),
+            SovAlertStage::Reachable(2).as_str()
+        );
+        assert_eq!(SovAlertStage::Reachable(1).footer_label(), "now reachable");
+        assert_eq!(
+            SovAlertStage::Reachable(7).footer_label(),
+            "now reachable",
+            "the footer never leaks the transition sequence to the user"
+        );
+    }
+
+    #[test]
+    fn has_reachable_leaf_finds_a_leaf_nested_under_and_or_not_and_is_false_without_one() {
+        let none = SovFilterNode::Condition(SovFilterCondition::EventType(vec![
+            "ihub_defense".to_string()
+        ]));
+        assert!(!none.has_reachable_leaf());
+
+        let direct = SovFilterNode::Condition(SovFilterCondition::Reachable {
+            max_jumps: 5,
+            allow_frigate_holes: false,
+        });
+        assert!(direct.has_reachable_leaf());
+
+        let nested = SovFilterNode::And(vec![
+            SovFilterNode::Condition(SovFilterCondition::VulnerableWithin { hours: 12 }),
+            SovFilterNode::Not(Box::new(SovFilterNode::Or(vec![SovFilterNode::Condition(
+                SovFilterCondition::Reachable {
+                    max_jumps: 5,
+                    allow_frigate_holes: true,
+                },
+            )]))),
+        ]);
+        assert!(nested.has_reachable_leaf());
+    }
+
+    #[test]
+    fn validate_rejects_a_reachable_leaf_directly_under_not() {
+        let node = SovFilterNode::Not(Box::new(SovFilterNode::Condition(
+            SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            },
+        )));
+        let error = node
+            .validate()
+            .expect_err("Not(Reachable) must be rejected");
+        assert_eq!(error, "reachable cannot be negated");
+    }
+
+    #[test]
+    fn validate_rejects_a_reachable_leaf_nested_under_not_at_any_depth() {
+        // Nested inside And/Or under the Not.
+        let nested = SovFilterNode::And(vec![
+            SovFilterNode::Condition(SovFilterCondition::VulnerableWithin { hours: 12 }),
+            SovFilterNode::Not(Box::new(SovFilterNode::Or(vec![SovFilterNode::Condition(
+                SovFilterCondition::Reachable {
+                    max_jumps: 5,
+                    allow_frigate_holes: true,
+                },
+            )]))),
+        ]);
+        assert!(nested.validate().is_err());
+
+        // Double negation: still rejected -- "any Reachable leaf under a
+        // Not, any depth" is the rule, regardless of whether an even
+        // number of negations would cancel out semantically.
+        let double_negated = SovFilterNode::Not(Box::new(SovFilterNode::Not(Box::new(
+            SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            }),
+        ))));
+        assert!(double_negated.validate().is_err());
+
+        // A Not much further from the Reachable leaf than the leaf's own
+        // direct parent still catches it.
+        let deeply_nested = SovFilterNode::Not(Box::new(SovFilterNode::And(vec![
+            SovFilterNode::Condition(SovFilterCondition::Region(vec![10_000_060])),
+            SovFilterNode::Or(vec![
+                SovFilterNode::Condition(SovFilterCondition::EventType(vec![
+                    "ihub_defense".to_string()
+                ])),
+                SovFilterNode::Condition(SovFilterCondition::Reachable {
+                    max_jumps: 3,
+                    allow_frigate_holes: false,
+                }),
+            ]),
+        ])));
+        assert!(deeply_nested.validate().is_err());
+    }
+
+    #[test]
+    fn validate_still_accepts_not_over_a_non_reachable_leaf() {
+        let node = SovFilterNode::Not(Box::new(SovFilterNode::Condition(
+            SovFilterCondition::EventType(vec!["station_freeport".to_string()]),
+        )));
+        assert!(node.validate().is_ok());
+
+        // A Reachable leaf elsewhere in the same tree, but not under this
+        // Not, is still fine.
+        let mixed = SovFilterNode::And(vec![
+            SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            }),
+            SovFilterNode::Not(Box::new(SovFilterNode::Condition(
+                SovFilterCondition::EventType(vec!["station_freeport".to_string()]),
+            ))),
+        ]);
+        assert!(mixed.validate().is_ok());
+    }
+
+    #[test]
+    fn reachable_leaf_state_is_none_for_a_subscription_with_no_reachable_leaf() {
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+        let campaign = make_campaign(1, "ihub_defense", 30_000_001, Some(99_000_001), observed_at);
+        let node = SovFilterNode::Condition(SovFilterCondition::Defender {
+            alliance_ids: vec![99_000_001],
+        });
+        assert_eq!(node.reachable_leaf_state(&campaign, &|_, _| Some(2)), None);
+    }
+
+    #[test]
+    fn reachable_leaf_state_reports_the_leafs_own_boolean_independent_of_other_leaves() {
+        // A campaign whose Reachable leaf matches but whose Region leaf
+        // does not: `reachable_leaf_state` still reports `true`, because
+        // it follows the Reachable leaf alone -- gating the actual
+        // `reachable` alert on the *full* filter is a separate concern
+        // handled by the collector, not this function.
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+        let campaign = make_campaign(1, "ihub_defense", 30_000_001, Some(99_000_001), observed_at);
+        let node = SovFilterNode::And(vec![
+            SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            }),
+            SovFilterNode::Condition(SovFilterCondition::Region(vec![10_000_099])),
+        ]);
+        let reachable_jumps = |_: i64, _: bool| Some(2);
+        assert_eq!(
+            node.reachable_leaf_state(&campaign, &reachable_jumps),
+            Some(true)
+        );
+        // The full filter, by contrast, fails: Region never resolves
+        // through the empty resolver used here.
+        assert!(!node.matches(&campaign, observed_at, &|_| None, &reachable_jumps));
+    }
+
+    #[test]
+    fn reachable_leaf_state_reflects_unreachable_and_out_of_range_max_jumps() {
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+        let campaign = make_campaign(1, "ihub_defense", 30_000_001, Some(99_000_001), observed_at);
+
+        let unreachable = SovFilterNode::Condition(SovFilterCondition::Reachable {
+            max_jumps: 5,
+            allow_frigate_holes: false,
+        });
+        assert_eq!(
+            unreachable.reachable_leaf_state(&campaign, &|_, _| None),
+            Some(false)
+        );
+
+        // Defensive guard, mirroring `matches`: an out-of-range max_jumps
+        // bypassing validate() never reports "always reachable".
+        let out_of_range = SovFilterNode::Condition(SovFilterCondition::Reachable {
+            max_jumps: SOV_REACHABLE_MAX_JUMPS + 1,
+            allow_frigate_holes: false,
+        });
+        assert_eq!(
+            out_of_range.reachable_leaf_state(&campaign, &|_, _| Some(1)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn reachable_leaf_state_not_inverts_the_underlying_leaf() {
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+        let campaign = make_campaign(1, "ihub_defense", 30_000_001, Some(99_000_001), observed_at);
+        let node = SovFilterNode::Not(Box::new(SovFilterNode::Condition(
+            SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            },
+        )));
+        assert_eq!(
+            node.reachable_leaf_state(&campaign, &|_, _| Some(2)),
+            Some(false)
+        );
+        assert_eq!(
+            node.reachable_leaf_state(&campaign, &|_, _| None),
+            Some(true)
+        );
     }
 }

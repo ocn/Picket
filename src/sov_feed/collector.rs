@@ -16,7 +16,7 @@ use crate::sov_feed::model::{
     effective_tminus_marks_minutes, PreparedSovDelivery, SovAlertStage, SovCampaign, SovDelivery,
     SovEmbedField, SovNotificationMessage,
 };
-use crate::sov_feed::store::{SovStore, SOV_CAMPAIGNS_RESOURCE_KEY};
+use crate::sov_feed::store::{SovReachabilityTransition, SovStore, SOV_CAMPAIGNS_RESOURCE_KEY};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::sync::Arc;
@@ -195,6 +195,11 @@ pub struct SovCollectionReport {
 pub struct SovStageEvaluationReport {
     pub campaigns_evaluated: usize,
     pub tminus_prepared: usize,
+    /// Freshly prepared `reachable:<seq>` deliveries this cycle (ticket
+    /// 06): an observed false->true transition for a subscription's
+    /// `Reachable` leaf whose full filter also matched at the moment of
+    /// the transition.
+    pub reachable_prepared: usize,
 }
 
 impl SovCollectionReport {
@@ -344,6 +349,7 @@ impl SovCollector {
 
         let campaigns = self.store.open_campaigns().await.map_err(store_error)?;
         let mut tminus_prepared = 0usize;
+        let mut reachable_prepared = 0usize;
         if !campaigns.is_empty() {
             let subscriptions = self.store.subscriptions().await.map_err(store_error)?;
             let region_of =
@@ -353,59 +359,177 @@ impl SovCollector {
                     .reachable(system_id, allow_frigate_holes)
                     .map(|info| info.jumps)
             };
+            // Fix round finding 1: when the reachability source itself is
+            // unavailable (missing/malformed stargate file, ticket 04's
+            // degrade path), `reachable_jumps` above returns `None` for
+            // every system -- indistinguishable, at that closure's level,
+            // from "loaded graph, genuinely unreachable". Recording that
+            // as an observed `false` would be wrong: if the graph then
+            // comes back, every campaign that was actually reachable all
+            // along would look like a fresh false->true transition and
+            // the whole feed would burst-fire "now reachable" for
+            // everything at once. Checked once per cycle (a property of
+            // the reachability source as a whole, not per system) and used
+            // to skip the entire reachability pass below when true: no
+            // observation is recorded at all, so state -- including
+            // whether a campaign first seen during the outage has ever
+            // gotten its baseline row -- simply waits for the graph to
+            // come back.
+            let graph_available = self.reachability.graph_available();
             for campaign in &campaigns {
-                // "start_time > now" (spec): a campaign that has already
-                // started never gets a T-minus mark.
-                if campaign.start_time <= observed_at {
-                    continue;
-                }
-                let remaining = campaign.start_time - observed_at;
-                for subscription in &subscriptions {
-                    if !subscription.filter.root.matches(
-                        campaign,
-                        observed_at,
-                        &region_of,
-                        &reachable_jumps,
-                    ) {
-                        continue;
-                    }
-                    // All due marks fire in this same pass (e.g. after
-                    // downtime skipped an earlier evaluation), each once
-                    // via `prepare_delivery`'s unique-constraint dedup.
-                    for minutes in effective_tminus_marks_minutes(&subscription.options) {
-                        // Non-panicking construction (review finding 1b):
-                        // `/sov_subscribe` already rejects marks above
-                        // `SOV_TMINUS_MARK_MAX_MINUTES`, but a value
-                        // stored some other way (direct `options` write,
-                        // a future migration) must never reach the
-                        // panicking `ChronoDuration::minutes`. Treat an
-                        // out-of-range mark as permanently not-due rather
-                        // than always-due.
-                        let Some(mark_duration) = ChronoDuration::try_minutes(minutes) else {
-                            continue;
-                        };
-                        if remaining > mark_duration {
+                // T-minus marks: "start_time > now" (spec) -- a campaign
+                // that has already started never gets a T-minus mark. This
+                // gate is specific to T-minus; reachability transitions
+                // below run for every open campaign regardless of
+                // start_time (ticket 06 sets no such restriction -- a
+                // chain-opens-a-door moment matters for as long as the
+                // campaign stays open).
+                if campaign.start_time > observed_at {
+                    let remaining = campaign.start_time - observed_at;
+                    for subscription in &subscriptions {
+                        if !subscription.filter.root.matches(
+                            campaign,
+                            observed_at,
+                            &region_of,
+                            &reachable_jumps,
+                        ) {
                             continue;
                         }
+                        // All due marks fire in this same pass (e.g. after
+                        // downtime skipped an earlier evaluation), each
+                        // once via `prepare_delivery`'s unique-constraint
+                        // dedup.
+                        for minutes in effective_tminus_marks_minutes(&subscription.options) {
+                            // Non-panicking construction (review finding
+                            // 1b): `/sov_subscribe` already rejects marks
+                            // above `SOV_TMINUS_MARK_MAX_MINUTES`, but a
+                            // value stored some other way (direct
+                            // `options` write, a future migration) must
+                            // never reach the panicking
+                            // `ChronoDuration::minutes`. Treat an
+                            // out-of-range mark as permanently not-due
+                            // rather than always-due.
+                            let Some(mark_duration) = ChronoDuration::try_minutes(minutes) else {
+                                continue;
+                            };
+                            if remaining > mark_duration {
+                                continue;
+                            }
+                            let message = self
+                                .render_stage_message(
+                                    campaign,
+                                    SovAlertStage::TMinus(minutes),
+                                    subscription.filter.root.allows_frigate_holes_anywhere(),
+                                )
+                                .await;
+                            let freshly_prepared = self
+                                .store
+                                .prepare_delivery(
+                                    subscription,
+                                    campaign.campaign_id,
+                                    SovAlertStage::TMinus(minutes),
+                                    &message,
+                                )
+                                .await
+                                .map_err(store_error)?;
+                            if freshly_prepared {
+                                tminus_prepared += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Reachability transitions (ticket 06): state is tracked
+                // per (subscription, campaign) for every subscription
+                // whose filter contains a `Reachable` leaf, following that
+                // leaf's own boolean alone -- independent of whether the
+                // subscription's other leaves (Region, Defender, ...)
+                // match this campaign. Only firing the `reachable` alert
+                // itself additionally requires the *full* filter to match
+                // (recommended in the ticket: otherwise a campaign in the
+                // wrong region would announce "now reachable") -- and that
+                // check runs on *every* pass while an announcement is
+                // pending, not only the pass that produced the transition
+                // (fix round finding 2), so `And(Reachable,
+                // VulnerableWithin(12h))` still fires once the campaign
+                // enters the window, even many passes after the leaf
+                // itself flipped true.
+                if graph_available {
+                    for subscription in &subscriptions {
+                        if !subscription.filter.root.has_reachable_leaf() {
+                            continue;
+                        }
+                        let reachable_now = subscription
+                            .filter
+                            .root
+                            .reachable_leaf_state(campaign, &reachable_jumps)
+                            .unwrap_or(false);
+                        let transition = self
+                            .store
+                            .record_reachability_observation(
+                                subscription.guild_id,
+                                subscription.channel_id,
+                                &subscription.name,
+                                campaign.campaign_id,
+                                reachable_now,
+                                observed_at,
+                            )
+                            .await
+                            .map_err(store_error)?;
+                        let SovReachabilityTransition::Observed {
+                            reachable,
+                            transition_sequence,
+                            pending_announcement,
+                        } = transition
+                        else {
+                            // Baseline: never fires, regardless of value.
+                            continue;
+                        };
+                        if !reachable || !pending_announcement {
+                            continue;
+                        }
+                        if !subscription.filter.root.matches(
+                            campaign,
+                            observed_at,
+                            &region_of,
+                            &reachable_jumps,
+                        ) {
+                            // Still pending: the leaf flipped true but the
+                            // full filter does not match yet. Try again
+                            // next pass rather than losing the
+                            // announcement.
+                            continue;
+                        }
+                        let stage = SovAlertStage::Reachable(transition_sequence);
                         let message = self
                             .render_stage_message(
                                 campaign,
-                                SovAlertStage::TMinus(minutes),
+                                stage,
                                 subscription.filter.root.allows_frigate_holes_anywhere(),
                             )
                             .await;
                         let freshly_prepared = self
                             .store
-                            .prepare_delivery(
-                                subscription,
+                            .prepare_delivery(subscription, campaign.campaign_id, stage, &message)
+                            .await
+                            .map_err(store_error)?;
+                        // Marked announced once a durable delivery row is
+                        // confirmed to exist, whether freshly prepared
+                        // here or already prepared by an earlier attempt
+                        // (restart-safe: the delivery's own lease/dedup
+                        // path owns exactly-once send from here).
+                        self.store
+                            .mark_reachability_announced(
+                                subscription.guild_id,
+                                subscription.channel_id,
+                                &subscription.name,
                                 campaign.campaign_id,
-                                SovAlertStage::TMinus(minutes),
-                                &message,
+                                transition_sequence,
                             )
                             .await
                             .map_err(store_error)?;
                         if freshly_prepared {
-                            tminus_prepared += 1;
+                            reachable_prepared += 1;
                         }
                     }
                 }
@@ -415,6 +539,7 @@ impl SovCollector {
         Ok(SovStageEvaluationReport {
             campaigns_evaluated: campaigns.len(),
             tminus_prepared,
+            reachable_prepared,
         })
     }
 
