@@ -18008,11 +18008,11 @@ async fn contract_migrations_apply_to_clean_and_already_current_databases() {
         .fetch_one(&validation_pool)
         .await
         .expect("read already-current migration ledger");
-    // Bumped by the sov campaign feed's migration
-    // (`migrations/20260826000000_add_sov_campaign_feed.sql`), which the
-    // shared `MIGRATOR` covers along with every other file under
+    // Bumped by the sov campaign feed's migrations, most recently
+    // `migrations/20260827000001_add_sov_reachability_state.sql`, which
+    // the shared `MIGRATOR` covers along with every other file under
     // `migrations/`.
-    assert_eq!(current_migration_count, 28);
+    assert_eq!(current_migration_count, 29);
     assert_eq!(
         current_store
             .storage_counts()
@@ -32588,11 +32588,11 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         .fetch_one(&clean_pool)
         .await
         .expect("read clean migration ledger");
-    // Bumped by the sov campaign feed's migration
-    // (`migrations/20260826000000_add_sov_campaign_feed.sql`), which the
-    // shared `MIGRATOR` covers along with every other file under
+    // Bumped by the sov campaign feed's migrations, most recently
+    // `migrations/20260827000001_add_sov_reachability_state.sql`, which
+    // the shared `MIGRATOR` covers along with every other file under
     // `migrations/`.
-    assert_eq!(clean_migration_count, 28);
+    assert_eq!(clean_migration_count, 29);
     let clean_pacing_column_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'esi_collection_limiter_state' AND column_name = 'next_request_at')",
     )

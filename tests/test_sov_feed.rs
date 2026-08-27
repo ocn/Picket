@@ -18,7 +18,7 @@ use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use killbot_rust::contract_intelligence::ContractCollectionStore;
 use killbot_rust::esi_cache::{CacheMetadata, EsiError, EsiResponse};
 use killbot_rust::sov_feed::{
-    DynamicChainSovReachability, PreparedSovDelivery, SovAlertStage, SovCampaign,
+    DynamicChainSovReachability, PathRisk, PreparedSovDelivery, SovAlertStage, SovCampaign,
     SovChainCollector, SovChainStatus, SovClock, SovCollector, SovDelivery, SovDeliveryError,
     SovFilter, SovFilterCondition, SovFilterNode, SovReachabilityInfo, SovReachabilitySource,
     SovStore, SovSubscription, SovSystemDirectory, SovSystemInfo, SovTickerResolver,
@@ -229,6 +229,73 @@ impl SovReachabilitySource for FakeSovReachability {
 
     fn graph_available(&self) -> bool {
         self.available
+    }
+}
+
+/// A reachability source whose jump count (and, if set, Path Risk) can be
+/// changed between collector cycles (ticket 06): unlike `FakeSovReachability`,
+/// which is fixed at construction, this simulates a wormhole chain
+/// opening, closing, and re-opening -- one system's reachability
+/// transitioning cycle to cycle the way `DynamicChainSovReachability`
+/// does after a real chain poll.
+struct VariableSovReachability {
+    system_id: i64,
+    jumps: Mutex<Option<i64>>,
+    path_risk: Mutex<Option<PathRisk>>,
+    available: Mutex<bool>,
+}
+
+impl VariableSovReachability {
+    fn new(system_id: i64) -> Self {
+        Self {
+            system_id,
+            jumps: Mutex::new(None),
+            path_risk: Mutex::new(None),
+            available: Mutex::new(true),
+        }
+    }
+
+    /// Sets the current jump count; `None` means unreachable.
+    fn set_jumps(&self, jumps: Option<i64>) {
+        *self.jumps.lock().unwrap() = jumps;
+    }
+
+    fn set_path_risk(&self, risk: Option<PathRisk>) {
+        *self.path_risk.lock().unwrap() = risk;
+    }
+
+    /// Simulates the graph itself becoming unavailable/available (fix
+    /// round finding 1), independent of `jumps`: `reachable()` still
+    /// answers per `jumps` regardless of this flag (mirroring
+    /// `StaticSovReachability`/`DynamicChainSovReachability`, whose
+    /// `reachable()` does not consult their own availability either) --
+    /// it is the collector's job to consult `graph_available()` and skip
+    /// the reachability pass entirely when it is false.
+    fn set_graph_available(&self, available: bool) {
+        *self.available.lock().unwrap() = available;
+    }
+}
+
+impl SovReachabilitySource for VariableSovReachability {
+    fn reachable(
+        &self,
+        solar_system_id: i64,
+        _allow_frigate_holes: bool,
+    ) -> Option<SovReachabilityInfo> {
+        if solar_system_id != self.system_id {
+            return None;
+        }
+        let jumps = (*self.jumps.lock().unwrap())?;
+        Some(SovReachabilityInfo {
+            jumps,
+            route: vec![30_005_174, solar_system_id],
+            via_chain: false,
+            path_risk: *self.path_risk.lock().unwrap(),
+        })
+    }
+
+    fn graph_available(&self) -> bool {
+        *self.available.lock().unwrap()
     }
 }
 
@@ -2813,6 +2880,1199 @@ async fn a_subscription_without_reachable_is_unaffected_by_dynamic_chain_reachab
     assert_eq!(report.alerts_prepared, 1);
     assert_eq!(delivery.sent_count(), 1);
     assert_eq!(delivery.sent()[0].subscription_name, "defender-only");
+
+    database.destroy().await;
+}
+
+// --- Became-reachable transitions (ticket 06) ---
+//
+// These use `VariableSovReachability`, whose jump count can change between
+// `evaluate_stage_cycle` calls, to simulate a chain connection opening,
+// closing, and re-opening -- the same seam every other sov feed test
+// exercises (a real `SovCollector` against a temporary PostgreSQL
+// database), only with reachability driven by the test rather than a
+// fixed fake or the real Wanderer chain collector.
+
+#[tokio::test]
+async fn unreachable_to_reachable_transition_fires_the_reachable_stage_once_with_route_and_path_risk(
+) {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "roamers",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            }),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![target_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability = Arc::new(VariableSovReachability::new(30_004_737));
+    let reachability_source: Arc<dyn SovReachabilitySource> = reachability.clone();
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability_source,
+    );
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline campaign cycle");
+
+    // First stage evaluation: still unreachable. Establishes the baseline
+    // state row and never fires (spec: "reachable at first observation
+    // never fires").
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline reachability observation");
+    assert_eq!(report.reachable_prepared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+
+    // The chain opens: now reachable in 3 jumps, with a risky wormhole on
+    // the way.
+    reachability.set_jumps(Some(3));
+    reachability.set_path_risk(Some(PathRisk {
+        worst_time_status: WandererTimeStatus::Eol4Hours,
+        worst_mass_status: WandererMassStatus::Depleted,
+    }));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("the false-to-true transition fires once");
+    assert_eq!(report.reachable_prepared, 1);
+    assert_eq!(delivery.sent_count(), 1);
+    let sent = delivery.sent();
+    assert_eq!(sent[0].subject_id, target_campaign.campaign_id);
+    assert_eq!(sent[0].stage, "reachable:1");
+    assert_eq!(sent[0].message.footer, "now reachable");
+    assert!(
+        sent[0]
+            .message
+            .fields
+            .iter()
+            .any(|field| field.name == "Reachability"),
+        "the reachable embed carries jumps and route, like every other stage"
+    );
+    assert!(
+        sent[0]
+            .message
+            .fields
+            .iter()
+            .any(|field| field.name == "Path Risk"),
+        "the reachable embed carries Path Risk, like every other stage"
+    );
+
+    // A repeated cycle with reachability unchanged never fires again.
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("unchanged reachability does not refire");
+    assert_eq!(report.reachable_prepared, 0);
+    assert_eq!(delivery.sent_count(), 1);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn reachable_unreachable_reachable_fires_twice_with_distinct_stage_keys() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "roamers",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            }),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![target_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability = Arc::new(VariableSovReachability::new(30_004_737));
+    let reachability_source: Arc<dyn SovReachabilitySource> = reachability.clone();
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability_source,
+    );
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline campaign cycle");
+
+    // Baseline is already reachable: never fires, per the "reachable at
+    // first observation" rule.
+    reachability.set_jumps(Some(2));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline reachable observation");
+    assert_eq!(report.reachable_prepared, 0);
+
+    // Unreachable: no fire, but re-arms.
+    reachability.set_jumps(None);
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("becomes unreachable");
+    assert_eq!(report.reachable_prepared, 0);
+
+    // First observed transition.
+    reachability.set_jumps(Some(2));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("first transition fires");
+    assert_eq!(report.reachable_prepared, 1);
+
+    // Unreachable again.
+    reachability.set_jumps(None);
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("becomes unreachable again");
+
+    // Second observed transition: a fresh, distinct stage key.
+    reachability.set_jumps(Some(2));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("second transition fires");
+    assert_eq!(report.reachable_prepared, 1);
+
+    assert_eq!(delivery.sent_count(), 2);
+    let sent = delivery.sent();
+    assert_eq!(sent[0].stage, "reachable:1");
+    assert_eq!(sent[1].stage, "reachable:2");
+    assert_ne!(sent[0].stage, sent[1].stage);
+    assert!(sent.iter().all(|d| d.message.footer == "now reachable"));
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn reachable_at_first_observation_never_fires() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "roamers",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            }),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![target_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability = Arc::new(VariableSovReachability::new(30_004_737));
+    // Reachable from the very first evaluation -- no prior state row
+    // exists yet, so this must never fire.
+    reachability.set_jumps(Some(1));
+    let reachability_source: Arc<dyn SovReachabilitySource> = reachability.clone();
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability_source,
+    );
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline campaign cycle");
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("first observation already reachable");
+    assert_eq!(report.reachable_prepared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+
+    let state = store
+        .reachability_state_for_test(1, 2, "roamers", target_campaign.campaign_id)
+        .await
+        .expect("lookup reachability state")
+        .expect("baseline row was persisted");
+    assert!(state.0, "baseline row stores the observed reachable value");
+    assert_eq!(state.2, 0, "no transition has been observed yet");
+
+    // The chain-opens-a-door moment still fires normally afterward: this
+    // rule is about the first *observation*, not "this leaf never fires
+    // for this campaign".
+    reachability.set_jumps(None);
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("becomes unreachable");
+    reachability.set_jumps(Some(1));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("a genuine transition afterward still fires");
+    assert_eq!(report.reachable_prepared, 1);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn restart_between_prepare_and_send_does_not_double_post_a_reachable_alert() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "roamers",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            }),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![target_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let failing_delivery = Arc::new(FakeSovDelivery::new(true));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability = Arc::new(VariableSovReachability::new(30_004_737));
+    let reachability_source: Arc<dyn SovReachabilitySource> = reachability.clone();
+    let first_collector = collector_with_reachability(
+        store.clone(),
+        limiter.clone(),
+        esi,
+        failing_delivery.clone(),
+        clock.clone(),
+        reachability_source.clone(),
+    );
+
+    first_collector
+        .collect_cycle()
+        .await
+        .expect("baseline campaign cycle");
+    first_collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline reachability observation (unreachable)");
+
+    reachability.set_jumps(Some(3));
+    let report = first_collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("transition is prepared and its send fails transiently");
+    assert_eq!(report.reachable_prepared, 1);
+    assert_eq!(
+        store
+            .delivery_status_by_subject(target_campaign.campaign_id, SovAlertStage::Reachable(1))
+            .await
+            .expect("read delivery status"),
+        "prepared"
+    );
+
+    // Before the lease expires, a fresh collector (simulating a
+    // restarted process) must not re-claim the still-leased delivery.
+    let still_leased_esi = FakeSovereigntyEsi::new(vec![]);
+    let succeeding_delivery = Arc::new(FakeSovDelivery::new(false));
+    let second_collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        still_leased_esi,
+        succeeding_delivery.clone(),
+        clock.clone(),
+        reachability_source,
+    );
+    second_collector
+        .deliver_claimable_for_test(clock.now())
+        .await
+        .expect("unexpired lease is left alone");
+    assert_eq!(succeeding_delivery.attempt_count(), 0);
+
+    // After the lease expires (restart-safe recovery window), the next
+    // collector reclaims the prepared row and sends it exactly once.
+    clock.advance(ChronoDuration::minutes(3));
+    second_collector
+        .deliver_claimable_for_test(clock.now())
+        .await
+        .expect("expired lease is reclaimed");
+    assert_eq!(succeeding_delivery.sent_count(), 1);
+    assert_eq!(
+        store
+            .delivery_status_by_subject(target_campaign.campaign_id, SovAlertStage::Reachable(1))
+            .await
+            .expect("read delivery status"),
+        "sent"
+    );
+    assert_eq!(
+        store
+            .count_deliveries_for(target_campaign.campaign_id, SovAlertStage::Reachable(1))
+            .await
+            .expect("no duplicate delivery row exists"),
+        1
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_subscription_without_a_reachable_leaf_never_gets_reachability_state_or_the_stage() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "defender-only",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Defender {
+                alliance_ids: vec![99_006_751],
+            }),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![target_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability = Arc::new(VariableSovReachability::new(30_004_737));
+    let reachability_source: Arc<dyn SovReachabilitySource> = reachability.clone();
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability_source,
+    );
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline campaign cycle");
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("evaluate with reachability unreachable");
+    reachability.set_jumps(Some(1));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("evaluate after reachability changes");
+    assert_eq!(report.reachable_prepared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+    assert!(
+        store
+            .reachability_state_for_test(1, 2, "defender-only", target_campaign.campaign_id)
+            .await
+            .expect("lookup reachability state")
+            .is_none(),
+        "a subscription with no Reachable leaf must never get a state row"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn full_filter_gating_reachable_but_wrong_region_never_fires_the_stage() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "wrong-region",
+        SovFilter {
+            root: SovFilterNode::And(vec![
+                SovFilterNode::Condition(SovFilterCondition::Reachable {
+                    max_jumps: 5,
+                    allow_frigate_holes: false,
+                }),
+                // The fixture directory maps 30_004_737 (the campaign
+                // system below) to region 10_000_002; this never matches.
+                SovFilterNode::Condition(SovFilterCondition::Region(vec![10_000_099])),
+            ]),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![target_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability = Arc::new(VariableSovReachability::new(30_004_737));
+    let reachability_source: Arc<dyn SovReachabilitySource> = reachability.clone();
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability_source,
+    );
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline campaign cycle");
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline reachability observation (unreachable)");
+
+    reachability.set_jumps(Some(2));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("transition is observed but the wrong region gates the alert");
+    assert_eq!(report.reachable_prepared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+
+    // The Reachable-leaf-only state still recorded the transition, proven
+    // by the persisted sequence having advanced to 1 despite never
+    // firing -- a later genuine (correct-region) transition would key
+    // `reachable:2`, not re-use `reachable:1`. It also stays *pending*
+    // (not announced): the region can never change for this campaign, so
+    // this is the "wrong region forever" case fix round finding 2
+    // requires stay gated -- not the "wrong region for now" case that
+    // finding 2 requires eventually fire.
+    let state = store
+        .reachability_state_for_test(1, 2, "wrong-region", target_campaign.campaign_id)
+        .await
+        .expect("lookup reachability state")
+        .expect("state row exists");
+    assert!(state.0, "the Reachable leaf itself did transition to true");
+    assert_eq!(
+        state.2, 1,
+        "the transition sequence advances even though the full filter never matched"
+    );
+    assert!(
+        !state.3,
+        "the announcement stays pending -- never marked announced -- while the region never matches"
+    );
+
+    // A further pass confirms it stays pending rather than firing once
+    // for free or getting stuck unable to ever fire again.
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("still gated on a later pass");
+    assert_eq!(report.reachable_prepared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn an_ended_campaign_never_fires_reachable_and_its_state_is_pruned_with_it() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "roamers",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            }),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::minutes(30),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![target_campaign.clone()],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability = Arc::new(VariableSovReachability::new(30_004_737));
+    let reachability_source: Arc<dyn SovReachabilitySource> = reachability.clone();
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability_source,
+    );
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline campaign cycle");
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline reachability observation establishes the state row");
+    assert!(store
+        .reachability_state_for_test(1, 2, "roamers", target_campaign.campaign_id)
+        .await
+        .expect("lookup reachability state")
+        .is_some());
+
+    clock.advance(ChronoDuration::seconds(10));
+    collector
+        .collect_cycle()
+        .await
+        .expect("campaign vanishes from the listing and is marked ended");
+    assert!(store
+        .campaign_ended_at(target_campaign.campaign_id)
+        .await
+        .expect("read ended_at")
+        .is_some());
+
+    // Pruned alongside its campaign.
+    assert!(
+        store
+            .reachability_state_for_test(1, 2, "roamers", target_campaign.campaign_id)
+            .await
+            .expect("lookup reachability state")
+            .is_none(),
+        "reachability state is pruned when its campaign is marked ended"
+    );
+
+    reachability.set_jumps(Some(2));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("ended campaign is skipped entirely");
+    assert_eq!(report.reachable_prepared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn two_subscriptions_with_different_max_jumps_transition_independently_on_the_same_campaign()
+{
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "wide-budget",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            }),
+        },
+        None,
+    )
+    .await;
+    subscribe(
+        &store,
+        "narrow-budget",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 2,
+                allow_frigate_holes: false,
+            }),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![target_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability = Arc::new(VariableSovReachability::new(30_004_737));
+    let reachability_source: Arc<dyn SovReachabilitySource> = reachability.clone();
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability_source,
+    );
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline campaign cycle");
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline: unreachable for both subscriptions");
+
+    // 3 jumps: within wide-budget's 5, over narrow-budget's 2. Only
+    // wide-budget transitions.
+    reachability.set_jumps(Some(3));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("wide-budget transitions alone");
+    assert_eq!(report.reachable_prepared, 1);
+    assert_eq!(delivery.sent_count(), 1);
+    assert_eq!(delivery.sent()[0].subscription_name, "wide-budget");
+    assert_eq!(delivery.sent()[0].stage, "reachable:1");
+
+    // 10 jumps: over both budgets. wide-budget becomes unreachable again
+    // (no fire); narrow-budget stays unreachable (unchanged).
+    reachability.set_jumps(Some(10));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("wide-budget becomes unreachable again");
+    assert_eq!(report.reachable_prepared, 0);
+    assert_eq!(delivery.sent_count(), 1);
+
+    // 1 jump: within both budgets. wide-budget re-fires its second
+    // transition; narrow-budget fires its first, independently.
+    reachability.set_jumps(Some(1));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("both subscriptions transition on this cycle");
+    assert_eq!(report.reachable_prepared, 2);
+    assert_eq!(delivery.sent_count(), 3);
+    let sent = delivery.sent();
+    assert!(
+        sent.iter()
+            .any(|d| d.subscription_name == "wide-budget" && d.stage == "reachable:2"),
+        "wide-budget's second transition keys reachable:2"
+    );
+    assert!(
+        sent.iter()
+            .any(|d| d.subscription_name == "narrow-budget" && d.stage == "reachable:1"),
+        "narrow-budget's first transition keys reachable:1, independent of wide-budget's sequence"
+    );
+
+    database.destroy().await;
+}
+
+// --- Fix round tests (ticket 06 review findings 1, 2) ---
+
+#[tokio::test]
+async fn graph_unavailable_across_two_passes_leaves_state_untouched_and_nothing_fires() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "roamers",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            }),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![target_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability = Arc::new(VariableSovReachability::new(30_004_737));
+    reachability.set_graph_available(false);
+    // Would be reachable if the graph were available -- proves the outage
+    // gate is what suppresses this, not merely "jumps happen to be unset".
+    reachability.set_jumps(Some(2));
+    let reachability_source: Arc<dyn SovReachabilitySource> = reachability.clone();
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability_source,
+    );
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline campaign cycle");
+    let report_one = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("graph unavailable: first pass");
+    assert_eq!(report_one.reachable_prepared, 0);
+    let report_two = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("graph unavailable: second pass");
+    assert_eq!(report_two.reachable_prepared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+    assert!(
+        store
+            .reachability_state_for_test(1, 2, "roamers", target_campaign.campaign_id)
+            .await
+            .expect("lookup reachability state")
+            .is_none(),
+        "no state row is ever created while the graph is unavailable"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn graph_returning_after_an_outage_leaves_a_previously_reachable_row_unchanged_with_no_burst()
+{
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "roamers",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            }),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![target_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability = Arc::new(VariableSovReachability::new(30_004_737));
+    let reachability_source: Arc<dyn SovReachabilitySource> = reachability.clone();
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability_source,
+    );
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline campaign cycle");
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline reachability observation (unreachable)");
+    // Genuine transition before the outage, announced immediately (a bare
+    // Reachable leaf is the whole filter here).
+    reachability.set_jumps(Some(2));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("genuine transition before the outage");
+    assert_eq!(report.reachable_prepared, 1);
+    assert_eq!(delivery.sent_count(), 1);
+
+    // The graph goes down for several passes: skipped entirely.
+    reachability.set_graph_available(false);
+    for _ in 0..3 {
+        let report = collector
+            .evaluate_stage_cycle()
+            .await
+            .expect("graph unavailable: skipped entirely");
+        assert_eq!(report.reachable_prepared, 0);
+    }
+    assert_eq!(delivery.sent_count(), 1, "no burst while the graph is down");
+
+    // The graph comes back, still reporting the same reachable value as
+    // before the outage: this must read as Unchanged, not a fresh
+    // transition -- no burst-fire for "everything reachable all along".
+    reachability.set_graph_available(true);
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("graph recovers: state was already reachable and stays so");
+    assert_eq!(
+        report.reachable_prepared, 0,
+        "recovery must not re-fire an already-announced reachable row"
+    );
+    assert_eq!(delivery.sent_count(), 1);
+    let state = store
+        .reachability_state_for_test(1, 2, "roamers", target_campaign.campaign_id)
+        .await
+        .expect("lookup reachability state")
+        .expect("state row exists");
+    assert_eq!(state.2, 1, "the sequence did not advance across the outage");
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_campaign_first_seen_during_a_graph_outage_gets_baseline_on_first_available_observation()
+{
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "roamers",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            }),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![target_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability = Arc::new(VariableSovReachability::new(30_004_737));
+    reachability.set_graph_available(false);
+    let reachability_source: Arc<dyn SovReachabilitySource> = reachability.clone();
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability_source,
+    );
+
+    // The campaign appears while the graph is down.
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline campaign cycle");
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("graph unavailable: no observation recorded");
+    assert!(
+        store
+            .reachability_state_for_test(1, 2, "roamers", target_campaign.campaign_id)
+            .await
+            .expect("lookup reachability state")
+            .is_none(),
+        "no row exists yet -- the campaign was never observed while the graph was down"
+    );
+
+    // The graph comes back, already reachable.
+    reachability.set_graph_available(true);
+    reachability.set_jumps(Some(2));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("first available observation establishes the baseline");
+    assert_eq!(
+        report.reachable_prepared, 0,
+        "the first observation for this campaign is a baseline, even though the outage delayed it"
+    );
+    assert_eq!(delivery.sent_count(), 0);
+    let state = store
+        .reachability_state_for_test(1, 2, "roamers", target_campaign.campaign_id)
+        .await
+        .expect("lookup reachability state")
+        .expect("baseline row now exists");
+    assert!(state.0, "the baseline observed reachable = true");
+    assert_eq!(state.2, 0, "no transition has been observed yet");
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn reachable_leaf_true_but_full_filter_not_yet_matching_fires_once_the_window_is_entered_with_the_same_sequence(
+) {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "reachable-and-vulnerable-soon",
+        SovFilter {
+            root: SovFilterNode::And(vec![
+                SovFilterNode::Condition(SovFilterCondition::Reachable {
+                    max_jumps: 5,
+                    allow_frigate_holes: false,
+                }),
+                SovFilterNode::Condition(SovFilterCondition::VulnerableWithin { hours: 12 }),
+            ]),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(20),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![target_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability = Arc::new(VariableSovReachability::new(30_004_737));
+    let reachability_source: Arc<dyn SovReachabilitySource> = reachability.clone();
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability_source,
+    );
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline campaign cycle");
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline reachability observation (unreachable)");
+
+    // The leaf flips true, but the campaign is still 20h out --
+    // VulnerableWithin(12h) does not match yet, so nothing fires.
+    reachability.set_jumps(Some(2));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("leaf transitions but the full filter does not match yet");
+    assert_eq!(report.reachable_prepared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+    let state = store
+        .reachability_state_for_test(
+            1,
+            2,
+            "reachable-and-vulnerable-soon",
+            target_campaign.campaign_id,
+        )
+        .await
+        .expect("lookup reachability state")
+        .expect("state row exists");
+    assert!(state.0, "the leaf itself is reachable");
+    assert_eq!(state.2, 1, "the transition was recorded");
+    assert!(!state.3, "the announcement is still pending");
+
+    // The clock advances into the window; a later pass, with the
+    // reachability leaf's own value unchanged (still true, so the store
+    // reports `Observed` rather than a fresh transition), must still
+    // attempt the announcement and fire it now -- keyed by the SAME
+    // sequence recorded at the original transition.
+    clock.advance(ChronoDuration::hours(9));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("the pending announcement fires once the window is entered");
+    assert_eq!(report.reachable_prepared, 1);
+    assert_eq!(delivery.sent_count(), 1);
+    assert_eq!(delivery.sent()[0].stage, "reachable:1");
+
+    // A further pass does not double-post.
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("already announced");
+    assert_eq!(report.reachable_prepared, 0);
+    assert_eq!(delivery.sent_count(), 1);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn unreachable_then_reachable_again_after_announcement_fires_a_new_sequence_once_the_filter_matches(
+) {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "roamers",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 5,
+                allow_frigate_holes: false,
+            }),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target_campaign = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![target_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability = Arc::new(VariableSovReachability::new(30_004_737));
+    let reachability_source: Arc<dyn SovReachabilitySource> = reachability.clone();
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability_source,
+    );
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline campaign cycle");
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline reachability observation (unreachable)");
+
+    reachability.set_jumps(Some(2));
+    let report = collector.evaluate_stage_cycle().await.expect(
+        "first transition fires and is announced immediately (the full filter is just the leaf)",
+    );
+    assert_eq!(report.reachable_prepared, 1);
+    assert_eq!(delivery.sent()[0].stage, "reachable:1");
+
+    reachability.set_jumps(None);
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("becomes unreachable");
+
+    reachability.set_jumps(Some(2));
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("second transition fires immediately with a new sequence");
+    assert_eq!(report.reachable_prepared, 1);
+    assert_eq!(delivery.sent_count(), 2);
+    assert_eq!(delivery.sent()[1].stage, "reachable:2");
 
     database.destroy().await;
 }

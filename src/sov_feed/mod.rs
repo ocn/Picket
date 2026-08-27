@@ -53,7 +53,8 @@ pub use model::{
     SOV_TMINUS_MARKS_OPTION_KEY, SOV_TMINUS_MARK_MAX_MINUTES, SOV_VULNERABLE_WITHIN_MAX_HOURS,
 };
 pub use store::{
-    available_sov_store, new_sov_store_handle, SovStore, SovStoreHandle, SOV_CAMPAIGNS_RESOURCE_KEY,
+    available_sov_store, new_sov_store_handle, SovReachabilityTransition, SovStore, SovStoreHandle,
+    SOV_CAMPAIGNS_RESOURCE_KEY,
 };
 pub use wanderer::{
     WandererChainSource, WandererClient, WandererConfig, WandererConnection,
