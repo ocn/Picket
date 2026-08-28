@@ -20,16 +20,17 @@ use killbot_rust::esi_cache::{CacheMetadata, EsiError, EsiResponse};
 use killbot_rust::sov_feed::{
     DynamicChainSovReachability, PathRisk, PreparedSovDelivery, SovAlertStage, SovCampaign,
     SovChainCollector, SovChainStatus, SovClock, SovCollector, SovDelivery, SovDeliveryError,
-    SovFilter, SovFilterCondition, SovFilterNode, SovMapEntry, SovReachabilityInfo,
-    SovReachabilitySource, SovStore, SovStructure, SovSubscription, SovSystemDirectory,
-    SovSystemInfo, SovTickerResolver, SovereigntyEsi, StargateGraph, StargateGraphFile,
-    StaticSovReachability, WandererChainSource, WandererConnection, WandererConnectionType,
-    WandererError, WandererMassStatus, WandererShipSizeType, WandererSystem, WandererTimeStatus,
-    SOV_HUB_STRUCTURE_TYPE_IDS,
+    SovFilter, SovFilterCondition, SovFilterNode, SovMapEntry, SovNotificationMessage,
+    SovReachabilityInfo, SovReachabilitySource, SovStore, SovStructure, SovSubscription,
+    SovSystemDirectory, SovSystemInfo, SovTickerResolver, SovereigntyEsi, StargateGraph,
+    StargateGraphFile, StaticSovReachability, WandererChainSource, WandererConnection,
+    WandererConnectionType, WandererError, WandererMassStatus, WandererShipSizeType,
+    WandererSystem, WandererTimeStatus, SOV_HUB_STRUCTURE_TYPE_IDS,
 };
 use killbot_rust::spawn_sov_collection_loop;
 use sqlx::Row;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
@@ -203,6 +204,7 @@ impl SovDelivery for FakeSovDelivery {
 
 struct FakeSovSystemDirectory {
     systems: HashMap<i64, SovSystemInfo>,
+    resolve_calls: AtomicUsize,
 }
 
 impl FakeSovSystemDirectory {
@@ -224,12 +226,23 @@ impl FakeSovSystemDirectory {
                 region_id: 10_000_002,
             },
         );
-        Self { systems }
+        Self {
+            systems,
+            resolve_calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// Number of `resolve` calls, used by the lazy-render test (ticket 03) as
+    /// an observable proxy for "the notification was rendered": every
+    /// `render_stage_message` resolves the system exactly once.
+    fn resolve_calls(&self) -> usize {
+        self.resolve_calls.load(Ordering::SeqCst)
     }
 }
 
 impl SovSystemDirectory for FakeSovSystemDirectory {
     fn resolve(&self, solar_system_id: i64) -> Option<SovSystemInfo> {
+        self.resolve_calls.fetch_add(1, Ordering::SeqCst);
         self.systems.get(&solar_system_id).cloned()
     }
 }
@@ -5217,4 +5230,565 @@ async fn collect_map_cycle_treats_an_empty_listing_as_a_no_op() {
     );
 
     database.destroy().await;
+}
+
+// --- Consolidated fix round: chain restart/readiness (ticket 05 blocker /
+//     ticket 06 readiness), nonce atomicity (tickets 02/03), lazy render
+//     (ticket 03), and the ended-campaign observation guard (ticket 06). ---
+
+fn reachable_filter(max_jumps: i64, allow_frigate_holes: bool) -> SovFilter {
+    SovFilter {
+        root: SovFilterNode::Condition(SovFilterCondition::Reachable {
+            max_jumps,
+            allow_frigate_holes,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn a_restart_recomputes_the_chain_on_the_first_fetch_even_when_topology_is_unchanged() {
+    // Ticket 05 blocker: after a restart the in-memory variants start
+    // stargate-only, and the freshly-fetched connections are byte-identical
+    // to the snapshot persisted a poll ago, so `topology_changed` is false.
+    // The chain must still be served after the first cycle because the first
+    // successful fetch of a process forces a recompute regardless.
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    let edges: &[(i64, i64)] = &[(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)];
+    let connections = vec![wormhole(
+        1,
+        6,
+        WandererMassStatus::Normal,
+        WandererTimeStatus::Normal,
+        WandererShipSizeType::Medium,
+    )];
+    let clock = VirtualSovClock::new(Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap());
+
+    // First process: persist a snapshot carrying the chain shortcut.
+    {
+        let dynamic = Arc::new(DynamicChainSovReachability::new(
+            synthetic_stargate_graph(edges),
+            1,
+        ));
+        let source = FakeWandererChainSource::new(vec![Ok(connections.clone())]);
+        let collector = SovChainCollector::new(store.clone(), Arc::new(source), dynamic.clone())
+            .with_clock(clock.clone());
+        collector
+            .collect_cycle()
+            .await
+            .expect("first process persists a snapshot");
+        assert_eq!(dynamic.reachable(6, false).unwrap().jumps, 1);
+    }
+
+    // Second process (restart): brand-new reachability, stargate-only until
+    // it recomputes.
+    let dynamic = Arc::new(DynamicChainSovReachability::new(
+        synthetic_stargate_graph(edges),
+        1,
+    ));
+    assert_eq!(
+        dynamic.reachable(6, false).unwrap().jumps,
+        5,
+        "stargate-only before the first fetch of this process"
+    );
+    assert!(!dynamic.has_recomputed());
+    let source = FakeWandererChainSource::new(vec![Ok(connections.clone())]);
+    let collector = SovChainCollector::new(store.clone(), Arc::new(source), dynamic.clone())
+        .with_clock(clock.clone());
+    let report = collector
+        .collect_cycle()
+        .await
+        .expect("restart first cycle");
+    assert!(
+        !report.topology_changed,
+        "topology is unchanged from the persisted snapshot"
+    );
+    assert!(
+        report.recomputed,
+        "the first fetch of the process forces a recompute anyway"
+    );
+    let info = dynamic
+        .reachable(6, false)
+        .expect("chain shortcut present after restart");
+    assert_eq!(info.jumps, 1);
+    assert!(info.via_chain);
+    assert!(dynamic.has_recomputed());
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn seeding_from_the_persisted_snapshot_serves_the_chain_before_any_fetch() {
+    // Ticket 05 blocker: the start-up seed (called from `src/lib.rs` before
+    // the poll loop) repopulates the in-memory chain from the last persisted
+    // snapshot, so a restart during a Wanderer outage still serves the last
+    // known chain instead of dropping to stargate-only until the map topology
+    // next changes.
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    let edges: &[(i64, i64)] = &[(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)];
+    let connections = vec![wormhole(
+        1,
+        6,
+        WandererMassStatus::Normal,
+        WandererTimeStatus::Normal,
+        WandererShipSizeType::Medium,
+    )];
+    let clock = VirtualSovClock::new(Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap());
+
+    {
+        let dynamic = Arc::new(DynamicChainSovReachability::new(
+            synthetic_stargate_graph(edges),
+            1,
+        ));
+        let source = FakeWandererChainSource::new(vec![Ok(connections.clone())]);
+        let collector = SovChainCollector::new(store.clone(), Arc::new(source), dynamic.clone())
+            .with_clock(clock.clone());
+        collector.collect_cycle().await.expect("persist snapshot");
+    }
+
+    // Restart: seed before any fetch. The empty scripted source proves the
+    // seed path issues no fetch of its own.
+    let dynamic = Arc::new(DynamicChainSovReachability::new(
+        synthetic_stargate_graph(edges),
+        1,
+    ));
+    assert!(!dynamic.has_recomputed());
+    let source = FakeWandererChainSource::new(vec![]);
+    let collector = SovChainCollector::new(store.clone(), Arc::new(source), dynamic.clone())
+        .with_clock(clock.clone());
+    let seeded = collector
+        .seed_reachability_from_persisted_snapshot()
+        .await
+        .expect("seed from the persisted snapshot");
+    assert!(seeded, "a snapshot exists to seed from");
+    assert!(dynamic.has_recomputed());
+    let info = dynamic
+        .reachable(6, false)
+        .expect("chain served immediately after seeding, before any fetch");
+    assert_eq!(info.jumps, 1);
+    assert!(info.via_chain);
+    assert_eq!(
+        dynamic.chain_status(clock.now()),
+        SovChainStatus::Fresh,
+        "staleness is dated from the seeded snapshot's own fetched_at"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn evaluate_stage_cycle_records_no_reachability_observation_until_the_chain_is_ready() {
+    // Ticket 06 readiness (tied to the ticket 05 blocker): when Wanderer is
+    // configured, a `DynamicChainSovReachability` that has not fetched or been
+    // seeded yet reports `graph_available() == true` but is not a faithful
+    // picture of the live chain. The collector must record NO reachability
+    // observation until the chain is ready, so a restart across a Wanderer
+    // outage cannot manufacture a false->true transition and burst-fire "now
+    // reachable".
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "roamers", reachable_filter(11, false), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target = campaign(1, 6, 99_006_751, observed_at + ChronoDuration::hours(6));
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![target.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+
+    let edges: &[(i64, i64)] = &[(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)];
+    let dynamic = Arc::new(DynamicChainSovReachability::new(
+        synthetic_stargate_graph(edges),
+        1,
+    ));
+    assert!(!dynamic.has_recomputed());
+    let reachability_source: Arc<dyn SovReachabilitySource> = dynamic.clone();
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability_source,
+    );
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline campaign cycle");
+
+    // Chain not ready: no observation recorded at all, not even a baseline
+    // row.
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("stage cycle while the chain is not ready");
+    assert_eq!(report.reachable_prepared, 0);
+    assert!(
+        store
+            .reachability_state_for_test(1, 2, "roamers", 1)
+            .await
+            .expect("read reachability state")
+            .is_none(),
+        "no reachability observation is recorded until the chain is ready"
+    );
+
+    // The chain becomes ready (a live fetch/seed would do this): the next
+    // pass now records the baseline observation, which itself never fires.
+    dynamic.recompute(&[]);
+    assert!(dynamic.has_recomputed());
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("stage cycle once the chain is ready");
+    assert_eq!(report.reachable_prepared, 0, "baseline never fires");
+    let state = store
+        .reachability_state_for_test(1, 2, "roamers", 1)
+        .await
+        .expect("read reachability state")
+        .expect("a baseline observation is recorded once the chain is ready");
+    assert!(state.0, "system 6 is gate-reachable in 5 jumps (<= 11)");
+    assert!(
+        state.3,
+        "baseline rows are already announced so they never fire"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_claimed_delivery_always_carries_a_stable_non_empty_nonce() {
+    // Tickets 02/03: the delivery nonce is written atomically in the INSERT,
+    // and `begin_delivery_attempt` COALESCEs it at claim time, so every
+    // claimed delivery carries a stable, non-empty nonce equal to what a
+    // restart replay would use -- even if the row is somehow observed
+    // nonce-less (the historical race window between INSERT and a follow-up
+    // UPDATE).
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let subscription = store
+        .subscription(1, 2, "watch-all")
+        .await
+        .expect("read subscription")
+        .expect("subscription exists");
+    let message = SovNotificationMessage {
+        title: "title".to_string(),
+        fields: vec![],
+        footer: "Appeared".to_string(),
+    };
+    let fresh = store
+        .prepare_delivery(
+            &subscription,
+            "campaign",
+            1,
+            SovAlertStage::Appeared,
+            &message,
+        )
+        .await
+        .expect("prepare delivery");
+    assert!(fresh);
+    let ids = store
+        .prepared_delivery_ids()
+        .await
+        .expect("prepared delivery ids");
+    assert_eq!(ids.len(), 1);
+    let id = ids[0];
+    let expected = format!("sov-{id}");
+
+    // The atomic INSERT already set the nonce (no nonce-less window exists).
+    assert_eq!(
+        store.delivery_nonce_for_test(id).await.expect("read nonce"),
+        Some(expected.clone())
+    );
+
+    let t0 = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let claim1 = store
+        .begin_delivery_attempt(id, t0)
+        .await
+        .expect("first claim")
+        .expect("delivery claimed");
+    assert!(!claim1.nonce.is_empty());
+    assert_eq!(claim1.nonce, expected);
+
+    // Reproduce the historical nonce-less window and prove the claim-time
+    // COALESCE refills it with the same deterministic value a restart replay
+    // would use.
+    store
+        .clear_delivery_nonce_for_test(id)
+        .await
+        .expect("clear nonce");
+    let t1 = t0 + ChronoDuration::minutes(3); // past the two-minute lease
+    let claim2 = store
+        .begin_delivery_attempt(id, t1)
+        .await
+        .expect("second claim")
+        .expect("delivery re-claimed after its lease expired");
+    assert_eq!(
+        claim2.nonce, expected,
+        "the same stable non-empty nonce across two claims of the same row"
+    );
+    assert_eq!(
+        store.delivery_nonce_for_test(id).await.expect("read nonce"),
+        Some(expected),
+        "the nonce is durable after the claim, even after being cleared"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn an_already_prepared_tminus_mark_is_not_re_rendered_on_a_later_pass() {
+    // Ticket 03: the 30 s stage loop must not re-render the full notification
+    // (directory/ticker/owner lookups + a `map_owner` query) for a mark that
+    // is already prepared. A second pass over the same due mark performs no
+    // render, observed through the directory resolver's call count.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    // 25 minutes out: both the T-120 and T-30 marks are due.
+    let due_campaign = campaign(
+        1,
+        30_005_174,
+        99_006_751,
+        observed_at + ChronoDuration::minutes(25),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![due_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let directory = Arc::new(FakeSovSystemDirectory::new());
+    let collector = SovCollector::new(
+        store.clone(),
+        Arc::new(esi),
+        limiter,
+        delivery.clone(),
+        directory.clone(),
+        Arc::new(FakeSovTickerResolver),
+        Arc::new(StaticSovReachability(None)),
+    )
+    .with_clock(clock.clone());
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline cycle establishes the campaign");
+
+    let before_pass1 = directory.resolve_calls();
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("first stage pass renders and prepares both marks");
+    assert_eq!(report.tminus_prepared, 2);
+    let after_pass1 = directory.resolve_calls();
+    assert_eq!(
+        after_pass1 - before_pass1,
+        2,
+        "the first pass renders each due mark exactly once"
+    );
+
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("second stage pass over already-prepared marks");
+    assert_eq!(report.tminus_prepared, 0, "already prepared, nothing new");
+    assert_eq!(
+        directory.resolve_calls(),
+        after_pass1,
+        "an already-prepared mark performs no render on a later pass"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_reachability_observation_for_an_ended_campaign_records_no_orphan_state_row() {
+    // Ticket 06 nit: the stage loop reads `open_campaigns()` once then loops;
+    // a concurrent `mark_ended` (a different task) can end a campaign in
+    // between. A late observation must not re-insert an orphan state row for
+    // the now-ended campaign, which `mark_ended` (fires once) would never
+    // prune again.
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "roamers", reachable_filter(11, false), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let ended = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    store
+        .upsert_campaign(&ended, false, observed_at)
+        .await
+        .expect("insert campaign");
+    store
+        .mark_ended(
+            &[ended.campaign_id],
+            observed_at + ChronoDuration::minutes(1),
+        )
+        .await
+        .expect("end the campaign");
+
+    // A late observation for the ended campaign persists no row.
+    store
+        .record_reachability_observation(
+            1,
+            2,
+            "roamers",
+            ended.campaign_id,
+            true,
+            observed_at + ChronoDuration::minutes(2),
+        )
+        .await
+        .expect("observe the ended campaign");
+    assert!(
+        store
+            .reachability_state_for_test(1, 2, "roamers", ended.campaign_id)
+            .await
+            .expect("read reachability state")
+            .is_none(),
+        "no orphan reachability-state row for an ended campaign"
+    );
+
+    // Sanity: an open campaign still records its baseline row.
+    let open = campaign(
+        2,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    store
+        .upsert_campaign(&open, false, observed_at)
+        .await
+        .expect("insert open campaign");
+    store
+        .record_reachability_observation(
+            1,
+            2,
+            "roamers",
+            open.campaign_id,
+            true,
+            observed_at + ChronoDuration::minutes(2),
+        )
+        .await
+        .expect("observe the open campaign");
+    assert!(
+        store
+            .reachability_state_for_test(1, 2, "roamers", open.campaign_id)
+            .await
+            .expect("read reachability state")
+            .is_some(),
+        "an open campaign still gets its baseline state row"
+    );
+
+    database.destroy().await;
+}
+
+#[test]
+fn wanderer_connections_fixture_drives_traversability_and_path_risk() {
+    // Ticket 05 nit: exercise the real-shape connections fixture through the
+    // traversability/Path-Risk path (not just a parse test), so a future
+    // wire-shape drift is caught by behaviour. The fixture encodes one
+    // critical hole, one EOL hole, and one frigate hole from home (Turnur).
+    let raw = std::fs::read_to_string("resources/wanderer_connections_fixture.json")
+        .expect("read connections fixture");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("parse fixture json");
+    let connections: Vec<WandererConnection> =
+        serde_json::from_value(value["data"].clone()).expect("decode connections");
+
+    // Guards the wire shape: the fixture must still carry the critical and
+    // EOL holes the behaviour below depends on.
+    assert!(
+        connections
+            .iter()
+            .any(|c| c.mass_status == WandererMassStatus::Critical),
+        "fixture carries a critical hole"
+    );
+    assert!(
+        connections
+            .iter()
+            .any(|c| c.time_status != WandererTimeStatus::Normal),
+        "fixture carries an EOL hole"
+    );
+    assert!(
+        connections
+            .iter()
+            .any(|c| c.ship_size_type == WandererShipSizeType::Frigate),
+        "fixture carries a frigate hole"
+    );
+
+    // Home is Turnur (30002086); no stargate edges among these systems, so
+    // all reachability is chain-driven.
+    const TURNUR: i64 = 30_002_086;
+    const HUB_A: i64 = 31_000_005;
+    const HUB_B: i64 = 31_000_006;
+    const JITA: i64 = 30_004_737;
+    let dynamic = DynamicChainSovReachability::new(synthetic_stargate_graph(&[]), TURNUR);
+    dynamic.recompute(&connections);
+
+    // The critical hole (Turnur <-> HUB_A) never yields a route. Without
+    // frigate holes HUB_A's only alternative entry (via HUB_B) is gated
+    // behind the frigate hole, so HUB_A is unreachable by default.
+    assert!(
+        dynamic.reachable(HUB_A, false).is_none(),
+        "critical hole excluded and the alternative route needs a frigate hole"
+    );
+
+    // Jita is reachable via the Gate-type connection in one jump; a Gate is
+    // not a wormhole, so there is no Path Risk on that route.
+    let jita = dynamic
+        .reachable(JITA, false)
+        .expect("Jita reachable via the gate-type chain connection");
+    assert_eq!(jita.jumps, 1);
+    assert!(jita.via_chain);
+    assert!(
+        jita.path_risk.is_none(),
+        "a gate-type connection contributes no wormhole Path Risk"
+    );
+
+    // The frigate hole (HUB_B <-> Jita) is excluded by default, so HUB_B is
+    // unreachable without frigate holes; allowing them opens a two-jump route
+    // (Turnur -gate-> Jita -frigate-> HUB_B) whose only wormhole is that
+    // frigate hole (Normal), so Path Risk is present but not EOL.
+    assert!(
+        dynamic.reachable(HUB_B, false).is_none(),
+        "frigate hole excluded by default"
+    );
+    let hub_b = dynamic
+        .reachable(HUB_B, true)
+        .expect("HUB_B reachable once frigate holes are allowed");
+    assert_eq!(hub_b.jumps, 2);
+    assert!(hub_b.via_chain);
+    let hub_b_risk = hub_b
+        .path_risk
+        .expect("the frigate wormhole on the route carries a Path Risk line");
+    assert_eq!(hub_b_risk.worst_time_status, WandererTimeStatus::Normal);
+
+    // With frigate holes, HUB_A becomes reachable one hop further on
+    // (Turnur -gate-> Jita -frigate-> HUB_B -EOL-> HUB_A), crossing the EOL
+    // hole (conn2, time_status 2 == Eol4Hours). Path Risk reports that worst
+    // hole -- driven entirely by the parsed fixture.
+    let hub_a = dynamic
+        .reachable(HUB_A, true)
+        .expect("HUB_A reachable via the EOL hole once frigate holes are allowed");
+    assert_eq!(hub_a.jumps, 3);
+    assert!(hub_a.via_chain);
+    let hub_a_risk = hub_a
+        .path_risk
+        .expect("the EOL hole on the route carries a Path Risk line");
+    assert_eq!(
+        hub_a_risk.worst_time_status,
+        WandererTimeStatus::Eol4Hours,
+        "the worst hole on the HUB_A route is the EOL hole"
+    );
 }

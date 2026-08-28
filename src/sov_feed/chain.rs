@@ -19,6 +19,7 @@ use crate::sov_feed::wanderer::{
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::warn;
 
@@ -348,6 +349,18 @@ pub struct DynamicChainSovReachability {
     home_system_id: i64,
     state: RwLock<ChainReachabilityState>,
     last_success_at: RwLock<Option<DateTime<Utc>>>,
+    /// Whether the in-memory chain variants have been (re)computed from a
+    /// real chain observation at least once this process -- either a
+    /// successful live fetch or a seed from the persisted snapshot at
+    /// start-up. Until this is `true`, `state` holds the stargate-only
+    /// bootstrap built by [`Self::new`], which is *not* the live chain: a
+    /// process restart during a Wanderer outage would otherwise report the
+    /// chain silently absent while claiming to be available, and every
+    /// chain-only-reachable campaign would look unreachable and then fire a
+    /// spurious "now reachable" once the chain finally recomputed (ticket 05
+    /// blocker / ticket 06 readiness). Exposed as [`Self::has_recomputed`]
+    /// and surfaced through [`SovReachabilitySource::reachability_ready`].
+    recomputed_once: AtomicBool,
 }
 
 impl DynamicChainSovReachability {
@@ -363,7 +376,33 @@ impl DynamicChainSovReachability {
                 without_frigate,
             }),
             last_success_at: RwLock::new(None),
+            recomputed_once: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the chain variants reflect a real chain observation (live
+    /// fetch or persisted-snapshot seed) at least once this process. Used
+    /// both to force a recompute on the first successful fetch after a
+    /// restart (regardless of whether the topology changed against the
+    /// persisted snapshot) and as the readiness signal that gates recording
+    /// reachability observations at all.
+    pub fn has_recomputed(&self) -> bool {
+        self.recomputed_once.load(Ordering::Acquire)
+    }
+
+    /// Seeds the in-memory chain from the last persisted [`ChainSnapshot`]
+    /// before the poll loop starts, so a restart during a Wanderer outage
+    /// still serves the last known chain (spec story 18) instead of dropping
+    /// to stargate-only. Marks the reachability ready and dates staleness
+    /// from the snapshot's own `fetched_at`, so `chain_status` correctly
+    /// reports the seeded chain as stale if that snapshot is already old.
+    pub fn seed_from_snapshot(
+        &self,
+        connections: &[WandererConnection],
+        fetched_at: DateTime<Utc>,
+    ) {
+        self.recompute(connections);
+        self.mark_fetch_success(fetched_at);
     }
 
     /// Recomputes both cached BFS results from a freshly-fetched
@@ -388,6 +427,9 @@ impl DynamicChainSovReachability {
             with_frigate,
             without_frigate,
         };
+        // Released after the swap: readiness must never be observable before
+        // the variants it describes are actually in place.
+        self.recomputed_once.store(true, Ordering::Release);
     }
 
     /// Records a successful fetch's timestamp, independent of whether it
@@ -466,6 +508,18 @@ impl super::SovReachabilitySource for DynamicChainSovReachability {
         // reachability wiring); a load failure falls back to
         // `StaticSovReachability(None)` instead, same as ticket 04.
         true
+    }
+
+    fn reachability_ready(&self) -> bool {
+        // Distinct from `graph_available`: the stargate graph is always
+        // loaded, but until the *chain* has been computed from a real
+        // observation once this process (seed or first successful fetch),
+        // `reachable()` answers stargate-only and does not reflect the live
+        // chain. The collector must not record reachability observations
+        // during that window, or a restart across a Wanderer outage would
+        // manufacture false->true transitions and burst-fire "now reachable"
+        // (ticket 05 blocker / ticket 06 readiness).
+        self.has_recomputed()
     }
 
     fn chain_status(&self, now: DateTime<Utc>) -> SovChainStatus {
@@ -564,6 +618,25 @@ impl SovChainCollector {
         self
     }
 
+    /// Seeds the in-memory reachability from the last persisted chain
+    /// snapshot before the poll loop starts (ticket 05 blocker). Called once
+    /// at start-up (`src/lib.rs`) so a restart during a Wanderer outage still
+    /// serves the last known chain instead of dropping to stargate-only until
+    /// the map topology next changes. Returns whether a snapshot was found
+    /// and used to seed.
+    pub async fn seed_reachability_from_persisted_snapshot(
+        &self,
+    ) -> Result<bool, SovChainCollectionError> {
+        match self.store.latest_chain_snapshot().await? {
+            Some(snapshot) => {
+                self.reachability
+                    .seed_from_snapshot(&snapshot.connections, snapshot.fetched_at);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// One poll cycle. On any Wanderer error (401/403/503/timeout/parse
     /// error) this returns `Err` *without* touching the store or the
     /// reachability state at all -- the previously persisted snapshot and
@@ -609,7 +682,16 @@ impl SovChainCollector {
         // doc comment).
         self.reachability.mark_fetch_success(observed_at);
 
-        let recomputed = topology_changed;
+        // Force a recompute on the first successful fetch of this process,
+        // even when the fetched topology is byte-identical to the persisted
+        // snapshot (ticket 05 blocker). After a restart the in-memory
+        // variants start stargate-only (see `DynamicChainSovReachability::new`)
+        // while `topology_changed` diffs against the snapshot persisted a
+        // poll ago -- almost always unchanged -- so without this the live
+        // chain would stay absent from reachability until the map topology
+        // next changed. `has_recomputed()` is true after a start-up seed, so
+        // a seeded process does not redundantly recompute here.
+        let recomputed = topology_changed || !self.reachability.has_recomputed();
         if recomputed {
             self.reachability.recompute(&connections);
         }
@@ -639,6 +721,11 @@ pub async fn log_sse_probe_result(
         crate::sov_feed::WandererSseProbeResult::Disabled => {
             tracing::info!(
                 "Wanderer SSE stream is disabled on this host; the chain feed continues polling"
+            );
+        }
+        crate::sov_feed::WandererSseProbeResult::AuthRejected => {
+            warn!(
+                "Wanderer SSE probe was rejected with an auth error (401/403); check the map API key -- polling continues regardless"
             );
         }
         crate::sov_feed::WandererSseProbeResult::Unknown => {

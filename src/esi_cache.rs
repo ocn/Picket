@@ -300,8 +300,18 @@ pub(crate) fn rate_limit_pacing_deadline(
     if remaining < 0 || remaining.saturating_mul(10) > limit {
         return None;
     }
-    let spacing_seconds = (window_seconds + remaining.max(1) - 1) / remaining.max(1);
-    Some(observed_at + ChronoDuration::seconds(spacing_seconds.max(1)))
+    // Ceiling division, but the numerator adds two header-derived i64s and
+    // would overflow (debug panic, release wrap to a bogus deadline) on a
+    // pathological window such as `20/9223372036854775807s`. This helper now
+    // lives in the shared `esi_cache` home that every feed's limiter path
+    // calls, so the arithmetic on this external ESI data must be
+    // non-panicking: saturate the numerator, and build the resulting
+    // `Duration`/deadline with the fallible constructors so an absurd spacing
+    // clamps to `None` rather than panicking.
+    let divisor = remaining.max(1);
+    let spacing_seconds = window_seconds.saturating_add(divisor).saturating_sub(1) / divisor;
+    let spacing = ChronoDuration::try_seconds(spacing_seconds.max(1))?;
+    observed_at.checked_add_signed(spacing)
 }
 
 pub(crate) fn merge_cache_metadata(
@@ -425,6 +435,22 @@ mod tests {
             .await
             .unwrap();
         store.active_esi_limiter_deadline().await.unwrap()
+    }
+
+    #[test]
+    fn rate_limit_pacing_deadline_does_not_panic_on_a_saturating_window() {
+        let observed_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        // `window_seconds` parses to i64::MAX; the guard admits remaining==2
+        // (2*10 == limit), so the old ceiling-division numerator
+        // (window_seconds + 2 - 1) overflowed. Saturating arithmetic plus the
+        // fallible `try_seconds` clamps this to `None` instead of panicking.
+        let deadline = rate_limit_pacing_deadline("20/9223372036854775807s", 2, observed_at);
+        assert_eq!(deadline, None);
+
+        // A sane header still yields a real deadline: 600/900s with 3 requests
+        // left paces at ceil(900/3) == 300 seconds out.
+        let sane = rate_limit_pacing_deadline("600/900s", 3, observed_at);
+        assert_eq!(sane, Some(observed_at + ChronoDuration::seconds(300)));
     }
 
     #[tokio::test]

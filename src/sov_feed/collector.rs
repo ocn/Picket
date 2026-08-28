@@ -117,6 +117,21 @@ pub trait SovReachabilitySource: Send + Sync {
     ) -> Option<SovReachabilityInfo>;
     fn graph_available(&self) -> bool;
 
+    /// Whether the reachability source's graph reflects a real observation
+    /// yet -- the readiness signal that gates recording reachability
+    /// observations (ticket 06). Defaults to `true` for every source with a
+    /// static or immediately-available graph (`StaticSovReachability`, every
+    /// test fake): those are ready the moment they are constructed. Only
+    /// [`crate::sov_feed::chain::DynamicChainSovReachability`] overrides it,
+    /// returning `false` until the Wanderer chain has been computed from a
+    /// live fetch or a persisted-snapshot seed at least once this process, so
+    /// a restart across a Wanderer outage records no observation (and thus
+    /// produces no burst of spurious "now reachable" alerts) until the chain
+    /// is actually loaded.
+    fn reachability_ready(&self) -> bool {
+        true
+    }
+
     /// Whether a Wanderer chain feed is configured and, if so, how fresh
     /// its most recent successful fetch is (ticket 05, spec "On Wanderer
     /// errors ... the last good snapshot is kept and marked stale after
@@ -688,7 +703,18 @@ impl SovCollector {
             // whether a campaign first seen during the outage has ever
             // gotten its baseline row -- simply waits for the graph to
             // come back.
-            let graph_available = self.reachability.graph_available();
+            //
+            // `reachability_ready()` is the second half of the same guard
+            // (ticket 05 blocker / ticket 06 readiness): a dynamic Wanderer
+            // chain reports `graph_available() == true` (its stargate graph
+            // is always loaded) but is not yet a faithful picture of the live
+            // chain until it has been fetched or seeded once this process.
+            // Until then it answers stargate-only, so recording observations
+            // would manufacture false->true transitions for chain-only
+            // campaigns after a restart. Static/immediately-available sources
+            // default `reachability_ready()` to true and are unaffected.
+            let record_reachability =
+                self.reachability.graph_available() && self.reachability.reachability_ready();
             for campaign in &campaigns {
                 // T-minus marks: "start_time > now" (spec) -- a campaign
                 // that has already started never gets a T-minus mark. This
@@ -728,10 +754,33 @@ impl SovCollector {
                             if remaining > mark_duration {
                                 continue;
                             }
+                            let stage = SovAlertStage::TMinus(minutes);
+                            // Skip the expensive render (directory/ticker/
+                            // owner lookups + a `map_owner` query) when a
+                            // delivery for this mark already exists: the mark
+                            // stays "due" for its whole T-120..start window,
+                            // so every 30 s pass would otherwise re-render and
+                            // throw the work away once `prepare_delivery`
+                            // no-ops (tickets 03/07). `prepare_delivery`'s
+                            // ON CONFLICT still guards correctness on the rare
+                            // race between this check and the insert.
+                            if self
+                                .store
+                                .delivery_exists(
+                                    subscription,
+                                    "campaign",
+                                    campaign.campaign_id,
+                                    stage,
+                                )
+                                .await
+                                .map_err(store_error)?
+                            {
+                                continue;
+                            }
                             let message = self
                                 .render_stage_message(
                                     campaign,
-                                    SovAlertStage::TMinus(minutes),
+                                    stage,
                                     subscription.filter.root.allows_frigate_holes_anywhere(),
                                 )
                                 .await;
@@ -741,7 +790,7 @@ impl SovCollector {
                                     subscription,
                                     "campaign",
                                     campaign.campaign_id,
-                                    SovAlertStage::TMinus(minutes),
+                                    stage,
                                     &message,
                                 )
                                 .await
@@ -768,7 +817,7 @@ impl SovCollector {
                 // VulnerableWithin(12h))` still fires once the campaign
                 // enters the window, even many passes after the leaf
                 // itself flipped true.
-                if graph_available {
+                if record_reachability {
                     for subscription in &subscriptions {
                         if !subscription.filter.root.has_reachable_leaf() {
                             continue;
@@ -815,24 +864,38 @@ impl SovCollector {
                             continue;
                         }
                         let stage = SovAlertStage::Reachable(transition_sequence);
-                        let message = self
-                            .render_stage_message(
-                                campaign,
-                                stage,
-                                subscription.filter.root.allows_frigate_holes_anywhere(),
-                            )
-                            .await;
-                        let freshly_prepared = self
+                        // Skip the render when a delivery for this exact
+                        // transition already exists (e.g. a prior process
+                        // prepared it and crashed before marking it announced,
+                        // so this pass re-attempts): the row is durable, so
+                        // just re-mark it announced below without paying for
+                        // another render (tickets 03/07).
+                        let freshly_prepared = if self
                             .store
-                            .prepare_delivery(
-                                subscription,
-                                "campaign",
-                                campaign.campaign_id,
-                                stage,
-                                &message,
-                            )
+                            .delivery_exists(subscription, "campaign", campaign.campaign_id, stage)
                             .await
-                            .map_err(store_error)?;
+                            .map_err(store_error)?
+                        {
+                            false
+                        } else {
+                            let message = self
+                                .render_stage_message(
+                                    campaign,
+                                    stage,
+                                    subscription.filter.root.allows_frigate_holes_anywhere(),
+                                )
+                                .await;
+                            self.store
+                                .prepare_delivery(
+                                    subscription,
+                                    "campaign",
+                                    campaign.campaign_id,
+                                    stage,
+                                    &message,
+                                )
+                                .await
+                                .map_err(store_error)?
+                        };
                         // Marked announced once a durable delivery row is
                         // confirmed to exist, whether freshly prepared
                         // here or already prepared by an earlier attempt
@@ -944,20 +1007,32 @@ impl SovCollector {
                         continue;
                     }
                     let stage = SovAlertStage::TzWindowEntered(transition_sequence);
-                    let message = self
-                        .render_tz_window_message(structure, window, stage)
-                        .await;
-                    let freshly_prepared = self
+                    // Skip the render when a delivery for this exact
+                    // transition already exists (restart-replay): the row is
+                    // durable, so just re-mark it announced below without
+                    // paying for another render (tickets 03/07).
+                    let freshly_prepared = if self
                         .store
-                        .prepare_delivery(
-                            subscription,
-                            "structure",
-                            structure.structure_id,
-                            stage,
-                            &message,
-                        )
+                        .delivery_exists(subscription, "structure", structure.structure_id, stage)
                         .await
-                        .map_err(store_error)?;
+                        .map_err(store_error)?
+                    {
+                        false
+                    } else {
+                        let message = self
+                            .render_tz_window_message(structure, window, stage)
+                            .await;
+                        self.store
+                            .prepare_delivery(
+                                subscription,
+                                "structure",
+                                structure.structure_id,
+                                stage,
+                                &message,
+                            )
+                            .await
+                            .map_err(store_error)?
+                    };
                     self.store
                         .mark_tz_window_announced(
                             subscription.guild_id,
@@ -1052,6 +1127,25 @@ impl SovCollector {
                         &region_of,
                         &reachable_jumps,
                     ) {
+                        // Skip the render once the `appeared` delivery exists:
+                        // the campaign re-matches on every 60 s poll for its
+                        // whole twelve-hour window, and re-rendering just to
+                        // have `prepare_delivery` no-op is wasted work
+                        // (tickets 03/07). ON CONFLICT still guards the rare
+                        // race between this check and the insert.
+                        if self
+                            .store
+                            .delivery_exists(
+                                subscription,
+                                "campaign",
+                                campaign.campaign_id,
+                                SovAlertStage::Appeared,
+                            )
+                            .await
+                            .map_err(store_error)?
+                        {
+                            continue;
+                        }
                         let message = self
                             .render_stage_message(
                                 campaign,
