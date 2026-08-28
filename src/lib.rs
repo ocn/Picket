@@ -20,6 +20,7 @@ pub mod presentation;
 pub mod processor;
 pub mod sov_feed;
 pub mod structure_resolver;
+pub mod watchlist_feed;
 
 use crate::commands::contract_subscribe::ContractSubscribeCommand;
 use crate::commands::contract_unsubscribe::ContractUnsubscribeCommand;
@@ -28,6 +29,9 @@ use crate::commands::health::HealthCommand;
 use crate::commands::sov_subscribe::SovSubscribeCommand;
 use crate::commands::sov_timers::SovTimersCommand;
 use crate::commands::sov_unsubscribe::SovUnsubscribeCommand;
+use crate::commands::watch::WatchCommand;
+use crate::commands::watch_subscribe::WatchSubscribeCommand;
+use crate::commands::watch_unsubscribe::WatchUnsubscribeCommand;
 use commands::diag::DiagCommand;
 use commands::subscribe::SubscribeCommand;
 use commands::sync_clear::SyncClearCommand;
@@ -59,6 +63,34 @@ pub struct SovStoreContainer;
 
 impl TypeMapKey for SovStoreContainer {
     type Value = sov_feed::SovStoreHandle;
+}
+
+pub struct WatchlistStoreContainer;
+
+impl TypeMapKey for WatchlistStoreContainer {
+    type Value = watchlist_feed::WatchlistStoreHandle;
+}
+
+/// Composition-root adapter letting the sov collector resolve a
+/// `Defender { watchlist: true }` leaf against a guild's current watchlist
+/// (ticket 08) without `sov_feed` depending on `watchlist_feed`. Wraps a
+/// connected [`watchlist_feed::WatchlistStore`] behind
+/// [`sov_feed::SovWatchlistSource`].
+pub struct WatchlistDefenderSource {
+    store: Arc<watchlist_feed::WatchlistStore>,
+}
+
+impl WatchlistDefenderSource {
+    pub fn new(store: Arc<watchlist_feed::WatchlistStore>) -> Self {
+        Self { store }
+    }
+}
+
+#[serenity::async_trait]
+impl sov_feed::SovWatchlistSource for WatchlistDefenderSource {
+    async fn watched_alliance_ids(&self, guild_id: u64) -> Result<Vec<i64>, sqlx::Error> {
+        self.store.watched_alliance_ids(guild_id).await
+    }
 }
 
 /// Shared handle to the sov feed's reachability source (ticket 04's
@@ -102,6 +134,11 @@ const SOV_MAP_COLLECTION_INTERVAL: Duration = Duration::from_secs(3600);
 /// Wanderer chain poll cadence (spec "Sources and cadence": "The Wanderer
 /// chain is polled every two minutes (systems and connections)").
 const SOV_CHAIN_POLL_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Watchlist alliance corporation-list poll cadence (ticket 08, spec
+/// "Hourly collectors"): the `/alliances/{id}/corporations/` route caches
+/// for one hour, so an hourly conditional re-poll is almost always a 304.
+const WATCHLIST_COLLECTION_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Default reachability origin: Turnur (spec "Reachability": "Single
 /// origin: Turnur (configurable by environment)").
@@ -332,6 +369,15 @@ pub async fn run() {
     let sov_timers_command = Box::new(SovTimersCommand);
     command_map.insert(sov_timers_command.name(), sov_timers_command);
 
+    let watch_command = Box::new(WatchCommand);
+    command_map.insert(watch_command.name(), watch_command);
+
+    let watch_subscribe_command = Box::new(WatchSubscribeCommand);
+    command_map.insert(watch_subscribe_command.name(), watch_subscribe_command);
+
+    let watch_unsubscribe_command = Box::new(WatchUnsubscribeCommand);
+    command_map.insert(watch_unsubscribe_command.name(), watch_unsubscribe_command);
+
     let command_map_arc = Arc::new(command_map);
 
     let contract_runtime = match std::env::var("CONTRACT_DATABASE_URL") {
@@ -356,6 +402,14 @@ pub async fn run() {
     // finding 1 on
     // `.scratch/esi-intel-feeds/issues/02-sov-campaign-appeared-alert-end-to-end.md`).
     let sov_store_handle = sov_feed::new_sov_store_handle();
+
+    // Watchlist feed (ticket 08): same optionality and late-bound-handle
+    // pattern as the sov feed. The handle starts empty; the watchlist
+    // collection loop (below) populates it once it connects, so a
+    // briefly-unavailable Postgres at boot never delays the gateway or the
+    // killmail pipeline, and `/watch*` commands answer "not connected"
+    // rather than panicking until it is populated.
+    let watchlist_store_handle = watchlist_feed::new_watchlist_store_handle();
 
     // Stargate reachability graph (ticket 04): loaded synchronously here,
     // before the Discord client exists, because it is pure local-disk and
@@ -400,6 +454,7 @@ pub async fn run() {
         if contract_runtime.is_some() {
             data.insert::<SovStoreContainer>(sov_store_handle.clone());
             data.insert::<SovReachabilityContainer>(sov_reachability.clone());
+            data.insert::<WatchlistStoreContainer>(watchlist_store_handle.clone());
         }
     }
 
@@ -477,6 +532,35 @@ pub async fn run() {
             }
             Err(error) => {
                 warn!("Sov campaign feed disabled: HTTP client initialization failed: {error}");
+            }
+        }
+
+        // Watchlist feed (ticket 08): an independent hourly collection loop
+        // beside the sov runtime, behind the same database gate, with its
+        // own late-bound store handle. Never awaited on the path to starting
+        // the Discord client.
+        match watchlist_feed::HttpWatchlistEsi::new(Duration::from_secs(
+            app_config.esi_http_timeout_secs,
+        )) {
+            Ok(watchlist_esi) => {
+                let watchlist_esi: Arc<dyn watchlist_feed::WatchlistEsi> = Arc::new(watchlist_esi);
+                let watchlist_delivery: Arc<dyn watchlist_feed::WatchlistDelivery> = Arc::new(
+                    discord_bot::DiscordWatchlistDelivery::new(http_client.clone()),
+                );
+                let watchlist_resolver: Arc<dyn watchlist_feed::WatchlistEntityResolver> = Arc::new(
+                    discord_bot::DiscordWatchlistResolver::new(app_state.clone()),
+                );
+                spawn_watchlist_collection_loop(
+                    database_url.clone(),
+                    watchlist_store_handle,
+                    WATCHLIST_COLLECTION_INTERVAL,
+                    watchlist_esi,
+                    watchlist_delivery,
+                    watchlist_resolver,
+                );
+            }
+            Err(error) => {
+                warn!("Watchlist feed disabled: HTTP client initialization failed: {error}");
             }
         }
     } else {
@@ -689,6 +773,22 @@ pub async fn run() {
     .await;
 }
 
+/// Connects a watchlist-store-backed [`sov_feed::SovWatchlistSource`] for
+/// resolving `Defender { watchlist: true }` leaves (ticket 08), falling back
+/// to [`sov_feed::NoSovWatchlist`] (watchlist leaves never match) when the
+/// watchlist store is momentarily unavailable. Migrations are already
+/// applied by the loop's `ContractCollectionStore::connect`, so the
+/// `watchlist_*` tables exist by the time this runs.
+async fn connect_sov_watchlist_source(database_url: &str) -> Arc<dyn sov_feed::SovWatchlistSource> {
+    match watchlist_feed::WatchlistStore::connect(database_url).await {
+        Ok(store) => Arc::new(WatchlistDefenderSource::new(Arc::new(store))),
+        Err(error) => {
+            warn!("watchlist source unavailable for sov defender resolution: {error}");
+            Arc::new(sov_feed::NoSovWatchlist)
+        }
+    }
+}
+
 /// Spawns the sov campaign feed's independent collection loop. Generic
 /// over the sov feed's trait objects (not concrete Discord types) so tests
 /// can inject fakes, mirroring
@@ -745,6 +845,7 @@ async fn run_sov_collection_loop(
                 Ok(store) => {
                     let store = Arc::new(store);
                     *store_handle.write().await = Some(store.clone());
+                    let watchlist_source = connect_sov_watchlist_source(&database_url).await;
                     let collector = sov_feed::SovCollector::new(
                         (*store).clone(),
                         esi.clone(),
@@ -753,7 +854,8 @@ async fn run_sov_collection_loop(
                         directory.clone(),
                         tickers.clone(),
                         reachability.clone(),
-                    );
+                    )
+                    .with_watchlist_source(watchlist_source);
                     match run_sov_cycle_isolated(async move { collector.collect_cycle().await })
                         .await
                     {
@@ -855,6 +957,7 @@ async fn run_sov_stage_loop(
         match contract_intelligence::ContractCollectionStore::connect(&database_url).await {
             Ok(limiter_store) => match sov_feed::SovStore::connect(&database_url).await {
                 Ok(store) => {
+                    let watchlist_source = connect_sov_watchlist_source(&database_url).await;
                     let collector = sov_feed::SovCollector::new(
                         store,
                         esi.clone(),
@@ -863,7 +966,8 @@ async fn run_sov_stage_loop(
                         directory.clone(),
                         tickers.clone(),
                         reachability.clone(),
-                    );
+                    )
+                    .with_watchlist_source(watchlist_source);
                     if let Err(error) =
                         run_sov_cycle_isolated(
                             async move { collector.evaluate_stage_cycle().await },
@@ -1094,6 +1198,107 @@ async fn run_sov_chain_loop(
             },
             Err(error) => warn!("sov chain feed migrations unavailable: {error}"),
         }
+    }
+}
+
+/// Spawns the watchlist feed's independent hourly collection loop (ticket
+/// 08). Mirrors [`spawn_sov_collection_loop`]: it does not itself connect to
+/// Postgres, only spawns a task that reconnects every iteration
+/// (self-healing, idempotent migrations) and isolates each cycle's panics
+/// via [`run_sov_cycle_isolated`].
+pub fn spawn_watchlist_collection_loop(
+    database_url: String,
+    store_handle: watchlist_feed::WatchlistStoreHandle,
+    interval: Duration,
+    esi: Arc<dyn watchlist_feed::WatchlistEsi>,
+    delivery: Arc<dyn watchlist_feed::WatchlistDelivery>,
+    resolver: Arc<dyn watchlist_feed::WatchlistEntityResolver>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_watchlist_collection_loop(
+        database_url,
+        store_handle,
+        interval,
+        esi,
+        delivery,
+        resolver,
+    ))
+}
+
+async fn run_watchlist_collection_loop(
+    database_url: String,
+    store_handle: watchlist_feed::WatchlistStoreHandle,
+    interval: Duration,
+    esi: Arc<dyn watchlist_feed::WatchlistEsi>,
+    delivery: Arc<dyn watchlist_feed::WatchlistDelivery>,
+    resolver: Arc<dyn watchlist_feed::WatchlistEntityResolver>,
+) {
+    let mut consecutive_failures = 0_u32;
+    loop {
+        let mut delay = interval;
+        match contract_intelligence::ContractCollectionStore::connect(&database_url).await {
+            Ok(limiter_store) => match watchlist_feed::WatchlistStore::connect(&database_url).await
+            {
+                Ok(store) => {
+                    let store = Arc::new(store);
+                    *store_handle.write().await = Some(store.clone());
+                    let collector = watchlist_feed::WatchlistCollector::new(
+                        (*store).clone(),
+                        esi.clone(),
+                        Arc::new(limiter_store),
+                        delivery.clone(),
+                        resolver.clone(),
+                    );
+                    match run_sov_cycle_isolated(async move { collector.collect_cycle().await })
+                        .await
+                    {
+                        Ok(report) => {
+                            if let Some(paused_until) = report.paused_until {
+                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                delay = contract_intelligence::collection_retry_delay(
+                                    interval,
+                                    Some(paused_until),
+                                    consecutive_failures,
+                                );
+                            } else {
+                                consecutive_failures = 0;
+                            }
+                        }
+                        Err(error) => {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            delay = contract_intelligence::collection_retry_delay(
+                                interval,
+                                None,
+                                consecutive_failures,
+                            );
+                            warn!("watchlist collection paused after failure: {error}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    delay = contract_intelligence::collection_retry_delay(
+                        interval,
+                        None,
+                        consecutive_failures,
+                    );
+                    *store_handle.write().await = None;
+                    warn!(
+                        "watchlist feed database unavailable; retrying without an in-memory fallback: {error}"
+                    );
+                }
+            },
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                delay = contract_intelligence::collection_retry_delay(
+                    interval,
+                    None,
+                    consecutive_failures,
+                );
+                *store_handle.write().await = None;
+                warn!("watchlist feed migrations unavailable; retrying: {error}");
+            }
+        }
+        tokio::time::sleep(delay).await;
     }
 }
 

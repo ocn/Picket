@@ -36,10 +36,10 @@ pub use chain::{
     SOV_CHAIN_STALE_AFTER,
 };
 pub use collector::{
-    SovClock, SovCollectionError, SovCollectionReport, SovCollector, SovMapCollectionReport,
-    SovReachabilityInfo, SovReachabilitySource, SovStageEvaluationReport,
+    NoSovWatchlist, SovClock, SovCollectionError, SovCollectionReport, SovCollector,
+    SovMapCollectionReport, SovReachabilityInfo, SovReachabilitySource, SovStageEvaluationReport,
     SovStructuresCollectionReport, SovSystemDirectory, SovSystemInfo, SovTickerResolver,
-    StaticSovReachability, SystemSovClock,
+    SovWatchlistSource, StaticSovReachability, SystemSovClock,
 };
 pub use esi::{HttpSovereigntyEsi, SovereigntyEsi, SOV_COMPATIBILITY_DATE};
 pub use graph::{

@@ -193,6 +193,50 @@ impl EsiClient {
         Ok(entity.ticker)
     }
 
+    /// Resolves a full alliance/corporation *name* to its id via
+    /// `POST /universe/ids/` (ticket 08's `/watch add` fallback). Note ESI's
+    /// ids endpoint resolves *names*, not tickers, so this only succeeds for
+    /// an exact (case-insensitive) full name; a bare ticker that is not a
+    /// name resolves to nothing here. Returns `(id, resolved_name)` for the
+    /// first match in the requested kind's result bucket.
+    pub async fn resolve_watchlist_entity(
+        &self,
+        is_alliance: bool,
+        query: &str,
+    ) -> Result<Option<(u64, String)>, Box<dyn Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        struct NamedEntity {
+            id: u64,
+            name: String,
+        }
+        #[derive(Default, Deserialize)]
+        struct UniverseIds {
+            #[serde(default)]
+            alliances: Vec<NamedEntity>,
+            #[serde(default)]
+            corporations: Vec<NamedEntity>,
+        }
+        let response = self
+            .client
+            .post(format!("{}universe/ids/", ESI_URL))
+            .json(&[query])
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(format!("ESI universe/ids returned status: {}", response.status()).into());
+        }
+        let resolved: UniverseIds = response.json().await?;
+        let bucket = if is_alliance {
+            resolved.alliances
+        } else {
+            resolved.corporations
+        };
+        Ok(bucket
+            .into_iter()
+            .next()
+            .map(|entity| (entity.id, entity.name)))
+    }
+
     pub async fn get_celestial(
         &self,
         system_id: u32,

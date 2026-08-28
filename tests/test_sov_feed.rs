@@ -22,10 +22,10 @@ use killbot_rust::sov_feed::{
     SovChainCollector, SovChainStatus, SovClock, SovCollector, SovDelivery, SovDeliveryError,
     SovFilter, SovFilterCondition, SovFilterNode, SovMapEntry, SovNotificationMessage,
     SovReachabilityInfo, SovReachabilitySource, SovStore, SovStructure, SovSubscription,
-    SovSystemDirectory, SovSystemInfo, SovTickerResolver, SovereigntyEsi, StargateGraph,
-    StargateGraphFile, StaticSovReachability, WandererChainSource, WandererConnection,
-    WandererConnectionType, WandererError, WandererMassStatus, WandererShipSizeType,
-    WandererSystem, WandererTimeStatus, SOV_HUB_STRUCTURE_TYPE_IDS,
+    SovSystemDirectory, SovSystemInfo, SovTickerResolver, SovWatchlistSource, SovereigntyEsi,
+    StargateGraph, StargateGraphFile, StaticSovReachability, WandererChainSource,
+    WandererConnection, WandererConnectionType, WandererError, WandererMassStatus,
+    WandererShipSizeType, WandererSystem, WandererTimeStatus, SOV_HUB_STRUCTURE_TYPE_IDS,
 };
 use killbot_rust::spawn_sov_collection_loop;
 use sqlx::Row;
@@ -2271,6 +2271,7 @@ async fn reachable_composes_with_defender_via_and() {
                 }),
                 SovFilterNode::Condition(SovFilterCondition::Defender {
                     alliance_ids: vec![99_006_751],
+                    watchlist: false,
                 }),
             ]),
         },
@@ -2957,6 +2958,7 @@ async fn a_subscription_without_reachable_is_unaffected_by_dynamic_chain_reachab
         SovFilter {
             root: SovFilterNode::Condition(SovFilterCondition::Defender {
                 alliance_ids: vec![99_006_751],
+                watchlist: false,
             }),
         },
         None,
@@ -3415,6 +3417,7 @@ async fn a_subscription_without_a_reachable_leaf_never_gets_reachability_state_o
         SovFilter {
             root: SovFilterNode::Condition(SovFilterCondition::Defender {
                 alliance_ids: vec![99_006_751],
+                watchlist: false,
             }),
         },
         None,
@@ -4777,6 +4780,7 @@ async fn tz_window_is_gated_by_defender_and_region_leaves() {
         SovFilter {
             root: SovFilterNode::Condition(SovFilterCondition::Defender {
                 alliance_ids: vec![99_000_001],
+                watchlist: false,
             }),
         },
         "00:00-04:00",
@@ -5791,4 +5795,137 @@ fn wanderer_connections_fixture_drives_traversability_and_path_risk() {
         WandererTimeStatus::Eol4Hours,
         "the worst hole on the HUB_A route is the EOL hole"
     );
+}
+
+// --- Defender { watchlist } resolution (ticket 08) ---
+
+/// A `SovWatchlistSource` whose watched alliance ids can be changed between
+/// collector cycles, simulating a guild adding and later removing an
+/// alliance from its watchlist.
+struct FakeSovWatchlist {
+    guild_id: u64,
+    alliance_ids: Mutex<Vec<i64>>,
+}
+
+impl FakeSovWatchlist {
+    fn new(guild_id: u64, alliance_ids: Vec<i64>) -> Self {
+        Self {
+            guild_id,
+            alliance_ids: Mutex::new(alliance_ids),
+        }
+    }
+
+    fn set(&self, alliance_ids: Vec<i64>) {
+        *self.alliance_ids.lock().unwrap() = alliance_ids;
+    }
+}
+
+#[async_trait]
+impl SovWatchlistSource for FakeSovWatchlist {
+    async fn watched_alliance_ids(&self, guild_id: u64) -> Result<Vec<i64>, sqlx::Error> {
+        if guild_id == self.guild_id {
+            Ok(self.alliance_ids.lock().unwrap().clone())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+}
+
+fn defender_watchlist_filter() -> SovFilter {
+    SovFilter {
+        root: SovFilterNode::Condition(SovFilterCondition::Defender {
+            alliance_ids: Vec::new(),
+            watchlist: true,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn defender_watchlist_leaf_matches_a_watched_alliance_and_stops_after_removal() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    // Subscriptions in test_sov_feed use guild_id 1, channel_id 2.
+    subscribe(
+        &store,
+        "watchlist-defender",
+        defender_watchlist_filter(),
+        None,
+    )
+    .await;
+
+    let watched_alliance = 99_006_751_i64;
+    let watchlist = Arc::new(FakeSovWatchlist::new(1, vec![watched_alliance]));
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    // Baseline campaign, then campaign A (defended by the watched alliance)
+    // appears while the alliance is watched, then campaign B (also defended
+    // by it) appears after removal.
+    let baseline = campaign(
+        1,
+        30_005_174,
+        watched_alliance,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let campaign_a = campaign(
+        2,
+        30_004_737,
+        watched_alliance,
+        observed_at + ChronoDuration::hours(3),
+    );
+    let campaign_b = campaign(
+        3,
+        30_004_737,
+        watched_alliance,
+        observed_at + ChronoDuration::hours(3),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![baseline.clone()],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![baseline.clone(), campaign_a.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![baseline.clone(), campaign_a.clone(), campaign_b.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(20), "etag-3"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = SovCollector::new(
+        store.clone(),
+        Arc::new(esi),
+        limiter,
+        delivery.clone(),
+        Arc::new(FakeSovSystemDirectory::new()),
+        Arc::new(FakeSovTickerResolver),
+        Arc::new(StaticSovReachability(None)),
+    )
+    .with_clock(clock.clone())
+    .with_watchlist_source(watchlist.clone());
+
+    // Baseline cycle: no alerts.
+    collector.collect_cycle().await.expect("baseline");
+    assert_eq!(delivery.sent_count(), 0);
+
+    // Campaign A appears while the alliance is watched -> the watchlist
+    // defender leaf resolves to the watched alliance and matches.
+    clock.advance(ChronoDuration::seconds(10));
+    let report = collector.collect_cycle().await.expect("campaign A cycle");
+    assert_eq!(report.alerts_prepared, 1);
+    assert_eq!(delivery.sent_count(), 1);
+    assert_eq!(delivery.sent()[0].subject_id, campaign_a.campaign_id);
+
+    // Remove the alliance from the watchlist; campaign B (defended by the
+    // same, now-unwatched, alliance) appears -> the leaf resolves to an
+    // empty alliance list and no longer matches.
+    watchlist.set(Vec::new());
+    clock.advance(ChronoDuration::seconds(10));
+    let report = collector.collect_cycle().await.expect("campaign B cycle");
+    assert_eq!(report.alerts_prepared, 0);
+    assert_eq!(delivery.sent_count(), 1);
+
+    database.destroy().await;
 }

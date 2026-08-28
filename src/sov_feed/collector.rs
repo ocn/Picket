@@ -24,8 +24,35 @@ use crate::sov_feed::store::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::warn;
+
+/// Supplies a guild's currently-watched alliance ids so a sov
+/// `Defender { watchlist: true }` leaf can be resolved against that guild's
+/// watchlist at evaluation time (ticket 08). The sov collector holds this
+/// as a trait object obtained at composition-root wiring time
+/// (`src/lib.rs`), so `sov_feed` does not depend on `watchlist_feed`
+/// directly. The default [`NoSovWatchlist`] returns an empty list for every
+/// guild, which leaves an unresolved watchlist leaf never matching -- the
+/// correct "no watchlist context" fallback for every existing collector.
+#[async_trait]
+pub trait SovWatchlistSource: Send + Sync {
+    async fn watched_alliance_ids(&self, guild_id: u64) -> Result<Vec<i64>, sqlx::Error>;
+}
+
+/// The default watchlist source: no guild watches anything, so a
+/// `Defender { watchlist: true }` leaf resolves to an empty `alliance_ids`
+/// and never matches. Used by every collector that predates ticket 08 and
+/// by the structures/map loops, which never evaluate subscriptions.
+pub struct NoSovWatchlist;
+
+#[async_trait]
+impl SovWatchlistSource for NoSovWatchlist {
+    async fn watched_alliance_ids(&self, _guild_id: u64) -> Result<Vec<i64>, sqlx::Error> {
+        Ok(Vec::new())
+    }
+}
 
 /// How far ahead of `observed_at` a non-baseline campaign's `start_time`
 /// may be for the `appeared` stage to fire (spec: "start within twelve
@@ -364,6 +391,7 @@ pub struct SovCollector {
     tickers: Arc<dyn SovTickerResolver>,
     reachability: Arc<dyn SovReachabilitySource>,
     clock: Arc<dyn SovClock>,
+    watchlist: Arc<dyn SovWatchlistSource>,
 }
 
 impl SovCollector {
@@ -386,12 +414,59 @@ impl SovCollector {
             tickers,
             reachability,
             clock: Arc::new(SystemSovClock),
+            watchlist: Arc::new(NoSovWatchlist),
         }
     }
 
     pub fn with_clock(mut self, clock: Arc<dyn SovClock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Injects the watchlist source used to resolve
+    /// `Defender { watchlist: true }` leaves against a guild's current
+    /// watchlist (ticket 08). Defaults to [`NoSovWatchlist`]; the collection
+    /// and stage loops (`src/lib.rs`) wire the real
+    /// `watchlist_feed`-backed source.
+    pub fn with_watchlist_source(mut self, watchlist: Arc<dyn SovWatchlistSource>) -> Self {
+        self.watchlist = watchlist;
+        self
+    }
+
+    /// Fetches every subscription and replaces each watchlist-backed
+    /// `Defender` leaf with its guild's currently-watched alliance ids
+    /// unioned in (ticket 08). Watched ids are loaded once per distinct
+    /// guild that actually references the watchlist, so a filter with no
+    /// watchlist leaf pays nothing. After this every `Defender` leaf matches
+    /// purely on `alliance_ids`, so all downstream `matches`/
+    /// `matches_structure` calls need no watchlist parameter.
+    async fn subscriptions_with_watchlist_resolved(
+        &self,
+    ) -> Result<Vec<crate::sov_feed::model::SovSubscription>, SovCollectionError> {
+        let mut subscriptions = self.store.subscriptions().await.map_err(store_error)?;
+        let mut watched_by_guild: HashMap<u64, Vec<i64>> = HashMap::new();
+        for subscription in subscriptions.iter() {
+            if subscription.filter.root.references_watchlist()
+                && !watched_by_guild.contains_key(&subscription.guild_id)
+            {
+                let ids = self
+                    .watchlist
+                    .watched_alliance_ids(subscription.guild_id)
+                    .await
+                    .map_err(store_error)?;
+                watched_by_guild.insert(subscription.guild_id, ids);
+            }
+        }
+        for subscription in subscriptions.iter_mut() {
+            if subscription.filter.root.references_watchlist() {
+                let ids = watched_by_guild
+                    .get(&subscription.guild_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                subscription.filter.root = subscription.filter.root.with_watchlist_resolved(ids);
+            }
+        }
+        Ok(subscriptions)
     }
 
     /// Exercises exactly the restart-recovery claim step (no ESI request,
@@ -678,7 +753,7 @@ impl SovCollector {
         // pass (gated on `!structures.is_empty()`) need the full
         // subscription list, and it is small (one row per channel
         // subscription).
-        let subscriptions = self.store.subscriptions().await.map_err(store_error)?;
+        let subscriptions = self.subscriptions_with_watchlist_resolved().await?;
         let region_of =
             |system_id: i64| self.directory.resolve(system_id).map(|info| info.region_id);
         if !campaigns.is_empty() {
@@ -1111,7 +1186,7 @@ impl SovCollector {
 
         let mut alerts_prepared = 0usize;
         if !alert_candidates.is_empty() {
-            let subscriptions = self.store.subscriptions().await.map_err(store_error)?;
+            let subscriptions = self.subscriptions_with_watchlist_resolved().await?;
             let region_of =
                 |system_id: i64| self.directory.resolve(system_id).map(|info| info.region_id);
             let reachable_jumps = |system_id: i64, allow_frigate_holes: bool| {
