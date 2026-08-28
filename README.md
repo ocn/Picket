@@ -257,13 +257,20 @@ For a subscription with `tz_shift_enabled:true`, the `tz_window_entered` Alert S
 
 ### Watchlist feed
 
-Each server keeps a watchlist of alliances and corporations and receives an embed whenever a corporation joins or leaves a watched alliance. It shares the contract feed's PostgreSQL database and only starts when `CONTRACT_DATABASE_URL` is configured.
+Each server keeps a watchlist of alliances and corporations and receives an embed whenever a corporation joins or leaves a watched alliance, a watched entity's member count swings sharply, or a watched corporation changes alliance. It shares the contract feed's PostgreSQL database and only starts when `CONTRACT_DATABASE_URL` is configured.
 
 - `/watch add kind:<alliance|corporation> ticker:<text>` adds an entity. The `ticker` option is resolved through the bot's ticker cache first, then an ESI name lookup (`POST /universe/ids/`). Note ESI's ids endpoint resolves *names*, not tickers, so a bare ticker only works when it is already in the bot's cache; otherwise supply the full alliance/corporation name. The reply confirms the resolved name and id ephemerally. Adding the same entity twice is idempotent.
 - `/watch remove kind:<...> ticker:<...>` removes an entity; `/watch list` shows the current watchlist.
-- `/watch_subscribe name:<...> event_kinds:<comma list>` subscribes the current channel; `event_kinds` defaults to all kinds (currently `corp_joined`, `corp_left`) and takes an optional `role` to ping. `/watch_unsubscribe name:<...>` removes a channel subscription.
+- `/watch_subscribe name:<...> event_kinds:<comma list>` subscribes the current channel; `event_kinds` defaults to all kinds (`corp_joined`, `corp_left`, `member_delta`, `corp_changed_alliance`) and takes an optional `role` to ping. `/watch_unsubscribe name:<...>` removes a channel subscription.
 
 An hourly collector fetches each watched alliance's corporation list (`GET /alliances/{id}/corporations/`) with conditional requests through the shared ESI limiter and diffs it against the last snapshot. The first successful snapshot per alliance is a silent baseline (adding an alliance does not announce all its existing corporations); after that, a corporation appearing produces `corp_joined` and one disappearing produces `corp_left`, each delivered once per subscription with the alliance and corporation names/tickers, the event, and Dotlan/zKillboard links. Sov subscriptions can reference the watchlist as their defender filter with `{"defender": {"watchlist": true}}` (see the filter grammar above).
+
+The same collector also fetches public corporation info (`GET /corporations/{id}/`) for every watched corporation and every current member corporation of each watched alliance, persisting timestamped member-count snapshots:
+
+- **`member_delta`** — a watched entity's member count moving at least **10 %** in either direction against the snapshot **nearest seven days ago** (an alliance's count is the sum over its current member corporations' latest snapshots; a corporation's is direct). It requires roughly 6.5 days of history before it can fire, so a freshly added entity stays silent until it has a week of data. It fires **once per band crossing** and **re-arms only after the count returns inside the ±10 % band**, so a slowly shrinking alliance does not alert every hour. The embed shows the before/after counts, the percentage, the direction, and the reference window.
+- **`corp_changed_alliance`** — a watched corporation whose current alliance differs from its previous snapshot (including joining or leaving an alliance entirely). It fires once per change and shows the old → new alliance names/tickers (`none` when unaffiliated). The first snapshot per corporation is a silent baseline.
+
+Cost note: the corporation-info pass is one conditional request per corporation per hour, so a watched alliance of 150 corporations is ~150 requests per hour. It is bounded to at most 200 corporation-info fetches per cycle (least-recently-fetched first, the rest deferred to later cycles) and pauses on the shared ESI limiter, and the route's one-hour cache means most re-polls are cheap `304`s. Snapshots older than 30 days are pruned each cycle.
 
 ### Refreshing the stargate graph
 

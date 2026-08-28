@@ -35,13 +35,44 @@
 //!   checkpoint on the wire; the collector persists its own first/last-seen
 //!   and per-alliance baseline state.
 //!
-//! Corporation and alliance identity resolution (`GET /corporations/{id}/`,
-//! `GET /alliances/{id}/`, both `x-compatibility-date: 2020-01-01`,
-//! `cache-control: max-age=3600`) and name resolution (`POST /universe/ids/`,
-//! `x-compatibility-date: 2020-01-01`) are performed through the killfeed's
-//! shared `EsiClient` rather than this trait; see
+//! Alliance identity resolution (`GET /alliances/{id}/`) and name resolution
+//! (`POST /universe/ids/`) for the embed are performed through the
+//! killfeed's shared `EsiClient` rather than this trait; see
 //! `crate::esi::EsiClient::resolve_watchlist_entity` and the Discord-side
 //! resolver in `src/discord_bot.rs`.
+//!
+//! # `GET /corporations/{corporation_id}/` (ticket 09)
+//!
+//! The member-snapshot pass fetches public corporation info conditionally,
+//! with its own resource key per corporation
+//! (`watchlist/corporations/{id}`) and the same limiter discipline as the
+//! alliance listing. Five-axis evidence (captured live against
+//! `esi.evetech.net` on 2026-08-28, corporation 98077439 "Lightning Squad",
+//! a member of Snuffed Out; fixture `resources/watchlist_corporation_info_98077439.json`):
+//! - **Wire**: OpenAPI operation `GetCorporationsCorporationId`, no security
+//!   (public), `x-compatibility-date: 2020-01-01`. The body is a JSON object
+//!   whose fields include `member_count` (int), `alliance_id` (int, absent
+//!   when unaffiliated), `name` and `ticker` (strings). The collector reads
+//!   only those four; the rest (CEO, description, tax rate, ...) are ignored.
+//! - **Cache**: `cache-control: public, max-age=3600, must-revalidate,
+//!   stale-if-error=900`, a weak `ETag`, `expires` = `last-modified` + 3600s.
+//!   One-hour freshness matches the hourly cadence, so a conditional re-poll
+//!   is almost always a `304 Not Modified`.
+//! - **Limiter**: carries the legacy `x-esi-error-limit-remain` /
+//!   `x-esi-error-limit-reset` allowance and *no* `x-ratelimit-group`
+//!   bucket, exactly like the alliance-corporations route. Per ADR 0004 the
+//!   legacy allowance is global-per-application, so the collector coordinates
+//!   through the shared [`crate::esi_cache::EsiLimiterStore`] row and records
+//!   whatever limiter metadata is present after every response including 304s
+//!   and errors.
+//! - **Domain**: `member_count` is the corporation's current head count;
+//!   `alliance_id` is its current alliance (absent = unaffiliated). Watched
+//!   alliances have no `member_count` field of their own on the wire, so an
+//!   alliance's member count is the sum over its current member
+//!   corporations' latest snapshots.
+//! - **State**: a point-in-time public record with no per-request
+//!   checkpoint; the collector persists its own timestamped snapshots and the
+//!   band/alliance-change state derived from them.
 
 use crate::esi_cache::{cache_metadata, EsiError, EsiResponse};
 use async_trait::async_trait;
@@ -62,6 +93,18 @@ const WATCHLIST_COLLECTOR_USER_AGENT: &str = "killbot-rust Watchlist Feed";
 /// conditional request. The returned [`EsiResponse`] carries the parsed
 /// corporation ID list (fresh) or `not_modified` (304), plus the cache and
 /// limiter metadata the collector records against the shared limiter row.
+/// The subset of `GET /corporations/{id}/` the watchlist member-snapshot
+/// pass reads. `name`/`ticker` feed the shared identity caches so the embed
+/// needs no extra lookup; `member_count`/`alliance_id` drive the member-delta
+/// and corp-changed-alliance events (ticket 09).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CorporationInfo {
+    pub member_count: i64,
+    pub alliance_id: Option<i64>,
+    pub name: Option<String>,
+    pub ticker: Option<String>,
+}
+
 #[async_trait]
 pub trait WatchlistEsi: Send + Sync {
     async fn fetch_alliance_corporations(
@@ -69,6 +112,16 @@ pub trait WatchlistEsi: Send + Sync {
         alliance_id: i64,
         etag: Option<String>,
     ) -> Result<EsiResponse<Vec<i64>>, EsiError>;
+
+    /// Fetches one corporation's public info with a conditional request.
+    /// A 304 short-circuits with no body; the cache and limiter metadata are
+    /// recorded by the collector after every response including 304s and
+    /// errors (ticket 09).
+    async fn fetch_corporation_info(
+        &self,
+        corporation_id: i64,
+        etag: Option<String>,
+    ) -> Result<EsiResponse<CorporationInfo>, EsiError>;
 }
 
 pub struct HttpWatchlistEsi {
@@ -152,5 +205,80 @@ impl WatchlistEsi for HttpWatchlistEsi {
             )
         })?;
         Ok(EsiResponse::fresh(corporation_ids, metadata))
+    }
+
+    async fn fetch_corporation_info(
+        &self,
+        corporation_id: i64,
+        etag: Option<String>,
+    ) -> Result<EsiResponse<CorporationInfo>, EsiError> {
+        let url = format!(
+            "{}corporations/{corporation_id}/?datasource=tranquility",
+            self.base_url
+        );
+        let mut request = self
+            .client
+            .get(&url)
+            .header("X-Compatibility-Date", WATCHLIST_COMPATIBILITY_DATE);
+        if let Some(etag) = &etag {
+            request = request.header(IF_NONE_MATCH, etag);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| EsiError::retryable(error.to_string(), None))?;
+        let metadata = cache_metadata(response.headers());
+        if response.status() == StatusCode::NOT_MODIFIED {
+            return Ok(EsiResponse::not_modified(metadata));
+        }
+        if !response.status().is_success() {
+            let mut metadata = metadata;
+            metadata.retry_after = metadata.retry_after.or_else(|| {
+                if matches!(response.status(), StatusCode::TOO_MANY_REQUESTS)
+                    || response.status().as_u16() == 420
+                {
+                    metadata
+                        .error_limit_reset
+                        .map(|seconds| Utc::now() + ChronoDuration::seconds(seconds))
+                } else {
+                    None
+                }
+            });
+            return Err(EsiError::from_metadata(
+                format!("ESI returned {}", response.status()),
+                Some(response.status()),
+                metadata,
+            ));
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| EsiError::from_metadata(error.to_string(), None, metadata.clone()))?;
+        #[derive(serde::Deserialize)]
+        struct CorporationInfoBody {
+            member_count: i64,
+            #[serde(default)]
+            alliance_id: Option<i64>,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            ticker: Option<String>,
+        }
+        let parsed: CorporationInfoBody = serde_json::from_slice(&body).map_err(|error| {
+            EsiError::from_metadata(
+                format!("error decoding response body: {error}"),
+                None,
+                metadata.clone(),
+            )
+        })?;
+        Ok(EsiResponse::fresh(
+            CorporationInfo {
+                member_count: parsed.member_count,
+                alliance_id: parsed.alliance_id,
+                name: parsed.name,
+                ticker: parsed.ticker,
+            },
+            metadata,
+        ))
     }
 }

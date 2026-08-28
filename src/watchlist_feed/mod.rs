@@ -26,14 +26,16 @@ pub use collector::{
     SystemWatchlistClock, WatchlistClock, WatchlistCollectionError, WatchlistCollectionReport,
     WatchlistCollector,
 };
-pub use esi::{HttpWatchlistEsi, WatchlistEsi, WATCHLIST_COMPATIBILITY_DATE};
+pub use esi::{CorporationInfo, HttpWatchlistEsi, WatchlistEsi, WATCHLIST_COMPATIBILITY_DATE};
 pub use model::{
-    parse_event_kinds, PreparedWatchlistDelivery, WatchedEntity, WatchlistAlliance,
-    WatchlistCorporation, WatchlistDelivery, WatchlistDeliveryError, WatchlistDeliveryErrorKind,
-    WatchlistEmbedField, WatchlistEntityResolver, WatchlistEvent, WatchlistEventKind,
-    WatchlistKind, WatchlistNotificationMessage, WatchlistSubscription, WATCHLIST_EVENT_KINDS,
+    evaluate_member_delta, parse_event_kinds, MemberDeltaAlert, MemberDeltaDirection,
+    MemberDeltaOutcome, MemberReference, PreparedWatchlistDelivery, WatchedEntity,
+    WatchlistAlliance, WatchlistCorporation, WatchlistDelivery, WatchlistDeliveryError,
+    WatchlistDeliveryErrorKind, WatchlistEmbedField, WatchlistEntityResolver, WatchlistEvent,
+    WatchlistEventKind, WatchlistKind, WatchlistNotificationMessage, WatchlistSubscription,
+    WATCHLIST_EVENT_KINDS,
 };
 pub use store::{
-    alliance_resource_key, available_watchlist_store, new_watchlist_store_handle, WatchlistStore,
-    WatchlistStoreHandle,
+    alliance_resource_key, available_watchlist_store, corp_resource_key,
+    new_watchlist_store_handle, WatchlistStore, WatchlistStoreHandle,
 };
