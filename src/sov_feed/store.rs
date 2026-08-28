@@ -262,16 +262,6 @@ impl SovStore {
         .transpose()
     }
 
-    /// `max(fetched_at)` across every persisted snapshot -- the sov chain
-    /// feed's health-check and `/sov_timers` staleness signal doubles as
-    /// "last successful fetch" because a row only ever exists after a
-    /// successful fetch (see the migration's doc comment).
-    pub async fn chain_progress_at(&self) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
-        sqlx::query_scalar("SELECT max(fetched_at) FROM sov_chain_snapshots")
-            .fetch_one(&self.pool)
-            .await
-    }
-
     /// Bounded retention (spec: "Retain a bounded history ... decide and
     /// document" -- this feed keeps the last 24 hours, always preserving
     /// at least the single newest row regardless of its age, so a long
@@ -555,9 +545,18 @@ impl SovStore {
                 // First observation: establish the row, already
                 // `announced` -- "reachable at first observation never
                 // fires" (spec), regardless of when the full filter might
-                // later match.
+                // later match. Guarded on the campaign still being open: the
+                // stage loop reads `open_campaigns()` once then loops, while
+                // the collection loop's `mark_ended` (a separate task) can
+                // end a campaign and delete its state row in between. Without
+                // this `WHERE EXISTS`, a late observation would re-INSERT an
+                // orphan row for the now-ended campaign that `mark_ended`
+                // (fires once, `WHERE ended_at IS NULL`) never prunes again.
+                // The returned `Baseline` never fires an alert, so skipping
+                // the insert for an ended campaign changes no alert
+                // behaviour.
                 sqlx::query(
-                    "INSERT INTO sov_reachability_state (guild_id, channel_id, subscription_name, campaign_id, reachable, since, transition_sequence, announced, updated_at) VALUES ($1,$2,$3,$4,$5,$6,0,TRUE,now())",
+                    "INSERT INTO sov_reachability_state (guild_id, channel_id, subscription_name, campaign_id, reachable, since, transition_sequence, announced, updated_at) SELECT $1,$2,$3,$4,$5,$6,0,TRUE,now() WHERE EXISTS (SELECT 1 FROM sov_campaigns WHERE campaign_id = $4 AND ended_at IS NULL)",
                 )
                 .bind(guild_id as i64)
                 .bind(channel_id as i64)
@@ -998,6 +997,33 @@ impl SovStore {
     /// `tz_window_entered` (ticket 07, spec "Alert stages and dedup": "the
     /// delivery table already has `subject_kind`; use
     /// `tz_window_entered:<seq>`").
+    /// Cheap existence check on the delivery dedup key, used by the 30 s
+    /// stage loop to skip the expensive notification render
+    /// (directory/ticker/owner lookups plus a `map_owner` query) for a mark
+    /// that is already prepared (tickets 03/07): while a mark stays "due" for
+    /// its whole T-120..start window, every pass would otherwise re-render
+    /// and throw the work away when `prepare_delivery` no-ops. This reads the
+    /// unique index directly and touches no ESI/ticker path.
+    pub async fn delivery_exists(
+        &self,
+        subscription: &SovSubscription,
+        subject_kind: &str,
+        subject_id: i64,
+        stage: SovAlertStage,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM sov_alert_deliveries WHERE guild_id = $1 AND channel_id = $2 AND subscription_name = $3 AND subject_kind = $4 AND subject_id = $5 AND stage = $6)",
+        )
+        .bind(subscription.guild_id as i64)
+        .bind(subscription.channel_id as i64)
+        .bind(&subscription.name)
+        .bind(subject_kind)
+        .bind(subject_id)
+        .bind(stage.as_str())
+        .fetch_one(&self.pool)
+        .await
+    }
+
     pub async fn prepare_delivery(
         &self,
         subscription: &SovSubscription,
@@ -1006,8 +1032,21 @@ impl SovStore {
         stage: SovAlertStage,
         message: &SovNotificationMessage,
     ) -> Result<bool, sqlx::Error> {
+        // The row and its `delivery_nonce` are written in a single INSERT so
+        // no prepared row is ever nonce-less (tickets 02/03): a concurrent
+        // `deliver_claimable` (several loops drain the queue) could otherwise
+        // claim a half-prepared row between an INSERT and a follow-up nonce
+        // UPDATE and send it with an empty nonce. The `id` is pre-allocated
+        // from the table's own `BIGSERIAL` sequence in a CTE so it can be
+        // referenced by both the primary key and the derived
+        // `'sov-' || id` nonce within the same statement. `begin_delivery_attempt`
+        // additionally COALESCEs the nonce at claim time as a belt-and-suspenders.
         let delivery_id: Option<i64> = sqlx::query_scalar(
-            "INSERT INTO sov_alert_deliveries (guild_id, channel_id, subscription_name, subject_kind, subject_id, stage, message, role_id, status) SELECT $1,$2,$3,$4,$5,$6,$7,$8,'prepared' WHERE EXISTS (SELECT 1 FROM sov_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND name = $3) ON CONFLICT (guild_id, channel_id, subscription_name, subject_kind, subject_id, stage) DO NOTHING RETURNING id",
+            "WITH new_id AS (SELECT nextval(pg_get_serial_sequence('sov_alert_deliveries', 'id')) AS id) \
+             INSERT INTO sov_alert_deliveries (id, guild_id, channel_id, subscription_name, subject_kind, subject_id, stage, message, role_id, delivery_nonce, status) \
+             SELECT new_id.id, $1,$2,$3,$4,$5,$6,$7,$8, 'sov-' || new_id.id, 'prepared' FROM new_id \
+             WHERE EXISTS (SELECT 1 FROM sov_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND name = $3) \
+             ON CONFLICT (guild_id, channel_id, subscription_name, subject_kind, subject_id, stage) DO NOTHING RETURNING id",
         )
         .bind(subscription.guild_id as i64)
         .bind(subscription.channel_id as i64)
@@ -1019,15 +1058,7 @@ impl SovStore {
         .bind(subscription.role_id.map(|id| id as i64))
         .fetch_optional(&self.pool)
         .await?;
-        if let Some(delivery_id) = delivery_id {
-            sqlx::query("UPDATE sov_alert_deliveries SET delivery_nonce = $2 WHERE id = $1")
-                .bind(delivery_id)
-                .bind(format!("sov-{delivery_id}"))
-                .execute(&self.pool)
-                .await?;
-            return Ok(true);
-        }
-        Ok(false)
+        Ok(delivery_id.is_some())
     }
 
     pub async fn prepared_delivery_ids(&self) -> Result<Vec<i64>, sqlx::Error> {
@@ -1051,7 +1082,7 @@ impl SovStore {
         let claim_token = format!("sov-delivery-{:032x}", rand::thread_rng().gen::<u128>());
         let lease_until = attempted_at + SOV_DELIVERY_LEASE;
         let row = sqlx::query(
-            "UPDATE sov_alert_deliveries SET attempt_count = attempt_count + 1, nonce_window_until = COALESCE(nonce_window_until, $2), delivery_claim_token = $3, delivery_claimed_at = $4, delivery_lease_until = $5 WHERE id = $1 AND status = 'prepared' AND (delivery_lease_until IS NULL OR delivery_lease_until <= $4) RETURNING id, guild_id, channel_id, subscription_name, subject_kind, subject_id, stage, message, role_id, delivery_nonce, nonce_window_until, delivery_claim_token, attempt_count",
+            "UPDATE sov_alert_deliveries SET attempt_count = attempt_count + 1, nonce_window_until = COALESCE(nonce_window_until, $2), delivery_nonce = COALESCE(delivery_nonce, 'sov-' || id), delivery_claim_token = $3, delivery_claimed_at = $4, delivery_lease_until = $5 WHERE id = $1 AND status = 'prepared' AND (delivery_lease_until IS NULL OR delivery_lease_until <= $4) RETURNING id, guild_id, channel_id, subscription_name, subject_kind, subject_id, stage, message, role_id, delivery_nonce, nonce_window_until, delivery_claim_token, attempt_count",
         )
         .bind(delivery_id)
         .bind(nonce_window_until)
@@ -1132,6 +1163,29 @@ impl SovStore {
             .execute(&self.pool)
             .await?;
         }
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub async fn delivery_nonce_for_test(
+        &self,
+        delivery_id: i64,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT delivery_nonce FROM sov_alert_deliveries WHERE id = $1")
+            .bind(delivery_id)
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    /// Reproduces the historical race window (a prepared row observed with a
+    /// still-`NULL` nonce) so a test can prove the claim-time COALESCE fills
+    /// it deterministically.
+    #[doc(hidden)]
+    pub async fn clear_delivery_nonce_for_test(&self, delivery_id: i64) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE sov_alert_deliveries SET delivery_nonce = NULL WHERE id = $1")
+            .bind(delivery_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

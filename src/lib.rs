@@ -1040,6 +1040,27 @@ async fn run_sov_chain_loop(
     source: Arc<dyn sov_feed::WandererChainSource>,
     reachability: Arc<sov_feed::DynamicChainSovReachability>,
 ) {
+    // Seed the in-memory chain from the last persisted snapshot before the
+    // first fetch (ticket 05 blocker), so a restart during a Wanderer outage
+    // serves the last known chain instead of dropping to stargate-only until
+    // the map topology next changes. Best effort: if the database is
+    // momentarily unavailable here, the first successful fetch's forced
+    // recompute (`collect_cycle`) repopulates the chain anyway.
+    if let Ok(store) = sov_feed::SovStore::connect(&database_url).await {
+        let seed_collector =
+            sov_feed::SovChainCollector::new(store, source.clone(), reachability.clone());
+        match seed_collector
+            .seed_reachability_from_persisted_snapshot()
+            .await
+        {
+            Ok(true) => {
+                info!("sov chain reachability seeded from the last persisted snapshot")
+            }
+            Ok(false) => {}
+            Err(error) => warn!("sov chain reachability seed skipped: {error}"),
+        }
+    }
+
     let mut cadence = tokio::time::interval_at(tokio::time::Instant::now(), interval);
     cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {

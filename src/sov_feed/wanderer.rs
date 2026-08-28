@@ -361,7 +361,18 @@ impl std::error::Error for WandererError {}
 fn summarize_body(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     if text.len() > WANDERER_ERROR_BODY_SUMMARY_MAX_BYTES {
-        format!("{}...", &text[..WANDERER_ERROR_BODY_SUMMARY_MAX_BYTES])
+        // `String::from_utf8_lossy` emits multi-byte replacement characters
+        // (U+FFFD is three bytes) for a non-UTF-8 body, so the byte offset
+        // may land mid-character; slicing a `str` there panics. Walk back to
+        // the nearest char boundary at or below the limit first (a
+        // background-loop error path must never panic on untrusted upstream
+        // data). `is_char_boundary(0)` is always true, so the loop
+        // terminates.
+        let mut end = WANDERER_ERROR_BODY_SUMMARY_MAX_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &text[..end])
     } else {
         text.into_owned()
     }
@@ -374,11 +385,34 @@ fn summarize_body(bytes: &[u8]) -> String {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum WandererSseProbeResult {
     Enabled,
+    /// A confirmed "SSE off on this host": reserved for `503`
+    /// (research/02: `503 "Server-Sent Events are disabled on this
+    /// server"`). Not used for auth rejections -- those say nothing about
+    /// whether SSE itself is enabled.
     Disabled,
+    /// The host rejected our bearer key (`401`/`403`). Distinct from
+    /// `Disabled` because it points at a credential/scope problem, not at
+    /// SSE being off; an operator seeing this should check the map key
+    /// rather than conclude the upgrade path is closed.
+    AuthRejected,
     /// The probe itself failed (network error, timeout, or an unexpected
     /// status) -- distinct from a confirmed-disabled `503`, since this
     /// tells an operator nothing about whether SSE would work if retried.
     Unknown,
+}
+
+/// Classifies a probe response status into a [`WandererSseProbeResult`].
+/// Pure (no network) so the mapping is unit-testable without a mock server.
+fn classify_sse_probe_status(status: StatusCode) -> WandererSseProbeResult {
+    if status.is_success() {
+        WandererSseProbeResult::Enabled
+    } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        WandererSseProbeResult::AuthRejected
+    } else if status == StatusCode::SERVICE_UNAVAILABLE {
+        WandererSseProbeResult::Disabled
+    } else {
+        WandererSseProbeResult::Unknown
+    }
 }
 
 impl std::fmt::Display for WandererSseProbeResult {
@@ -386,6 +420,7 @@ impl std::fmt::Display for WandererSseProbeResult {
         let text = match self {
             Self::Enabled => "enabled",
             Self::Disabled => "disabled",
+            Self::AuthRejected => "auth rejected (map key)",
             Self::Unknown => "unknown (probe failed)",
         };
         formatter.write_str(text)
@@ -477,19 +512,12 @@ impl WandererClient {
             .send()
             .await;
         match response {
-            Ok(response) if response.status().is_success() => WandererSseProbeResult::Enabled,
             // research/02: "SSE disabled on this host (`GET
             // .../events/stream` -> `503 "Server-Sent Events are disabled
-            // on this server"`)". Any client/server error status is
-            // treated the same way (disabled), since the only host fact
-            // this probe needs is "not usable right now".
-            Ok(response)
-                if response.status() == StatusCode::SERVICE_UNAVAILABLE
-                    || response.status().is_client_error() =>
-            {
-                WandererSseProbeResult::Disabled
-            }
-            Ok(_) => WandererSseProbeResult::Unknown,
+            // on this server"`)". `Disabled` is reserved for that `503`;
+            // `401`/`403` map to `AuthRejected` (a credential problem, not
+            // SSE being off) and every other status to `Unknown`.
+            Ok(response) => classify_sse_probe_status(response.status()),
             Err(_) => WandererSseProbeResult::Unknown,
         }
     }
@@ -513,6 +541,49 @@ impl WandererChainSource for WandererClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summarize_body_truncates_on_a_char_boundary_without_panicking() {
+        // A lossy body whose multi-byte replacement character straddles the
+        // byte limit must not panic. Build a body of ASCII 'a' up to the
+        // limit, then an invalid byte that `from_utf8_lossy` renders as the
+        // 3-byte U+FFFD spanning the cut point.
+        let mut bytes = vec![b'a'; WANDERER_ERROR_BODY_SUMMARY_MAX_BYTES - 1];
+        bytes.push(0xF0); // lone invalid byte -> U+FFFD after the limit-1 'a's
+        bytes.extend_from_slice(&[b'b'; 50]);
+        let summary = summarize_body(&bytes);
+        assert!(summary.ends_with("..."));
+        // Truncated strictly before the limit at a valid boundary (the
+        // replacement char that would have crossed byte 200 is dropped).
+        assert!(summary.len() <= WANDERER_ERROR_BODY_SUMMARY_MAX_BYTES + 3);
+        assert!(summary.starts_with("aaa"));
+    }
+
+    #[test]
+    fn sse_probe_status_reserves_disabled_for_503_and_flags_auth_rejections() {
+        assert_eq!(
+            classify_sse_probe_status(StatusCode::OK),
+            WandererSseProbeResult::Enabled
+        );
+        assert_eq!(
+            classify_sse_probe_status(StatusCode::SERVICE_UNAVAILABLE),
+            WandererSseProbeResult::Disabled
+        );
+        assert_eq!(
+            classify_sse_probe_status(StatusCode::UNAUTHORIZED),
+            WandererSseProbeResult::AuthRejected
+        );
+        assert_eq!(
+            classify_sse_probe_status(StatusCode::FORBIDDEN),
+            WandererSseProbeResult::AuthRejected
+        );
+        // A 404 or other client error is neither a confirmed-disabled 503
+        // nor an auth rejection: Unknown, not Disabled.
+        assert_eq!(
+            classify_sse_probe_status(StatusCode::NOT_FOUND),
+            WandererSseProbeResult::Unknown
+        );
+    }
 
     #[test]
     fn unknown_connection_type_falls_back_to_the_unknown_variant() {
