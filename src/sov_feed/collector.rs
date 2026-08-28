@@ -13,10 +13,15 @@
 
 use crate::esi_cache::{merge_cache_metadata, EsiError, EsiLimiterStore};
 use crate::sov_feed::model::{
-    effective_tminus_marks_minutes, PreparedSovDelivery, SovAlertStage, SovCampaign, SovDelivery,
-    SovEmbedField, SovNotificationMessage,
+    effective_tminus_marks_minutes, effective_tz_shift_enabled, effective_tz_window,
+    tz_window_overlap_minutes, PreparedSovDelivery, SovAlertStage, SovCampaign, SovDelivery,
+    SovEmbedField, SovNotificationMessage, SovStructure, SOV_HUB_STRUCTURE_TYPE_IDS,
+    SOV_TZ_WINDOW_MIN_OVERLAP_MINUTES,
 };
-use crate::sov_feed::store::{SovReachabilityTransition, SovStore, SOV_CAMPAIGNS_RESOURCE_KEY};
+use crate::sov_feed::store::{
+    SovReachabilityTransition, SovStore, SovTzWindowTransition, SOV_CAMPAIGNS_RESOURCE_KEY,
+    SOV_MAP_RESOURCE_KEY, SOV_STRUCTURES_RESOURCE_KEY,
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::sync::Arc;
@@ -56,11 +61,24 @@ pub trait SovSystemDirectory: Send + Sync {
     fn resolve(&self, solar_system_id: i64) -> Option<SovSystemInfo>;
 }
 
-/// Alliance ticker lookup, with an ESI fallback for tickers not yet cached
-/// (mirrors the killfeed embed's ticker resolution).
+/// Alliance/corporation ticker and faction name lookup, with an ESI
+/// fallback for entries not yet cached (mirrors the killfeed embed's
+/// ticker resolution). `corporation_ticker` and `faction_name` default to
+/// `None` so every fake implementing only `alliance_ticker` from before
+/// ticket 07 keeps compiling unchanged; the sovereignty map's "current
+/// owner" field (ticket 07, spec "Embed": "current owner from the
+/// sovereignty map") is the only caller of the two new methods.
 #[async_trait]
 pub trait SovTickerResolver: Send + Sync {
     async fn alliance_ticker(&self, alliance_id: i64) -> Option<String>;
+
+    async fn corporation_ticker(&self, _corporation_id: i64) -> Option<String> {
+        None
+    }
+
+    async fn faction_name(&self, _faction_id: i64) -> Option<String> {
+        None
+    }
 }
 
 /// Per-campaign reachability facts for the `Reachable` filter leaf and
@@ -200,6 +218,11 @@ pub struct SovStageEvaluationReport {
     /// `Reachable` leaf whose full filter also matched at the moment of
     /// the transition.
     pub reachable_prepared: usize,
+    /// Freshly prepared `tz_window_entered:<seq>` deliveries this cycle
+    /// (ticket 07): an observed not-in-window-to-in-window transition for
+    /// a `tz_shift_enabled` subscription whose Defender/Region/System
+    /// leaves also matched at the moment of the transition.
+    pub tz_window_prepared: usize,
 }
 
 impl SovCollectionReport {
@@ -220,6 +243,98 @@ impl SovCollectionReport {
     fn not_modified() -> Self {
         Self {
             not_modified: true,
+            ..Default::default()
+        }
+    }
+}
+
+/// What one `collect_structures_cycle()` did, for tests and logging.
+/// Mirrors [`SovCollectionReport`], scoped to Sovereignty Hubs.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct SovStructuresCollectionReport {
+    pub paused_until: Option<DateTime<Utc>>,
+    pub not_yet_expired: bool,
+    pub not_modified: bool,
+    /// A successful `200` whose body was an empty listing. Treated as a
+    /// no-op (fix round finding 4): a legitimately empty ESI sovereignty
+    /// structures listing does not exist, so an empty body is almost
+    /// certainly a transient upstream glitch and must not remove every
+    /// hub (which would cascade `sov_tz_window_state`).
+    pub empty_listing: bool,
+    pub baseline_established_this_cycle: bool,
+    pub hubs_observed: usize,
+    pub removed: usize,
+}
+
+impl SovStructuresCollectionReport {
+    fn paused(deadline: DateTime<Utc>) -> Self {
+        Self {
+            paused_until: Some(deadline),
+            ..Default::default()
+        }
+    }
+
+    fn not_yet_expired() -> Self {
+        Self {
+            not_yet_expired: true,
+            ..Default::default()
+        }
+    }
+
+    fn not_modified() -> Self {
+        Self {
+            not_modified: true,
+            ..Default::default()
+        }
+    }
+
+    fn empty_listing() -> Self {
+        Self {
+            empty_listing: true,
+            ..Default::default()
+        }
+    }
+}
+
+/// What one `collect_map_cycle()` did, for tests and logging.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct SovMapCollectionReport {
+    pub paused_until: Option<DateTime<Utc>>,
+    pub not_yet_expired: bool,
+    pub not_modified: bool,
+    /// A successful `200` whose body was an empty listing. Treated as a
+    /// no-op (fix round finding 4): a legitimately empty ESI sovereignty
+    /// map does not exist, so an empty body must not `replace_map` every
+    /// current owner away.
+    pub empty_listing: bool,
+    pub entries_observed: usize,
+}
+
+impl SovMapCollectionReport {
+    fn paused(deadline: DateTime<Utc>) -> Self {
+        Self {
+            paused_until: Some(deadline),
+            ..Default::default()
+        }
+    }
+
+    fn not_yet_expired() -> Self {
+        Self {
+            not_yet_expired: true,
+            ..Default::default()
+        }
+    }
+
+    fn not_modified() -> Self {
+        Self {
+            not_modified: true,
+            ..Default::default()
+        }
+    }
+
+    fn empty_listing() -> Self {
+        Self {
+            empty_listing: true,
             ..Default::default()
         }
     }
@@ -331,6 +446,198 @@ impl SovCollector {
         Ok(report)
     }
 
+    /// Polls `GET /sovereignty/structures/` at its own `max-age=300`
+    /// conditional cadence (ticket 07, spec "Sources and cadence") and
+    /// persists Sovereignty Hubs only (spec "sov hubs only" --
+    /// [`SOV_HUB_STRUCTURE_TYPE_IDS`] filters the raw listing before
+    /// anything reaches the store, so a legacy TCU or any other structure
+    /// type is never inserted at all). Sov Baseline and hub removal mirror
+    /// `diff_and_alert`'s campaign handling, minus any alerting -- this
+    /// stage produces no Alert Stage of its own; `evaluate_stage_cycle`
+    /// reads the persisted hubs for `tz_window_entered`. Prepares no
+    /// delivery, so this never calls `deliver_claimable`.
+    pub async fn collect_structures_cycle(
+        &self,
+    ) -> Result<SovStructuresCollectionReport, SovCollectionError> {
+        let observed_at = self.clock.now();
+
+        if let Some(deadline) = self
+            .limiter
+            .active_esi_limiter_deadline()
+            .await
+            .map_err(store_error)?
+        {
+            return Ok(SovStructuresCollectionReport::paused(deadline));
+        }
+
+        let cached = self
+            .store
+            .cache_metadata(SOV_STRUCTURES_RESOURCE_KEY)
+            .await
+            .map_err(store_error)?;
+        if cached.is_fresh() {
+            return Ok(SovStructuresCollectionReport::not_yet_expired());
+        }
+
+        let response = match self.esi.fetch_structures(cached.etag.clone()).await {
+            Ok(response) => response,
+            Err(error) => {
+                let merged = merge_cache_metadata(&cached, error.metadata.clone());
+                self.store
+                    .persist_cache_metadata(SOV_STRUCTURES_RESOURCE_KEY, &merged)
+                    .await
+                    .map_err(store_error)?;
+                self.limiter
+                    .record_esi_limiter_at(&error.metadata, observed_at)
+                    .await
+                    .map_err(store_error)?;
+                return Err(error.into());
+            }
+        };
+        let merged = merge_cache_metadata(&cached, response.metadata.clone());
+        self.store
+            .persist_cache_metadata(SOV_STRUCTURES_RESOURCE_KEY, &merged)
+            .await
+            .map_err(store_error)?;
+        self.limiter
+            .record_esi_limiter_at(&response.metadata, observed_at)
+            .await
+            .map_err(store_error)?;
+
+        if response.not_modified {
+            return Ok(SovStructuresCollectionReport::not_modified());
+        }
+        let listing = response.value.unwrap_or_default();
+        if listing.is_empty() {
+            // A legitimately empty sovereignty structures listing does not
+            // exist (fix round finding 4): removing every hub here would
+            // cascade `sov_tz_window_state`. Keep the persisted cache
+            // metadata (already written above) and leave hubs untouched.
+            warn!(
+                "sov structures listing returned an empty 200 body; \
+                 treating as a no-op to avoid removing every hub"
+            );
+            return Ok(SovStructuresCollectionReport::empty_listing());
+        }
+        let hubs: Vec<SovStructure> = listing
+            .into_iter()
+            .filter(|structure| SOV_HUB_STRUCTURE_TYPE_IDS.contains(&structure.structure_type_id))
+            .collect();
+
+        let baseline_established = self
+            .store
+            .structures_baseline_established()
+            .await
+            .map_err(store_error)?;
+        let existing_ids = self
+            .store
+            .known_structure_ids()
+            .await
+            .map_err(store_error)?;
+        for hub in &hubs {
+            self.store
+                .upsert_structure(hub, !baseline_established, observed_at)
+                .await
+                .map_err(store_error)?;
+        }
+        let current_ids: std::collections::HashSet<i64> =
+            hubs.iter().map(|hub| hub.structure_id).collect();
+        let removed_ids: Vec<i64> = existing_ids.difference(&current_ids).copied().collect();
+        self.store
+            .remove_structures(&removed_ids)
+            .await
+            .map_err(store_error)?;
+        if !baseline_established {
+            self.store
+                .establish_structures_baseline(observed_at)
+                .await
+                .map_err(store_error)?;
+        }
+
+        Ok(SovStructuresCollectionReport {
+            baseline_established_this_cycle: !baseline_established,
+            hubs_observed: hubs.len(),
+            removed: removed_ids.len(),
+            ..Default::default()
+        })
+    }
+
+    /// Polls `GET /sovereignty/map/` at its own `max-age=3600` conditional
+    /// cadence (ticket 07, spec "Sources and cadence") and replaces
+    /// `sov_map` wholesale (`SovStore::replace_map`) -- only "current
+    /// owner" is needed, never map history.
+    pub async fn collect_map_cycle(&self) -> Result<SovMapCollectionReport, SovCollectionError> {
+        let observed_at = self.clock.now();
+
+        if let Some(deadline) = self
+            .limiter
+            .active_esi_limiter_deadline()
+            .await
+            .map_err(store_error)?
+        {
+            return Ok(SovMapCollectionReport::paused(deadline));
+        }
+
+        let cached = self
+            .store
+            .cache_metadata(SOV_MAP_RESOURCE_KEY)
+            .await
+            .map_err(store_error)?;
+        if cached.is_fresh() {
+            return Ok(SovMapCollectionReport::not_yet_expired());
+        }
+
+        let response = match self.esi.fetch_map(cached.etag.clone()).await {
+            Ok(response) => response,
+            Err(error) => {
+                let merged = merge_cache_metadata(&cached, error.metadata.clone());
+                self.store
+                    .persist_cache_metadata(SOV_MAP_RESOURCE_KEY, &merged)
+                    .await
+                    .map_err(store_error)?;
+                self.limiter
+                    .record_esi_limiter_at(&error.metadata, observed_at)
+                    .await
+                    .map_err(store_error)?;
+                return Err(error.into());
+            }
+        };
+        let merged = merge_cache_metadata(&cached, response.metadata.clone());
+        self.store
+            .persist_cache_metadata(SOV_MAP_RESOURCE_KEY, &merged)
+            .await
+            .map_err(store_error)?;
+        self.limiter
+            .record_esi_limiter_at(&response.metadata, observed_at)
+            .await
+            .map_err(store_error)?;
+
+        if response.not_modified {
+            return Ok(SovMapCollectionReport::not_modified());
+        }
+        let entries = response.value.unwrap_or_default();
+        if entries.is_empty() {
+            // A legitimately empty sovereignty map does not exist (fix
+            // round finding 4): `replace_map` on an empty listing would
+            // wipe every current owner. Keep the persisted cache metadata
+            // (already written above) and leave owners untouched.
+            warn!(
+                "sov map listing returned an empty 200 body; \
+                 treating as a no-op to avoid wiping every current owner"
+            );
+            return Ok(SovMapCollectionReport::empty_listing());
+        }
+        self.store
+            .replace_map(&entries, observed_at)
+            .await
+            .map_err(store_error)?;
+
+        Ok(SovMapCollectionReport {
+            entries_observed: entries.len(),
+            ..Default::default()
+        })
+    }
+
     /// Evaluates T-minus marks for every open (non-ended) campaign against
     /// every subscription's filter and configured marks, purely from
     /// persisted state and the controlled clock: no ESI request is made,
@@ -350,10 +657,16 @@ impl SovCollector {
         let campaigns = self.store.open_campaigns().await.map_err(store_error)?;
         let mut tminus_prepared = 0usize;
         let mut reachable_prepared = 0usize;
+        let mut tz_window_prepared = 0usize;
+        // Fetched once, unconditionally: both the campaign-shaped passes
+        // below (gated on `!campaigns.is_empty()`) and the `tz_window_entered`
+        // pass (gated on `!structures.is_empty()`) need the full
+        // subscription list, and it is small (one row per channel
+        // subscription).
+        let subscriptions = self.store.subscriptions().await.map_err(store_error)?;
+        let region_of =
+            |system_id: i64| self.directory.resolve(system_id).map(|info| info.region_id);
         if !campaigns.is_empty() {
-            let subscriptions = self.store.subscriptions().await.map_err(store_error)?;
-            let region_of =
-                |system_id: i64| self.directory.resolve(system_id).map(|info| info.region_id);
             let reachable_jumps = |system_id: i64, allow_frigate_holes: bool| {
                 self.reachability
                     .reachable(system_id, allow_frigate_holes)
@@ -426,6 +739,7 @@ impl SovCollector {
                                 .store
                                 .prepare_delivery(
                                     subscription,
+                                    "campaign",
                                     campaign.campaign_id,
                                     SovAlertStage::TMinus(minutes),
                                     &message,
@@ -510,7 +824,13 @@ impl SovCollector {
                             .await;
                         let freshly_prepared = self
                             .store
-                            .prepare_delivery(subscription, campaign.campaign_id, stage, &message)
+                            .prepare_delivery(
+                                subscription,
+                                "campaign",
+                                campaign.campaign_id,
+                                stage,
+                                &message,
+                            )
                             .await
                             .map_err(store_error)?;
                         // Marked announced once a durable delivery row is
@@ -535,11 +855,132 @@ impl SovCollector {
                 }
             }
         }
+
+        // `tz_window_entered` (ticket 07): state is tracked per
+        // (subscription, structure) for every `tz_shift_enabled`
+        // subscription, following the overlap fact alone -- independent of
+        // whether the subscription's Defender/Region/System leaves also
+        // match this hub (mirrors the `Reachable` leaf's "track the leaf,
+        // gate the alert on the full filter" split immediately above).
+        // Only firing the alert itself additionally requires those leaves
+        // to match (`matches_structure`, which ignores `Reachable`/
+        // `VulnerableWithin`/`EventType`), re-checked on every pass while
+        // an announcement is pending, exactly like the reachability pass.
+        // Gate the whole structures pass on at least one subscription
+        // opting in (fix round finding 3): with ~2700 hubs and a
+        // FOR UPDATE observation transaction per (hub x tz-enabled
+        // subscription), reading `open_structures()` every 30 s stage
+        // cycle is pure waste when nobody enabled `tz_shift_enabled`. The
+        // per-subscription guard inside the loop still applies so a mix of
+        // enabled and disabled subscriptions only observes for the enabled
+        // ones.
+        let any_tz_enabled = subscriptions
+            .iter()
+            .any(|subscription| effective_tz_shift_enabled(&subscription.options));
+        let structures = if any_tz_enabled {
+            self.store.open_structures().await.map_err(store_error)?
+        } else {
+            Vec::new()
+        };
+        if !structures.is_empty() {
+            for structure in &structures {
+                for subscription in &subscriptions {
+                    if !effective_tz_shift_enabled(&subscription.options) {
+                        continue;
+                    }
+                    let Some(window) = effective_tz_window(&subscription.options) else {
+                        // Defensive: a malformed stored `tz_window` (see
+                        // `effective_tz_window`'s doc comment) never
+                        // participates rather than panicking or guessing a
+                        // default.
+                        continue;
+                    };
+                    let in_window_now = match (
+                        structure.vulnerable_start_time,
+                        structure.vulnerable_end_time,
+                    ) {
+                        (Some(start), Some(end)) => {
+                            tz_window_overlap_minutes(start, end, window)
+                                >= SOV_TZ_WINDOW_MIN_OVERLAP_MINUTES
+                        }
+                        // Spec: "A hub whose vulnerability fields are
+                        // null/absent is not-in-window".
+                        _ => false,
+                    };
+                    let transition = self
+                        .store
+                        .record_tz_window_observation(
+                            subscription.guild_id,
+                            subscription.channel_id,
+                            &subscription.name,
+                            structure.structure_id,
+                            in_window_now,
+                            observed_at,
+                        )
+                        .await
+                        .map_err(store_error)?;
+                    let SovTzWindowTransition::Observed {
+                        in_window,
+                        transition_sequence,
+                        pending_announcement,
+                    } = transition
+                    else {
+                        // Baseline: never fires (Sov Baseline), regardless
+                        // of value.
+                        continue;
+                    };
+                    if !in_window || !pending_announcement {
+                        continue;
+                    }
+                    if !subscription.filter.root.matches_structure(
+                        structure.alliance_id,
+                        structure.solar_system_id,
+                        &region_of,
+                    ) {
+                        // Still pending: the window overlap flipped true
+                        // but Defender/Region/System does not match yet.
+                        // Try again next pass rather than losing the
+                        // announcement.
+                        continue;
+                    }
+                    let stage = SovAlertStage::TzWindowEntered(transition_sequence);
+                    let message = self
+                        .render_tz_window_message(structure, window, stage)
+                        .await;
+                    let freshly_prepared = self
+                        .store
+                        .prepare_delivery(
+                            subscription,
+                            "structure",
+                            structure.structure_id,
+                            stage,
+                            &message,
+                        )
+                        .await
+                        .map_err(store_error)?;
+                    self.store
+                        .mark_tz_window_announced(
+                            subscription.guild_id,
+                            subscription.channel_id,
+                            &subscription.name,
+                            structure.structure_id,
+                            transition_sequence,
+                        )
+                        .await
+                        .map_err(store_error)?;
+                    if freshly_prepared {
+                        tz_window_prepared += 1;
+                    }
+                }
+            }
+        }
+
         self.deliver_claimable(observed_at).await?;
         Ok(SovStageEvaluationReport {
             campaigns_evaluated: campaigns.len(),
             tminus_prepared,
             reachable_prepared,
+            tz_window_prepared,
         })
     }
 
@@ -622,6 +1063,7 @@ impl SovCollector {
                             .store
                             .prepare_delivery(
                                 subscription,
+                                "campaign",
                                 campaign.campaign_id,
                                 SovAlertStage::Appeared,
                                 &message,
@@ -742,6 +1184,20 @@ impl SovCollector {
             }
         }
 
+        // Current system owner from the sovereignty map (ticket 07, spec
+        // "Embed": "current owner from the sovereignty map"), applied to
+        // every stage from this ticket on -- omitted entirely when the map
+        // has not loaded this system yet, rather than shown as a
+        // placeholder (mirrors the Reachability field's "omit, don't
+        // placeholder" convention above).
+        if let Some(owner) = self.owner_field_value(campaign.solar_system_id).await {
+            fields.push(SovEmbedField {
+                name: "System Owner".to_string(),
+                value: owner,
+                inline: true,
+            });
+        }
+
         fields.push(SovEmbedField {
             name: "Links".to_string(),
             value: format!(
@@ -756,6 +1212,116 @@ impl SovCollector {
             fields,
             footer: stage.footer_label(),
         }
+    }
+
+    /// Renders one Sovereignty Hub's `tz_window_entered` notification
+    /// (ticket 07, spec "Embed"): the hub's system and region, its own
+    /// owner alliance ticker in the title (mirrors the campaign embed's
+    /// defender ticker), the vulnerability window as EVE times with a
+    /// Discord relative timestamp for the start, the current system owner
+    /// from the sovereignty map, and zKillboard/Dotlan links. Footer:
+    /// `"vuln window entered <window>"` (the subscription's own window,
+    /// not the hub's vulnerability window).
+    async fn render_tz_window_message(
+        &self,
+        structure: &SovStructure,
+        window: crate::sov_feed::model::TzWindow,
+        stage: SovAlertStage,
+    ) -> SovNotificationMessage {
+        let system_info = self.directory.resolve(structure.solar_system_id);
+        let (system_name, region_name) = system_info
+            .map(|info| (info.name, info.region_name))
+            .unwrap_or_else(|| {
+                (
+                    structure.solar_system_id.to_string(),
+                    "Unknown Region".to_string(),
+                )
+            });
+        let hub_owner_ticker = match structure.alliance_id {
+            Some(alliance_id) => self
+                .tickers
+                .alliance_ticker(alliance_id)
+                .await
+                .unwrap_or_else(|| "Unknown".to_string()),
+            None => "Unknown".to_string(),
+        };
+        let title = format!(
+            "{system_name} ({region_name}) \u{2014} Vulnerability Window Shift \u{2014} {hub_owner_ticker}"
+        );
+
+        let mut fields = Vec::new();
+        if let (Some(start), Some(end)) = (
+            structure.vulnerable_start_time,
+            structure.vulnerable_end_time,
+        ) {
+            let unix = start.timestamp();
+            fields.push(SovEmbedField {
+                name: "Vulnerability Window".to_string(),
+                value: format!(
+                    "{} \u{2013} {} EVE\n<t:{unix}:R>",
+                    start.format("%Y-%m-%d %H:%M:%S"),
+                    end.format("%H:%M:%S")
+                ),
+                inline: false,
+            });
+        }
+
+        if let Some(owner) = self.owner_field_value(structure.solar_system_id).await {
+            fields.push(SovEmbedField {
+                name: "System Owner".to_string(),
+                value: owner,
+                inline: true,
+            });
+        }
+
+        fields.push(SovEmbedField {
+            name: "Links".to_string(),
+            value: format!(
+                "[zKillboard](https://zkillboard.com/system/{}/) | [Dotlan](https://evemaps.dotlan.net/system/{})",
+                structure.solar_system_id, structure.solar_system_id
+            ),
+            inline: true,
+        });
+
+        SovNotificationMessage {
+            title,
+            fields,
+            footer: format!("{} {}", stage.footer_label(), window.display()),
+        }
+    }
+
+    /// Resolves one system's current sovereignty owner into display text
+    /// (spec "Embed": "current owner from the sovereignty map"; task:
+    /// "alliance ticker/name via the existing ticker resolver; corporation
+    /// or faction fallback"). `None` when the map has no row for this
+    /// system yet (not fetched, or the system carries no sovereignty) --
+    /// callers omit the field entirely rather than showing a placeholder.
+    /// A resolvable ID whose ticker/name lookup itself comes back empty
+    /// (ESI miss) still shows the numeric ID rather than "Unknown", since
+    /// unlike a defender ticker (which the campaign/hub embed already
+    /// shows elsewhere), this is the *only* place the map's owner fact
+    /// appears at all.
+    async fn owner_field_value(&self, solar_system_id: i64) -> Option<String> {
+        let entry = match self.store.map_owner(solar_system_id).await {
+            Ok(entry) => entry?,
+            Err(error) => {
+                warn!("cannot resolve sov map owner for system {solar_system_id}: {error}");
+                return None;
+            }
+        };
+        if let Some(alliance_id) = entry.alliance_id {
+            let ticker = self.tickers.alliance_ticker(alliance_id).await;
+            return Some(ticker.unwrap_or_else(|| format!("Alliance {alliance_id}")));
+        }
+        if let Some(corporation_id) = entry.corporation_id {
+            let ticker = self.tickers.corporation_ticker(corporation_id).await;
+            return Some(ticker.unwrap_or_else(|| format!("Corporation {corporation_id}")));
+        }
+        if let Some(faction_id) = entry.faction_id {
+            let name = self.tickers.faction_name(faction_id).await;
+            return Some(name.unwrap_or_else(|| format!("Faction {faction_id}")));
+        }
+        None
     }
 
     /// Renders a route (home-to-target system IDs, in travel order) as a

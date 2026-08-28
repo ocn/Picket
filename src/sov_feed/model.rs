@@ -58,6 +58,14 @@ pub enum SovAlertStage {
     /// from `SovStore::record_reachability_observation`, never computed
     /// here.
     Reachable(i64),
+    /// An observed not-in-window-to-in-window transition for one
+    /// subscription's timezone window against one Sovereignty Hub's
+    /// vulnerability window, keyed by the persisted transition sequence
+    /// number (spec "Alert stages and dedup": "tz_window_entered ... the
+    /// window-shift alert only on the transition into the window"; ticket
+    /// 07). Mirrors [`Self::Reachable`] exactly; the sequence comes from
+    /// `SovStore::record_tz_window_observation`, never computed here.
+    TzWindowEntered(i64),
 }
 
 impl SovAlertStage {
@@ -70,18 +78,24 @@ impl SovAlertStage {
             Self::Appeared => "appeared".to_string(),
             Self::TMinus(minutes) => format!("tminus:{minutes}"),
             Self::Reachable(sequence) => format!("reachable:{sequence}"),
+            Self::TzWindowEntered(sequence) => format!("tz_window_entered:{sequence}"),
         }
     }
 
     /// The embed footer text naming this stage (spec "Embed": "Footer
     /// names the stage", example `T-120m`; ticket 06: "the embed footer
     /// reads 'now reachable'" -- the transition sequence is dedup
-    /// plumbing, not shown to the user).
+    /// plumbing, not shown to the user). `TzWindowEntered`'s footer is
+    /// only the fixed prefix (ticket 07 spec: `footer reads "vuln window
+    /// entered <window>"`); the caller (`SovCollector::render_tz_window_message`)
+    /// appends the subscription's own window text, which this stage value
+    /// alone does not carry.
     pub fn footer_label(self) -> String {
         match self {
             Self::Appeared => "Appeared".to_string(),
             Self::TMinus(minutes) => format!("T-{minutes}m"),
             Self::Reachable(_) => "now reachable".to_string(),
+            Self::TzWindowEntered(_) => "vuln window entered".to_string(),
         }
     }
 }
@@ -345,6 +359,42 @@ impl SovFilterNode {
                 .map(|value| !value),
         }
     }
+
+    /// Evaluates this filter tree against one Sovereignty Hub's facts for
+    /// the `tz_window_entered` Alert Stage (ticket 07, spec: "`Reachable`/
+    /// `VulnerableWithin` leaves are ignored for this stage; `Defender`
+    /// (hub owner alliance), `Region`, `System` apply; `EventType` is not
+    /// applicable (treat as matching)"). "Ignored"/"not applicable" leaves
+    /// evaluate as always-matching here -- the same tree used for the
+    /// campaign-shaped `matches` above, reinterpreted leaf by leaf for a
+    /// structure that has no event type, start time, or reachability
+    /// concept of its own. A `Not` over one of these neutral leaves does
+    /// invert the neutral `true` to `false`, same as it would for any
+    /// other leaf; this is a known, documented corner case (mirroring the
+    /// disclaimers on [`Self::allows_frigate_holes_anywhere`] and
+    /// [`Self::reachable_leaf_state`]), not one the spec's test list
+    /// exercises.
+    pub fn matches_structure(
+        &self,
+        defender_alliance_id: Option<i64>,
+        solar_system_id: i64,
+        region_of: &dyn Fn(i64) -> Option<i64>,
+    ) -> bool {
+        match self {
+            Self::Condition(condition) => {
+                condition.matches_structure(defender_alliance_id, solar_system_id, region_of)
+            }
+            Self::And(nodes) => nodes.iter().all(|node| {
+                node.matches_structure(defender_alliance_id, solar_system_id, region_of)
+            }),
+            Self::Or(nodes) => nodes.iter().any(|node| {
+                node.matches_structure(defender_alliance_id, solar_system_id, region_of)
+            }),
+            Self::Not(node) => {
+                !node.matches_structure(defender_alliance_id, solar_system_id, region_of)
+            }
+        }
+    }
 }
 
 /// `And` aggregation for [`SovFilterNode::reachable_leaf_state`]: `None`
@@ -537,6 +587,30 @@ impl SovFilterCondition {
             | Self::EventType(_) => None,
         }
     }
+
+    /// The structure-shaped counterpart of [`Self::matches`], used by
+    /// [`SovFilterNode::matches_structure`] (ticket 07): `Reachable` and
+    /// `VulnerableWithin` are ignored (always match); `EventType` is not
+    /// applicable to a structure (always matches); `Defender` compares
+    /// against the hub's own owner alliance; `Region`/`System` compare
+    /// against the hub's system, exactly as for a campaign.
+    fn matches_structure(
+        &self,
+        defender_alliance_id: Option<i64>,
+        solar_system_id: i64,
+        region_of: &dyn Fn(i64) -> Option<i64>,
+    ) -> bool {
+        match self {
+            Self::VulnerableWithin { .. } | Self::Reachable { .. } | Self::EventType(_) => true,
+            Self::Defender { alliance_ids } => {
+                defender_alliance_id.is_some_and(|id| alliance_ids.contains(&id))
+            }
+            Self::Region(ids) => {
+                region_of(solar_system_id).is_some_and(|region_id| ids.contains(&region_id))
+            }
+            Self::System(ids) => ids.contains(&solar_system_id),
+        }
+    }
 }
 
 fn validate_ids(ids: &[i64], label: &str) -> Result<(), String> {
@@ -582,6 +656,297 @@ impl SovSubscription {
         }
         self.filter.validate()
     }
+}
+
+// --- Sovereignty Hubs and the sovereignty map (ticket 07) ---
+
+/// `structure_type_id` values this feed treats as Sovereignty Hubs (spec:
+/// "sov hubs only"). Evidence: `GET /sovereignty/structures/` against
+/// `esi.evetech.net` on 2026-08-27 returned 2708 structures, all with
+/// `structure_type_id: 32458`; `GET /universe/types/32458/` resolves that
+/// ID to name `"Sovereignty Hub"`, group `1012`. The research catalog
+/// (`.scratch/esi-intel-feeds/research/01-esi-endpoint-catalog.md`) notes
+/// the route "lists sovereignty structures only (Sovereignty Hubs and
+/// legacy TCUs)"; no legacy TCU type ID appeared in the live tally (post-
+/// Equinox TCUs cannot be entosised and, evidently, no longer appear in
+/// this listing at all), so this list holds exactly the one observed ID.
+/// A structure of any other `structure_type_id` (this list ever grows, or
+/// a genuine legacy TCU reappears) is excluded from `sov_structures`
+/// entirely by [`crate::sov_feed::collector::SovCollector::collect_structures_cycle`].
+pub const SOV_HUB_STRUCTURE_TYPE_IDS: &[i64] = &[32458];
+
+/// One Sovereignty Hub, as observed by one collection cycle. Mirrors
+/// `GET /sovereignty/structures/`
+/// (`.scratch/esi-intel-feeds/research/01-esi-endpoint-catalog.md`):
+/// `alliance_id`, `vulnerability_occupancy_level`, `vulnerable_start_time`,
+/// and `vulnerable_end_time` are all optional on the wire (a freshly
+/// deployed or contested hub may not have an owner or a vulnerability
+/// window yet); a hub with no vulnerability window is never in-window for
+/// the `tz_window_entered` stage (spec: "A hub whose vulnerability fields
+/// are null/absent is not-in-window").
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SovStructure {
+    pub structure_id: i64,
+    pub structure_type_id: i64,
+    #[serde(default)]
+    pub alliance_id: Option<i64>,
+    pub solar_system_id: i64,
+    #[serde(default)]
+    pub vulnerability_occupancy_level: Option<f64>,
+    #[serde(default)]
+    pub vulnerable_start_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub vulnerable_end_time: Option<DateTime<Utc>>,
+}
+
+/// One system's current sovereignty owner, as observed by one collection
+/// cycle. Mirrors `GET /sovereignty/map/`: a system may carry any subset
+/// of `alliance_id`/`corporation_id`/`faction_id` simultaneously (player
+/// sov systems carry alliance and corporation together; FW/NPC systems
+/// carry only a faction). The wire field is `system_id`; renamed here to
+/// `solar_system_id` for consistency with every other sov feed type.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SovMapEntry {
+    #[serde(rename = "system_id")]
+    pub solar_system_id: i64,
+    #[serde(default)]
+    pub alliance_id: Option<i64>,
+    #[serde(default)]
+    pub corporation_id: Option<i64>,
+    #[serde(default)]
+    pub faction_id: Option<i64>,
+}
+
+/// A per-subscription timezone window, parsed from the `tz_window` option
+/// (spec "Sov timer subscription language": "timezone window (default
+/// 00:00-04:00 EVE), may cross midnight"). Stored as minutes-since-midnight
+/// so overlap arithmetic never re-parses `HH:MM` text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TzWindow {
+    /// 0..=1439.
+    pub start_minutes: u16,
+    /// 0..=1439. When less than `start_minutes`, the window crosses
+    /// midnight (spec: "may cross midnight").
+    pub end_minutes: u16,
+}
+
+impl TzWindow {
+    /// The window's duration in minutes: `end - start` when it does not
+    /// cross midnight, `(1440 - start) + end` when it does. Always in
+    /// `1..=1440` for a window built by [`parse_tz_window`] (which
+    /// rejects `start == end`); a `TzWindow` value bypassing that
+    /// constructor with equal start/end degrades to the full 1440-minute
+    /// day rather than zero, by the same formula -- never negative, never
+    /// panicking.
+    fn duration_minutes(&self) -> u16 {
+        if self.end_minutes > self.start_minutes {
+            self.end_minutes - self.start_minutes
+        } else {
+            (1440 - self.start_minutes) + self.end_minutes
+        }
+    }
+
+    /// This window's concrete UTC interval for the occurrence that begins
+    /// on `day`, or `None` on an internal overflow (never expected for any
+    /// in-range `NaiveDate`/`TzWindow`, but every constructor here is
+    /// `checked_*`/`Option`-returning end to end -- no panicking path
+    /// exists for a persisted or malformed value to reach).
+    fn occurrence_on(&self, day: chrono::NaiveDate) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let start_naive = day.and_hms_opt(
+            u32::from(self.start_minutes / 60),
+            u32::from(self.start_minutes % 60),
+            0,
+        )?;
+        let start = DateTime::<Utc>::from_naive_utc_and_offset(start_naive, Utc);
+        let end = start
+            .checked_add_signed(ChronoDuration::minutes(i64::from(self.duration_minutes())))?;
+        Some((start, end))
+    }
+
+    /// Renders `HH:MM–HH:MM` (en dash) for embeds and footers (spec
+    /// "Embed": footer `"vuln window entered 00:00–04:00"`).
+    pub fn display(&self) -> String {
+        format!(
+            "{}\u{2013}{}",
+            format_hhmm(self.start_minutes),
+            format_hhmm(self.end_minutes)
+        )
+    }
+
+    /// Renders `HH:MM-HH:MM` (plain ASCII hyphen), the normalized form
+    /// stored in a subscription's `options` document -- round-trips
+    /// through [`parse_tz_window`] unchanged, unlike [`Self::display`]'s
+    /// en dash. Used by `/sov_subscribe` so re-typed whitespace or
+    /// formatting in the raw command input never ends up persisted
+    /// verbatim.
+    pub fn to_option_string(&self) -> String {
+        format!(
+            "{}-{}",
+            format_hhmm(self.start_minutes),
+            format_hhmm(self.end_minutes)
+        )
+    }
+}
+
+fn format_hhmm(total_minutes: u16) -> String {
+    format!("{:02}:{:02}", total_minutes / 60, total_minutes % 60)
+}
+
+/// Parses one `HH:MM` clock value into minutes-since-midnight. Bounded,
+/// non-panicking `u16` parsing throughout (review decision carried over
+/// from ticket 03/05's T-minus-marks and `max_jumps` guards): no input
+/// ever reaches a panicking integer conversion.
+fn parse_hhmm(raw: &str) -> Result<u16, String> {
+    let raw = raw.trim();
+    let (hour_str, minute_str) = raw
+        .split_once(':')
+        .ok_or_else(|| format!("expected HH:MM, got '{raw}'"))?;
+    let hour: u16 = hour_str
+        .parse()
+        .map_err(|_| format!("invalid hour '{hour_str}'"))?;
+    let minute: u16 = minute_str
+        .parse()
+        .map_err(|_| format!("invalid minute '{minute_str}'"))?;
+    if hour > 23 {
+        return Err(format!("hour must be 0-23, got {hour}"));
+    }
+    if minute > 59 {
+        return Err(format!("minute must be 0-59, got {minute}"));
+    }
+    Ok(hour * 60 + minute)
+}
+
+/// Parses the `/sov_subscribe` `tz_window` command option:
+/// `HH:MM-HH:MM`, EVE/UTC time, optionally crossing midnight (spec: "may
+/// cross midnight"). `start == end` is rejected as ambiguous (neither "the
+/// whole day" nor "an instant" is spelled out by the spec) rather than
+/// silently picking one.
+pub fn parse_tz_window(raw: &str) -> Result<TzWindow, String> {
+    let trimmed = raw.trim();
+    let (start_str, end_str) = trimmed
+        .split_once('-')
+        .ok_or_else(|| format!("tz_window must be HH:MM-HH:MM, got '{trimmed}'"))?;
+    let start_minutes = parse_hhmm(start_str)?;
+    let end_minutes = parse_hhmm(end_str)?;
+    if start_minutes == end_minutes {
+        return Err("tz_window start and end must differ".to_string());
+    }
+    Ok(TzWindow {
+        start_minutes,
+        end_minutes,
+    })
+}
+
+/// Per-subscription option key storing the raw `tz_window` string (spec
+/// "Sov timer subscription language").
+pub const SOV_TZ_WINDOW_OPTION_KEY: &str = "tz_window";
+
+/// Per-subscription option key storing the `tz_shift_enabled` boolean.
+pub const SOV_TZ_SHIFT_ENABLED_OPTION_KEY: &str = "tz_shift_enabled";
+
+/// Default timezone window applied when a subscription's `options` has no
+/// `tz_window` key at all (spec: "default 00:00-04:00 EVE").
+pub const SOV_DEFAULT_TZ_WINDOW: &str = "00:00-04:00";
+
+/// Minimum overlap, in minutes, between a hub's vulnerability window and a
+/// subscription's timezone window for the `tz_window_entered` stage to be
+/// eligible to fire (spec: "at least sixty minutes").
+pub const SOV_TZ_WINDOW_MIN_OVERLAP_MINUTES: i64 = 60;
+
+/// The effective [`TzWindow`] for a subscription's stored `options`
+/// document: the parsed `tz_window` string when present, or
+/// [`SOV_DEFAULT_TZ_WINDOW`] when the key is absent -- covering every
+/// subscription persisted before this ticket as well as any subscription
+/// created without the `tz_window` command option. `None` when a stored
+/// value fails to parse (defensive: `/sov_subscribe` already validates via
+/// [`parse_tz_window`], but a value stored some other way, e.g. a direct
+/// `options` write, must degrade to "never in window" rather than panic
+/// or silently fall back to the default).
+pub fn effective_tz_window(options: &serde_json::Value) -> Option<TzWindow> {
+    match options
+        .get(SOV_TZ_WINDOW_OPTION_KEY)
+        .and_then(|v| v.as_str())
+    {
+        Some(raw) => parse_tz_window(raw).ok(),
+        None => parse_tz_window(SOV_DEFAULT_TZ_WINDOW).ok(),
+    }
+}
+
+/// The effective `tz_shift_enabled` flag for a subscription's stored
+/// `options` document: `false` when absent or not a boolean (spec:
+/// "default false"; only subscriptions that explicitly opt in ever
+/// participate in the `tz_window_entered` stage).
+pub fn effective_tz_shift_enabled(options: &serde_json::Value) -> bool {
+    options
+        .get(SOV_TZ_SHIFT_ENABLED_OPTION_KEY)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+/// Safety bound on how many candidate days [`tz_window_overlap_minutes`]
+/// scans. Sovereignty vulnerability windows are always a few hours long in
+/// practice (ESI-observed: a handful of hours), so a genuine hub never
+/// approaches this; malformed or adversarial persisted timestamps far
+/// apart degrade to "no overlap" rather than an unbounded loop.
+const SOV_TZ_WINDOW_OVERLAP_MAX_SPAN_DAYS: i64 = 14;
+
+/// The total overlap, in minutes, between a hub's concrete vulnerability
+/// interval (`vulnerable_start_time..vulnerable_end_time`, UTC) and every
+/// daily occurrence of a subscription's [`TzWindow`] on the days that
+/// interval spans (spec: "the occurrences of `HH:MM-HH:MM` UTC on the days
+/// the vulnerability interval spans"). Non-panicking throughout: every
+/// date/time construction is `checked_*`/`Option`-returning, and an
+/// out-of-order or implausibly wide interval (guarded by
+/// [`SOV_TZ_WINDOW_OVERLAP_MAX_SPAN_DAYS`]) returns `0` rather than
+/// looping unboundedly or overflowing.
+pub fn tz_window_overlap_minutes(
+    vulnerable_start: DateTime<Utc>,
+    vulnerable_end: DateTime<Utc>,
+    window: TzWindow,
+) -> i64 {
+    if vulnerable_end <= vulnerable_start {
+        return 0;
+    }
+    let span_days = (vulnerable_end.date_naive() - vulnerable_start.date_naive()).num_days();
+    if !(0..=SOV_TZ_WINDOW_OVERLAP_MAX_SPAN_DAYS).contains(&span_days) {
+        return 0;
+    }
+    // Scanning starts one day before the interval's start date so a
+    // window occurrence that began the day before (and crosses midnight
+    // into the interval) is still considered.
+    let Some(mut day) = vulnerable_start
+        .date_naive()
+        .checked_sub_days(chrono::Days::new(1))
+    else {
+        return 0;
+    };
+    let last_day = vulnerable_end.date_naive();
+    let mut total = ChronoDuration::zero();
+    loop {
+        if day > last_day {
+            break;
+        }
+        if let Some((window_start, window_end)) = window.occurrence_on(day) {
+            let overlap_start = window_start.max(vulnerable_start);
+            let overlap_end = window_end.min(vulnerable_end);
+            if overlap_end > overlap_start {
+                // Summing per-day intersections (rather than taking the
+                // per-day max) is safe because an ESI sovereignty
+                // vulnerability window is a single contiguous few-hour
+                // interval that touches at most one daily window
+                // occurrence in practice; combined with the 14-day span
+                // cap above, it can never accumulate 60 minutes out of
+                // many tiny cross-day slivers on a real hub. The synthetic
+                // multi-day test pins this chosen rule.
+                total += overlap_end - overlap_start;
+            }
+        }
+        let Some(next_day) = day.checked_add_days(chrono::Days::new(1)) else {
+            break;
+        };
+        day = next_day;
+    }
+    total.num_minutes()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1470,5 +1835,234 @@ mod tests {
             node.reachable_leaf_state(&campaign, &|_, _| None),
             Some(true)
         );
+    }
+
+    // --- tz_window (ticket 07) ---
+
+    fn eve(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    #[test]
+    fn parse_tz_window_accepts_a_well_formed_window() {
+        let window = parse_tz_window("00:00-04:00").expect("valid window");
+        assert_eq!(window.start_minutes, 0);
+        assert_eq!(window.end_minutes, 240);
+        assert_eq!(window.display(), "00:00\u{2013}04:00");
+    }
+
+    #[test]
+    fn parse_tz_window_accepts_a_window_crossing_midnight() {
+        let window = parse_tz_window("22:00-02:00").expect("valid crossing window");
+        assert_eq!(window.start_minutes, 22 * 60);
+        assert_eq!(window.end_minutes, 2 * 60);
+    }
+
+    #[test]
+    fn parse_tz_window_rejects_malformed_or_out_of_range_input() {
+        for raw in [
+            "not-a-window",
+            "24:00-01:00",
+            "01:00-24:00",
+            "01:60-02:00",
+            "01:00-02:60",
+            "01:00",
+            "",
+            "01:00-01:00",
+        ] {
+            assert!(
+                parse_tz_window(raw).is_err(),
+                "expected '{raw}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn tz_window_overlap_minutes_is_zero_when_the_window_does_not_touch_the_interval() {
+        let window = parse_tz_window("00:00-04:00").unwrap();
+        let overlap =
+            tz_window_overlap_minutes(eve(2026, 8, 27, 6, 0), eve(2026, 8, 27, 8, 0), window);
+        assert_eq!(overlap, 0);
+    }
+
+    #[test]
+    fn tz_window_overlap_minutes_covers_the_whole_window_when_the_interval_contains_it() {
+        let window = parse_tz_window("00:00-04:00").unwrap();
+        let overlap =
+            tz_window_overlap_minutes(eve(2026, 8, 26, 22, 0), eve(2026, 8, 27, 6, 0), window);
+        assert_eq!(overlap, 240);
+    }
+
+    #[test]
+    fn tz_window_overlap_minutes_computes_a_partial_overlap_at_or_above_sixty_minutes() {
+        let window = parse_tz_window("00:00-04:00").unwrap();
+        // Interval 03:15-05:15 overlaps the window for 45 minutes (03:15-04:00).
+        let overlap =
+            tz_window_overlap_minutes(eve(2026, 8, 27, 3, 15), eve(2026, 8, 27, 5, 15), window);
+        assert_eq!(overlap, 45);
+        assert!(overlap < SOV_TZ_WINDOW_MIN_OVERLAP_MINUTES);
+
+        // Interval 03:00-05:00 overlaps for exactly 60 minutes.
+        let overlap =
+            tz_window_overlap_minutes(eve(2026, 8, 27, 3, 0), eve(2026, 8, 27, 5, 0), window);
+        assert_eq!(overlap, 60);
+        assert!(overlap >= SOV_TZ_WINDOW_MIN_OVERLAP_MINUTES);
+    }
+
+    #[test]
+    fn tz_window_overlap_minutes_handles_a_window_crossing_midnight() {
+        let window = parse_tz_window("22:00-02:00").unwrap();
+        // Interval spans 23:00 through 01:00: fully inside the crossing window.
+        let overlap =
+            tz_window_overlap_minutes(eve(2026, 8, 27, 23, 0), eve(2026, 8, 28, 1, 0), window);
+        assert_eq!(overlap, 120);
+    }
+
+    #[test]
+    fn tz_window_overlap_minutes_sums_overlap_across_an_interval_spanning_two_days() {
+        let window = parse_tz_window("00:00-04:00").unwrap();
+        // Interval 2026-08-26 23:00 through 2026-08-27 02:00 crosses one
+        // midnight and overlaps the window on both days: 1h on the 26th
+        // (23:00-24:00 is outside 00:00-04:00, so actually 0) -- restated:
+        // the interval overlaps only the 27th's occurrence (00:00-02:00 =
+        // 120 minutes), since 23:00-24:00 on the 26th is not inside
+        // 00:00-04:00 at all.
+        let overlap =
+            tz_window_overlap_minutes(eve(2026, 8, 26, 23, 0), eve(2026, 8, 27, 2, 0), window);
+        assert_eq!(overlap, 120);
+
+        // An interval that truly spans two full occurrences: 2026-08-26
+        // 02:00 through 2026-08-27 02:00 overlaps 00:00-04:00 on the 26th
+        // (02:00-04:00 = 120m) and on the 27th (00:00-02:00 = 120m).
+        let overlap =
+            tz_window_overlap_minutes(eve(2026, 8, 26, 2, 0), eve(2026, 8, 27, 2, 0), window);
+        assert_eq!(overlap, 240);
+    }
+
+    #[test]
+    fn tz_window_overlap_minutes_sums_small_daily_slivers_across_a_multi_day_interval() {
+        // Pins the chosen rule (sum per-day intersections, NOT per-day max)
+        // for a synthetic interval whose daily overlaps are individually
+        // below the 60-minute threshold but sum to exactly it. Window
+        // 00:00-04:00; interval 2026-08-26 03:30 -> 2026-08-27 00:30:
+        //   - the 26th's occurrence overlaps 03:30-04:00 = 30 minutes
+        //   - the 27th's occurrence overlaps 00:00-00:30 = 30 minutes
+        // Summing yields 60 (>= threshold); a per-day max would yield 30.
+        let window = parse_tz_window("00:00-04:00").unwrap();
+        let overlap =
+            tz_window_overlap_minutes(eve(2026, 8, 26, 3, 30), eve(2026, 8, 27, 0, 30), window);
+        assert_eq!(overlap, 60);
+        assert!(overlap >= SOV_TZ_WINDOW_MIN_OVERLAP_MINUTES);
+    }
+
+    #[test]
+    fn tz_window_overlap_minutes_never_panics_on_an_out_of_order_or_implausibly_wide_interval() {
+        let window = parse_tz_window("00:00-04:00").unwrap();
+        // end before start
+        assert_eq!(
+            tz_window_overlap_minutes(eve(2026, 8, 27, 4, 0), eve(2026, 8, 27, 0, 0), window),
+            0
+        );
+        // implausibly wide (beyond the safety bound)
+        assert_eq!(
+            tz_window_overlap_minutes(eve(2020, 1, 1, 0, 0), eve(2030, 1, 1, 0, 0), window),
+            0
+        );
+    }
+
+    #[test]
+    fn effective_tz_window_defaults_when_absent_and_parses_when_present() {
+        assert_eq!(
+            effective_tz_window(&serde_json::json!({})),
+            Some(parse_tz_window(SOV_DEFAULT_TZ_WINDOW).unwrap())
+        );
+        assert_eq!(
+            effective_tz_window(&serde_json::json!({"tz_window": "06:00-10:00"})),
+            Some(parse_tz_window("06:00-10:00").unwrap())
+        );
+        assert_eq!(
+            effective_tz_window(&serde_json::json!({"tz_window": "not-a-window"})),
+            None
+        );
+    }
+
+    #[test]
+    fn effective_tz_shift_enabled_defaults_to_false() {
+        assert!(!effective_tz_shift_enabled(&serde_json::json!({})));
+        assert!(!effective_tz_shift_enabled(
+            &serde_json::json!({"tz_shift_enabled": "not-a-bool"})
+        ));
+        assert!(effective_tz_shift_enabled(
+            &serde_json::json!({"tz_shift_enabled": true})
+        ));
+    }
+
+    #[test]
+    fn tz_window_entered_stage_key_and_footer_are_formatted_from_the_sequence() {
+        assert_eq!(
+            SovAlertStage::TzWindowEntered(1).as_str(),
+            "tz_window_entered:1"
+        );
+        assert_ne!(
+            SovAlertStage::TzWindowEntered(1).as_str(),
+            SovAlertStage::TzWindowEntered(2).as_str()
+        );
+        assert_eq!(
+            SovAlertStage::TzWindowEntered(1).footer_label(),
+            "vuln window entered"
+        );
+    }
+
+    #[test]
+    fn matches_structure_ignores_reachable_vulnerable_within_and_event_type() {
+        let node = SovFilterNode::And(vec![
+            SovFilterNode::Condition(SovFilterCondition::VulnerableWithin { hours: 6 }),
+            SovFilterNode::Condition(SovFilterCondition::Reachable {
+                max_jumps: 1,
+                allow_frigate_holes: false,
+            }),
+            SovFilterNode::Condition(SovFilterCondition::EventType(vec![
+                "station_freeport".to_string()
+            ])),
+        ]);
+        assert!(node.matches_structure(Some(99_000_001), 30_000_001, &|_| None));
+    }
+
+    #[test]
+    fn matches_structure_applies_defender_region_and_system() {
+        let mut regions = std::collections::HashMap::new();
+        regions.insert(30_000_001_i64, 10_000_060_i64);
+        let region_of = region_of(&regions);
+
+        let defender = SovFilterNode::Condition(SovFilterCondition::Defender {
+            alliance_ids: vec![99_000_001],
+        });
+        assert!(defender.matches_structure(Some(99_000_001), 30_000_001, &|_| None));
+        assert!(!defender.matches_structure(Some(99_999_999), 30_000_001, &|_| None));
+        assert!(!defender.matches_structure(None, 30_000_001, &|_| None));
+
+        let region = SovFilterNode::Condition(SovFilterCondition::Region(vec![10_000_060]));
+        assert!(region.matches_structure(None, 30_000_001, &region_of));
+        assert!(!region.matches_structure(None, 30_000_002, &region_of));
+
+        let system = SovFilterNode::Condition(SovFilterCondition::System(vec![30_000_001]));
+        assert!(system.matches_structure(None, 30_000_001, &|_| None));
+        assert!(!system.matches_structure(None, 30_000_002, &|_| None));
+    }
+
+    #[test]
+    fn matches_structure_composes_with_and_or_not() {
+        let node = SovFilterNode::Not(Box::new(SovFilterNode::Condition(
+            SovFilterCondition::System(vec![30_000_099]),
+        )));
+        assert!(node.matches_structure(None, 30_000_001, &|_| None));
+
+        let node = SovFilterNode::Or(vec![
+            SovFilterNode::Condition(SovFilterCondition::System(vec![30_000_099])),
+            SovFilterNode::Condition(SovFilterCondition::Defender {
+                alliance_ids: vec![99_000_001],
+            }),
+        ]);
+        assert!(node.matches_structure(Some(99_000_001), 30_000_001, &|_| None));
     }
 }
