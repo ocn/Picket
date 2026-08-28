@@ -938,11 +938,21 @@ fn watchlist_delivery_error(error: serenity::Error) -> watchlist_feed::Watchlist
 /// (`GET /corporations/{id}/`, `GET /alliances/{id}/`).
 pub struct DiscordWatchlistResolver {
     app_state: Arc<AppState>,
+    /// Set when `note_corporation` mutated the in-memory names/tickers maps,
+    /// so `flush_noted_corporations` writes each backing file at most once per
+    /// member-snapshot pass instead of once per fresh corporation (ticket-09
+    /// finding 5).
+    names_dirty: std::sync::atomic::AtomicBool,
+    tickers_dirty: std::sync::atomic::AtomicBool,
 }
 
 impl DiscordWatchlistResolver {
     pub fn new(app_state: Arc<AppState>) -> Self {
-        Self { app_state }
+        Self {
+            app_state,
+            names_dirty: std::sync::atomic::AtomicBool::new(false),
+            tickers_dirty: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 }
 
@@ -977,6 +987,50 @@ impl watchlist_feed::WatchlistEntityResolver for DiscordWatchlistResolver {
         watchlist_feed::WatchlistAlliance {
             name: get_name(&self.app_state, id).await,
             ticker: get_ticker(&self.app_state, id, true).await,
+        }
+    }
+
+    async fn note_corporation(
+        &self,
+        corporation_id: i64,
+        name: Option<String>,
+        ticker: Option<String>,
+    ) {
+        use std::sync::atomic::Ordering;
+        let Ok(id) = u64::try_from(corporation_id) else {
+            return;
+        };
+        // Update only the in-memory maps here; the backing JSON files are
+        // written once by `flush_noted_corporations` at the end of the pass
+        // (finding 5). The in-memory update is what a same-pass embed render
+        // reads, so nothing waits on the flush.
+        if let Some(name) = name {
+            let mut names = self.app_state.names.write().unwrap();
+            if names.get(&id) != Some(&name) {
+                names.insert(id, name);
+                self.names_dirty.store(true, Ordering::Relaxed);
+            }
+        }
+        if let Some(ticker) = ticker {
+            let mut tickers = self.app_state.tickers.write().unwrap();
+            if tickers.get(&id) != Some(&ticker) {
+                tickers.insert(id, ticker);
+                self.tickers_dirty.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    async fn flush_noted_corporations(&self) {
+        use std::sync::atomic::Ordering;
+        if self.names_dirty.swap(false, Ordering::Relaxed) {
+            let _lock = self.app_state.names_file_lock.lock().await;
+            let names = self.app_state.names.read().unwrap();
+            save_names(&names);
+        }
+        if self.tickers_dirty.swap(false, Ordering::Relaxed) {
+            let _lock = self.app_state.tickers_file_lock.lock().await;
+            let tickers = self.app_state.tickers.read().unwrap();
+            crate::config::save_tickers(&tickers);
         }
     }
 }

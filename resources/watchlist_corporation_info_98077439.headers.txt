@@ -1,0 +1,18 @@
+GET https://esi.evetech.net/latest/corporations/98077439/?datasource=tranquility
+X-Compatibility-Date: 2020-01-01
+Captured live 2026-08-28 (corporation 98077439 = Lightning Squad, member of Snuffed Out 99004901).
+
+Response 200 headers (trimmed):
+  cache-control: public, max-age=3600, must-revalidate, stale-if-error=900
+  expires: Fri, 28 Aug 2026 20:16:08 GMT        (last-modified + 3600s == 1 hour)
+  last-modified: Fri, 28 Aug 2026 18:57:58 GMT
+  etag: W/"1018c14d153f6a4c99f5938472aa49453314efacb92af9c508a55db60d210757"
+  x-compatibility-date: 2020-01-01
+  x-esi-error-limit-remain: 100
+  x-esi-error-limit-reset: 52
+  (no x-ratelimit-group on this route; legacy error-limit allowance is global per ADR 0004)
+
+Body: JSON object; the collector reads member_count (int), alliance_id (int,
+absent when unaffiliated), name and ticker (strings). The description field is
+trimmed here for readability. member_count/alliance_id drive member_delta and
+corp_changed_alliance; name/ticker feed the shared identity caches.

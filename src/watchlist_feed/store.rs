@@ -18,8 +18,9 @@
 
 use crate::esi_cache::CacheMetadata;
 use crate::watchlist_feed::model::{
-    PreparedWatchlistDelivery, WatchedEntity, WatchlistDeliveryError, WatchlistEventKind,
-    WatchlistKind, WatchlistNotificationMessage, WatchlistSubscription,
+    MemberDeltaDirection, MemberReference, PreparedWatchlistDelivery, WatchedEntity,
+    WatchlistDeliveryError, WatchlistEventKind, WatchlistKind, WatchlistNotificationMessage,
+    WatchlistSubscription,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rand::Rng;
@@ -38,6 +39,37 @@ const WATCHLIST_TRANSIENT_RETRY_MAX_BACKOFF: ChronoDuration = ChronoDuration::ho
 /// feed visible to the `watchlist_esi_progress` health check.
 pub fn alliance_resource_key(alliance_id: i64) -> String {
     format!("watchlist/alliances/{alliance_id}")
+}
+
+/// The `esi_cache_metadata` resource key for one corporation's public-info
+/// conditional request (`GET /corporations/{id}/`, ticket 09). The
+/// `watchlist/` prefix keeps it visible to the `watchlist_esi_progress`
+/// health check.
+pub fn corp_resource_key(corporation_id: i64) -> String {
+    format!("watchlist/corporations/{corporation_id}")
+}
+
+/// How many days of member snapshots are retained; older rows are pruned
+/// every cycle (see the migration for the rationale).
+pub const MEMBER_SNAPSHOT_RETENTION: ChronoDuration = ChronoDuration::days(30);
+
+/// How many consecutive corporation-info fetch failures exclude a member from
+/// its alliance's "every member has a snapshot" aggregate requirement
+/// (ticket-09 finding 3). At three, the aggregate is evaluated without the
+/// stuck member rather than blocked forever.
+pub const CORP_FETCH_FAILURE_EXCLUSION_THRESHOLD: i32 = 3;
+
+/// The outcome of aggregating an alliance's member count from its current
+/// members' latest corporation snapshots.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AllianceAggregate {
+    /// The aggregate member count, or `None` when it cannot be evaluated this
+    /// cycle (a required member lacks a snapshot, or there is no data at all).
+    pub total: Option<i64>,
+    /// Current members excluded from the snapshot requirement because their
+    /// corporation-info fetch has failed for at least
+    /// [`CORP_FETCH_FAILURE_EXCLUSION_THRESHOLD`] cycles.
+    pub excluded_members: i64,
 }
 
 /// Mirrors [`crate::sov_feed::store::sov_transient_retry_backoff`]: 2, 4, 8,
@@ -158,22 +190,26 @@ impl WatchlistStore {
     ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
-        // Fix round finding 4: `remove_entity` intentionally leaves the
-        // alliance's membership snapshot and baseline marker in place (other
-        // guilds may still watch it). But when an alliance is added while NO
-        // guild currently watches it, those rows are stale from an earlier
-        // watch that was fully removed; diffing the next listing against them
-        // would flood the gap's churn. Reset the snapshot and baseline in the
+        // Fix round finding 4 / ticket-09 finding 1: `remove_entity`
+        // intentionally leaves an entity's persisted state in place (other
+        // guilds may still watch it). But when an entity is added while NO
+        // guild currently watches it, that state is stale from an earlier
+        // watch that was fully removed; evaluating the next cycle against it
+        // would flood the membership gap's churn (alliances) or fire a
+        // `member_delta` / `corp_changed_alliance` against pre-watch history
+        // and a possibly-disarmed band state (both kinds). Reset it in the
         // same transaction so the next cycle re-establishes a silent baseline.
-        // Do NOT reset when another guild already watches the alliance.
-        if entity.kind.is_alliance() {
-            let already_watched: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM watchlist_entities WHERE kind = 'alliance' AND entity_id = $1)",
-            )
-            .bind(entity.entity_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if !already_watched {
+        // Do NOT reset when another guild already watches the entity.
+        let already_watched: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM watchlist_entities WHERE kind = $1 AND entity_id = $2)",
+        )
+        .bind(entity.kind.as_str())
+        .bind(entity.entity_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !already_watched {
+            if entity.kind.is_alliance() {
+                // Ticket-08 corp join/leave state.
                 sqlx::query("DELETE FROM watchlist_alliance_corps WHERE alliance_id = $1")
                     .bind(entity.entity_id)
                     .execute(&mut *tx)
@@ -182,14 +218,54 @@ impl WatchlistStore {
                     .bind(entity.entity_id)
                     .execute(&mut *tx)
                     .await?;
-                // Re-review finding: also drop the alliance's conditional-request
-                // metadata. Otherwise a re-add within the listing's cache TTL
-                // (or one answered by a 304) skips the fresh listing that would
-                // re-establish the silent baseline, and the first real
-                // membership change afterwards is folded into that deferred
-                // baseline and lost.
-                sqlx::query("DELETE FROM esi_cache_metadata WHERE resource_key = $1")
-                    .bind(alliance_resource_key(entity.entity_id))
+            }
+            // Re-review finding (both kinds): drop the entity's own
+            // conditional-request metadata. Otherwise a re-add within the
+            // route's cache TTL (or one answered by a 304) skips the fresh
+            // response that would re-establish the silent baseline, and the
+            // first real change afterwards is folded into that deferred
+            // baseline and lost. A corporation's row may also be shared with
+            // its role as a watched alliance's member; forcing one extra fetch
+            // there is harmless.
+            let resource_key = if entity.kind.is_alliance() {
+                alliance_resource_key(entity.entity_id)
+            } else {
+                corp_resource_key(entity.entity_id)
+            };
+            sqlx::query("DELETE FROM esi_cache_metadata WHERE resource_key = $1")
+                .bind(resource_key)
+                .execute(&mut *tx)
+                .await?;
+            // Ticket-09 finding 1: watch-scoped member-delta state, both
+            // kinds. Deleting a corporation's own snapshot rows may also drop
+            // rows that served a watched alliance's aggregate; that is
+            // acceptable because the aggregate requires every current member
+            // to have a snapshot and the next cycle re-fetches this
+            // corporation, so the aggregate is simply deferred one cycle.
+            sqlx::query(
+                "DELETE FROM watchlist_member_snapshots WHERE entity_kind = $1 AND entity_id = $2",
+            )
+            .bind(entity.kind.as_str())
+            .bind(entity.entity_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM watchlist_member_band_state WHERE entity_kind = $1 AND entity_id = $2",
+            )
+            .bind(entity.kind.as_str())
+            .bind(entity.entity_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM watchlist_member_baseline WHERE entity_kind = $1 AND entity_id = $2",
+            )
+            .bind(entity.kind.as_str())
+            .bind(entity.entity_id)
+            .execute(&mut *tx)
+            .await?;
+            if !entity.kind.is_alliance() {
+                sqlx::query("DELETE FROM watchlist_corp_fetch_failures WHERE corporation_id = $1")
+                    .bind(entity.entity_id)
                     .execute(&mut *tx)
                     .await?;
             }
@@ -383,6 +459,500 @@ impl WatchlistStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // --- Watched corporations & entity fan-out (ticket 09) ---
+
+    /// Every distinct corporation id watched by any guild.
+    pub async fn all_watched_corporation_ids(&self) -> Result<Vec<i64>, sqlx::Error> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT DISTINCT entity_id FROM watchlist_entities WHERE kind = 'corporation' ORDER BY entity_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// The guilds watching one entity of a given kind, used to fan a
+    /// member-delta or corp-changed-alliance event out only to the guilds
+    /// that care about it.
+    pub async fn guilds_watching_entity(
+        &self,
+        kind: WatchlistKind,
+        entity_id: i64,
+    ) -> Result<Vec<u64>, sqlx::Error> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT guild_id FROM watchlist_entities WHERE kind = $1 AND entity_id = $2",
+        )
+        .bind(kind.as_str())
+        .bind(entity_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|id| id as u64)
+        .collect())
+    }
+
+    /// The corporation ids currently members of an alliance (present in the
+    /// last snapshot with no `left_at`).
+    pub async fn current_alliance_member_ids(
+        &self,
+        alliance_id: i64,
+    ) -> Result<Vec<i64>, sqlx::Error> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT corporation_id FROM watchlist_alliance_corps WHERE alliance_id = $1 AND left_at IS NULL ORDER BY corporation_id",
+        )
+        .bind(alliance_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    // --- Member snapshots & band state (ticket 09) ---
+
+    /// `updated_at` of each corporation's public-info cache row, for the
+    /// least-recently-fetched-first ordering the collector uses to keep the
+    /// per-cycle corporation-info fetch bounded and eventually fair. A
+    /// corporation with no cache row (never fetched) is absent from the map.
+    pub async fn corp_cache_updated_ats(
+        &self,
+        corporation_ids: &[i64],
+    ) -> Result<HashMap<i64, DateTime<Utc>>, sqlx::Error> {
+        if corporation_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let keys: Vec<String> = corporation_ids
+            .iter()
+            .map(|id| corp_resource_key(*id))
+            .collect();
+        let rows = sqlx::query(
+            "SELECT resource_key, updated_at FROM esi_cache_metadata WHERE resource_key = ANY($1)",
+        )
+        .bind(&keys)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let key: String = row.get("resource_key");
+            if let Some(id) = key
+                .strip_prefix("watchlist/corporations/")
+                .and_then(|rest| rest.parse::<i64>().ok())
+            {
+                map.insert(id, row.get::<DateTime<Utc>, _>("updated_at"));
+            }
+        }
+        Ok(map)
+    }
+
+    /// Records one corporation's member-count snapshot (one row per
+    /// (entity, observed_at); idempotent within an hour via the primary key).
+    pub async fn record_corp_snapshot(
+        &self,
+        corporation_id: i64,
+        member_count: i64,
+        alliance_id: Option<i64>,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO watchlist_member_snapshots (entity_kind, entity_id, member_count, alliance_id, observed_at) VALUES ('corporation',$1,$2,$3,$4) ON CONFLICT (entity_kind, entity_id, observed_at) DO UPDATE SET member_count = EXCLUDED.member_count, alliance_id = EXCLUDED.alliance_id",
+        )
+        .bind(corporation_id)
+        .bind(member_count)
+        .bind(alliance_id)
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Records one alliance's aggregate member-count snapshot.
+    pub async fn record_alliance_member_snapshot(
+        &self,
+        alliance_id: i64,
+        member_count: i64,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO watchlist_member_snapshots (entity_kind, entity_id, member_count, alliance_id, observed_at) VALUES ('alliance',$1,$2,NULL,$3) ON CONFLICT (entity_kind, entity_id, observed_at) DO UPDATE SET member_count = EXCLUDED.member_count",
+        )
+        .bind(alliance_id)
+        .bind(member_count)
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The previous (most recent) corporation snapshot's `alliance_id`, used
+    /// to detect a corp-changed-alliance transition. Returns `None` when the
+    /// corporation has no prior snapshot at/after `min_observed_at` (a silent
+    /// baseline), or `Some(alliance_id)` where the inner option is the
+    /// recorded alliance (`None` = the corporation was unaffiliated).
+    ///
+    /// `min_observed_at` is the watch-scoped baseline (ticket-09 finding 1):
+    /// snapshots taken before the corporation became watched (e.g. while it
+    /// was only a member of a watched alliance) are ignored so a fresh watch
+    /// never fires against pre-watch history.
+    pub async fn previous_corp_alliance(
+        &self,
+        corporation_id: i64,
+        min_observed_at: DateTime<Utc>,
+    ) -> Result<Option<Option<i64>>, sqlx::Error> {
+        Ok(sqlx::query(
+            "SELECT alliance_id FROM watchlist_member_snapshots WHERE entity_kind = 'corporation' AND entity_id = $1 AND observed_at >= $2 ORDER BY observed_at DESC LIMIT 1",
+        )
+        .bind(corporation_id)
+        .bind(min_observed_at)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| row.get::<Option<i64>, _>("alliance_id")))
+    }
+
+    /// The watch-scoped member-delta baseline for an entity, i.e. when the
+    /// current watch first evaluated it (ticket-09 finding 1). `None` until
+    /// the member-snapshot pass has established it.
+    pub async fn member_baseline(
+        &self,
+        entity_kind: WatchlistKind,
+        entity_id: i64,
+    ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT established_at FROM watchlist_member_baseline WHERE entity_kind = $1 AND entity_id = $2",
+        )
+        .bind(entity_kind.as_str())
+        .bind(entity_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Establishes the watch-scoped member-delta baseline for an entity if it
+    /// has none yet (idempotent). Called by the member-snapshot pass on the
+    /// first successful evaluation after the entity became watched.
+    pub async fn establish_member_baseline(
+        &self,
+        entity_kind: WatchlistKind,
+        entity_id: i64,
+        established_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO watchlist_member_baseline (entity_kind, entity_id, established_at) VALUES ($1,$2,$3) ON CONFLICT (entity_kind, entity_id) DO NOTHING",
+        )
+        .bind(entity_kind.as_str())
+        .bind(entity_id)
+        .bind(established_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The current member count of an alliance: the sum over its current
+    /// member corporations' latest snapshots.
+    ///
+    /// Normally the aggregate is evaluated only when *every* current member
+    /// has a snapshot (otherwise `total` is `None`, meaning no evaluation this
+    /// cycle). Ticket-09 finding 3: a member whose corporation-info fetch has
+    /// failed continuously for at least [`CORP_FETCH_FAILURE_EXCLUSION_THRESHOLD`]
+    /// cycles is excluded from that requirement -- its last known snapshot is
+    /// summed if one exists, otherwise it is skipped -- so one persistently
+    /// failing member cannot block the aggregate forever. `excluded_members`
+    /// surfaces how many current members were excluded this way. `total` is
+    /// `None` when the alliance has no current members, or when every current
+    /// member is excluded and none of them has any snapshot (no data at all).
+    pub async fn current_alliance_member_count(
+        &self,
+        alliance_id: i64,
+    ) -> Result<AllianceAggregate, sqlx::Error> {
+        let row = sqlx::query(
+            "WITH members AS (\
+                 SELECT corporation_id FROM watchlist_alliance_corps WHERE alliance_id = $1 AND left_at IS NULL\
+             ), failing AS (\
+                 SELECT corporation_id FROM watchlist_corp_fetch_failures WHERE consecutive_failures >= $2\
+             ), required AS (\
+                 SELECT corporation_id FROM members \
+                 WHERE corporation_id NOT IN (SELECT corporation_id FROM failing)\
+             ), latest AS (\
+                 SELECT DISTINCT ON (entity_id) entity_id, member_count \
+                 FROM watchlist_member_snapshots \
+                 WHERE entity_kind = 'corporation' AND entity_id IN (SELECT corporation_id FROM members) \
+                 ORDER BY entity_id, observed_at DESC\
+             ) \
+             SELECT (SELECT count(*) FROM members) AS member_count, \
+                    (SELECT count(*) FROM required) AS required_count, \
+                    (SELECT count(*) FROM required r \
+                       WHERE EXISTS (SELECT 1 FROM latest l WHERE l.entity_id = r.corporation_id)) AS required_with_snapshot, \
+                    (SELECT count(*) FROM members m \
+                       JOIN failing f ON f.corporation_id = m.corporation_id) AS excluded_count, \
+                    (SELECT count(*) FROM latest) AS snapshot_count, \
+                    (SELECT COALESCE(sum(member_count), 0)::bigint FROM latest) AS total",
+        )
+        .bind(alliance_id)
+        .bind(CORP_FETCH_FAILURE_EXCLUSION_THRESHOLD)
+        .fetch_one(&self.pool)
+        .await?;
+        let member_count: i64 = row.get("member_count");
+        let required_count: i64 = row.get("required_count");
+        let required_with_snapshot: i64 = row.get("required_with_snapshot");
+        let excluded_count: i64 = row.get("excluded_count");
+        let snapshot_count: i64 = row.get("snapshot_count");
+        let total: i64 = row.get("total");
+        // No members, or every required (non-excluded) member lacks a
+        // snapshot: cannot evaluate this cycle.
+        let total =
+            if member_count == 0 || required_with_snapshot != required_count || snapshot_count == 0
+            {
+                None
+            } else {
+                Some(total)
+            };
+        Ok(AllianceAggregate {
+            total,
+            excluded_members: excluded_count,
+        })
+    }
+
+    /// Records one corporation-info fetch failure, incrementing its
+    /// consecutive-failure counter (ticket-09 finding 3).
+    pub async fn record_corp_fetch_failure(
+        &self,
+        corporation_id: i64,
+        error: &str,
+        observed_at: DateTime<Utc>,
+    ) -> Result<i32, sqlx::Error> {
+        sqlx::query_scalar::<_, i32>(
+            "INSERT INTO watchlist_corp_fetch_failures (corporation_id, consecutive_failures, last_error, updated_at) \
+             VALUES ($1, 1, $2, $3) \
+             ON CONFLICT (corporation_id) DO UPDATE SET \
+                 consecutive_failures = watchlist_corp_fetch_failures.consecutive_failures + 1, \
+                 last_error = EXCLUDED.last_error, \
+                 updated_at = EXCLUDED.updated_at \
+             RETURNING consecutive_failures",
+        )
+        .bind(corporation_id)
+        .bind(error)
+        .bind(observed_at)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Resets a corporation's consecutive-failure counter after any success
+    /// (`200`) or `304` (ticket-09 finding 3). A no-op when the corporation
+    /// has no failure row.
+    pub async fn reset_corp_fetch_failures(&self, corporation_id: i64) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM watchlist_corp_fetch_failures WHERE corporation_id = $1")
+            .bind(corporation_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub async fn corp_fetch_failures_for_test(
+        &self,
+        corporation_id: i64,
+    ) -> Result<Option<i32>, sqlx::Error> {
+        sqlx::query_scalar::<_, i32>(
+            "SELECT consecutive_failures FROM watchlist_corp_fetch_failures WHERE corporation_id = $1",
+        )
+        .bind(corporation_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// The most recent member count recorded for an entity, or `None` if it
+    /// has no snapshots yet. Used as the "current" count for a watched
+    /// corporation's delta evaluation.
+    pub async fn latest_member_count(
+        &self,
+        entity_kind: WatchlistKind,
+        entity_id: i64,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT member_count FROM watchlist_member_snapshots WHERE entity_kind = $1 AND entity_id = $2 ORDER BY observed_at DESC LIMIT 1",
+        )
+        .bind(entity_kind.as_str())
+        .bind(entity_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// The member-delta reference: the snapshot nearest `target` (usually
+    /// `now - 7d`) for an entity, restricted to snapshots at/after
+    /// `min_observed_at` (the watch-scoped baseline, ticket-09 finding 1), or
+    /// `None` if the entity has no such snapshots. The pure
+    /// `evaluate_member_delta` applies the minimum-history and zero-count
+    /// rules to the returned reference.
+    ///
+    /// The `ORDER BY abs(...)` is a sort over the entity's own snapshot rows
+    /// (bounded by the 30-day retention, so at most ~720 rows), filtered by
+    /// the `(entity_kind, entity_id, observed_at)` index prefix -- it is not
+    /// an index-ordered proximity seek.
+    pub async fn member_reference(
+        &self,
+        entity_kind: WatchlistKind,
+        entity_id: i64,
+        target: DateTime<Utc>,
+        min_observed_at: DateTime<Utc>,
+    ) -> Result<Option<MemberReference>, sqlx::Error> {
+        Ok(sqlx::query(
+            "SELECT member_count, observed_at FROM watchlist_member_snapshots \
+             WHERE entity_kind = $1 AND entity_id = $2 AND observed_at >= $4 \
+             ORDER BY abs(EXTRACT(EPOCH FROM (observed_at - $3))) ASC, observed_at DESC LIMIT 1",
+        )
+        .bind(entity_kind.as_str())
+        .bind(entity_id)
+        .bind(target)
+        .bind(min_observed_at)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| MemberReference {
+            count: row.get("member_count"),
+            observed_at: row.get("observed_at"),
+        }))
+    }
+
+    /// Whether an entity's member-delta band state is armed (may fire on the
+    /// next crossing): `true` when there is no state row or its
+    /// `last_fired_direction` is NULL.
+    pub async fn member_band_armed(
+        &self,
+        entity_kind: WatchlistKind,
+        entity_id: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let last: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT last_fired_direction FROM watchlist_member_band_state WHERE entity_kind = $1 AND entity_id = $2",
+        )
+        .bind(entity_kind.as_str())
+        .bind(entity_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match last {
+            None => true,
+            Some(direction) => direction.is_none(),
+        })
+    }
+
+    /// Records a re-arm (inside-band) evaluation of an entity's band state:
+    /// clears `last_fired_direction` and refreshes the reference for
+    /// observability. `crossing_sequence` is deliberately left untouched (it
+    /// only ever advances on a fire, in [`Self::fire_member_delta_crossing`]),
+    /// so a subsequent crossing mints a fresh, never-reused evidence key.
+    pub async fn rearm_member_band_state(
+        &self,
+        entity_kind: WatchlistKind,
+        entity_id: i64,
+        reference: Option<MemberReference>,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO watchlist_member_band_state (entity_kind, entity_id, reference_count, reference_observed_at, last_fired_direction, updated_at) VALUES ($1,$2,$3,$4,NULL,$5) ON CONFLICT (entity_kind, entity_id) DO UPDATE SET reference_count = EXCLUDED.reference_count, reference_observed_at = EXCLUDED.reference_observed_at, last_fired_direction = NULL, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(entity_kind.as_str())
+        .bind(entity_id)
+        .bind(reference.map(|reference| reference.count))
+        .bind(reference.map(|reference| reference.observed_at))
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Atomically records a fired member-delta crossing (ticket-09 finding 2).
+    /// In one transaction it bumps the entity's `crossing_sequence`, disarms
+    /// the band (`last_fired_direction`), refreshes the reference, and inserts
+    /// one `prepared` delivery row per target keyed
+    /// `{kind}:{entity}:{direction}:{sequence}`. Sending happens afterward
+    /// through the existing lease path, so a crash anywhere after the commit
+    /// yields exactly one post per crossing (the disarm can never be lost
+    /// while the delivery rows survive, and the sequence -- unlike the old
+    /// sliding `reference_observed_at` key -- does not change across the
+    /// crash). Passing no targets still disarms and bumps the sequence, so a
+    /// crossing with no subscriber is not re-fired next cycle. Returns the
+    /// evidence key and the number of rows freshly prepared.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fire_member_delta_crossing(
+        &self,
+        entity_kind: WatchlistKind,
+        entity_id: i64,
+        direction: MemberDeltaDirection,
+        reference: Option<MemberReference>,
+        observed_at: DateTime<Utc>,
+        targets: &[WatchlistSubscription],
+        message: Option<&WatchlistNotificationMessage>,
+    ) -> Result<(String, usize), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let sequence: i64 = sqlx::query_scalar(
+            "INSERT INTO watchlist_member_band_state (entity_kind, entity_id, reference_count, reference_observed_at, last_fired_direction, crossing_sequence, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,1,$6) \
+             ON CONFLICT (entity_kind, entity_id) DO UPDATE SET \
+                 reference_count = EXCLUDED.reference_count, \
+                 reference_observed_at = EXCLUDED.reference_observed_at, \
+                 last_fired_direction = EXCLUDED.last_fired_direction, \
+                 crossing_sequence = watchlist_member_band_state.crossing_sequence + 1, \
+                 updated_at = EXCLUDED.updated_at \
+             RETURNING crossing_sequence",
+        )
+        .bind(entity_kind.as_str())
+        .bind(entity_id)
+        .bind(reference.map(|reference| reference.count))
+        .bind(reference.map(|reference| reference.observed_at))
+        .bind(direction.as_str())
+        .bind(observed_at)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let evidence_key = format!(
+            "{}:{}:{}:{}",
+            entity_kind.as_str(),
+            entity_id,
+            direction.as_str(),
+            sequence
+        );
+
+        let mut prepared = 0usize;
+        if !targets.is_empty() {
+            let message = message.ok_or_else(|| {
+                sqlx::Error::Protocol(
+                    "fire_member_delta_crossing called with targets but no message".to_string(),
+                )
+            })?;
+            let message_json = serde_json::to_value(message).map_err(json_to_sqlx)?;
+            for subscription in targets {
+                let delivery_id: Option<i64> = sqlx::query_scalar(
+                    "WITH new_id AS (SELECT nextval(pg_get_serial_sequence('watchlist_deliveries', 'id')) AS id) \
+                     INSERT INTO watchlist_deliveries (id, guild_id, channel_id, subscription_name, event_kind, entity_id, evidence_key, message, role_id, delivery_nonce, status) \
+                     SELECT new_id.id, $1,$2,$3,$4,$5,$6,$7,$8, 'wl-' || new_id.id, 'prepared' FROM new_id \
+                     WHERE EXISTS (SELECT 1 FROM watchlist_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND name = $3) \
+                     ON CONFLICT (guild_id, channel_id, subscription_name, event_kind, entity_id, evidence_key) DO NOTHING RETURNING id",
+                )
+                .bind(subscription.guild_id as i64)
+                .bind(subscription.channel_id as i64)
+                .bind(&subscription.name)
+                .bind(WatchlistEventKind::MemberDelta.as_str())
+                .bind(entity_id)
+                .bind(&evidence_key)
+                .bind(&message_json)
+                .bind(subscription.role_id.map(|id| id as i64))
+                .fetch_optional(&mut *tx)
+                .await?;
+                if delivery_id.is_some() {
+                    prepared += 1;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok((evidence_key, prepared))
+    }
+
+    /// Deletes member snapshots older than the retention window, bounding
+    /// table growth. Runs once per cycle.
+    pub async fn prune_member_snapshots(
+        &self,
+        observed_at: DateTime<Utc>,
+    ) -> Result<u64, sqlx::Error> {
+        let cutoff = observed_at - MEMBER_SNAPSHOT_RETENTION;
+        let result = sqlx::query("DELETE FROM watchlist_member_snapshots WHERE observed_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     // --- Subscriptions ---
@@ -627,6 +1197,36 @@ impl WatchlistStore {
         .bind(event_kind.as_str())
         .bind(entity_id)
         .bind(evidence_key)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn deliveries_for_entity(
+        &self,
+        event_kind: WatchlistEventKind,
+        entity_id: i64,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM watchlist_deliveries WHERE event_kind = $1 AND entity_id = $2",
+        )
+        .bind(event_kind.as_str())
+        .bind(entity_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn band_crossing_sequence_for_test(
+        &self,
+        entity_kind: WatchlistKind,
+        entity_id: i64,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT crossing_sequence FROM watchlist_member_band_state WHERE entity_kind = $1 AND entity_id = $2",
+        )
+        .bind(entity_kind.as_str())
+        .bind(entity_id)
         .fetch_optional(&self.pool)
         .await
     }

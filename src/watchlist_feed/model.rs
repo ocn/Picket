@@ -74,14 +74,26 @@ pub enum WatchlistEventKind {
     /// A corporation that was a member last snapshot is absent from a fresh
     /// listing.
     CorpLeft,
+    /// A watched entity's member count moved more than ten percent against
+    /// the snapshot nearest seven days ago (ticket 09). Fires once per band
+    /// crossing, re-arming only after the count returns inside the band.
+    MemberDelta,
+    /// A watched corporation's current alliance differs from its previous
+    /// snapshot's alliance, including joining or leaving an alliance
+    /// entirely (ticket 09).
+    CorpChangedAlliance,
 }
 
 /// Every event kind a subscription may select today (spec: "Subscriptions
 /// per channel choose event kinds"). Later tickets append to this list; a
 /// stored `event_kinds` array element this does not recognize is simply
 /// dropped at read time (forward-compatible), never a parse failure.
-pub const WATCHLIST_EVENT_KINDS: &[WatchlistEventKind] =
-    &[WatchlistEventKind::CorpJoined, WatchlistEventKind::CorpLeft];
+pub const WATCHLIST_EVENT_KINDS: &[WatchlistEventKind] = &[
+    WatchlistEventKind::CorpJoined,
+    WatchlistEventKind::CorpLeft,
+    WatchlistEventKind::MemberDelta,
+    WatchlistEventKind::CorpChangedAlliance,
+];
 
 impl WatchlistEventKind {
     /// The stored `event_kind` string (part of the delivery dedup key and
@@ -90,6 +102,8 @@ impl WatchlistEventKind {
         match self {
             Self::CorpJoined => "corp_joined",
             Self::CorpLeft => "corp_left",
+            Self::MemberDelta => "member_delta",
+            Self::CorpChangedAlliance => "corp_changed_alliance",
         }
     }
 
@@ -101,6 +115,8 @@ impl WatchlistEventKind {
         match raw.trim().to_ascii_lowercase().as_str() {
             "corp_joined" => Some(Self::CorpJoined),
             "corp_left" => Some(Self::CorpLeft),
+            "member_delta" => Some(Self::MemberDelta),
+            "corp_changed_alliance" => Some(Self::CorpChangedAlliance),
             _ => None,
         }
     }
@@ -111,6 +127,8 @@ impl WatchlistEventKind {
         match self {
             Self::CorpJoined => "Corporation Joined",
             Self::CorpLeft => "Corporation Left",
+            Self::MemberDelta => "Member Count Change",
+            Self::CorpChangedAlliance => "Corporation Changed Alliance",
         }
     }
 }
@@ -211,6 +229,27 @@ pub struct WatchlistAlliance {
 pub trait WatchlistEntityResolver: Send + Sync {
     async fn corporation(&self, corporation_id: i64) -> WatchlistCorporation;
     async fn alliance(&self, alliance_id: i64) -> WatchlistAlliance;
+
+    /// Feeds a corporation's identity (as returned by
+    /// `GET /corporations/{id}/` during the member-snapshot pass) into the
+    /// shared killfeed caches so a later [`Self::corporation`] resolution at
+    /// prepare time is a cache hit and the embed needs no extra ESI lookup
+    /// (ticket 09). Default no-op for resolvers without a writable cache
+    /// (the test fake).
+    async fn note_corporation(
+        &self,
+        _corporation_id: i64,
+        _name: Option<String>,
+        _ticker: Option<String>,
+    ) {
+    }
+
+    /// Persists whatever the member-snapshot pass accumulated through
+    /// [`Self::note_corporation`], called once at the end of the pass (ticket
+    /// 09). This lets an implementation update only its in-memory caches per
+    /// corporation and flush the backing store a single time, instead of
+    /// rewriting it once per fresh corporation. Default no-op.
+    async fn flush_noted_corporations(&self) {}
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -328,9 +367,146 @@ impl WatchlistEvent {
     }
 }
 
+// --- Member-count delta band crossing (ticket 09) ---
+//
+// A pure, database-free function so the band-crossing rule is unit-testable
+// (Testing Decisions, `.scratch/esi-intel-feeds/spec.md`: "member-delta band
+// crossing must be a pure function with unit tests").
+
+/// The ten-percent band half-width, as an integer percentage so the
+/// comparison avoids floating point.
+pub const MEMBER_DELTA_THRESHOLD_PERCENT: i128 = 10;
+
+/// The reference window: the delta is measured against the snapshot nearest
+/// this far in the past.
+pub const MEMBER_DELTA_REFERENCE_WINDOW: chrono::Duration = chrono::Duration::days(7);
+
+/// Minimum age of the reference snapshot before a delta may fire. The
+/// reference is the snapshot *nearest* seven days ago, but if the oldest
+/// history we have is younger than this, we have too little history to judge
+/// a "seven day" move and stay silent. Chosen as 6.5 days: close enough to
+/// the seven-day window to accept the normal hourly snapshot that lands just
+/// before or after the exact mark, but far enough to reject a freshly-added
+/// entity whose only history is a few days old.
+pub const MEMBER_DELTA_MIN_HISTORY: chrono::Duration =
+    chrono::Duration::milliseconds(6 * 24 * 3600 * 1000 + 12 * 3600 * 1000);
+
+/// The direction of a member-count crossing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberDeltaDirection {
+    Up,
+    Down,
+}
+
+impl MemberDeltaDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "up" => Some(Self::Up),
+            "down" => Some(Self::Down),
+            _ => None,
+        }
+    }
+}
+
+/// The reference snapshot a delta is measured against: the count and when it
+/// was observed (the snapshot nearest [`MEMBER_DELTA_REFERENCE_WINDOW`] ago).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MemberReference {
+    pub count: i64,
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A fired member-count crossing, carrying the evidence the embed renders.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MemberDeltaAlert {
+    pub direction: MemberDeltaDirection,
+    pub reference_count: i64,
+    pub current_count: i64,
+    pub reference_observed_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl MemberDeltaAlert {
+    /// The percentage magnitude of the move, rounded down, for the embed.
+    /// `reference_count` is guaranteed positive by [`evaluate_member_delta`].
+    pub fn percentage(&self) -> i64 {
+        let delta = (self.current_count as i128 - self.reference_count as i128).abs();
+        ((delta * 100) / self.reference_count as i128) as i64
+    }
+}
+
+/// The outcome of evaluating one entity's member count against its reference
+/// and armed state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MemberDeltaOutcome {
+    /// No reference snapshot old enough (or reference count zero): stay
+    /// silent, leave band state unchanged.
+    InsufficientHistory,
+    /// Inside the +/-10 % band: re-arm (no event).
+    InsideBand,
+    /// Outside the band but the entity already fired this crossing: no event.
+    AlreadyFired,
+    /// A fresh crossing: fire once.
+    Fires(MemberDeltaAlert),
+}
+
+/// The band-crossing rule (spec user stories 45-46). Pure and total: no
+/// database, no clock reads beyond the `now` passed in, no panics, no
+/// division by a zero reference.
+///
+/// - `armed` is `true` when the entity is inside the band (or has never
+///   fired) and may fire on the next crossing; `false` when it fired the
+///   current crossing and must return inside the band to re-arm.
+/// - A reference count of zero never fires (no division, and a percentage of
+///   any positive count is undefined against zero).
+/// - A reference younger than [`MEMBER_DELTA_MIN_HISTORY`] is insufficient
+///   history and stays silent.
+pub fn evaluate_member_delta(
+    now: chrono::DateTime<chrono::Utc>,
+    current_count: i64,
+    reference: Option<MemberReference>,
+    armed: bool,
+) -> MemberDeltaOutcome {
+    let Some(reference) = reference else {
+        return MemberDeltaOutcome::InsufficientHistory;
+    };
+    if reference.count <= 0 {
+        return MemberDeltaOutcome::InsufficientHistory;
+    }
+    if now.signed_duration_since(reference.observed_at) < MEMBER_DELTA_MIN_HISTORY {
+        return MemberDeltaOutcome::InsufficientHistory;
+    }
+    let delta = (current_count as i128 - reference.count as i128).abs();
+    let outside = delta * 100 >= reference.count as i128 * MEMBER_DELTA_THRESHOLD_PERCENT;
+    if !outside {
+        return MemberDeltaOutcome::InsideBand;
+    }
+    if !armed {
+        return MemberDeltaOutcome::AlreadyFired;
+    }
+    let direction = if current_count >= reference.count {
+        MemberDeltaDirection::Up
+    } else {
+        MemberDeltaDirection::Down
+    };
+    MemberDeltaOutcome::Fires(MemberDeltaAlert {
+        direction,
+        reference_count: reference.count,
+        current_count,
+        reference_observed_at: reference.observed_at,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn event_kinds_parse_default_all_on_empty_input() {
@@ -355,6 +531,174 @@ mod tests {
     #[test]
     fn event_kinds_reject_an_unknown_token() {
         assert!(parse_event_kinds("corp_joined, war_declared").is_err());
+    }
+
+    #[test]
+    fn event_kinds_parse_the_two_new_kinds() {
+        assert_eq!(
+            parse_event_kinds("member_delta, corp_changed_alliance").unwrap(),
+            vec![
+                WatchlistEventKind::MemberDelta,
+                WatchlistEventKind::CorpChangedAlliance
+            ]
+        );
+        assert_eq!(
+            WatchlistEventKind::parse("member_delta"),
+            Some(WatchlistEventKind::MemberDelta)
+        );
+        assert_eq!(
+            WatchlistEventKind::parse("corp_changed_alliance"),
+            Some(WatchlistEventKind::CorpChangedAlliance)
+        );
+    }
+
+    #[test]
+    fn default_all_event_kinds_includes_the_new_kinds() {
+        let all = parse_event_kinds("").unwrap();
+        assert!(all.contains(&WatchlistEventKind::MemberDelta));
+        assert!(all.contains(&WatchlistEventKind::CorpChangedAlliance));
+    }
+
+    // --- member_delta pure function ---
+
+    fn at(days_ago: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap()
+            - chrono::Duration::days(days_ago)
+    }
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn member_delta_fires_up_on_a_ten_percent_rise() {
+        let outcome = evaluate_member_delta(
+            now(),
+            110,
+            Some(MemberReference {
+                count: 100,
+                observed_at: at(7),
+            }),
+            true,
+        );
+        match outcome {
+            MemberDeltaOutcome::Fires(alert) => {
+                assert_eq!(alert.direction, MemberDeltaDirection::Up);
+                assert_eq!(alert.reference_count, 100);
+                assert_eq!(alert.current_count, 110);
+                assert_eq!(alert.percentage(), 10);
+            }
+            other => panic!("expected a fire, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn member_delta_fires_down_on_a_ten_percent_drop() {
+        let outcome = evaluate_member_delta(
+            now(),
+            90,
+            Some(MemberReference {
+                count: 100,
+                observed_at: at(7),
+            }),
+            true,
+        );
+        match outcome {
+            MemberDeltaOutcome::Fires(alert) => {
+                assert_eq!(alert.direction, MemberDeltaDirection::Down);
+                assert_eq!(alert.percentage(), 10);
+            }
+            other => panic!("expected a fire, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn member_delta_inside_band_does_not_fire() {
+        assert_eq!(
+            evaluate_member_delta(
+                now(),
+                109,
+                Some(MemberReference {
+                    count: 100,
+                    observed_at: at(7),
+                }),
+                true,
+            ),
+            MemberDeltaOutcome::InsideBand
+        );
+    }
+
+    #[test]
+    fn member_delta_fires_once_per_crossing() {
+        // Already outside the band and disarmed: no second fire.
+        assert_eq!(
+            evaluate_member_delta(
+                now(),
+                120,
+                Some(MemberReference {
+                    count: 100,
+                    observed_at: at(7),
+                }),
+                false,
+            ),
+            MemberDeltaOutcome::AlreadyFired
+        );
+    }
+
+    #[test]
+    fn member_delta_rearms_after_returning_inside_the_band() {
+        // Disarmed, but the count is now back inside the band: re-arm.
+        assert_eq!(
+            evaluate_member_delta(
+                now(),
+                105,
+                Some(MemberReference {
+                    count: 100,
+                    observed_at: at(7),
+                }),
+                false,
+            ),
+            MemberDeltaOutcome::InsideBand
+        );
+    }
+
+    #[test]
+    fn member_delta_never_fires_against_a_zero_reference() {
+        assert_eq!(
+            evaluate_member_delta(
+                now(),
+                50,
+                Some(MemberReference {
+                    count: 0,
+                    observed_at: at(7),
+                }),
+                true,
+            ),
+            MemberDeltaOutcome::InsufficientHistory
+        );
+    }
+
+    #[test]
+    fn member_delta_needs_enough_history() {
+        // A big move but the reference is only three days old: too little
+        // history, stay silent.
+        assert_eq!(
+            evaluate_member_delta(
+                now(),
+                200,
+                Some(MemberReference {
+                    count: 100,
+                    observed_at: at(3),
+                }),
+                true,
+            ),
+            MemberDeltaOutcome::InsufficientHistory
+        );
+        // No reference at all is likewise insufficient.
+        assert_eq!(
+            evaluate_member_delta(now(), 200, None, true),
+            MemberDeltaOutcome::InsufficientHistory
+        );
     }
 
     #[test]

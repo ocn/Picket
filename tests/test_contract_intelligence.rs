@@ -18008,11 +18008,11 @@ async fn contract_migrations_apply_to_clean_and_already_current_databases() {
         .fetch_one(&validation_pool)
         .await
         .expect("read already-current migration ledger");
-    // Bumped by the sov campaign feed's migrations, most recently
-    // `migrations/20260827000002_add_sov_structures_and_map.sql`, which
+    // Bumped by the watchlist member-snapshots migration
+    // `migrations/20260828000000_add_watchlist_member_snapshots.sql`, which
     // the shared `MIGRATOR` covers along with every other file under
     // `migrations/`.
-    assert_eq!(current_migration_count, 31);
+    assert_eq!(current_migration_count, 32);
     assert_eq!(
         current_store
             .storage_counts()
@@ -32588,11 +32588,11 @@ async fn regional_observation_batch_and_health_snapshot_migrations_apply_to_clea
         .fetch_one(&clean_pool)
         .await
         .expect("read clean migration ledger");
-    // Bumped by the sov campaign feed's migrations, most recently
-    // `migrations/20260827000002_add_sov_structures_and_map.sql`, which
+    // Bumped by the watchlist member-snapshots migration
+    // `migrations/20260828000000_add_watchlist_member_snapshots.sql`, which
     // the shared `MIGRATOR` covers along with every other file under
     // `migrations/`.
-    assert_eq!(clean_migration_count, 31);
+    assert_eq!(clean_migration_count, 32);
     let clean_pacing_column_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'esi_collection_limiter_state' AND column_name = 'next_request_at')",
     )
