@@ -22,6 +22,9 @@ pub mod sync_clear;
 pub mod sync_remove;
 pub mod sync_standings;
 pub mod unsubscribe;
+pub mod watch;
+pub mod watch_subscribe;
+pub mod watch_unsubscribe;
 
 #[async_trait]
 pub trait Command: Send + Sync {

@@ -2336,6 +2336,8 @@ struct HealthInputs {
     esi_progress_at: Option<DateTime<Utc>>,
     sov_esi_progress_at: Option<DateTime<Utc>>,
     sov_chain_progress_at: Option<DateTime<Utc>>,
+    watchlist_esi_progress_at: Option<DateTime<Utc>>,
+    watchlist_permanent_delivery_failures: i64,
     esi_pause_until: Option<DateTime<Utc>>,
     due_backlog_count: i64,
     oldest_due_backlog_at: Option<DateTime<Utc>>,
@@ -2398,6 +2400,11 @@ impl HealthCycle {
             inputs.sov_chain_progress_at,
             observed_at,
         ));
+        checks.push(watchlist_esi_progress_health_check(
+            inputs.watchlist_esi_progress_at,
+            observed_at,
+            &self.thresholds,
+        ));
         checks.push(permanent_delivery_health_check(
             "permanent_delivery_failure",
             observed_at,
@@ -2407,6 +2414,11 @@ impl HealthCycle {
             "sov_permanent_delivery_failure",
             observed_at,
             inputs.sov_permanent_delivery_failures,
+        ));
+        checks.push(permanent_delivery_health_check(
+            "watchlist_permanent_delivery_failure",
+            observed_at,
+            inputs.watchlist_permanent_delivery_failures,
         ));
         if let Some((enabled, status, error, updated_at)) = &inputs.structure_resolver {
             checks.push(structure_resolver_health_check(
@@ -2707,6 +2719,40 @@ fn sov_esi_progress_health_check(
         thresholds.esi_progress_degraded,
         thresholds.esi_progress_critical,
         "sov campaign ESI progress",
+    )
+}
+
+/// The watchlist feed's ESI progress signal (ticket 08). Mirrors
+/// [`sov_esi_progress_health_check`]: neutral (Healthy) until the feed first
+/// reports, then shares the contract feed's ESI-progress staleness
+/// thresholds. `watchlist_esi_progress_at` is `max(updated_at)` across
+/// `esi_cache_metadata` rows whose `resource_key` matches `watchlist/%`
+/// (each watched alliance's corporation-list conditional request), and is
+/// `None` in exactly the "never reported" state (feed not started, or no
+/// alliance is watched yet).
+fn watchlist_esi_progress_health_check(
+    watchlist_esi_progress_at: Option<DateTime<Utc>>,
+    observed_at: DateTime<Utc>,
+    thresholds: &HealthThresholds,
+) -> HealthCheck {
+    let Some(progress_at) = watchlist_esi_progress_at else {
+        return HealthCheck {
+            key: "watchlist_esi_progress".to_string(),
+            status: HealthStatus::Healthy,
+            observed_at,
+            evidence:
+                "no watchlist ESI progress reported yet (feed not started or no alliance watched)"
+                    .to_string(),
+            consecutive_failures: 0,
+        };
+    };
+    age_health_check(
+        "watchlist_esi_progress",
+        Some(progress_at),
+        observed_at,
+        thresholds.esi_progress_degraded,
+        thresholds.esi_progress_critical,
+        "watchlist ESI progress",
     )
 }
 
@@ -5428,6 +5474,22 @@ impl ContractCollectionStore {
         )
         .fetch_one(&self.pool)
         .await?;
+        // Watchlist feed progress (ticket 08): a distinct signal from the
+        // contract and sov feeds. `watchlist/%` is the watchlist feed's own
+        // `esi_cache_metadata` resource-key prefix (one row per watched
+        // alliance, `src/watchlist_feed/store.rs`); `None` before the first
+        // successful poll (feed not started, or no alliance watched) is
+        // handled neutrally by `watchlist_esi_progress_health_check`.
+        let watchlist_esi_progress_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT max(updated_at) FROM esi_cache_metadata WHERE resource_key LIKE 'watchlist/%'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let watchlist_permanent_delivery_failures = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM watchlist_deliveries WHERE status = 'failed' AND failure_kind = 'permanent'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         let esi_pause_until = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
             "SELECT pause_until FROM esi_collection_limiter_state WHERE limiter_scope = TRUE",
         )
@@ -5492,6 +5554,8 @@ impl ContractCollectionStore {
             esi_progress_at,
             sov_esi_progress_at,
             sov_chain_progress_at,
+            watchlist_esi_progress_at,
+            watchlist_permanent_delivery_failures,
             esi_pause_until,
             due_backlog_count,
             oldest_due_backlog_at,

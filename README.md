@@ -221,7 +221,7 @@ When `WANDERER_BASE_URL`, `WANDERER_MAP`, and `WANDERER_MAP_API_KEY` are all set
 | Leaf tag | Shape | Bounds |
 | --- | --- | --- |
 | `vulnerable_within` | `{"hours": N}` | 1-720 (30 days) |
-| `defender` | `{"alliance_ids": [N, ...]}` | non-empty, positive IDs |
+| `defender` | `{"alliance_ids": [N, ...], "watchlist": bool}` | both fields optional but at least one must select something: a non-empty list of positive alliance IDs and/or `"watchlist": true`. `"watchlist": true` additionally matches every alliance on the subscribing server's watchlist (see "Watchlist feed" below), resolved at evaluation time, so the leaf follows `/watch add`/`/watch remove` without re-subscribing |
 | `region` | `[N, ...]` | non-empty, positive region IDs |
 | `system` | `[N, ...]` | non-empty, positive system IDs |
 | `event_type` | `["tcu_defense" \| "ihub_defense" \| "station_defense" \| "station_freeport", ...]` | non-empty |
@@ -241,6 +241,12 @@ Campaigns in Jita that are not station freeports:
 {"root":{"and":[{"condition":{"system":[30000142]}},{"not":{"condition":{"event_type":["station_freeport"]}}}]}}
 ```
 
+Campaigns defended by any alliance on this server's watchlist:
+
+```text
+{"root":{"condition":{"defender":{"watchlist":true}}}}
+```
+
 `/sov_subscribe` also takes convenience options instead of hand-writing the equivalent leaf: `region_id`, `defender_alliance_id`, `max_jumps`, and `allow_frigate_holes` (requires `max_jumps` also be set) are each ANDed onto the `filter` root as an extra `region`/`defender`/`reachable` leaf when supplied. `tminus_marks` is a separate per-subscription option (comma-separated T-minus minutes; default 120,30), not a filter leaf. `tz_window` (`HH:MM-HH:MM`, EVE/UTC, default `00:00-04:00`, may cross midnight) and `tz_shift_enabled` (boolean, default `false`) are likewise plain options, not filter leaves; see "Vulnerability window shift alerts" below.
 
 ### Vulnerability window shift alerts
@@ -248,6 +254,16 @@ Campaigns in Jita that are not station freeports:
 Every five minutes (the route's own cache age) the bot polls `GET /sovereignty/structures/` and persists Sovereignty Hubs only -- legacy TCUs, which have not been entosisable since Equinox, are filtered out at collection time by `structure_type_id`. Hourly, it polls `GET /sovereignty/map/` and replaces the current system-ownership table wholesale; from this feed on, every sov alert embed (`appeared`, `tminus`, `reachable`, and `tz_window_entered` alike) shows a "System Owner" field resolved from that map (alliance ticker, corporation ticker, or faction name, in that order; omitted when the map has not loaded the system yet).
 
 For a subscription with `tz_shift_enabled:true`, the `tz_window_entered` Alert Stage fires when a watched hub's `vulnerable_start_time..vulnerable_end_time` overlaps the subscription's `tz_window` by at least sixty minutes and the previously observed state for that hub and subscription was not in window; `Reachable` and `VulnerableWithin` filter leaves are ignored for this stage (treated as always matching), `EventType` does not apply to a structure (also treated as matching), and `Defender`, `Region`, and `System` leaves gate the alert normally. A hub whose vulnerability window is null or absent is never in window. Hubs present in the first successful structures cycle establish their in-window state silently (Sov Baseline), exactly like the reachability transition state added in an earlier ticket; leaving and re-entering the window fires again with a fresh stage key (`tz_window_entered:<n>`). The embed's footer reads `vuln window entered <window>` using the subscription's own window, not the hub's vulnerability window.
+
+### Watchlist feed
+
+Each server keeps a watchlist of alliances and corporations and receives an embed whenever a corporation joins or leaves a watched alliance. It shares the contract feed's PostgreSQL database and only starts when `CONTRACT_DATABASE_URL` is configured.
+
+- `/watch add kind:<alliance|corporation> ticker:<text>` adds an entity. The `ticker` option is resolved through the bot's ticker cache first, then an ESI name lookup (`POST /universe/ids/`). Note ESI's ids endpoint resolves *names*, not tickers, so a bare ticker only works when it is already in the bot's cache; otherwise supply the full alliance/corporation name. The reply confirms the resolved name and id ephemerally. Adding the same entity twice is idempotent.
+- `/watch remove kind:<...> ticker:<...>` removes an entity; `/watch list` shows the current watchlist.
+- `/watch_subscribe name:<...> event_kinds:<comma list>` subscribes the current channel; `event_kinds` defaults to all kinds (currently `corp_joined`, `corp_left`) and takes an optional `role` to ping. `/watch_unsubscribe name:<...>` removes a channel subscription.
+
+An hourly collector fetches each watched alliance's corporation list (`GET /alliances/{id}/corporations/`) with conditional requests through the shared ESI limiter and diffs it against the last snapshot. The first successful snapshot per alliance is a silent baseline (adding an alliance does not announce all its existing corporations); after that, a corporation appearing produces `corp_joined` and one disappearing produces `corp_left`, each delivered once per subscription with the alliance and corporation names/tickers, the event, and Dotlan/zKillboard links. Sov subscriptions can reference the watchlist as their defender filter with `{"defender": {"watchlist": true}}` (see the filter grammar above).
 
 ### Refreshing the stargate graph
 

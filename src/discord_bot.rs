@@ -17,6 +17,7 @@ use crate::presentation::{
 };
 use crate::processor::{AttackerKey, Color, NamedFilterResult};
 use crate::sov_feed;
+use crate::watchlist_feed;
 use chrono::{DateTime, FixedOffset, Utc};
 use serde_json::Value;
 use serenity::async_trait;
@@ -848,6 +849,135 @@ impl sov_feed::SovTickerResolver for DiscordSovTickerResolver {
     async fn faction_name(&self, faction_id: i64) -> Option<String> {
         let id = u64::try_from(faction_id).ok()?;
         self.app_state.esi_client.get_name(id).await.ok()
+    }
+}
+
+/// Renders one watchlist notification (spec "Embed": alliance/corporation
+/// names and tickers, the event, Dotlan and zKillboard links; footer names
+/// the event kind). Mirrors [`sov_campaign_embed`].
+pub fn watchlist_embed(message: &watchlist_feed::WatchlistNotificationMessage) -> CreateEmbed {
+    let mut embed = CreateEmbed::default();
+    embed.title(&message.title);
+    for field in &message.fields {
+        embed.field(&field.name, &field.value, field.inline);
+    }
+    embed.footer(|builder| builder.text(&message.footer));
+    embed
+}
+
+pub struct DiscordWatchlistDelivery {
+    http: Arc<Http>,
+}
+
+impl DiscordWatchlistDelivery {
+    pub fn new(http: Arc<Http>) -> Self {
+        Self { http }
+    }
+}
+
+#[async_trait]
+impl watchlist_feed::WatchlistDelivery for DiscordWatchlistDelivery {
+    async fn send(
+        &self,
+        delivery: watchlist_feed::PreparedWatchlistDelivery,
+    ) -> Result<String, watchlist_feed::WatchlistDeliveryError> {
+        let message = ChannelId(delivery.channel_id)
+            .send_message(&self.http, |builder| {
+                if let Some(role_id) = delivery.role_id {
+                    builder.content(format!("<@&{role_id}>"));
+                }
+                builder.allowed_mentions(|mentions| {
+                    let mentions = mentions.empty_parse();
+                    match delivery.role_id {
+                        Some(role_id) => mentions.roles([role_id]),
+                        None => mentions,
+                    }
+                });
+                builder.set_embed(watchlist_embed(&delivery.message));
+                builder
+                    .0
+                    .insert("nonce", Value::String(delivery.nonce.clone()));
+                builder
+                    .0
+                    .insert("enforce_nonce", Value::Bool(delivery.enforce_nonce));
+                builder
+            })
+            .await
+            .map_err(watchlist_delivery_error)?;
+        Ok(message.id.to_string())
+    }
+}
+
+/// Classifies a Serenity send failure as transient or permanent, reusing
+/// the same Discord HTTP status/JSON-code judgment as the sov feed's
+/// `sov_delivery_error`.
+fn watchlist_delivery_error(error: serenity::Error) -> watchlist_feed::WatchlistDeliveryError {
+    let message = error.to_string();
+    if let serenity::Error::Http(http_error) = &error {
+        if let serenity::http::error::Error::UnsuccessfulRequest(response) = &**http_error {
+            let status = response.status_code.as_u16();
+            let code = response.error.code;
+            let detail = format!(
+                "Discord HTTP {status}, JSON code {code}: {}",
+                response.error.message
+            );
+            if status == 429 || status >= 500 || is_temporary_discord_delivery_code(code) {
+                return watchlist_feed::WatchlistDeliveryError::transient(detail);
+            }
+            if matches!(status, 401 | 403 | 404 | 405) || is_permanent_discord_delivery_code(code) {
+                return watchlist_feed::WatchlistDeliveryError::permanent(detail);
+            }
+            return watchlist_feed::WatchlistDeliveryError::transient(detail);
+        }
+    }
+    watchlist_feed::WatchlistDeliveryError::transient(message)
+}
+
+/// Resolves alliance/corporation names and tickers for watchlist embeds,
+/// reusing the killfeed's tickers/names caches with an ESI fallback
+/// (`GET /corporations/{id}/`, `GET /alliances/{id}/`).
+pub struct DiscordWatchlistResolver {
+    app_state: Arc<AppState>,
+}
+
+impl DiscordWatchlistResolver {
+    pub fn new(app_state: Arc<AppState>) -> Self {
+        Self { app_state }
+    }
+}
+
+#[async_trait]
+impl watchlist_feed::WatchlistEntityResolver for DiscordWatchlistResolver {
+    async fn corporation(&self, corporation_id: i64) -> watchlist_feed::WatchlistCorporation {
+        let id = match u64::try_from(corporation_id) {
+            Ok(id) => id,
+            Err(_) => {
+                return watchlist_feed::WatchlistCorporation {
+                    name: None,
+                    ticker: None,
+                }
+            }
+        };
+        watchlist_feed::WatchlistCorporation {
+            name: get_name(&self.app_state, id).await,
+            ticker: get_ticker(&self.app_state, id, false).await,
+        }
+    }
+
+    async fn alliance(&self, alliance_id: i64) -> watchlist_feed::WatchlistAlliance {
+        let id = match u64::try_from(alliance_id) {
+            Ok(id) => id,
+            Err(_) => {
+                return watchlist_feed::WatchlistAlliance {
+                    name: None,
+                    ticker: None,
+                }
+            }
+        };
+        watchlist_feed::WatchlistAlliance {
+            name: get_name(&self.app_state, id).await,
+            ticker: get_ticker(&self.app_state, id, true).await,
+        }
     }
 }
 

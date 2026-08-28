@@ -1,0 +1,18 @@
+GET https://esi.evetech.net/latest/alliances/99004901/corporations/?datasource=tranquility
+X-Compatibility-Date: 2020-01-01
+Captured live 2026-08-28 (alliance 99004901 = Snuffed Out).
+
+Response 200 headers (trimmed):
+  cache-control: public
+  expires: Fri, 28 Aug 2026 18:43:02 GMT        (last-modified + 3600s == 1 hour)
+  last-modified: Fri, 28 Aug 2026 17:43:02 GMT
+  etag: "daebc6fb5da3293f81e643be45a70e77902f2468c8b09c7bd51dc6f3"
+  x-compatibility-date: 2020-01-01
+  x-esi-error-limit-remain: 100
+  x-esi-error-limit-reset: 56
+  (no x-ratelimit-group on this route; legacy error-limit allowance is global per ADR 0004)
+
+Body: bare JSON array of int64 corporation IDs (17 in the live response;
+trimmed to 5 in the sibling .json fixture). A corporation that leaves the
+alliance simply disappears from the next listing (no per-corp "left" flag),
+which is why the collector diffs against its own persisted snapshot.

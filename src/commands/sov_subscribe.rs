@@ -140,6 +140,7 @@ impl SovSubscribeCommand {
         if let Some(alliance_id) = documents.defender_alliance_id {
             extra.push(SovFilterNode::Condition(SovFilterCondition::Defender {
                 alliance_ids: vec![alliance_id],
+                watchlist: false,
             }));
         }
         if let Some(max_jumps) = documents.max_jumps {
@@ -427,7 +428,7 @@ mod tests {
                 ));
                 assert!(matches!(
                     nodes[2],
-                    SovFilterNode::Condition(SovFilterCondition::Defender { ref alliance_ids }) if alliance_ids == &vec![99_000_001]
+                    SovFilterNode::Condition(SovFilterCondition::Defender { ref alliance_ids, .. }) if alliance_ids == &vec![99_000_001]
                 ));
             }
             other => panic!("expected an And node, got {other:?}"),

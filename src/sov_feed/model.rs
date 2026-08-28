@@ -360,6 +360,67 @@ impl SovFilterNode {
         }
     }
 
+    /// Whether this filter tree contains any watchlist-backed `Defender`
+    /// leaf (`Defender { watchlist: true }`, ticket 08). Callers check this
+    /// before paying for a watchlist lookup: a tree this returns `false`
+    /// for never needs [`Self::with_watchlist_resolved`] and evaluates
+    /// identically with or without a watchlist context.
+    pub fn references_watchlist(&self) -> bool {
+        match self {
+            Self::Condition(SovFilterCondition::Defender { watchlist, .. }) => *watchlist,
+            Self::Condition(_) => false,
+            Self::And(nodes) | Self::Or(nodes) => nodes.iter().any(Self::references_watchlist),
+            Self::Not(node) => node.references_watchlist(),
+        }
+    }
+
+    /// Returns a copy of this tree with every watchlist-backed `Defender`
+    /// leaf resolved against `watched_alliance_ids` (the guild's currently
+    /// watched alliance ids), unioning them into that leaf's own
+    /// `alliance_ids` and clearing its `watchlist` flag (ticket 08, spec:
+    /// "resolved against the guild's current watchlist at evaluation
+    /// time"). After resolution every `Defender` leaf matches purely on its
+    /// `alliance_ids`, so [`Self::matches`]/[`Self::matches_structure`]
+    /// need no watchlist parameter and every existing call site is
+    /// unchanged. An unresolved `Defender { watchlist: true }` leaf (a
+    /// caller that never resolves) carries an empty `alliance_ids` and thus
+    /// simply never matches, the correct "no watchlist context" fallback.
+    pub fn with_watchlist_resolved(&self, watched_alliance_ids: &[i64]) -> SovFilterNode {
+        match self {
+            Self::Condition(SovFilterCondition::Defender {
+                alliance_ids,
+                watchlist,
+            }) if *watchlist => {
+                let mut resolved = alliance_ids.clone();
+                for id in watched_alliance_ids {
+                    if !resolved.contains(id) {
+                        resolved.push(*id);
+                    }
+                }
+                Self::Condition(SovFilterCondition::Defender {
+                    alliance_ids: resolved,
+                    watchlist: false,
+                })
+            }
+            Self::Condition(condition) => Self::Condition(condition.clone()),
+            Self::And(nodes) => Self::And(
+                nodes
+                    .iter()
+                    .map(|node| node.with_watchlist_resolved(watched_alliance_ids))
+                    .collect(),
+            ),
+            Self::Or(nodes) => Self::Or(
+                nodes
+                    .iter()
+                    .map(|node| node.with_watchlist_resolved(watched_alliance_ids))
+                    .collect(),
+            ),
+            Self::Not(node) => {
+                Self::Not(Box::new(node.with_watchlist_resolved(watched_alliance_ids)))
+            }
+        }
+    }
+
     /// Evaluates this filter tree against one Sovereignty Hub's facts for
     /// the `tz_window_entered` Alert Stage (ticket 07, spec: "`Reachable`/
     /// `VulnerableWithin` leaves are ignored for this stage; `Defender`
@@ -430,17 +491,30 @@ pub const SOV_VULNERABLE_WITHIN_MAX_HOURS: i64 = 24 * 30;
 /// jumps never means anything a subscriber would configure.
 pub const SOV_REACHABLE_MAX_JUMPS: i64 = 11;
 
-/// Leaves of the sov filter grammar. The watchlist-backed `Defender`
-/// variant (spec "sov feed's defender filter... reference the watchlist")
-/// is deliberately out of scope here.
+/// Leaves of the sov filter grammar. The `Defender` leaf matches on an
+/// explicit `alliance_ids` list and/or the guild's watchlist (spec "sov
+/// feed's defender filter... reference the watchlist"; ticket 08): a
+/// `Defender { watchlist: true }` leaf is resolved against the guild's
+/// currently-watched alliance ids at evaluation time
+/// ([`SovFilterNode::with_watchlist_resolved`]) before matching, so
+/// [`SovFilterCondition::matches`] itself only ever compares against the
+/// resolved `alliance_ids`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SovFilterCondition {
     VulnerableWithin {
         hours: i64,
     },
+    /// `alliance_ids` names explicit defending alliances; `watchlist`, when
+    /// `true`, additionally matches any alliance on the subscription
+    /// guild's watchlist, resolved at evaluation time (ticket 08). Both
+    /// fields default so `{"defender": {"alliance_ids": [...]}}` and
+    /// `{"defender": {"watchlist": true}}` are each valid on their own.
     Defender {
+        #[serde(default)]
         alliance_ids: Vec<i64>,
+        #[serde(default)]
+        watchlist: bool,
     },
     Region(Vec<i64>),
     System(Vec<i64>),
@@ -476,7 +550,22 @@ impl SovFilterCondition {
                     Ok(())
                 }
             }
-            Self::Defender { alliance_ids } => validate_ids(alliance_ids, "defender alliance ID"),
+            Self::Defender {
+                alliance_ids,
+                watchlist,
+            } => {
+                // A watchlist-backed defender leaf may carry an empty
+                // `alliance_ids` (the watchlist is its whole source); a
+                // non-watchlist leaf must name at least one alliance. Any
+                // explicit id present must still be positive either way.
+                if !*watchlist {
+                    return validate_ids(alliance_ids, "defender alliance ID");
+                }
+                if alliance_ids.iter().any(|id| *id <= 0) {
+                    return Err("defender alliance ID values must be positive".to_string());
+                }
+                Ok(())
+            }
             Self::Region(ids) => validate_ids(ids, "region ID"),
             Self::System(ids) => validate_ids(ids, "system ID"),
             Self::EventType(kinds) => {
@@ -530,7 +619,7 @@ impl SovFilterCondition {
                 };
                 campaign.start_time <= deadline
             }
-            Self::Defender { alliance_ids } => campaign
+            Self::Defender { alliance_ids, .. } => campaign
                 .defender_id
                 .is_some_and(|id| alliance_ids.contains(&id)),
             Self::Region(ids) => region_of(campaign.solar_system_id)
@@ -602,7 +691,7 @@ impl SovFilterCondition {
     ) -> bool {
         match self {
             Self::VulnerableWithin { .. } | Self::Reachable { .. } | Self::EventType(_) => true,
-            Self::Defender { alliance_ids } => {
+            Self::Defender { alliance_ids, .. } => {
                 defender_alliance_id.is_some_and(|id| alliance_ids.contains(&id))
             }
             Self::Region(ids) => {
@@ -1153,11 +1242,13 @@ mod tests {
         let campaign = make_campaign(1, "ihub_defense", 30_000_001, Some(99_000_001), observed_at);
         let node = SovFilterNode::Condition(SovFilterCondition::Defender {
             alliance_ids: vec![99_000_001],
+            watchlist: false,
         });
         assert!(node.matches(&campaign, observed_at, &|_| None, &|_, _| None));
 
         let node = SovFilterNode::Condition(SovFilterCondition::Defender {
             alliance_ids: vec![99_999_999],
+            watchlist: false,
         });
         assert!(!node.matches(&campaign, observed_at, &|_| None, &|_, _| None));
 
@@ -1165,8 +1256,69 @@ mod tests {
             make_campaign(1, "station_freeport", 30_000_001, None, observed_at);
         let node = SovFilterNode::Condition(SovFilterCondition::Defender {
             alliance_ids: vec![99_000_001],
+            watchlist: false,
         });
         assert!(!node.matches(&no_defender_campaign, observed_at, &|_| None, &|_, _| None));
+    }
+
+    #[test]
+    fn defender_watchlist_leaf_resolves_against_the_guild_watchlist() {
+        // A `Defender { watchlist: true }` leaf matches nothing until it is
+        // resolved against the guild's watched alliance ids (ticket 08);
+        // once resolved it matches exactly those alliances, and drops the
+        // match again when the watchlist no longer contains the defender.
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+        let campaign = make_campaign(1, "ihub_defense", 30_000_001, Some(99_006_751), observed_at);
+        let node = SovFilterNode::Condition(SovFilterCondition::Defender {
+            alliance_ids: vec![],
+            watchlist: true,
+        });
+        assert!(node.references_watchlist());
+        // Unresolved: never matches.
+        assert!(!node.matches(&campaign, observed_at, &|_| None, &|_, _| None));
+        // Resolved against a watchlist that includes the defender: matches.
+        let resolved = node.with_watchlist_resolved(&[99_006_751]);
+        assert!(!resolved.references_watchlist());
+        assert!(resolved.matches(&campaign, observed_at, &|_| None, &|_, _| None));
+        // Resolved against a watchlist that no longer includes it: no match.
+        let removed = node.with_watchlist_resolved(&[99_999_999]);
+        assert!(!removed.matches(&campaign, observed_at, &|_| None, &|_, _| None));
+    }
+
+    #[test]
+    fn defender_watchlist_leaf_unions_with_explicit_alliance_ids() {
+        let node = SovFilterNode::Condition(SovFilterCondition::Defender {
+            alliance_ids: vec![42],
+            watchlist: true,
+        });
+        let resolved = node.with_watchlist_resolved(&[99_006_751, 42]);
+        match resolved {
+            SovFilterNode::Condition(SovFilterCondition::Defender {
+                alliance_ids,
+                watchlist,
+            }) => {
+                assert!(!watchlist);
+                assert_eq!(alliance_ids, vec![42, 99_006_751]);
+            }
+            other => panic!("expected a resolved Defender leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defender_watchlist_leaf_validates_without_explicit_alliance_ids() {
+        assert!(SovFilterNode::Condition(SovFilterCondition::Defender {
+            alliance_ids: vec![],
+            watchlist: true,
+        })
+        .validate()
+        .is_ok());
+        // A non-watchlist Defender leaf still requires at least one id.
+        assert!(SovFilterNode::Condition(SovFilterCondition::Defender {
+            alliance_ids: vec![],
+            watchlist: false,
+        })
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -1391,6 +1543,7 @@ mod tests {
             }),
             SovFilterNode::Condition(SovFilterCondition::Defender {
                 alliance_ids: vec![99_000_001],
+                watchlist: false,
             }),
         ]);
         assert!(node.matches(&campaign, observed_at, &|_| None, &reachable_jumps));
@@ -1404,6 +1557,7 @@ mod tests {
             }),
             SovFilterNode::Condition(SovFilterCondition::Defender {
                 alliance_ids: vec![99_000_001],
+                watchlist: false,
             }),
         ]);
         assert!(!node.matches(&campaign, observed_at, &|_| None, &reachable_jumps));
@@ -1629,6 +1783,20 @@ mod tests {
             .validate()
             .expect("README Jita-not-freeport example validates");
         assert!(matches!(parsed.root, SovFilterNode::And(ref nodes) if nodes.len() == 2));
+
+        // Ticket 08: the watchlist-backed defender example. A bare
+        // `{"defender": {"watchlist": true}}` parses and validates with an
+        // empty `alliance_ids`, and its tree reports referencing the
+        // watchlist so the collector resolves it against the guild's
+        // watchlist at evaluation time.
+        let watchlist_defender_example =
+            r#"{"root":{"condition":{"defender":{"watchlist":true}}}}"#;
+        let parsed: SovFilter = serde_json::from_str(watchlist_defender_example)
+            .expect("README watchlist-defender example parses");
+        parsed
+            .validate()
+            .expect("README watchlist-defender example validates");
+        assert!(parsed.root.references_watchlist());
     }
 
     // --- SovAlertStage::Reachable / has_reachable_leaf / reachable_leaf_state (ticket 06) ---
@@ -1761,6 +1929,7 @@ mod tests {
         let campaign = make_campaign(1, "ihub_defense", 30_000_001, Some(99_000_001), observed_at);
         let node = SovFilterNode::Condition(SovFilterCondition::Defender {
             alliance_ids: vec![99_000_001],
+            watchlist: false,
         });
         assert_eq!(node.reachable_leaf_state(&campaign, &|_, _| Some(2)), None);
     }
@@ -2036,6 +2205,7 @@ mod tests {
 
         let defender = SovFilterNode::Condition(SovFilterCondition::Defender {
             alliance_ids: vec![99_000_001],
+            watchlist: false,
         });
         assert!(defender.matches_structure(Some(99_000_001), 30_000_001, &|_| None));
         assert!(!defender.matches_structure(Some(99_999_999), 30_000_001, &|_| None));
@@ -2061,6 +2231,7 @@ mod tests {
             SovFilterNode::Condition(SovFilterCondition::System(vec![30_000_099])),
             SovFilterNode::Condition(SovFilterCondition::Defender {
                 alliance_ids: vec![99_000_001],
+                watchlist: false,
             }),
         ]);
         assert!(node.matches_structure(Some(99_000_001), 30_000_001, &|_| None));
