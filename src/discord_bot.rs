@@ -829,6 +829,26 @@ impl sov_feed::SovTickerResolver for DiscordSovTickerResolver {
         let id = u64::try_from(alliance_id).ok()?;
         get_ticker(&self.app_state, id, true).await
     }
+
+    /// Corporation ticker for the sovereignty map's "current owner" field
+    /// (ticket 07), reusing the same cache/ESI path as `alliance_ticker`
+    /// with `is_alliance: false`.
+    async fn corporation_ticker(&self, corporation_id: i64) -> Option<String> {
+        let id = u64::try_from(corporation_id).ok()?;
+        get_ticker(&self.app_state, id, false).await
+    }
+
+    /// Faction name for the sovereignty map's "current owner" field
+    /// (ticket 07, FW/NPC systems). ESI's `/universe/names/` bulk resolver
+    /// (`EsiClient::get_name`) covers faction IDs like any other category;
+    /// unlike alliance/corporation tickers this is not cached in
+    /// `config/tickers.json` -- EVE has only a few dozen factions and the
+    /// map polls hourly, so the extra request per unresolved faction per
+    /// poll is not worth a new cache file for this ticket.
+    async fn faction_name(&self, faction_id: i64) -> Option<String> {
+        let id = u64::try_from(faction_id).ok()?;
+        self.app_state.esi_client.get_name(id).await.ok()
+    }
 }
 
 pub struct CommandMap;

@@ -23,8 +23,8 @@
 use crate::esi_cache::CacheMetadata;
 use crate::sov_feed::chain::ChainSnapshot;
 use crate::sov_feed::model::{
-    PreparedSovDelivery, SovAlertStage, SovCampaign, SovDeliveryError, SovFilter,
-    SovNotificationMessage, SovSubscription,
+    PreparedSovDelivery, SovAlertStage, SovCampaign, SovDeliveryError, SovFilter, SovMapEntry,
+    SovNotificationMessage, SovStructure, SovSubscription,
 };
 use crate::sov_feed::wanderer::{WandererConnection, WandererSystem};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -38,6 +38,18 @@ use tokio::sync::RwLock;
 /// The `esi_cache_metadata` resource key this feed's collector uses for
 /// conditional requests against `/sovereignty/campaigns/`.
 pub const SOV_CAMPAIGNS_RESOURCE_KEY: &str = "sovereignty/campaigns";
+
+/// The `esi_cache_metadata` resource key for `/sovereignty/structures/`
+/// (ticket 07). Sharing the `sovereignty/` prefix with
+/// [`SOV_CAMPAIGNS_RESOURCE_KEY`] keeps this feed visible to the existing
+/// `sov_esi_progress` health check, which matches `resource_key LIKE
+/// 'sovereignty/%'` (`src/contract_intelligence.rs`).
+pub const SOV_STRUCTURES_RESOURCE_KEY: &str = "sovereignty/structures";
+
+/// The `esi_cache_metadata` resource key for `/sovereignty/map/` (ticket
+/// 07). Same `sovereignty/` prefix rationale as
+/// [`SOV_STRUCTURES_RESOURCE_KEY`].
+pub const SOV_MAP_RESOURCE_KEY: &str = "sovereignty/map";
 
 const SOV_NONCE_ENFORCEMENT_WINDOW: ChronoDuration = ChronoDuration::minutes(5);
 const SOV_DELIVERY_LEASE: ChronoDuration = ChronoDuration::minutes(2);
@@ -91,6 +103,26 @@ pub enum SovReachabilityTransition {
     /// caused the flip.
     Observed {
         reachable: bool,
+        transition_sequence: i64,
+        pending_announcement: bool,
+    },
+}
+
+/// The outcome of one [`SovStore::record_tz_window_observation`] call
+/// (ticket 07). Mirrors [`SovReachabilityTransition`] exactly, substituting
+/// "in window" for "reachable" -- see that type's doc comment for the full
+/// rationale, which applies unchanged here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SovTzWindowTransition {
+    /// No prior row existed for this (subscription, structure) pair
+    /// (Sov Baseline: "hubs present in the first successful cycle
+    /// establish state silently").
+    Baseline { in_window: bool },
+    /// A prior row existed; `pending_announcement` is `true` exactly when
+    /// `in_window` is `true` and the `tz_window_entered:<sequence>` alert
+    /// for the current in-window streak has not yet been marked announced.
+    Observed {
+        in_window: bool,
         transition_sequence: i64,
         pending_announcement: bool,
     },
@@ -670,28 +702,318 @@ impl SovStore {
         }))
     }
 
+    // --- Sovereignty Hubs and Sov Baseline (ticket 07) ---
+
+    pub async fn structures_baseline_established(&self) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sov_structures_baseline)")
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    pub async fn establish_structures_baseline(
+        &self,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO sov_structures_baseline (singleton, established_at) VALUES (TRUE, $1) ON CONFLICT (singleton) DO NOTHING",
+        )
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn known_structure_ids(&self) -> Result<HashSet<i64>, sqlx::Error> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT structure_id FROM sov_structures")
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// Upserts one Sovereignty Hub's facts and bumps `last_seen_at`.
+    /// Returns `(inserted, is_baseline)`, mirroring [`Self::upsert_campaign`]
+    /// exactly (`is_baseline` is the row's persisted flag, preserved across
+    /// updates, set only at insert time).
+    pub async fn upsert_structure(
+        &self,
+        structure: &SovStructure,
+        is_baseline_for_new_rows: bool,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(bool, bool), sqlx::Error> {
+        sqlx::query_as(
+            "INSERT INTO sov_structures (structure_id, structure_type_id, alliance_id, solar_system_id, vulnerability_occupancy_level, vulnerable_start_time, vulnerable_end_time, is_baseline, first_seen_at, last_seen_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) ON CONFLICT (structure_id) DO UPDATE SET structure_type_id = EXCLUDED.structure_type_id, alliance_id = EXCLUDED.alliance_id, solar_system_id = EXCLUDED.solar_system_id, vulnerability_occupancy_level = EXCLUDED.vulnerability_occupancy_level, vulnerable_start_time = EXCLUDED.vulnerable_start_time, vulnerable_end_time = EXCLUDED.vulnerable_end_time, last_seen_at = EXCLUDED.last_seen_at RETURNING (xmax = 0) AS inserted, is_baseline",
+        )
+        .bind(structure.structure_id)
+        .bind(structure.structure_type_id)
+        .bind(structure.alliance_id)
+        .bind(structure.solar_system_id)
+        .bind(structure.vulnerability_occupancy_level)
+        .bind(structure.vulnerable_start_time)
+        .bind(structure.vulnerable_end_time)
+        .bind(is_baseline_for_new_rows)
+        .bind(observed_at)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Removes hubs no longer present in a fresh listing (destroyed, or
+    /// sov lost -- there is no "ended" fact worth keeping for a hub, only
+    /// "currently exists"). Cascades into `sov_tz_window_state` via that
+    /// table's `structure_id` foreign key.
+    pub async fn remove_structures(&self, structure_ids: &[i64]) -> Result<(), sqlx::Error> {
+        if structure_ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM sov_structures WHERE structure_id = ANY($1)")
+            .bind(structure_ids)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Every currently known Sovereignty Hub (baseline and non-baseline
+    /// alike), used by the `tz_window_entered` stage-evaluation pass.
+    pub async fn open_structures(&self) -> Result<Vec<SovStructure>, sqlx::Error> {
+        sqlx::query(
+            "SELECT structure_id, structure_type_id, alliance_id, solar_system_id, vulnerability_occupancy_level, vulnerable_start_time, vulnerable_end_time FROM sov_structures",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(sov_structure_from_row)
+        .collect()
+    }
+
+    // --- Sovereignty map (ticket 07) ---
+
+    /// Replaces `sov_map` wholesale with a fresh listing: upserts every
+    /// entry, then deletes any system absent from `entries` -- the feed
+    /// only needs "current owner", never map history (spec "Embed":
+    /// "current owner from the sovereignty map").
+    pub async fn replace_map(
+        &self,
+        entries: &[SovMapEntry],
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for entry in entries {
+            sqlx::query(
+                "INSERT INTO sov_map (solar_system_id, alliance_id, corporation_id, faction_id, updated_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (solar_system_id) DO UPDATE SET alliance_id = EXCLUDED.alliance_id, corporation_id = EXCLUDED.corporation_id, faction_id = EXCLUDED.faction_id, updated_at = EXCLUDED.updated_at",
+            )
+            .bind(entry.solar_system_id)
+            .bind(entry.alliance_id)
+            .bind(entry.corporation_id)
+            .bind(entry.faction_id)
+            .bind(observed_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let current_ids: Vec<i64> = entries.iter().map(|entry| entry.solar_system_id).collect();
+        sqlx::query("DELETE FROM sov_map WHERE solar_system_id <> ALL($1)")
+            .bind(&current_ids)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The current sovereignty owner of one system, or `None` when the
+    /// system carries no sovereignty (never in `sov_map`) or the map has
+    /// not been fetched yet.
+    pub async fn map_owner(
+        &self,
+        solar_system_id: i64,
+    ) -> Result<Option<SovMapEntry>, sqlx::Error> {
+        sqlx::query(
+            "SELECT solar_system_id, alliance_id, corporation_id, faction_id FROM sov_map WHERE solar_system_id = $1",
+        )
+        .bind(solar_system_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(sov_map_entry_from_row)
+        .transpose()
+    }
+
+    // --- Timezone window transition state (ticket 07) ---
+
+    /// Records one subscription's observation of whether one Sovereignty
+    /// Hub's vulnerability window currently overlaps that subscription's
+    /// timezone window by at least [`crate::sov_feed::model::SOV_TZ_WINDOW_MIN_OVERLAP_MINUTES`]
+    /// and reports what kind of transition, if any, this observation is.
+    /// Mirrors [`Self::record_reachability_observation`] exactly --
+    /// substitute "in window" for "reachable" throughout its doc comment.
+    pub async fn record_tz_window_observation(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+        subscription_name: &str,
+        structure_id: i64,
+        in_window_now: bool,
+        observed_at: DateTime<Utc>,
+    ) -> Result<SovTzWindowTransition, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let existing = sqlx::query(
+            "SELECT in_window, transition_sequence, announced FROM sov_tz_window_state WHERE guild_id = $1 AND channel_id = $2 AND subscription_name = $3 AND structure_id = $4 FOR UPDATE",
+        )
+        .bind(guild_id as i64)
+        .bind(channel_id as i64)
+        .bind(subscription_name)
+        .bind(structure_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let transition = match existing {
+            None => {
+                sqlx::query(
+                    "INSERT INTO sov_tz_window_state (guild_id, channel_id, subscription_name, structure_id, in_window, since, transition_sequence, announced, updated_at) VALUES ($1,$2,$3,$4,$5,$6,0,TRUE,now())",
+                )
+                .bind(guild_id as i64)
+                .bind(channel_id as i64)
+                .bind(subscription_name)
+                .bind(structure_id)
+                .bind(in_window_now)
+                .bind(observed_at)
+                .execute(&mut *tx)
+                .await?;
+                SovTzWindowTransition::Baseline {
+                    in_window: in_window_now,
+                }
+            }
+            Some(row) => {
+                let previous_in_window: bool = row.get("in_window");
+                let previous_sequence: i64 = row.get("transition_sequence");
+                let previous_announced: bool = row.get("announced");
+                if previous_in_window == in_window_now {
+                    SovTzWindowTransition::Observed {
+                        in_window: in_window_now,
+                        transition_sequence: previous_sequence,
+                        pending_announcement: in_window_now && !previous_announced,
+                    }
+                } else if in_window_now {
+                    let new_sequence = previous_sequence.saturating_add(1);
+                    sqlx::query(
+                        "UPDATE sov_tz_window_state SET in_window = TRUE, since = $5, transition_sequence = $6, announced = FALSE, updated_at = now() WHERE guild_id = $1 AND channel_id = $2 AND subscription_name = $3 AND structure_id = $4",
+                    )
+                    .bind(guild_id as i64)
+                    .bind(channel_id as i64)
+                    .bind(subscription_name)
+                    .bind(structure_id)
+                    .bind(observed_at)
+                    .bind(new_sequence)
+                    .execute(&mut *tx)
+                    .await?;
+                    SovTzWindowTransition::Observed {
+                        in_window: true,
+                        transition_sequence: new_sequence,
+                        pending_announcement: true,
+                    }
+                } else {
+                    sqlx::query(
+                        "UPDATE sov_tz_window_state SET in_window = FALSE, since = $5, announced = TRUE, updated_at = now() WHERE guild_id = $1 AND channel_id = $2 AND subscription_name = $3 AND structure_id = $4",
+                    )
+                    .bind(guild_id as i64)
+                    .bind(channel_id as i64)
+                    .bind(subscription_name)
+                    .bind(structure_id)
+                    .bind(observed_at)
+                    .execute(&mut *tx)
+                    .await?;
+                    SovTzWindowTransition::Observed {
+                        in_window: false,
+                        transition_sequence: previous_sequence,
+                        pending_announcement: false,
+                    }
+                }
+            }
+        };
+        tx.commit().await?;
+        Ok(transition)
+    }
+
+    /// Marks the current `tz_window_entered:<transition_sequence>`
+    /// announcement as done. Mirrors [`Self::mark_reachability_announced`]
+    /// exactly, including the "keyed by `transition_sequence` too, so a
+    /// call racing behind a newer transition matches zero rows" guard.
+    pub async fn mark_tz_window_announced(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+        subscription_name: &str,
+        structure_id: i64,
+        transition_sequence: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE sov_tz_window_state SET announced = TRUE, updated_at = now() WHERE guild_id = $1 AND channel_id = $2 AND subscription_name = $3 AND structure_id = $4 AND transition_sequence = $5",
+        )
+        .bind(guild_id as i64)
+        .bind(channel_id as i64)
+        .bind(subscription_name)
+        .bind(structure_id)
+        .bind(transition_sequence)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub async fn tz_window_state_for_test(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+        subscription_name: &str,
+        structure_id: i64,
+    ) -> Result<Option<(bool, DateTime<Utc>, i64, bool)>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT in_window, since, transition_sequence, announced FROM sov_tz_window_state WHERE guild_id = $1 AND channel_id = $2 AND subscription_name = $3 AND structure_id = $4",
+        )
+        .bind(guild_id as i64)
+        .bind(channel_id as i64)
+        .bind(subscription_name)
+        .bind(structure_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| {
+            (
+                row.get("in_window"),
+                row.get("since"),
+                row.get("transition_sequence"),
+                row.get("announced"),
+            )
+        }))
+    }
+
     // --- Deliveries ---
 
     /// Inserts a prepared delivery if none exists yet for
-    /// `(subscription, subject_kind='campaign', subject_id, stage)`.
-    /// Idempotent: a duplicate call for the same identity is a no-op, which
-    /// is the dedup authority for "never post the same stage twice" (the
-    /// collector may call this every cycle for a still-eligible campaign;
-    /// only a genuinely fresh row returns `true`).
+    /// `(subscription, subject_kind, subject_id, stage)`. Idempotent: a
+    /// duplicate call for the same identity is a no-op, which is the dedup
+    /// authority for "never post the same stage twice" (the collector may
+    /// call this every cycle for a still-eligible campaign or structure;
+    /// only a genuinely fresh row returns `true`). `subject_kind` is
+    /// `"campaign"` for every campaign-shaped Alert Stage
+    /// (`appeared`/`tminus`/`reachable`) and `"structure"` for
+    /// `tz_window_entered` (ticket 07, spec "Alert stages and dedup": "the
+    /// delivery table already has `subject_kind`; use
+    /// `tz_window_entered:<seq>`").
     pub async fn prepare_delivery(
         &self,
         subscription: &SovSubscription,
-        campaign_id: i64,
+        subject_kind: &str,
+        subject_id: i64,
         stage: SovAlertStage,
         message: &SovNotificationMessage,
     ) -> Result<bool, sqlx::Error> {
         let delivery_id: Option<i64> = sqlx::query_scalar(
-            "INSERT INTO sov_alert_deliveries (guild_id, channel_id, subscription_name, subject_kind, subject_id, stage, message, role_id, status) SELECT $1,$2,$3,'campaign',$4,$5,$6,$7,'prepared' WHERE EXISTS (SELECT 1 FROM sov_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND name = $3) ON CONFLICT (guild_id, channel_id, subscription_name, subject_kind, subject_id, stage) DO NOTHING RETURNING id",
+            "INSERT INTO sov_alert_deliveries (guild_id, channel_id, subscription_name, subject_kind, subject_id, stage, message, role_id, status) SELECT $1,$2,$3,$4,$5,$6,$7,$8,'prepared' WHERE EXISTS (SELECT 1 FROM sov_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND name = $3) ON CONFLICT (guild_id, channel_id, subscription_name, subject_kind, subject_id, stage) DO NOTHING RETURNING id",
         )
         .bind(subscription.guild_id as i64)
         .bind(subscription.channel_id as i64)
         .bind(&subscription.name)
-        .bind(campaign_id)
+        .bind(subject_kind)
+        .bind(subject_id)
         .bind(stage.as_str())
         .bind(serde_json::to_value(message).map_err(json_to_sqlx)?)
         .bind(subscription.role_id.map(|id| id as i64))
@@ -850,6 +1172,41 @@ impl SovStore {
         .fetch_one(&self.pool)
         .await
     }
+
+    /// `subject_kind = 'structure'` counterpart of
+    /// [`Self::delivery_status_by_subject`], used by `tz_window_entered`
+    /// tests (ticket 07).
+    #[doc(hidden)]
+    pub async fn structure_delivery_status(
+        &self,
+        subject_id: i64,
+        stage: SovAlertStage,
+    ) -> Result<String, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT status FROM sov_alert_deliveries WHERE subject_kind = 'structure' AND subject_id = $1 AND stage = $2",
+        )
+        .bind(subject_id)
+        .bind(stage.as_str())
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// `subject_kind = 'structure'` counterpart of
+    /// [`Self::count_deliveries_for`].
+    #[doc(hidden)]
+    pub async fn count_structure_deliveries_for(
+        &self,
+        subject_id: i64,
+        stage: SovAlertStage,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM sov_alert_deliveries WHERE subject_kind = 'structure' AND subject_id = $1 AND stage = $2",
+        )
+        .bind(subject_id)
+        .bind(stage.as_str())
+        .fetch_one(&self.pool)
+        .await
+    }
 }
 
 fn chain_snapshot_from_row(row: PgRow) -> Result<ChainSnapshot, sqlx::Error> {
@@ -873,6 +1230,27 @@ fn sov_campaign_from_row(row: PgRow) -> Result<SovCampaign, sqlx::Error> {
         defender_score: row.get("defender_score"),
         attackers_score: row.get("attackers_score"),
         start_time: row.get("start_time"),
+    })
+}
+
+fn sov_structure_from_row(row: PgRow) -> Result<SovStructure, sqlx::Error> {
+    Ok(SovStructure {
+        structure_id: row.get("structure_id"),
+        structure_type_id: row.get("structure_type_id"),
+        alliance_id: row.get("alliance_id"),
+        solar_system_id: row.get("solar_system_id"),
+        vulnerability_occupancy_level: row.get("vulnerability_occupancy_level"),
+        vulnerable_start_time: row.get("vulnerable_start_time"),
+        vulnerable_end_time: row.get("vulnerable_end_time"),
+    })
+}
+
+fn sov_map_entry_from_row(row: PgRow) -> Result<SovMapEntry, sqlx::Error> {
+    Ok(SovMapEntry {
+        solar_system_id: row.get("solar_system_id"),
+        alliance_id: row.get("alliance_id"),
+        corporation_id: row.get("corporation_id"),
+        faction_id: row.get("faction_id"),
     })
 }
 

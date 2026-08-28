@@ -1,0 +1,56 @@
+[
+  {
+    "alliance_id": 99003581,
+    "solar_system_id": 30000208,
+    "structure_id": 1034510825648,
+    "structure_type_id": 32458,
+    "vulnerability_occupancy_level": 6.0,
+    "vulnerable_end_time": "2026-08-28T12:30:00Z",
+    "vulnerable_start_time": "2026-08-28T09:30:00Z"
+  },
+  {
+    "alliance_id": 99003581,
+    "solar_system_id": 30000209,
+    "structure_id": 1034500429496,
+    "structure_type_id": 32458,
+    "vulnerability_occupancy_level": 4.5,
+    "vulnerable_end_time": "2026-08-28T13:00:00Z",
+    "vulnerable_start_time": "2026-08-28T09:00:00Z"
+  },
+  {
+    "alliance_id": 99003581,
+    "solar_system_id": 30000210,
+    "structure_id": 1034504930543,
+    "structure_type_id": 32458,
+    "vulnerability_occupancy_level": 6.0,
+    "vulnerable_end_time": "2026-08-28T12:30:00Z",
+    "vulnerable_start_time": "2026-08-28T09:30:00Z"
+  },
+  {
+    "alliance_id": 99003581,
+    "solar_system_id": 30000211,
+    "structure_id": 1034526656293,
+    "structure_type_id": 32458,
+    "vulnerability_occupancy_level": 6.0,
+    "vulnerable_end_time": "2026-08-28T12:30:00Z",
+    "vulnerable_start_time": "2026-08-28T09:30:00Z"
+  },
+  {
+    "alliance_id": 99003581,
+    "solar_system_id": 30000212,
+    "structure_id": 1031813951271,
+    "structure_type_id": 32458,
+    "vulnerability_occupancy_level": 6.0,
+    "vulnerable_end_time": "2026-08-28T12:30:00Z",
+    "vulnerable_start_time": "2026-08-28T09:30:00Z"
+  },
+  {
+    "alliance_id": 99003581,
+    "solar_system_id": 30000213,
+    "structure_id": 1034510906698,
+    "structure_type_id": 32458,
+    "vulnerability_occupancy_level": 6.0,
+    "vulnerable_end_time": "2026-08-28T12:30:00Z",
+    "vulnerable_start_time": "2026-08-28T09:30:00Z"
+  }
+]

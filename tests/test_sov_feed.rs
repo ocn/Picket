@@ -20,11 +20,12 @@ use killbot_rust::esi_cache::{CacheMetadata, EsiError, EsiResponse};
 use killbot_rust::sov_feed::{
     DynamicChainSovReachability, PathRisk, PreparedSovDelivery, SovAlertStage, SovCampaign,
     SovChainCollector, SovChainStatus, SovClock, SovCollector, SovDelivery, SovDeliveryError,
-    SovFilter, SovFilterCondition, SovFilterNode, SovReachabilityInfo, SovReachabilitySource,
-    SovStore, SovSubscription, SovSystemDirectory, SovSystemInfo, SovTickerResolver,
-    SovereigntyEsi, StargateGraph, StargateGraphFile, StaticSovReachability, WandererChainSource,
-    WandererConnection, WandererConnectionType, WandererError, WandererMassStatus,
-    WandererShipSizeType, WandererSystem, WandererTimeStatus,
+    SovFilter, SovFilterCondition, SovFilterNode, SovMapEntry, SovReachabilityInfo,
+    SovReachabilitySource, SovStore, SovStructure, SovSubscription, SovSystemDirectory,
+    SovSystemInfo, SovTickerResolver, SovereigntyEsi, StargateGraph, StargateGraphFile,
+    StaticSovReachability, WandererChainSource, WandererConnection, WandererConnectionType,
+    WandererError, WandererMassStatus, WandererShipSizeType, WandererSystem, WandererTimeStatus,
+    SOV_HUB_STRUCTURE_TYPE_IDS,
 };
 use killbot_rust::spawn_sov_collection_loop;
 use sqlx::Row;
@@ -39,6 +40,16 @@ use common::TemporaryDatabase;
 struct FakeSovereigntyEsi {
     responses: Vec<Result<EsiResponse<Vec<SovCampaign>>, EsiError>>,
     cursor: Mutex<usize>,
+    /// Scripted `fetch_structures`/`fetch_map` responses (ticket 07).
+    /// Empty by default: the 45 pre-ticket-07 call sites never invoke
+    /// either method (`collect_structures_cycle`/`collect_map_cycle` are
+    /// only exercised by this ticket's own tests), so the "no scripted
+    /// responses" assertion mirrors `fetch_campaigns`'s without requiring
+    /// every existing `FakeSovereigntyEsi::new(...)` call site to change.
+    structures_responses: Mutex<Vec<Result<EsiResponse<Vec<SovStructure>>, EsiError>>>,
+    structures_cursor: Mutex<usize>,
+    map_responses: Mutex<Vec<Result<EsiResponse<Vec<SovMapEntry>>, EsiError>>>,
+    map_cursor: Mutex<usize>,
 }
 
 impl FakeSovereigntyEsi {
@@ -46,7 +57,24 @@ impl FakeSovereigntyEsi {
         Self {
             responses,
             cursor: Mutex::new(0),
+            structures_responses: Mutex::new(Vec::new()),
+            structures_cursor: Mutex::new(0),
+            map_responses: Mutex::new(Vec::new()),
+            map_cursor: Mutex::new(0),
         }
+    }
+
+    fn with_structures(
+        self,
+        responses: Vec<Result<EsiResponse<Vec<SovStructure>>, EsiError>>,
+    ) -> Self {
+        *self.structures_responses.lock().unwrap() = responses;
+        self
+    }
+
+    fn with_map(self, responses: Vec<Result<EsiResponse<Vec<SovMapEntry>>, EsiError>>) -> Self {
+        *self.map_responses.lock().unwrap() = responses;
+        self
     }
 }
 
@@ -68,6 +96,36 @@ impl SovereigntyEsi for FakeSovereigntyEsi {
         let index = (*cursor).min(self.responses.len() - 1);
         *cursor += 1;
         self.responses[index].clone()
+    }
+
+    async fn fetch_structures(
+        &self,
+        _etag: Option<String>,
+    ) -> Result<EsiResponse<Vec<SovStructure>>, EsiError> {
+        let responses = self.structures_responses.lock().unwrap();
+        assert!(
+            !responses.is_empty(),
+            "fake sovereignty ESI was called for structures but has no scripted responses"
+        );
+        let mut cursor = self.structures_cursor.lock().unwrap();
+        let index = (*cursor).min(responses.len() - 1);
+        *cursor += 1;
+        responses[index].clone()
+    }
+
+    async fn fetch_map(
+        &self,
+        _etag: Option<String>,
+    ) -> Result<EsiResponse<Vec<SovMapEntry>>, EsiError> {
+        let responses = self.map_responses.lock().unwrap();
+        assert!(
+            !responses.is_empty(),
+            "fake sovereignty ESI was called for the map but has no scripted responses"
+        );
+        let mut cursor = self.map_cursor.lock().unwrap();
+        let index = (*cursor).min(responses.len() - 1);
+        *cursor += 1;
+        responses[index].clone()
     }
 }
 
@@ -408,6 +466,60 @@ async fn subscribe_with_options(
         .upsert_subscription(&subscription)
         .await
         .expect("persist sov subscription");
+}
+
+/// A Sovereignty Hub fixture (ticket 07): `structure_type_id` defaults to
+/// the real observed hub type ([`SOV_HUB_STRUCTURE_TYPE_IDS`]) unless
+/// overridden by [`non_hub_structure`].
+fn hub(
+    structure_id: i64,
+    solar_system_id: i64,
+    alliance_id: Option<i64>,
+    vulnerable_start_time: Option<DateTime<Utc>>,
+    vulnerable_end_time: Option<DateTime<Utc>>,
+) -> SovStructure {
+    SovStructure {
+        structure_id,
+        structure_type_id: SOV_HUB_STRUCTURE_TYPE_IDS[0],
+        alliance_id,
+        solar_system_id,
+        vulnerability_occupancy_level: Some(6.0),
+        vulnerable_start_time,
+        vulnerable_end_time,
+    }
+}
+
+/// A structure with a `structure_type_id` this feed does not treat as a
+/// Sovereignty Hub (ticket 07: "a non-hub structure type is ignored").
+fn non_hub_structure(structure_id: i64, solar_system_id: i64) -> SovStructure {
+    SovStructure {
+        structure_id,
+        structure_type_id: 99_999, // not in SOV_HUB_STRUCTURE_TYPE_IDS
+        alliance_id: Some(99_000_001),
+        solar_system_id,
+        vulnerability_occupancy_level: Some(6.0),
+        vulnerable_start_time: None,
+        vulnerable_end_time: None,
+    }
+}
+
+/// Like [`subscribe_with_options`] but sets `tz_window`/`tz_shift_enabled`
+/// directly (ticket 07).
+async fn subscribe_with_tz(
+    store: &SovStore,
+    name: &str,
+    filter: SovFilter,
+    tz_window: &str,
+    tz_shift_enabled: bool,
+) {
+    subscribe_with_options(
+        store,
+        name,
+        filter,
+        None,
+        serde_json::json!({"tz_window": tz_window, "tz_shift_enabled": tz_shift_enabled}),
+    )
+    .await
 }
 
 async fn provisioned_stores(
@@ -4073,6 +4185,1036 @@ async fn unreachable_then_reachable_again_after_announcement_fires_a_new_sequenc
     assert_eq!(report.reachable_prepared, 1);
     assert_eq!(delivery.sent_count(), 2);
     assert_eq!(delivery.sent()[1].stage, "reachable:2");
+
+    database.destroy().await;
+}
+
+// --- Vulnerability Window shift into the guild timezone (ticket 07) ---
+
+/// A trimmed six-entry slice of a live `GET /sovereignty/structures/`
+/// response, captured against `esi.evetech.net` on 2026-08-27. Observed
+/// response headers on the full (2708-entry) listing this was trimmed
+/// from: `cache-control: public, max-age=300, must-revalidate,
+/// stale-if-error=900`, `x-compatibility-date: 2020-01-01`,
+/// `x-ratelimit-group: sovereignty`, `x-ratelimit-limit: 600/15m` (see
+/// `src/sov_feed/esi.rs`'s `SovereigntyEsi` trait doc comment for the full
+/// five-axis note).
+#[tokio::test]
+async fn fixture_shaped_structures_deserialize_and_flow_through_a_baseline_cycle() {
+    let fixture = std::fs::read_to_string("resources/sov_structures_fixture.json")
+        .expect("read live-shape sov structures fixture");
+    let structures: Vec<SovStructure> =
+        serde_json::from_str(&fixture).expect("fixture matches the ESI wire shape");
+    assert!(!structures.is_empty());
+    assert!(structures
+        .iter()
+        .all(|structure| SOV_HUB_STRUCTURE_TYPE_IDS.contains(&structure.structure_type_id)));
+
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let esi = FakeSovereigntyEsi::new(vec![]).with_structures(vec![Ok(EsiResponse::fresh(
+        structures.clone(),
+        fresh_metadata(observed_at, "s-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store, limiter, esi, delivery, clock);
+
+    let report = collector
+        .collect_structures_cycle()
+        .await
+        .expect("baseline cycle over live-shape structures fixture");
+    assert!(report.baseline_established_this_cycle);
+    assert_eq!(report.hubs_observed, structures.len());
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn collect_structures_cycle_persists_hubs_and_baseline_establishes_silently() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let baseline_hub = hub(
+        1_000_000_000_001,
+        30_005_174,
+        Some(99_000_001),
+        Some(observed_at + ChronoDuration::hours(6)),
+        Some(observed_at + ChronoDuration::hours(9)),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![]).with_structures(vec![Ok(EsiResponse::fresh(
+        vec![baseline_hub.clone()],
+        fresh_metadata(observed_at, "s-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery, clock);
+
+    let report = collector
+        .collect_structures_cycle()
+        .await
+        .expect("baseline structures cycle");
+    assert!(report.baseline_established_this_cycle);
+    assert_eq!(report.hubs_observed, 1);
+
+    let open = store
+        .open_structures()
+        .await
+        .expect("read persisted structures");
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].structure_id, baseline_hub.structure_id);
+    assert_eq!(open[0].alliance_id, Some(99_000_001));
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn collect_structures_cycle_ignores_a_non_hub_structure_type() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let esi = FakeSovereigntyEsi::new(vec![]).with_structures(vec![Ok(EsiResponse::fresh(
+        vec![non_hub_structure(1_000_000_000_002, 30_005_174)],
+        fresh_metadata(observed_at, "s-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery, clock);
+
+    let report = collector
+        .collect_structures_cycle()
+        .await
+        .expect("structures cycle with a non-hub structure");
+    assert_eq!(
+        report.hubs_observed, 0,
+        "a non-hub structure_type_id is never persisted"
+    );
+    assert!(store
+        .open_structures()
+        .await
+        .expect("read persisted structures")
+        .is_empty());
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn tz_window_baseline_establishes_state_silently_regardless_of_overlap() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe_with_tz(
+        &store,
+        "prime-time",
+        all_campaigns_filter(),
+        "00:00-04:00",
+        true,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let structure_id = 1_000_000_000_101;
+    // Already inside the window at first observation: baseline never
+    // fires regardless of the observed value (spec: "Hubs present in the
+    // first successful cycle establish state silently").
+    let in_window_hub = hub(
+        structure_id,
+        30_005_174,
+        Some(99_000_001),
+        Some(observed_at + ChronoDuration::hours(1)),
+        Some(observed_at + ChronoDuration::hours(4)),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![]).with_structures(vec![Ok(EsiResponse::fresh(
+        vec![in_window_hub],
+        fresh_metadata(observed_at, "s-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock);
+
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("structures cycle");
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline tz window observation");
+    assert_eq!(report.tz_window_prepared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+
+    let state = store
+        .tz_window_state_for_test(1, 2, "prime-time", structure_id)
+        .await
+        .expect("lookup tz window state")
+        .expect("baseline row was persisted");
+    assert!(state.0, "baseline row stores the observed in_window value");
+    assert_eq!(state.2, 0, "no transition has been observed yet");
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn tz_window_transition_fires_once_and_unchanged_state_does_not_refire() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe_with_tz(
+        &store,
+        "prime-time",
+        all_campaigns_filter(),
+        "00:00-04:00",
+        true,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let structure_id = 1_000_000_000_102;
+    // Baseline: outside the window (06:00-09:00 never touches 00:00-04:00).
+    let outside_window = hub(
+        structure_id,
+        30_005_174,
+        Some(99_000_001),
+        Some(observed_at + ChronoDuration::hours(6)),
+        Some(observed_at + ChronoDuration::hours(9)),
+    );
+    // Shifted fully inside the window: >=60 minutes overlap.
+    let inside_window = hub(
+        structure_id,
+        30_005_174,
+        Some(99_000_001),
+        Some(observed_at + ChronoDuration::hours(1)),
+        Some(observed_at + ChronoDuration::hours(4)),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![]).with_structures(vec![
+        Ok(EsiResponse::fresh(
+            vec![outside_window],
+            fresh_metadata(observed_at, "s-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![inside_window.clone()],
+            fresh_metadata(observed_at, "s-2"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![inside_window],
+            fresh_metadata(observed_at, "s-3"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock);
+
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("baseline structures cycle");
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline tz window observation (outside window)");
+    assert_eq!(delivery.sent_count(), 0);
+
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("structures cycle with the window shifted in");
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("transition into the window fires once");
+    assert_eq!(report.tz_window_prepared, 1);
+    assert_eq!(delivery.sent_count(), 1);
+    assert_eq!(delivery.sent()[0].stage, "tz_window_entered:1");
+    assert_eq!(
+        delivery.sent()[0].message.footer,
+        "vuln window entered 00:00\u{2013}04:00"
+    );
+
+    // A later pass observing the same in-window state must not re-fire.
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("structures cycle with the window unchanged");
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("unchanged in-window state does not re-fire");
+    assert_eq!(report.tz_window_prepared, 0);
+    assert_eq!(delivery.sent_count(), 1);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn tz_window_leaving_and_reentering_fires_again_with_a_new_key() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe_with_tz(
+        &store,
+        "prime-time",
+        all_campaigns_filter(),
+        "00:00-04:00",
+        true,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let structure_id = 1_000_000_000_103;
+    let outside_window = hub(
+        structure_id,
+        30_005_174,
+        Some(99_000_001),
+        Some(observed_at + ChronoDuration::hours(6)),
+        Some(observed_at + ChronoDuration::hours(9)),
+    );
+    let inside_window = hub(
+        structure_id,
+        30_005_174,
+        Some(99_000_001),
+        Some(observed_at + ChronoDuration::hours(1)),
+        Some(observed_at + ChronoDuration::hours(4)),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![]).with_structures(vec![
+        Ok(EsiResponse::fresh(
+            vec![outside_window.clone()],
+            fresh_metadata(observed_at, "s-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![inside_window.clone()],
+            fresh_metadata(observed_at, "s-2"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![outside_window],
+            fresh_metadata(observed_at, "s-3"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![inside_window],
+            fresh_metadata(observed_at, "s-4"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock);
+
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("baseline structures cycle");
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline tz window observation");
+
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("shift into the window");
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("first transition fires");
+    assert_eq!(report.tz_window_prepared, 1);
+
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("shift out of the window");
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("leaving the window never fires");
+
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("shift back into the window");
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("re-entering the window fires again");
+    assert_eq!(report.tz_window_prepared, 1);
+
+    assert_eq!(delivery.sent_count(), 2);
+    let sent = delivery.sent();
+    assert_eq!(sent[0].stage, "tz_window_entered:1");
+    assert_eq!(sent[1].stage, "tz_window_entered:2");
+    assert_ne!(sent[0].stage, sent[1].stage);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn tz_window_never_fires_when_tz_shift_enabled_is_false() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    // tz_shift_enabled defaults to false when omitted.
+    subscribe(&store, "prime-time-disabled", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let structure_id = 1_000_000_000_104;
+    let outside_window = hub(
+        structure_id,
+        30_005_174,
+        Some(99_000_001),
+        Some(observed_at + ChronoDuration::hours(6)),
+        Some(observed_at + ChronoDuration::hours(9)),
+    );
+    let inside_window = hub(
+        structure_id,
+        30_005_174,
+        Some(99_000_001),
+        Some(observed_at + ChronoDuration::hours(1)),
+        Some(observed_at + ChronoDuration::hours(4)),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![]).with_structures(vec![
+        Ok(EsiResponse::fresh(
+            vec![outside_window],
+            fresh_metadata(observed_at, "s-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![inside_window],
+            fresh_metadata(observed_at, "s-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock);
+
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("baseline structures cycle");
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline observation");
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("shift into the window");
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("evaluation with tz_shift_enabled false");
+    assert_eq!(report.tz_window_prepared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+    assert!(
+        store
+            .tz_window_state_for_test(1, 2, "prime-time-disabled", structure_id)
+            .await
+            .expect("lookup tz window state")
+            .is_none(),
+        "a subscription without tz_shift_enabled never gets a state row at all"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn evaluate_stage_cycle_skips_the_structures_pass_when_no_subscription_enables_tz_shift() {
+    // Fix round finding 3: even with hubs persisted, if no subscription
+    // opts into `tz_shift_enabled` the tz-window pass records no
+    // observations at all (and, behind that assertion, skips the
+    // `open_structures()` read entirely). A hub sitting inside the window
+    // must therefore leave no `sov_tz_window_state` row.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    // A subscription that never sets tz_shift_enabled (defaults false).
+    subscribe(&store, "no-tz-here", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let structure_id = 1_000_000_000_120;
+    let inside_window = hub(
+        structure_id,
+        30_005_174,
+        Some(99_000_001),
+        Some(observed_at + ChronoDuration::hours(1)),
+        Some(observed_at + ChronoDuration::hours(4)),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![]).with_structures(vec![Ok(EsiResponse::fresh(
+        vec![inside_window],
+        fresh_metadata(observed_at, "s-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock);
+
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("baseline structures cycle persists the hub");
+    // The hub is genuinely persisted, so the only reason no observation is
+    // recorded is the tz-shift gate, not an empty structures table.
+    assert_eq!(
+        store
+            .open_structures()
+            .await
+            .expect("read persisted structures")
+            .len(),
+        1
+    );
+
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("stage cycle with no tz-enabled subscription");
+    assert_eq!(report.tz_window_prepared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+    assert!(
+        store
+            .tz_window_state_for_test(1, 2, "no-tz-here", structure_id)
+            .await
+            .expect("lookup tz window state")
+            .is_none(),
+        "no tz-enabled subscription means no observation is recorded"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn collect_structures_cycle_treats_an_empty_listing_as_a_no_op() {
+    // Fix round finding 4: an empty successful (200) structures body must
+    // not remove every hub (which would cascade sov_tz_window_state). It is
+    // a no-op with a warn, leaving persisted hubs and tz state intact.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe_with_tz(
+        &store,
+        "prime-time",
+        all_campaigns_filter(),
+        "00:00-04:00",
+        true,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let structure_id = 1_000_000_000_121;
+    let persisted_hub = hub(
+        structure_id,
+        30_005_174,
+        Some(99_000_001),
+        Some(observed_at + ChronoDuration::hours(1)),
+        Some(observed_at + ChronoDuration::hours(4)),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![]).with_structures(vec![
+        Ok(EsiResponse::fresh(
+            vec![persisted_hub],
+            fresh_metadata(observed_at, "s-1"),
+        )),
+        // A later successful poll returns an empty listing.
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "s-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery, clock);
+
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("baseline structures cycle persists the hub");
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline tz observation writes a state row");
+    let state_before = store
+        .tz_window_state_for_test(1, 2, "prime-time", structure_id)
+        .await
+        .expect("lookup tz window state")
+        .expect("baseline row was persisted");
+
+    let report = collector
+        .collect_structures_cycle()
+        .await
+        .expect("structures cycle over an empty listing");
+    assert!(report.empty_listing, "an empty 200 body is flagged");
+    assert_eq!(report.removed, 0, "no hub is removed on an empty listing");
+
+    // The hub survives.
+    let open = store
+        .open_structures()
+        .await
+        .expect("read persisted structures");
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].structure_id, structure_id);
+    // The tz state row survives unchanged.
+    let state_after = store
+        .tz_window_state_for_test(1, 2, "prime-time", structure_id)
+        .await
+        .expect("lookup tz window state")
+        .expect("tz state row still present after an empty listing");
+    assert_eq!(state_after, state_before);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn tz_window_is_gated_by_defender_and_region_leaves() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    // Only alerts for hubs owned by this alliance.
+    subscribe_with_tz(
+        &store,
+        "watch-snuffed",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Defender {
+                alliance_ids: vec![99_000_001],
+            }),
+        },
+        "00:00-04:00",
+        true,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let structure_id = 1_000_000_000_105;
+    let outside_window = hub(
+        structure_id,
+        30_005_174,
+        Some(99_999_999), // wrong owner
+        Some(observed_at + ChronoDuration::hours(6)),
+        Some(observed_at + ChronoDuration::hours(9)),
+    );
+    let inside_window_wrong_owner = hub(
+        structure_id,
+        30_005_174,
+        Some(99_999_999),
+        Some(observed_at + ChronoDuration::hours(1)),
+        Some(observed_at + ChronoDuration::hours(4)),
+    );
+    let inside_window_right_owner = hub(
+        structure_id,
+        30_005_174,
+        Some(99_000_001),
+        Some(observed_at + ChronoDuration::hours(1)),
+        Some(observed_at + ChronoDuration::hours(4)),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![]).with_structures(vec![
+        Ok(EsiResponse::fresh(
+            vec![outside_window],
+            fresh_metadata(observed_at, "s-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![inside_window_wrong_owner],
+            fresh_metadata(observed_at, "s-2"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![inside_window_right_owner],
+            fresh_metadata(observed_at, "s-3"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock);
+
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("baseline structures cycle");
+    collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline observation");
+
+    // In-window, but the wrong owner: the leaf's own state transitions,
+    // but Defender never matches, so the alert never fires -- and the
+    // announcement stays pending rather than lost.
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("shift into the window, wrong owner");
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("in-window but wrong defender never fires");
+    assert_eq!(report.tz_window_prepared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+
+    // Same in-window state, now the right owner: the pending announcement
+    // fires without needing a fresh transition.
+    collector
+        .collect_structures_cycle()
+        .await
+        .expect("same window, correct owner");
+    let report = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("pending announcement fires once the defender matches");
+    assert_eq!(report.tz_window_prepared, 1);
+    assert_eq!(delivery.sent_count(), 1);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn restart_between_prepare_and_send_does_not_double_post_a_tz_window_alert() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe_with_tz(
+        &store,
+        "prime-time",
+        all_campaigns_filter(),
+        "00:00-04:00",
+        true,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let structure_id = 1_000_000_000_106;
+    let outside_window = hub(
+        structure_id,
+        30_005_174,
+        Some(99_000_001),
+        Some(observed_at + ChronoDuration::hours(6)),
+        Some(observed_at + ChronoDuration::hours(9)),
+    );
+    let inside_window = hub(
+        structure_id,
+        30_005_174,
+        Some(99_000_001),
+        Some(observed_at + ChronoDuration::hours(1)),
+        Some(observed_at + ChronoDuration::hours(4)),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![]).with_structures(vec![
+        Ok(EsiResponse::fresh(
+            vec![outside_window],
+            fresh_metadata(observed_at, "s-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![inside_window],
+            fresh_metadata(observed_at, "s-2"),
+        )),
+    ]);
+    let failing_delivery = Arc::new(FakeSovDelivery::new(true));
+    let clock = VirtualSovClock::new(observed_at);
+    let first_collector = collector(
+        store.clone(),
+        limiter.clone(),
+        esi,
+        failing_delivery.clone(),
+        clock.clone(),
+    );
+
+    first_collector
+        .collect_structures_cycle()
+        .await
+        .expect("baseline structures cycle");
+    first_collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("baseline tz window observation");
+
+    first_collector
+        .collect_structures_cycle()
+        .await
+        .expect("shift into the window");
+    let report = first_collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("transition is prepared and its send fails transiently");
+    assert_eq!(report.tz_window_prepared, 1);
+    assert_eq!(
+        store
+            .structure_delivery_status(structure_id, SovAlertStage::TzWindowEntered(1))
+            .await
+            .expect("read delivery status"),
+        "prepared"
+    );
+
+    let still_leased_esi = FakeSovereigntyEsi::new(vec![]);
+    let succeeding_delivery = Arc::new(FakeSovDelivery::new(false));
+    let second_collector = collector(
+        store.clone(),
+        limiter,
+        still_leased_esi,
+        succeeding_delivery.clone(),
+        clock.clone(),
+    );
+    second_collector
+        .deliver_claimable_for_test(clock.now())
+        .await
+        .expect("unexpired lease is left alone");
+    assert_eq!(succeeding_delivery.attempt_count(), 0);
+
+    clock.advance(ChronoDuration::minutes(3));
+    second_collector
+        .deliver_claimable_for_test(clock.now())
+        .await
+        .expect("expired lease is reclaimed");
+    assert_eq!(succeeding_delivery.sent_count(), 1);
+    assert_eq!(
+        store
+            .structure_delivery_status(structure_id, SovAlertStage::TzWindowEntered(1))
+            .await
+            .expect("read delivery status"),
+        "sent"
+    );
+    assert_eq!(
+        store
+            .count_structure_deliveries_for(structure_id, SovAlertStage::TzWindowEntered(1))
+            .await
+            .expect("no duplicate delivery row exists"),
+        1
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn sov_map_owner_field_is_omitted_from_an_appeared_embed_when_the_map_has_not_loaded_the_system(
+) {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let baseline_campaign = campaign(
+        1,
+        30_004_737,
+        99_012_982,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let new_campaign = campaign(
+        2,
+        30_005_174,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![baseline_campaign.clone()],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![baseline_campaign, new_campaign],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store, limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    clock.advance(ChronoDuration::seconds(10));
+    collector
+        .collect_cycle()
+        .await
+        .expect("appeared cycle without a loaded sovereignty map");
+    assert_eq!(delivery.sent_count(), 1);
+    assert!(
+        delivery.sent()[0]
+            .message
+            .fields
+            .iter()
+            .all(|field| field.name != "System Owner"),
+        "the owner field is omitted, not shown as a placeholder, when the map has no row yet"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn sov_map_owner_field_appears_in_an_appeared_embed_once_the_map_is_loaded() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let baseline_campaign = campaign(
+        1,
+        30_004_737,
+        99_012_982,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let new_campaign = campaign(
+        2,
+        30_005_174,
+        99_006_751,
+        observed_at + ChronoDuration::hours(6),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![baseline_campaign.clone()],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![baseline_campaign, new_campaign],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ])
+    .with_map(vec![Ok(EsiResponse::fresh(
+        vec![SovMapEntry {
+            solar_system_id: 30_005_174,
+            alliance_id: Some(99_003_581),
+            corporation_id: Some(98_599_770),
+            faction_id: None,
+        }],
+        fresh_metadata(observed_at, "m-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store, limiter, esi, delivery.clone(), clock.clone());
+
+    collector
+        .collect_map_cycle()
+        .await
+        .expect("map cycle loads the system's owner");
+    collector.collect_cycle().await.expect("baseline cycle");
+    clock.advance(ChronoDuration::seconds(10));
+    collector
+        .collect_cycle()
+        .await
+        .expect("appeared cycle with a loaded sovereignty map");
+    assert_eq!(delivery.sent_count(), 1);
+    let sent = delivery.sent();
+    let owner_field = sent[0]
+        .message
+        .fields
+        .iter()
+        .find(|field| field.name == "System Owner")
+        .expect("owner field present once the map is loaded");
+    // Alliance takes priority over corporation (FakeSovTickerResolver
+    // resolves every alliance ID to "TEST").
+    assert_eq!(owner_field.value, "TEST");
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn collect_map_cycle_replaces_the_map_wholesale_each_successful_poll() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let esi = FakeSovereigntyEsi::new(vec![]).with_map(vec![
+        Ok(EsiResponse::fresh(
+            vec![
+                SovMapEntry {
+                    solar_system_id: 30_005_174,
+                    alliance_id: Some(99_003_581),
+                    corporation_id: None,
+                    faction_id: None,
+                },
+                SovMapEntry {
+                    solar_system_id: 30_004_737,
+                    alliance_id: None,
+                    corporation_id: None,
+                    faction_id: Some(500_001),
+                },
+            ],
+            fresh_metadata(observed_at, "m-1"),
+        )),
+        // Second poll: Turnur lost sov entirely (absent from the fresh
+        // listing); Jita's faction changed.
+        Ok(EsiResponse::fresh(
+            vec![SovMapEntry {
+                solar_system_id: 30_004_737,
+                alliance_id: None,
+                corporation_id: None,
+                faction_id: Some(500_002),
+            }],
+            fresh_metadata(observed_at, "m-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery, clock);
+
+    let report = collector
+        .collect_map_cycle()
+        .await
+        .expect("first map cycle");
+    assert_eq!(report.entries_observed, 2);
+    assert_eq!(
+        store
+            .map_owner(30_005_174)
+            .await
+            .expect("read map owner")
+            .expect("Turnur has an owner")
+            .alliance_id,
+        Some(99_003_581)
+    );
+
+    collector
+        .collect_map_cycle()
+        .await
+        .expect("second map cycle");
+    assert!(
+        store
+            .map_owner(30_005_174)
+            .await
+            .expect("read map owner")
+            .is_none(),
+        "a system absent from a fresh listing is removed wholesale"
+    );
+    assert_eq!(
+        store
+            .map_owner(30_004_737)
+            .await
+            .expect("read map owner")
+            .expect("Jita still has an owner")
+            .faction_id,
+        Some(500_002)
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn collect_map_cycle_treats_an_empty_listing_as_a_no_op() {
+    // Fix round finding 4: an empty successful (200) map body must not
+    // `replace_map` every current owner away. It is a no-op with a warn,
+    // leaving existing owners intact.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let esi = FakeSovereigntyEsi::new(vec![]).with_map(vec![
+        Ok(EsiResponse::fresh(
+            vec![SovMapEntry {
+                solar_system_id: 30_005_174,
+                alliance_id: Some(99_003_581),
+                corporation_id: None,
+                faction_id: None,
+            }],
+            fresh_metadata(observed_at, "m-1"),
+        )),
+        // A later successful poll returns an empty listing.
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "m-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery, clock);
+
+    let report = collector
+        .collect_map_cycle()
+        .await
+        .expect("first map cycle loads an owner");
+    assert_eq!(report.entries_observed, 1);
+
+    let report = collector
+        .collect_map_cycle()
+        .await
+        .expect("second map cycle over an empty listing");
+    assert!(report.empty_listing, "an empty 200 body is flagged");
+
+    assert_eq!(
+        store
+            .map_owner(30_005_174)
+            .await
+            .expect("read map owner")
+            .expect("owner survives an empty listing")
+            .alliance_id,
+        Some(99_003_581)
+    );
 
     database.destroy().await;
 }

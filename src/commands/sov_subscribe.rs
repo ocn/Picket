@@ -2,8 +2,9 @@ use crate::commands::contract_command::{defer_then_edit, SerenityContractCommand
 use crate::commands::{get_option_value, Command};
 use crate::config::AppState;
 use crate::sov_feed::{
-    available_sov_store, parse_tminus_marks_minutes, SovFilter, SovFilterCondition, SovFilterNode,
-    SovSubscription, SOV_REACHABLE_MAX_JUMPS, SOV_TMINUS_MARKS_OPTION_KEY,
+    available_sov_store, parse_tminus_marks_minutes, parse_tz_window, SovFilter,
+    SovFilterCondition, SovFilterNode, SovSubscription, SOV_REACHABLE_MAX_JUMPS,
+    SOV_TMINUS_MARKS_OPTION_KEY, SOV_TZ_SHIFT_ENABLED_OPTION_KEY, SOV_TZ_WINDOW_OPTION_KEY,
 };
 use crate::SovStoreContainer;
 use serenity::async_trait;
@@ -38,6 +39,15 @@ struct SovSubscriptionDocuments<'a> {
     /// option; default [120, 30] when omitted; an explicit empty list
     /// disables marks").
     tminus_marks: Option<&'a str>,
+    /// Raw `tz_window` command option: `HH:MM-HH:MM` EVE/UTC, may cross
+    /// midnight (ticket 07). `None` when omitted, leaving the stored
+    /// `options` document without the key so evaluation applies the
+    /// default (00:00-04:00).
+    tz_window: Option<&'a str>,
+    /// `tz_shift_enabled` command option: whether the `tz_window_entered`
+    /// stage participates for this subscription at all (ticket 07;
+    /// default false when omitted).
+    tz_shift_enabled: Option<bool>,
 }
 
 impl SovSubscribeCommand {
@@ -86,6 +96,16 @@ impl SovSubscribeCommand {
             None => None,
             _ => return Err("tminus_marks must be a string option".to_string()),
         };
+        let tz_window = match get_option_value(&command.data.options, "tz_window") {
+            Some(CommandDataOptionValue::String(value)) => Some(value.as_str()),
+            None => None,
+            _ => return Err("tz_window must be a string option".to_string()),
+        };
+        let tz_shift_enabled = match get_option_value(&command.data.options, "tz_shift_enabled") {
+            Some(CommandDataOptionValue::Boolean(value)) => Some(*value),
+            None => None,
+            _ => return Err("tz_shift_enabled must be a boolean option".to_string()),
+        };
         Self::subscription_from_documents(
             guild_id,
             channel_id,
@@ -98,6 +118,8 @@ impl SovSubscribeCommand {
                 allow_frigate_holes,
                 role_id,
                 tminus_marks,
+                tz_window,
+                tz_shift_enabled,
             },
         )
     }
@@ -138,6 +160,18 @@ impl SovSubscribeCommand {
                 .map_err(|error| format!("invalid tminus_marks: {error}"))?;
             options[SOV_TMINUS_MARKS_OPTION_KEY] = serde_json::json!(marks);
         }
+        if let Some(raw) = documents.tz_window {
+            // Validated eagerly (rather than deferred to evaluation time)
+            // so `/sov_subscribe` rejects a malformed window immediately;
+            // the normalized `HH:MM-HH:MM` text is stored, not the raw
+            // input, so extra whitespace never round-trips into `options`.
+            let window =
+                parse_tz_window(raw).map_err(|error| format!("invalid tz_window: {error}"))?;
+            options[SOV_TZ_WINDOW_OPTION_KEY] = serde_json::json!(window.to_option_string());
+        }
+        if let Some(enabled) = documents.tz_shift_enabled {
+            options[SOV_TZ_SHIFT_ENABLED_OPTION_KEY] = serde_json::json!(enabled);
+        }
         let subscription = SovSubscription {
             guild_id,
             channel_id,
@@ -152,24 +186,37 @@ impl SovSubscribeCommand {
 
     /// Merges a freshly-built subscription document's `options` against
     /// whatever was already persisted for the same subscription, so
-    /// re-running `/sov_subscribe` without `tminus_marks` preserves
-    /// custom marks instead of silently resetting them to the default
-    /// (review finding 2 on ticket 03). `requested` is exactly `{}` when
-    /// the command supplied no options at all this time (every option
-    /// this ticket adds is opt-in); any other shape reflects something
-    /// the user explicitly set in this invocation, which always wins over
-    /// whatever was stored before. A brand-new subscription (`existing`
-    /// is `None`) falls back to `requested` unchanged, i.e. `{}`, so
-    /// evaluation applies the default marks as usual.
+    /// re-running `/sov_subscribe` with only some options preserves the
+    /// keys this invocation did not touch instead of silently resetting
+    /// them to their defaults (review finding 2 on ticket 03; extended in
+    /// ticket 07 now that `tz_window`/`tz_shift_enabled` share the same
+    /// document as `tminus_marks_minutes`).
+    ///
+    /// This is a per-key object merge, not all-or-nothing: start from the
+    /// existing document (or `{}` when none / not an object) and overlay
+    /// every key *present* in `requested`. Because
+    /// `subscription_from_documents` only writes a key when its command
+    /// option was supplied, a key present in `requested` is exactly a key
+    /// the user set this invocation, and it always wins over the stored
+    /// value -- including an explicit empty `tminus_marks_minutes: []`
+    /// (a present key that disables marks) while any untouched `tz_window`
+    /// / `tz_shift_enabled` survive, and vice versa. A brand-new
+    /// subscription (`existing` is `None`) with no options supplied stays
+    /// `{}`, so evaluation applies every default as usual.
     fn merge_options(
         existing: Option<&serde_json::Value>,
         requested: serde_json::Value,
     ) -> serde_json::Value {
-        if requested == serde_json::json!({}) {
-            existing.cloned().unwrap_or(requested)
-        } else {
-            requested
+        let mut merged = existing
+            .and_then(|value| value.as_object())
+            .cloned()
+            .unwrap_or_default();
+        if let Some(object) = requested.as_object() {
+            for (key, value) in object {
+                merged.insert(key.clone(), value.clone());
+            }
         }
+        serde_json::Value::Object(merged)
     }
 }
 
@@ -239,6 +286,20 @@ impl Command for SovSubscribeCommand {
                         "Comma-separated T-minus marks, minutes (default 120,30; empty disables; capped by VulnerableWithin).",
                     )
                     .kind(CommandOptionType::String)
+            })
+            .create_option(|option| {
+                option
+                    .name("tz_window")
+                    .description(
+                        "Timezone window HH:MM-HH:MM EVE (default 00:00-04:00; may cross midnight).",
+                    )
+                    .kind(CommandOptionType::String)
+            })
+            .create_option(|option| {
+                option
+                    .name("tz_shift_enabled")
+                    .description("Alert when a watched hub's vulnerability window enters tz_window.")
+                    .kind(CommandOptionType::Boolean)
             })
     }
 
@@ -325,6 +386,8 @@ mod tests {
                 allow_frigate_holes: None,
                 role_id: None,
                 tminus_marks: None,
+                tz_window: None,
+                tz_shift_enabled: None,
             },
         )
         .expect("valid recursive subscription document");
@@ -348,6 +411,8 @@ mod tests {
                 allow_frigate_holes: None,
                 role_id: Some(555),
                 tminus_marks: None,
+                tz_window: None,
+                tz_shift_enabled: None,
             },
         )
         .expect("valid composed document");
@@ -383,6 +448,8 @@ mod tests {
                 allow_frigate_holes: None,
                 role_id: None,
                 tminus_marks: None,
+                tz_window: None,
+                tz_shift_enabled: None,
             },
         )
         .expect("valid document with max_jumps");
@@ -415,6 +482,8 @@ mod tests {
                 allow_frigate_holes: Some(true),
                 role_id: None,
                 tminus_marks: None,
+                tz_window: None,
+                tz_shift_enabled: None,
             },
         )
         .expect("valid document with max_jumps and allow_frigate_holes");
@@ -446,6 +515,8 @@ mod tests {
                 allow_frigate_holes: Some(true),
                 role_id: None,
                 tminus_marks: None,
+                tz_window: None,
+                tz_shift_enabled: None,
             },
         )
         .is_err());
@@ -466,6 +537,8 @@ mod tests {
                     allow_frigate_holes: None,
                     role_id: None,
                     tminus_marks: None,
+                    tz_window: None,
+                    tz_shift_enabled: None,
                 },
             )
             .is_err());
@@ -492,6 +565,8 @@ mod tests {
                     allow_frigate_holes: None,
                     role_id: None,
                     tminus_marks: None,
+                    tz_window: None,
+                    tz_shift_enabled: None,
                 },
             )
             .is_err());
@@ -512,6 +587,8 @@ mod tests {
                 allow_frigate_holes: None,
                 role_id: None,
                 tminus_marks: Some("120, 45, 120"),
+                tz_window: None,
+                tz_shift_enabled: None,
             },
         )
         .expect("valid document with custom tminus marks");
@@ -535,6 +612,8 @@ mod tests {
                 allow_frigate_holes: None,
                 role_id: None,
                 tminus_marks: Some(""),
+                tz_window: None,
+                tz_shift_enabled: None,
             },
         )
         .expect("valid document disabling tminus marks");
@@ -558,6 +637,8 @@ mod tests {
                 allow_frigate_holes: None,
                 role_id: None,
                 tminus_marks: None,
+                tz_window: None,
+                tz_shift_enabled: None,
             },
         )
         .expect("valid document omitting tminus marks");
@@ -579,6 +660,8 @@ mod tests {
                     allow_frigate_holes: None,
                     role_id: None,
                     tminus_marks: Some(raw),
+                    tz_window: None,
+                    tz_shift_enabled: None,
                 },
             )
             .is_err());
@@ -643,5 +726,155 @@ mod tests {
         let requested = serde_json::json!({"tminus_marks_minutes": []});
         let merged = SovSubscribeCommand::merge_options(Some(&existing), requested.clone());
         assert_eq!(merged, requested);
+    }
+
+    #[test]
+    fn merge_options_overlays_tz_shift_without_dropping_stored_tminus_marks() {
+        // Fix round finding 1: `/sov_subscribe name:X tminus_marks:90`
+        // then `/sov_subscribe name:X tz_shift_enabled:true` must keep the
+        // custom marks -- a partial re-subscribe overlays one key rather
+        // than replacing the whole document.
+        let existing = serde_json::json!({"tminus_marks_minutes": [90]});
+        let requested = serde_json::json!({"tz_shift_enabled": true});
+        let merged = SovSubscribeCommand::merge_options(Some(&existing), requested);
+        assert_eq!(
+            merged,
+            serde_json::json!({"tminus_marks_minutes": [90], "tz_shift_enabled": true})
+        );
+    }
+
+    #[test]
+    fn merge_options_overlays_tminus_marks_without_dropping_stored_tz_keys() {
+        // The reverse order of the finding-1 scenario: tz keys were set
+        // first, then a later invocation supplies only `tminus_marks`.
+        let existing = serde_json::json!({"tz_window": "06:00-10:00", "tz_shift_enabled": true});
+        let requested = serde_json::json!({"tminus_marks_minutes": [90]});
+        let merged = SovSubscribeCommand::merge_options(Some(&existing), requested);
+        assert_eq!(
+            merged,
+            serde_json::json!({
+                "tz_window": "06:00-10:00",
+                "tz_shift_enabled": true,
+                "tminus_marks_minutes": [90],
+            })
+        );
+    }
+
+    #[test]
+    fn merge_options_lets_an_explicit_empty_tminus_disable_while_tz_keys_survive() {
+        // An explicit empty list is a present key (disables marks) yet the
+        // untouched tz keys must still survive the overlay.
+        let existing = serde_json::json!({"tz_window": "06:00-10:00", "tz_shift_enabled": true});
+        let requested = serde_json::json!({"tminus_marks_minutes": []});
+        let merged = SovSubscribeCommand::merge_options(Some(&existing), requested);
+        assert_eq!(
+            merged,
+            serde_json::json!({
+                "tz_window": "06:00-10:00",
+                "tz_shift_enabled": true,
+                "tminus_marks_minutes": [],
+            })
+        );
+    }
+
+    // --- tz_window / tz_shift_enabled (ticket 07) ---
+
+    #[test]
+    fn sov_subscribe_stores_a_normalized_tz_window_and_tz_shift_enabled_in_options() {
+        let subscription = SovSubscribeCommand::subscription_from_documents(
+            42,
+            77,
+            SovSubscriptionDocuments {
+                name: "tz-shift-front",
+                filter: FILTER,
+                region_id: None,
+                defender_alliance_id: None,
+                max_jumps: None,
+                allow_frigate_holes: None,
+                role_id: None,
+                tminus_marks: None,
+                tz_window: Some(" 06:00-10:00 "),
+                tz_shift_enabled: Some(true),
+            },
+        )
+        .expect("valid document with tz_window and tz_shift_enabled");
+        assert_eq!(
+            subscription.options,
+            serde_json::json!({"tz_window": "06:00-10:00", "tz_shift_enabled": true})
+        );
+    }
+
+    #[test]
+    fn sov_subscribe_omitted_tz_options_leave_options_without_those_keys() {
+        let subscription = SovSubscribeCommand::subscription_from_documents(
+            42,
+            77,
+            SovSubscriptionDocuments {
+                name: "default-tz",
+                filter: FILTER,
+                region_id: None,
+                defender_alliance_id: None,
+                max_jumps: None,
+                allow_frigate_holes: None,
+                role_id: None,
+                tminus_marks: None,
+                tz_window: None,
+                tz_shift_enabled: None,
+            },
+        )
+        .expect("valid document omitting tz options");
+        assert_eq!(subscription.options, serde_json::json!({}));
+    }
+
+    #[test]
+    fn sov_subscribe_rejects_a_malformed_tz_window() {
+        for raw in ["not-a-window", "24:00-01:00", "06:00-06:00"] {
+            assert!(SovSubscribeCommand::subscription_from_documents(
+                42,
+                77,
+                SovSubscriptionDocuments {
+                    name: "bad-tz-window",
+                    filter: FILTER,
+                    region_id: None,
+                    defender_alliance_id: None,
+                    max_jumps: None,
+                    allow_frigate_holes: None,
+                    role_id: None,
+                    tminus_marks: None,
+                    tz_window: Some(raw),
+                    tz_shift_enabled: None,
+                },
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn sov_subscribe_tz_window_option_and_tminus_marks_compose_in_the_same_options_document() {
+        let subscription = SovSubscribeCommand::subscription_from_documents(
+            42,
+            77,
+            SovSubscriptionDocuments {
+                name: "everything-front",
+                filter: FILTER,
+                region_id: None,
+                defender_alliance_id: None,
+                max_jumps: None,
+                allow_frigate_holes: None,
+                role_id: None,
+                tminus_marks: Some("120"),
+                tz_window: Some("22:00-02:00"),
+                tz_shift_enabled: Some(true),
+            },
+        )
+        .expect("valid document combining tminus_marks and tz options");
+        assert_eq!(
+            subscription.options,
+            serde_json::json!({
+                "tminus_marks_minutes": [120],
+                "tz_window": "22:00-02:00",
+                "tz_shift_enabled": true,
+            })
+        );
     }
 }

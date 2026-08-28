@@ -84,8 +84,20 @@ const SOV_COLLECTION_INTERVAL: Duration = Duration::from_secs(60);
 
 /// T-minus stage-evaluation cadence: independent of, and cheaper than,
 /// `SOV_COLLECTION_INTERVAL` because it makes no ESI request (ticket 03:
-/// "A stage-evaluation pass runs at least every thirty seconds").
+/// "A stage-evaluation pass runs at least every thirty seconds"). Also
+/// drives the `tz_window_entered` evaluation pass (ticket 07), which is
+/// likewise ESI-free.
 const SOV_STAGE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Sovereignty Hub structures collection cadence: `GET /sovereignty/structures/`'s
+/// own `max-age=300` (spec "Sources and cadence": "Sovereignty Hub
+/// vulnerability windows every five minutes (their cache age)"; ticket 07).
+const SOV_STRUCTURES_COLLECTION_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Sovereignty map collection cadence: `GET /sovereignty/map/`'s own
+/// `max-age=3600` (spec "Sources and cadence": "sovereignty ownership map
+/// hourly"; ticket 07).
+const SOV_MAP_COLLECTION_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Wanderer chain poll cadence (spec "Sources and cadence": "The Wanderer
 /// chain is polled every two minutes (systems and connections)").
@@ -416,9 +428,36 @@ pub async fn run() {
                     tickers.clone(),
                     sov_reachability.clone(),
                 );
-                // T-minus stage evaluation (ticket 03): a separate,
-                // independently-reconnecting loop rather than a faster
-                // cadence inside `run_sov_collection_loop`, mirroring how
+                // Sovereignty Hub structures and sovereignty map (ticket
+                // 07): two more independently-reconnecting loops at their
+                // own ESI-cache-age cadences, sharing the same `esi`
+                // client (one more trait method each, same base URL) and
+                // never touching `sov_store_handle` -- a stall in either
+                // cannot affect campaign polling, T-minus/reachability/
+                // tz-window evaluation, or command handling.
+                spawn_sov_structures_loop(
+                    database_url.clone(),
+                    SOV_STRUCTURES_COLLECTION_INTERVAL,
+                    esi.clone(),
+                    delivery.clone(),
+                    directory.clone(),
+                    tickers.clone(),
+                    sov_reachability.clone(),
+                );
+                spawn_sov_map_loop(
+                    database_url.clone(),
+                    SOV_MAP_COLLECTION_INTERVAL,
+                    esi.clone(),
+                    delivery.clone(),
+                    directory.clone(),
+                    tickers.clone(),
+                    sov_reachability.clone(),
+                );
+                // T-minus stage evaluation (ticket 03), reachability
+                // transitions (ticket 06), and tz-window-entered
+                // evaluation (ticket 07): a separate, independently-
+                // reconnecting loop rather than a faster cadence inside
+                // `run_sov_collection_loop`, mirroring how
                 // `run_terminal_resolution_recovery_loop` and
                 // `run_proximity_reconciliation_loop` already run their
                 // own cadences alongside the contract feed's main
@@ -837,6 +876,137 @@ async fn run_sov_stage_loop(
                 Err(error) => warn!("sov stage evaluation database unavailable: {error}"),
             },
             Err(error) => warn!("sov stage evaluation migrations unavailable: {error}"),
+        }
+    }
+}
+
+/// Spawns the Sovereignty Hub structures poll loop (ticket 07). Fixed
+/// cadence via `interval_at` + `MissedTickBehavior::Skip`, mirroring
+/// `spawn_sov_stage_loop`: reconnects every tick (self-healing, idempotent
+/// migrations), and produces no delivery of its own, so a stall here
+/// cannot affect campaign polling, stage evaluation, or command handling.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_sov_structures_loop(
+    database_url: String,
+    interval: Duration,
+    esi: Arc<dyn sov_feed::SovereigntyEsi>,
+    delivery: Arc<dyn sov_feed::SovDelivery>,
+    directory: Arc<dyn sov_feed::SovSystemDirectory>,
+    tickers: Arc<dyn sov_feed::SovTickerResolver>,
+    reachability: Arc<dyn sov_feed::SovReachabilitySource>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_sov_structures_loop(
+        database_url,
+        interval,
+        esi,
+        delivery,
+        directory,
+        tickers,
+        reachability,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_sov_structures_loop(
+    database_url: String,
+    interval: Duration,
+    esi: Arc<dyn sov_feed::SovereigntyEsi>,
+    delivery: Arc<dyn sov_feed::SovDelivery>,
+    directory: Arc<dyn sov_feed::SovSystemDirectory>,
+    tickers: Arc<dyn sov_feed::SovTickerResolver>,
+    reachability: Arc<dyn sov_feed::SovReachabilitySource>,
+) {
+    let mut cadence = tokio::time::interval_at(tokio::time::Instant::now(), interval);
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        cadence.tick().await;
+        match contract_intelligence::ContractCollectionStore::connect(&database_url).await {
+            Ok(limiter_store) => match sov_feed::SovStore::connect(&database_url).await {
+                Ok(store) => {
+                    let collector = sov_feed::SovCollector::new(
+                        store,
+                        esi.clone(),
+                        Arc::new(limiter_store),
+                        delivery.clone(),
+                        directory.clone(),
+                        tickers.clone(),
+                        reachability.clone(),
+                    );
+                    if let Err(error) =
+                        run_sov_cycle_isolated(
+                            async move { collector.collect_structures_cycle().await },
+                        )
+                        .await
+                    {
+                        warn!("sov structures collection cycle failed: {error}");
+                    }
+                }
+                Err(error) => warn!("sov structures feed database unavailable: {error}"),
+            },
+            Err(error) => warn!("sov structures feed migrations unavailable: {error}"),
+        }
+    }
+}
+
+/// Spawns the sovereignty map poll loop (ticket 07). Mirrors
+/// `spawn_sov_structures_loop` at its own hourly cadence.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_sov_map_loop(
+    database_url: String,
+    interval: Duration,
+    esi: Arc<dyn sov_feed::SovereigntyEsi>,
+    delivery: Arc<dyn sov_feed::SovDelivery>,
+    directory: Arc<dyn sov_feed::SovSystemDirectory>,
+    tickers: Arc<dyn sov_feed::SovTickerResolver>,
+    reachability: Arc<dyn sov_feed::SovReachabilitySource>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_sov_map_loop(
+        database_url,
+        interval,
+        esi,
+        delivery,
+        directory,
+        tickers,
+        reachability,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_sov_map_loop(
+    database_url: String,
+    interval: Duration,
+    esi: Arc<dyn sov_feed::SovereigntyEsi>,
+    delivery: Arc<dyn sov_feed::SovDelivery>,
+    directory: Arc<dyn sov_feed::SovSystemDirectory>,
+    tickers: Arc<dyn sov_feed::SovTickerResolver>,
+    reachability: Arc<dyn sov_feed::SovReachabilitySource>,
+) {
+    let mut cadence = tokio::time::interval_at(tokio::time::Instant::now(), interval);
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        cadence.tick().await;
+        match contract_intelligence::ContractCollectionStore::connect(&database_url).await {
+            Ok(limiter_store) => match sov_feed::SovStore::connect(&database_url).await {
+                Ok(store) => {
+                    let collector = sov_feed::SovCollector::new(
+                        store,
+                        esi.clone(),
+                        Arc::new(limiter_store),
+                        delivery.clone(),
+                        directory.clone(),
+                        tickers.clone(),
+                        reachability.clone(),
+                    );
+                    if let Err(error) =
+                        run_sov_cycle_isolated(async move { collector.collect_map_cycle().await })
+                            .await
+                    {
+                        warn!("sov map collection cycle failed: {error}");
+                    }
+                }
+                Err(error) => warn!("sov map feed database unavailable: {error}"),
+            },
+            Err(error) => warn!("sov map feed migrations unavailable: {error}"),
         }
     }
 }
