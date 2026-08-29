@@ -17,10 +17,10 @@ use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use killbot_rust::contract_intelligence::ContractCollectionStore;
 use killbot_rust::esi_cache::{CacheMetadata, EsiError, EsiLimiterStore, EsiResponse};
 use killbot_rust::watchlist_feed::{
-    alliance_resource_key, CorporationInfo, PreparedWatchlistDelivery, WatchedEntity,
-    WatchlistAlliance, WatchlistClock, WatchlistCollector, WatchlistCorporation, WatchlistDelivery,
-    WatchlistDeliveryError, WatchlistEntityResolver, WatchlistEsi, WatchlistEventKind,
-    WatchlistKind, WatchlistStore, WatchlistSubscription,
+    alliance_resource_key, CorporationInfo, PreparedWatchlistDelivery, WarDetail, WarParty,
+    WatchedEntity, WatchlistAlliance, WatchlistClock, WatchlistCollector, WatchlistCorporation,
+    WatchlistDelivery, WatchlistDeliveryError, WatchlistEntityResolver, WatchlistEsi,
+    WatchlistEventKind, WatchlistKind, WatchlistStore, WatchlistSubscription,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -35,6 +35,10 @@ struct FakeWatchlistEsi {
     cursors: Mutex<HashMap<i64, usize>>,
     corp_responses: Mutex<HashMap<i64, Vec<Result<EsiResponse<CorporationInfo>, EsiError>>>>,
     corp_cursors: Mutex<HashMap<i64, usize>>,
+    war_list: Mutex<HashMap<Option<i64>, Vec<Result<EsiResponse<Vec<i64>>, EsiError>>>>,
+    war_list_cursors: Mutex<HashMap<Option<i64>, usize>>,
+    war_details: Mutex<HashMap<i64, Vec<Result<EsiResponse<WarDetail>, EsiError>>>>,
+    war_cursors: Mutex<HashMap<i64, usize>>,
     calls: AtomicUsize,
 }
 
@@ -45,8 +49,32 @@ impl FakeWatchlistEsi {
             cursors: Mutex::new(HashMap::new()),
             corp_responses: Mutex::new(HashMap::new()),
             corp_cursors: Mutex::new(HashMap::new()),
+            war_list: Mutex::new(HashMap::new()),
+            war_list_cursors: Mutex::new(HashMap::new()),
+            war_details: Mutex::new(HashMap::new()),
+            war_cursors: Mutex::new(HashMap::new()),
             calls: AtomicUsize::new(0),
         }
+    }
+
+    /// Scripts the war-list responses for one `max_war_id` page key
+    /// (`None` is the head page). Consumed in sequence per cycle.
+    fn with_war_list_page(
+        self,
+        max_war_id: Option<i64>,
+        responses: Vec<Result<EsiResponse<Vec<i64>>, EsiError>>,
+    ) -> Self {
+        self.war_list.lock().unwrap().insert(max_war_id, responses);
+        self
+    }
+
+    fn with_war(
+        self,
+        war_id: i64,
+        responses: Vec<Result<EsiResponse<WarDetail>, EsiError>>,
+    ) -> Self {
+        self.war_details.lock().unwrap().insert(war_id, responses);
+        self
     }
 
     fn with_alliance(
@@ -75,6 +103,25 @@ impl FakeWatchlistEsi {
 
     fn call_count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// How many times `fetch_war` was invoked for one war id (the per-id
+    /// cursor advances on every call), so a test can assert a war was or was
+    /// not re-fetched.
+    fn war_fetch_count(&self, war_id: i64) -> usize {
+        *self.war_cursors.lock().unwrap().get(&war_id).unwrap_or(&0)
+    }
+
+    /// How many times `fetch_wars` was invoked for one page key (`None` is the
+    /// head; `Some(cursor)` is a downward page), so a test can assert the
+    /// baseline paged below the cursor rather than re-reading the head.
+    fn war_list_fetch_count(&self, max_war_id: Option<i64>) -> usize {
+        *self
+            .war_list_cursors
+            .lock()
+            .unwrap()
+            .get(&max_war_id)
+            .unwrap_or(&0)
     }
 }
 
@@ -132,6 +179,43 @@ impl WatchlistEsi for FakeWatchlistEsi {
         );
         let mut cursors = self.corp_cursors.lock().unwrap();
         let cursor = cursors.entry(corporation_id).or_insert(0);
+        let index = (*cursor).min(scripted.len() - 1);
+        *cursor += 1;
+        scripted[index].clone()
+    }
+
+    async fn fetch_wars(
+        &self,
+        max_war_id: Option<i64>,
+        _etag: Option<String>,
+    ) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let responses = self.war_list.lock().unwrap();
+        // An unscripted page is a benign 304 (real-past freshness so it never
+        // short-circuits the collector's freshness gate) -- lets ticket-08/09
+        // tests that never script wars run the war pass as a no-op.
+        let Some(scripted) = responses.get(&max_war_id) else {
+            return Ok(EsiResponse::not_modified(past_metadata("wars-unscripted")));
+        };
+        let mut cursors = self.war_list_cursors.lock().unwrap();
+        let cursor = cursors.entry(max_war_id).or_insert(0);
+        let index = (*cursor).min(scripted.len() - 1);
+        *cursor += 1;
+        scripted[index].clone()
+    }
+
+    async fn fetch_war(
+        &self,
+        war_id: i64,
+        _etag: Option<String>,
+    ) -> Result<EsiResponse<WarDetail>, EsiError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let responses = self.war_details.lock().unwrap();
+        let Some(scripted) = responses.get(&war_id) else {
+            return Ok(EsiResponse::not_modified(past_metadata("war-unscripted")));
+        };
+        let mut cursors = self.war_cursors.lock().unwrap();
+        let cursor = cursors.entry(war_id).or_insert(0);
         let index = (*cursor).min(scripted.len() - 1);
         *cursor += 1;
         scripted[index].clone()
@@ -279,6 +363,52 @@ fn corp_metadata(etag: &str) -> CacheMetadata {
         rate_limit_used: None,
         retry_after: None,
     }
+}
+
+/// Cache metadata whose `expires_at` is fixed in the real past, so
+/// `is_fresh()` (which reads the real `Utc::now()`) is always false and the
+/// collector re-polls the war list/details every cycle regardless of the
+/// virtual clock. Mirrors `corp_metadata`.
+fn past_metadata(etag: &str) -> CacheMetadata {
+    corp_metadata(etag)
+}
+
+// --- Ticket 10: war fixtures ---
+
+const WATCHED_CORP: i64 = 98_825_281;
+const WATCHED_AGGRESSOR_ALLY: i64 = 99_002_974;
+const WAR_BASELINE_ID: i64 = 762_000;
+const WAR_ID: i64 = 762_489;
+
+/// A war whose defender is the watched corporation and aggressor is an
+/// alliance, mirroring the live fixture `resources/watchlist_war_762489.json`.
+fn watched_war(war_id: i64, allies: Vec<WarParty>, retracted: bool, finished: bool) -> WarDetail {
+    WarDetail {
+        war_id,
+        aggressor: WarParty {
+            kind: WatchlistKind::Alliance,
+            id: WATCHED_AGGRESSOR_ALLY,
+        },
+        defender: WarParty {
+            kind: WatchlistKind::Corporation,
+            id: WATCHED_CORP,
+        },
+        allies,
+        declared: Some(Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap()),
+        started: Some(Utc.with_ymd_and_hms(2026, 8, 21, 0, 0, 0).unwrap()),
+        finished: finished.then(|| Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap()),
+        retracted: retracted.then(|| Utc.with_ymd_and_hms(2026, 8, 26, 0, 0, 0).unwrap()),
+        mutual: false,
+        open_for_allies: true,
+    }
+}
+
+fn war_detail_ok(detail: WarDetail, etag: &str) -> Result<EsiResponse<WarDetail>, EsiError> {
+    Ok(EsiResponse::fresh(detail, past_metadata(etag)))
+}
+
+fn war_list_ok(ids: Vec<i64>, etag: &str) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+    Ok(EsiResponse::fresh(ids, past_metadata(etag)))
 }
 
 fn corp_info(
@@ -1736,6 +1866,1158 @@ async fn a_subscription_selecting_only_member_delta_ignores_alliance_changes() {
     assert_eq!(delta.member_delta, 1);
     assert_eq!(delivery.sent_count(), 1);
     assert_eq!(delivery.sent()[0].event_kind, "member_delta");
+
+    database.destroy().await;
+}
+
+// --- Ticket 10: war declarations ---
+
+fn party(kind: WatchlistKind, id: i64) -> WarParty {
+    WarParty { kind, id }
+}
+
+/// A war with explicit aggressor/defender/allies for the involvement tests.
+fn war_with(
+    war_id: i64,
+    aggressor: WarParty,
+    defender: WarParty,
+    allies: Vec<WarParty>,
+    retracted: bool,
+    finished: bool,
+) -> WarDetail {
+    let mut detail = watched_war(war_id, allies, retracted, finished);
+    detail.aggressor = aggressor;
+    detail.defender = defender;
+    detail
+}
+
+async fn subscribe_kinds(store: &WatchlistStore, name: &str, kinds: Vec<WatchlistEventKind>) {
+    store
+        .upsert_subscription(&WatchlistSubscription {
+            guild_id: GUILD,
+            channel_id: CHANNEL,
+            name: name.to_string(),
+            event_kinds: kinds,
+            role_id: None,
+            options: serde_json::json!({}),
+        })
+        .await
+        .expect("subscribe kinds");
+}
+
+#[tokio::test]
+async fn a_first_war_scan_is_a_silent_baseline() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(None, vec![war_list_ok(vec![WAR_ID], "l0")])
+            .with_war(
+                WAR_ID,
+                vec![war_detail_ok(
+                    watched_war(WAR_ID, vec![], false, false),
+                    "w1",
+                )],
+            ),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(store.clone(), limiter, esi, delivery.clone(), clock);
+
+    let report = collector.collect_cycle().await.expect("baseline cycle");
+    assert!(report.war_baseline_established);
+    assert_eq!(report.war_declared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+    assert_eq!(store.delivery_count().await.expect("count"), 0);
+    // The open war is stored (so a later retraction/finish can be tracked) and
+    // the high-water mark is set to the scanned head.
+    assert!(store.war_is_stored_for_test(WAR_ID).await.expect("stored"));
+    assert_eq!(
+        store.war_high_water_mark_for_test().await.expect("mark"),
+        Some(WAR_ID)
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_new_war_with_a_watched_aggressor_posts_war_declared_once() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    let aggressor = party(WatchlistKind::Corporation, WATCHED_CORP);
+    let defender = party(WatchlistKind::Alliance, 111);
+    let detail = war_with(WAR_ID, aggressor, defender, vec![], false, false);
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(
+                None,
+                vec![
+                    war_list_ok(vec![WAR_BASELINE_ID], "l0"),
+                    war_list_ok(vec![WAR_ID, WAR_BASELINE_ID], "l1"),
+                    war_list_ok(vec![WAR_ID, WAR_BASELINE_ID], "l2"),
+                ],
+            )
+            .with_war(WAR_ID, vec![war_detail_ok(detail, "w1")]),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    // Baseline: WAR_BASELINE_ID (unscripted detail -> benign 304, not stored),
+    // mark set, nothing posted.
+    collector.collect_cycle().await.expect("baseline");
+    assert_eq!(delivery.sent_count(), 0);
+
+    // Declared.
+    clock.advance(ChronoDuration::hours(1));
+    let declared = collector.collect_cycle().await.expect("declared cycle");
+    assert_eq!(declared.war_declared, 1);
+    assert_eq!(delivery.sent_count(), 1);
+    assert_eq!(delivery.sent()[0].event_kind, "war_declared");
+    assert_eq!(delivery.sent()[0].entity_id, WAR_ID);
+    assert_eq!(delivery.sent()[0].evidence_key, WAR_ID.to_string());
+
+    // Not again.
+    clock.advance(ChronoDuration::hours(1));
+    let steady = collector.collect_cycle().await.expect("steady cycle");
+    assert_eq!(steady.war_declared, 0);
+    assert_eq!(delivery.sent_count(), 1);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_new_war_with_a_watched_ally_posts_war_declared() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    // Neither aggressor nor defender is watched; the watched corp is an ally.
+    let detail = war_with(
+        WAR_ID,
+        party(WatchlistKind::Alliance, 111),
+        party(WatchlistKind::Corporation, 222),
+        vec![party(WatchlistKind::Corporation, WATCHED_CORP)],
+        false,
+        false,
+    );
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(
+                None,
+                vec![
+                    war_list_ok(vec![WAR_BASELINE_ID], "l0"),
+                    war_list_ok(vec![WAR_ID, WAR_BASELINE_ID], "l1"),
+                ],
+            )
+            .with_war(WAR_ID, vec![war_detail_ok(detail, "w1")]),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline");
+    clock.advance(ChronoDuration::hours(1));
+    let declared = collector.collect_cycle().await.expect("declared cycle");
+    assert_eq!(declared.war_declared, 1);
+    assert_eq!(delivery.sent_count(), 1);
+    assert_eq!(delivery.sent()[0].event_kind, "war_declared");
+    assert!(store.war_is_stored_for_test(WAR_ID).await.expect("stored"));
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn wars_without_a_watched_party_are_stored_but_post_nothing() {
+    // Ticket 10 fix-round: every inspected war is now stored (so a late-added
+    // entity's pre-existing wars can be re-fetched), but a war with no
+    // currently-watched party fans out to no guilds and posts nothing.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    let detail = war_with(
+        WAR_ID,
+        party(WatchlistKind::Alliance, 111),
+        party(WatchlistKind::Corporation, 222),
+        vec![party(WatchlistKind::Alliance, 333)],
+        false,
+        false,
+    );
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(
+                None,
+                vec![
+                    war_list_ok(vec![WAR_BASELINE_ID], "l0"),
+                    war_list_ok(vec![WAR_ID, WAR_BASELINE_ID], "l1"),
+                ],
+            )
+            .with_war(WAR_ID, vec![war_detail_ok(detail, "w1")]),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline");
+    clock.advance(ChronoDuration::hours(1));
+    let report = collector.collect_cycle().await.expect("scan cycle");
+    assert_eq!(report.war_declared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+    // Stored (for later watch derivation) but no delivery, and the mark
+    // advanced past it.
+    assert!(store.war_is_stored_for_test(WAR_ID).await.expect("stored"));
+    assert_eq!(
+        store.war_high_water_mark_for_test().await.expect("mark"),
+        Some(WAR_ID)
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn the_high_water_scan_skips_ids_at_or_below_the_mark() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    // War 700 is below the baseline mark (762000); if it were fetched its
+    // scripted Err would surface as a war error. It must be skipped.
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(
+                None,
+                vec![
+                    war_list_ok(vec![WAR_BASELINE_ID], "l0"),
+                    war_list_ok(vec![WAR_BASELINE_ID, 700], "l1"),
+                ],
+            )
+            .with_war(700, vec![Err(EsiError::retryable("must not fetch", None))]),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline");
+    clock.advance(ChronoDuration::hours(1));
+    let report = collector.collect_cycle().await.expect("skip cycle");
+    assert_eq!(report.wars_scanned, 0);
+    assert_eq!(report.war_errors, 0);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn an_ally_joining_a_stored_war_posts_war_ally_joined_once() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    let ally = party(WatchlistKind::Alliance, 99_009_999);
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(None, vec![war_list_ok(vec![WAR_ID], "l0")])
+            .with_war(
+                WAR_ID,
+                vec![
+                    war_detail_ok(watched_war(WAR_ID, vec![], false, false), "w1"),
+                    war_detail_ok(watched_war(WAR_ID, vec![ally], false, false), "w2"),
+                    war_detail_ok(watched_war(WAR_ID, vec![ally], false, false), "w3"),
+                ],
+            ),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    // Baseline stores the open war silently (no same-cycle re-fetch).
+    collector.collect_cycle().await.expect("baseline");
+    assert_eq!(delivery.sent_count(), 0);
+
+    // Re-fetch sees the new ally -> one war_ally_joined.
+    clock.advance(ChronoDuration::hours(1));
+    let joined = collector.collect_cycle().await.expect("ally cycle");
+    assert_eq!(joined.war_ally_joined, 1);
+    assert_eq!(delivery.sent_count(), 1);
+    assert_eq!(delivery.sent()[0].event_kind, "war_ally_joined");
+    assert_eq!(
+        delivery.sent()[0].evidence_key,
+        format!("{WAR_ID}:ally:alliance:99009999")
+    );
+
+    // No re-fire on a later cycle with the same ally set.
+    clock.advance(ChronoDuration::hours(1));
+    let steady = collector.collect_cycle().await.expect("steady cycle");
+    assert_eq!(steady.war_ally_joined, 0);
+    assert_eq!(delivery.sent_count(), 1);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_retraction_then_a_finish_each_post_once() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(None, vec![war_list_ok(vec![WAR_ID], "l0")])
+            .with_war(
+                WAR_ID,
+                vec![
+                    war_detail_ok(watched_war(WAR_ID, vec![], false, false), "w1"),
+                    // retracted but still open (finished null)
+                    war_detail_ok(watched_war(WAR_ID, vec![], true, false), "w2"),
+                    // now finished
+                    war_detail_ok(watched_war(WAR_ID, vec![], true, true), "w3"),
+                    war_detail_ok(watched_war(WAR_ID, vec![], true, true), "w4"),
+                ],
+            ),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline");
+    assert_eq!(delivery.sent_count(), 0);
+
+    clock.advance(ChronoDuration::hours(1));
+    let retracted = collector.collect_cycle().await.expect("retract cycle");
+    assert_eq!(retracted.war_retracted, 1);
+    assert_eq!(delivery.sent()[0].event_kind, "war_retracted");
+
+    clock.advance(ChronoDuration::hours(1));
+    let finished = collector.collect_cycle().await.expect("finish cycle");
+    assert_eq!(finished.war_finished, 1);
+    assert_eq!(delivery.sent_count(), 2);
+    assert_eq!(delivery.sent()[1].event_kind, "war_finished");
+
+    // Finished wars are no longer re-fetched; nothing more posts.
+    clock.advance(ChronoDuration::hours(1));
+    let steady = collector.collect_cycle().await.expect("steady cycle");
+    assert_eq!(steady.war_retracted, 0);
+    assert_eq!(steady.war_finished, 0);
+    assert_eq!(delivery.sent_count(), 2);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_persistently_failing_war_is_skipped_after_three_cycles() {
+    // Ticket 10 fix-round (finding 2): a non-404 war id that keeps failing
+    // freezes the mark below it for the first two cycles, then is quarantined
+    // and skipped on the third so the mark advances past it. Higher ids are
+    // processed and posted every cycle regardless of the frozen id.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    // Baseline mark 100; then new ids 201, 202, 203. 202 errors (500).
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(
+                None,
+                vec![
+                    war_list_ok(vec![100], "l0"),
+                    war_list_ok(vec![203, 202, 201, 100], "l1"),
+                ],
+            )
+            .with_war(
+                201,
+                vec![war_detail_ok(
+                    watched_war(201, vec![], false, false),
+                    "w201",
+                )],
+            )
+            .with_war(202, vec![Err(EsiError::retryable("simulated 500", None))])
+            .with_war(
+                203,
+                vec![war_detail_ok(
+                    watched_war(203, vec![], false, false),
+                    "w203",
+                )],
+            ),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline");
+
+    // Cycle 1: 201 processed, 202 fails (mark frozen at 201), 203 still
+    // processed and posted this cycle.
+    clock.advance(ChronoDuration::hours(1));
+    let cycle1 = collector.collect_cycle().await.expect("error cycle 1");
+    assert_eq!(cycle1.war_errors, 1);
+    assert_eq!(cycle1.wars_skipped, 0);
+    assert!(store.war_is_stored_for_test(201).await.expect("201 stored"));
+    assert!(!store.war_is_stored_for_test(202).await.expect("202 stored"));
+    assert!(store.war_is_stored_for_test(203).await.expect("203 stored"));
+    assert_eq!(
+        store.war_high_water_mark_for_test().await.expect("mark"),
+        Some(201)
+    );
+    assert!(delivery
+        .sent()
+        .iter()
+        .any(|d| d.event_kind == "war_declared" && d.entity_id == 203));
+
+    // Cycle 2: 202 fails again, mark still frozen below it.
+    clock.advance(ChronoDuration::hours(1));
+    let cycle2 = collector.collect_cycle().await.expect("error cycle 2");
+    assert_eq!(cycle2.wars_skipped, 0);
+    assert_eq!(
+        store.war_high_water_mark_for_test().await.expect("mark"),
+        Some(201)
+    );
+
+    // Cycle 3: 202 quarantined and skipped; the mark advances past it to 203.
+    clock.advance(ChronoDuration::hours(1));
+    let cycle3 = collector.collect_cycle().await.expect("skip cycle");
+    assert_eq!(cycle3.wars_skipped, 1);
+    assert_eq!(
+        store.war_high_water_mark_for_test().await.expect("mark"),
+        Some(203)
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_not_found_war_is_skipped_immediately_and_higher_ids_process() {
+    // Ticket 10 fix-round (finding 2): a 404 is a permanent absence, skipped
+    // on the first cycle so the mark advances past it and higher ids post.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(
+                None,
+                vec![
+                    war_list_ok(vec![100], "l0"),
+                    war_list_ok(vec![202, 201, 100], "l1"),
+                ],
+            )
+            .with_war(201, vec![Err(EsiError::not_found("war 201 gone"))])
+            .with_war(
+                202,
+                vec![war_detail_ok(
+                    watched_war(202, vec![], false, false),
+                    "w202",
+                )],
+            ),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline");
+    clock.advance(ChronoDuration::hours(1));
+    let report = collector.collect_cycle().await.expect("404 cycle");
+    assert_eq!(report.wars_skipped, 1);
+    assert!(!store.war_is_stored_for_test(201).await.expect("201 stored"));
+    assert!(store.war_is_stored_for_test(202).await.expect("202 stored"));
+    assert!(delivery
+        .sent()
+        .iter()
+        .any(|d| d.event_kind == "war_declared" && d.entity_id == 202));
+    // The mark advanced past the 404 to the head.
+    assert_eq!(
+        store.war_high_water_mark_for_test().await.expect("mark"),
+        Some(202)
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn the_war_baseline_spans_cycles_and_completes() {
+    // Ticket 10 fix-round-2 (finding 1): the silent baseline must inspect every
+    // id that existed on the ORIGINAL head page, across multiple cycles bounded
+    // by the detail-fetch cap. Because the head drifts every hour (new wars
+    // enter at the head and push the oldest ids out of the window), a resume
+    // cycle must page DOWNWARD from the cursor rather than re-read the head --
+    // otherwise an id at the bottom of the original page rolls off the head
+    // before the cursor reaches it and is never inspected. This test models the
+    // drift: the head page's cursor pages are scripted per `max_war_id` key and
+    // the bottom id (300) is only reachable via a downward page, not the head.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    // Original head page (newest first): head max 700, floor 300 (open watched).
+    let original_head = vec![700, 600, 500, 400, 300];
+    // By the time the baseline finishes, the head has drifted: 900 (declared
+    // during the baseline, above the head max) entered and the oldest ids
+    // (400, 300) rolled off the head window entirely.
+    let drifted_head = vec![900, 700, 600, 500];
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            // Head page: cycle 1 pins head_max/floor; cycle 4's post-baseline
+            // head-scan sees the drifted head (900 above the mark = declared).
+            .with_war_list_page(
+                None,
+                vec![
+                    war_list_ok(original_head.clone(), "l0"),
+                    war_list_ok(drifted_head.clone(), "l-drift"),
+                ],
+            )
+            // Downward page below cursor 600 (cycle 2): 500, 400, 300 remain
+            // reachable even though 400/300 have rolled off the head.
+            .with_war_list_page(Some(600), vec![war_list_ok(vec![500, 400, 300], "l-600")])
+            // Downward page below cursor 400 (cycle 3): 300 (the floor), plus
+            // ids below the original floor (250, 200) that are out of scope.
+            .with_war_list_page(Some(400), vec![war_list_ok(vec![300, 250, 200], "l-400")])
+            .with_war(
+                300,
+                vec![war_detail_ok(
+                    watched_war(300, vec![], false, false),
+                    "w300",
+                )],
+            )
+            .with_war(
+                900,
+                vec![war_detail_ok(
+                    watched_war(900, vec![], false, false),
+                    "w900",
+                )],
+            ),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    // Lower the detail cap to 2 so the 5-id original page needs three baseline
+    // cycles, standing in for the production 2000-id page / 200 cap.
+    let collector = make_collector(
+        store.clone(),
+        limiter,
+        esi.clone(),
+        delivery.clone(),
+        clock.clone(),
+    )
+    .with_war_detail_cap(2);
+
+    // Cycle 1: baseline reads the head, inspects the newest 2 (700, 600);
+    // cursor descends to 600. Not yet established; 300 not yet reached.
+    let c1 = collector.collect_cycle().await.expect("baseline cycle 1");
+    assert!(!c1.war_baseline_established);
+    assert!(c1.war_baseline_pending);
+    assert_eq!(delivery.sent_count(), 0);
+    assert!(!store.war_is_stored_for_test(300).await.expect("300"));
+
+    // Cycle 2: pages DOWNWARD from cursor 600 (not the head), inspects 500, 400.
+    clock.advance(ChronoDuration::hours(1));
+    let c2 = collector.collect_cycle().await.expect("baseline cycle 2");
+    assert!(!c2.war_baseline_established);
+    assert!(c2.war_baseline_pending);
+
+    // Cycle 3: pages downward from cursor 400, inspects the floor (300) and
+    // skips the out-of-scope ids below it (250, 200); completes at mark 700.
+    clock.advance(ChronoDuration::hours(1));
+    let c3 = collector.collect_cycle().await.expect("baseline cycle 3");
+    assert!(c3.war_baseline_established);
+    assert_eq!(delivery.sent_count(), 0);
+    // The bottom-of-page open watched war, rolled off the head, is still stored.
+    assert!(store.war_is_stored_for_test(300).await.expect("300 stored"));
+    // The out-of-scope ids below the original floor were never inspected.
+    assert!(!store.war_is_stored_for_test(250).await.expect("250"));
+    assert!(!store.war_is_stored_for_test(200).await.expect("200"));
+    assert_eq!(
+        store.war_high_water_mark_for_test().await.expect("mark"),
+        Some(700)
+    );
+    // The baseline paged downward instead of re-reading the head every cycle.
+    assert!(
+        esi.war_list_fetch_count(Some(600)) >= 1,
+        "cycle 2 paged below cursor 600"
+    );
+    assert!(
+        esi.war_list_fetch_count(Some(400)) >= 1,
+        "cycle 3 paged below cursor 400"
+    );
+    assert_eq!(
+        esi.war_list_fetch_count(None),
+        1,
+        "the head page is read only on the first baseline cycle"
+    );
+
+    // Cycle 4: the war declared during the baseline (900, above the head max)
+    // posts once, and the bottom open watched war (300) is re-fetched.
+    clock.advance(ChronoDuration::hours(1));
+    let c4 = collector
+        .collect_cycle()
+        .await
+        .expect("post-baseline cycle");
+    assert_eq!(c4.war_declared, 1);
+    assert_eq!(delivery.sent_count(), 1);
+    assert_eq!(delivery.sent()[0].event_kind, "war_declared");
+    assert_eq!(delivery.sent()[0].entity_id, 900);
+    assert!(
+        esi.war_fetch_count(300) >= 2,
+        "the bottom open watched war is re-fetched after the baseline"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_watched_open_war_404ing_on_refetch_is_removed_and_not_refetched() {
+    // Ticket 10 fix-round-2 (finding 2): a stored open watched war that starts
+    // 404ing (CCP deleted it) must be marked gone on the re-fetch so it drops
+    // out of the open-war query -- otherwise its stale last_fetched_at
+    // re-selects it FIRST every cycle forever. No event is emitted.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(None, vec![war_list_ok(vec![WAR_ID], "l0")])
+            .with_war(
+                WAR_ID,
+                vec![
+                    war_detail_ok(watched_war(WAR_ID, vec![], false, false), "w1"),
+                    Err(EsiError::not_found("war gone")),
+                ],
+            ),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(
+        store.clone(),
+        limiter,
+        esi.clone(),
+        delivery.clone(),
+        clock.clone(),
+    );
+
+    // Baseline stores the open war silently (fetched once).
+    collector.collect_cycle().await.expect("baseline");
+    assert_eq!(esi.war_fetch_count(WAR_ID), 1);
+    assert!(store.war_is_open_for_test(WAR_ID).await.expect("open"));
+
+    // Cycle 2: the re-fetch 404s -> the war is marked removed (no event).
+    clock.advance(ChronoDuration::hours(1));
+    let removed = collector.collect_cycle().await.expect("404 cycle");
+    assert_eq!(removed.wars_removed, 1);
+    assert_eq!(removed.wars_refetched, 0);
+    assert_eq!(delivery.sent_count(), 0);
+    assert_eq!(esi.war_fetch_count(WAR_ID), 2);
+    assert!(!store.war_is_open_for_test(WAR_ID).await.expect("closed"));
+
+    // Cycle 3: the removed war is no longer selected for re-fetch (its
+    // fetch count does not advance) and still posts nothing.
+    clock.advance(ChronoDuration::hours(1));
+    let steady = collector.collect_cycle().await.expect("steady cycle");
+    assert_eq!(steady.wars_removed, 0);
+    assert_eq!(esi.war_fetch_count(WAR_ID), 2);
+    assert_eq!(delivery.sent_count(), 0);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_watched_open_war_500ing_on_refetch_rotates_to_the_back() {
+    // Ticket 10 fix-round-2 (finding 2): a stored open watched war that returns
+    // a transient 500 on re-fetch must still have its last_fetched_at bumped so
+    // it rotates to the BACK of the least-recently-fetched order (retried after
+    // other open wars), rather than staying pinned at the front forever.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    // Two open watched wars; 810 fails 500 on re-fetch, 820 succeeds.
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(None, vec![war_list_ok(vec![820, 810], "l0")])
+            .with_war(
+                810,
+                vec![
+                    war_detail_ok(watched_war(810, vec![], false, false), "w810"),
+                    Err(EsiError::retryable("simulated 500", None)),
+                ],
+            )
+            .with_war(
+                820,
+                vec![war_detail_ok(
+                    watched_war(820, vec![], false, false),
+                    "w820",
+                )],
+            ),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(
+        store.clone(),
+        limiter,
+        esi.clone(),
+        delivery.clone(),
+        clock.clone(),
+    );
+
+    // Baseline stores both open wars (last_fetched == cycle-1 observed_at).
+    collector.collect_cycle().await.expect("baseline");
+    let base_810 = store
+        .war_last_fetched_at_for_test(810)
+        .await
+        .expect("810")
+        .unwrap();
+    let base_820 = store
+        .war_last_fetched_at_for_test(820)
+        .await
+        .expect("820")
+        .unwrap();
+    assert_eq!(base_810, base_820);
+
+    // Cycle 2: 810's re-fetch 500s but its last_fetched_at is still bumped so
+    // it rotates to the back (equal to 820's, both advanced past the baseline),
+    // rather than remaining stuck at the old timestamp and re-selected first.
+    clock.advance(ChronoDuration::hours(1));
+    let cycle2 = collector.collect_cycle().await.expect("500 cycle");
+    assert_eq!(cycle2.wars_refetch_errors, 1);
+    let after_810 = store
+        .war_last_fetched_at_for_test(810)
+        .await
+        .expect("810")
+        .unwrap();
+    let after_820 = store
+        .war_last_fetched_at_for_test(820)
+        .await
+        .expect("820")
+        .unwrap();
+    assert!(
+        after_810 > base_810,
+        "the 500'd war's last_fetched_at advances so it does not re-select first forever"
+    );
+    assert_eq!(
+        after_810, after_820,
+        "the 500'd war rotates to the back alongside the successfully re-fetched war"
+    );
+    // Still open (a transient failure is not a removal).
+    assert!(store.war_is_open_for_test(810).await.expect("open"));
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_limiter_pause_during_the_war_baseline_does_not_establish_it() {
+    // Ticket 10 fix-round (finding 1): a limiter pause must never flip the
+    // baseline flag. With no watched entities the alliance/member passes are
+    // no-ops, so the war baseline runs; the war-list fetch records a pause
+    // deadline that halts the baseline before any id is inspected.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let pause_at = Utc::now() + ChronoDuration::hours(24);
+    let paused_list = Ok(EsiResponse::fresh(
+        vec![500, 400, 300],
+        CacheMetadata {
+            retry_after: Some(pause_at),
+            ..CacheMetadata::cached_for_seconds(0)
+        },
+    ));
+    let esi = Arc::new(FakeWatchlistEsi::new().with_war_list_page(None, vec![paused_list]));
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(store.clone(), limiter, esi, delivery.clone(), clock);
+
+    let report = collector
+        .collect_cycle()
+        .await
+        .expect("paused baseline cycle");
+    assert!(report.paused_until.is_some());
+    assert!(!report.war_baseline_established);
+    assert!(
+        !store
+            .war_baseline_established_for_test()
+            .await
+            .expect("baseline flag"),
+        "a pause must not establish the baseline"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_late_added_entity_refetches_its_pre_existing_open_war() {
+    // Ticket 10 fix-round (finding 3): a war stored while none of its parties
+    // was watched is re-fetched once a party is added, tracking ally joins /
+    // retraction / finish -- but `war_declared` is never emitted for it (it
+    // predates the watch; a silent war baseline for that entity).
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch").await;
+
+    let late_corp = 222_222_222;
+    let ally = party(WatchlistKind::Alliance, 999_000_111);
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(
+                None,
+                vec![
+                    war_list_ok(vec![100], "l0"),
+                    war_list_ok(vec![WAR_ID, 100], "l1"),
+                    war_list_ok(vec![WAR_ID, 100], "l2"),
+                ],
+            )
+            .with_war(
+                WAR_ID,
+                vec![
+                    // Neither party watched yet; stored silently (no post).
+                    war_detail_ok(
+                        war_with(
+                            WAR_ID,
+                            party(WatchlistKind::Alliance, 111),
+                            party(WatchlistKind::Corporation, late_corp),
+                            vec![],
+                            false,
+                            false,
+                        ),
+                        "w1",
+                    ),
+                    // After the corp is watched, an ally appears on the re-fetch.
+                    war_detail_ok(
+                        war_with(
+                            WAR_ID,
+                            party(WatchlistKind::Alliance, 111),
+                            party(WatchlistKind::Corporation, late_corp),
+                            vec![ally],
+                            false,
+                            false,
+                        ),
+                        "w2",
+                    ),
+                ],
+            ),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    // Baseline (mark 100).
+    collector.collect_cycle().await.expect("baseline");
+
+    // Cycle: the war is stored, but no party is watched -> no delivery.
+    clock.advance(ChronoDuration::hours(1));
+    let stored = collector
+        .collect_cycle()
+        .await
+        .expect("store unwatched war");
+    assert_eq!(stored.war_declared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+    assert!(store.war_is_stored_for_test(WAR_ID).await.expect("stored"));
+
+    // Now watch the defender corporation.
+    watch_corporation(&store, GUILD, late_corp).await;
+
+    // Next cycle re-fetches the now-watched open war and posts the ally join.
+    clock.advance(ChronoDuration::hours(1));
+    let joined = collector.collect_cycle().await.expect("late-added cycle");
+    assert_eq!(joined.war_ally_joined, 1);
+    assert_eq!(delivery.sent()[0].event_kind, "war_ally_joined");
+    assert!(
+        delivery
+            .sent()
+            .iter()
+            .all(|d| d.event_kind != "war_declared"),
+        "no war_declared is ever posted for a war that predates the watch"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn unwatching_the_only_guild_stops_refetching_the_war() {
+    // Ticket 10 fix-round (finding 4): once the only watching entity is
+    // removed, the open war is no longer re-fetched.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(None, vec![war_list_ok(vec![WAR_ID], "l0")])
+            .with_war(
+                WAR_ID,
+                vec![war_detail_ok(
+                    watched_war(WAR_ID, vec![], false, false),
+                    "w1",
+                )],
+            ),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(
+        store.clone(),
+        limiter,
+        esi.clone(),
+        delivery.clone(),
+        clock.clone(),
+    );
+
+    // Baseline stores the open watched war (fetched once).
+    collector.collect_cycle().await.expect("baseline");
+    assert_eq!(esi.war_fetch_count(WAR_ID), 1);
+
+    // Unwatch the only guild watching the war's party.
+    store
+        .remove_entity(GUILD, WatchlistKind::Corporation, WATCHED_CORP)
+        .await
+        .expect("remove watch");
+
+    // Next cycle must not re-fetch the war.
+    clock.advance(ChronoDuration::hours(1));
+    collector.collect_cycle().await.expect("post-unwatch cycle");
+    assert_eq!(
+        esi.war_fetch_count(WAR_ID),
+        1,
+        "an unwatched war is no longer re-fetched"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn prune_drops_old_finished_wars_but_keeps_open_and_recent() {
+    // Ticket 10 fix-round (finding 4 / retention): finished wars older than
+    // the 30-day window and below the head mark are pruned; open and
+    // recently-finished wars are kept.
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
+    store
+        .record_war_scan_mark(1_000_000, observed_at)
+        .await
+        .expect("set mark");
+
+    let make = |war_id: i64, finished: Option<DateTime<Utc>>| WarDetail {
+        war_id,
+        aggressor: WarParty {
+            kind: WatchlistKind::Alliance,
+            id: 111,
+        },
+        defender: WarParty {
+            kind: WatchlistKind::Corporation,
+            id: 222,
+        },
+        allies: vec![],
+        declared: Some(observed_at - ChronoDuration::days(90)),
+        started: Some(observed_at - ChronoDuration::days(89)),
+        finished,
+        retracted: None,
+        mutual: false,
+        open_for_allies: false,
+    };
+    // Old finished (61 days), recent finished (3 days), and open.
+    store
+        .upsert_war(
+            &make(100, Some(observed_at - ChronoDuration::days(61))),
+            observed_at,
+        )
+        .await
+        .expect("old");
+    store
+        .upsert_war(
+            &make(200, Some(observed_at - ChronoDuration::days(3))),
+            observed_at,
+        )
+        .await
+        .expect("recent");
+    store
+        .upsert_war(&make(300, None), observed_at)
+        .await
+        .expect("open");
+
+    let pruned = store.prune_finished_wars(observed_at).await.expect("prune");
+    assert_eq!(pruned, 1);
+    assert!(!store.war_is_stored_for_test(100).await.expect("100"));
+    assert!(store.war_is_stored_for_test(200).await.expect("200"));
+    assert!(store.war_is_stored_for_test(300).await.expect("300"));
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_conditional_304_on_the_war_list_makes_no_change() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(FakeWatchlistEsi::new().with_war_list_page(
+        None,
+        vec![
+            war_list_ok(vec![WAR_BASELINE_ID], "l0"),
+            Ok(EsiResponse::not_modified(past_metadata("l0"))),
+        ],
+    ));
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline");
+    clock.advance(ChronoDuration::hours(1));
+    let report = collector.collect_cycle().await.expect("304 cycle");
+    assert!(report.war_not_modified >= 1);
+    assert_eq!(report.war_declared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_war_declared_delivery_dedups_across_a_simulated_restart() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    subscribe(&store, "watch").await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(
+                None,
+                vec![
+                    war_list_ok(vec![WAR_BASELINE_ID], "l0"),
+                    war_list_ok(vec![WAR_ID, WAR_BASELINE_ID], "l1"),
+                ],
+            )
+            .with_war(
+                WAR_ID,
+                vec![war_detail_ok(
+                    watched_war(WAR_ID, vec![], false, false),
+                    "w1",
+                )],
+            ),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+
+    delivery.set_behavior(FakeDeliveryBehavior::FailTransient);
+    let collector = make_collector(
+        store.clone(),
+        limiter.clone(),
+        esi.clone(),
+        delivery.clone(),
+        clock.clone(),
+    );
+    collector.collect_cycle().await.expect("baseline");
+    clock.advance(ChronoDuration::hours(1));
+    collector.collect_cycle().await.expect("declared (fails)");
+    assert_eq!(delivery.sent_count(), 0);
+    assert_eq!(store.delivery_count().await.expect("count"), 1);
+
+    // Restart: fresh collector + delivery sink, past the transient lease.
+    clock.advance(ChronoDuration::minutes(10));
+    let delivery2 = Arc::new(FakeWatchlistDelivery::new());
+    let collector2 = make_collector(
+        store.clone(),
+        limiter,
+        esi,
+        delivery2.clone(),
+        clock.clone(),
+    );
+    collector2
+        .deliver_claimable_for_test(clock.now())
+        .await
+        .expect("drain after restart");
+    assert_eq!(delivery2.sent_count(), 1);
+    assert_eq!(delivery2.sent()[0].event_kind, "war_declared");
+    // A further cycle prepares nothing new (dedup on the war id evidence key).
+    clock.advance(ChronoDuration::hours(1));
+    collector2
+        .collect_cycle()
+        .await
+        .expect("post-restart cycle");
+    assert_eq!(store.delivery_count().await.expect("count"), 1);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_subscription_selecting_only_war_kinds_receives_only_those() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_corporation(&store, GUILD, WATCHED_CORP).await;
+    // Only war_finished is selected -- war_declared must not deliver.
+    subscribe_kinds(&store, "wars-only", vec![WatchlistEventKind::WarFinished]).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(
+        FakeWatchlistEsi::new()
+            .with_war_list_page(
+                None,
+                vec![
+                    war_list_ok(vec![WAR_BASELINE_ID], "l0"),
+                    war_list_ok(vec![WAR_ID, WAR_BASELINE_ID], "l1"),
+                    war_list_ok(vec![WAR_ID, WAR_BASELINE_ID], "l2"),
+                ],
+            )
+            .with_war(
+                WAR_ID,
+                vec![
+                    war_detail_ok(watched_war(WAR_ID, vec![], false, false), "w1"),
+                    war_detail_ok(watched_war(WAR_ID, vec![], false, true), "w2"),
+                ],
+            ),
+    );
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let collector = make_collector(store.clone(), limiter, esi, delivery.clone(), clock.clone());
+
+    collector.collect_cycle().await.expect("baseline");
+
+    // Declared -> not selected -> no delivery.
+    clock.advance(ChronoDuration::hours(1));
+    let declared = collector.collect_cycle().await.expect("declared cycle");
+    assert_eq!(declared.war_declared, 0);
+    assert_eq!(delivery.sent_count(), 0);
+
+    // Finished -> selected -> delivered.
+    clock.advance(ChronoDuration::hours(1));
+    let finished = collector.collect_cycle().await.expect("finish cycle");
+    assert_eq!(finished.war_finished, 1);
+    assert_eq!(delivery.sent_count(), 1);
+    assert_eq!(delivery.sent()[0].event_kind, "war_finished");
 
     database.destroy().await;
 }

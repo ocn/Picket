@@ -77,7 +77,7 @@ impl Command for WatchSubscribeCommand {
             .create_option(|option| {
                 option
                     .name("event_kinds")
-                    .description("Comma list: corp_joined, corp_left, member_delta, corp_changed_alliance (default: all).")
+                    .description("Comma list incl. corp_joined/left, member_delta, war_declared/ally_joined/retracted/finished.")
                     .kind(CommandOptionType::String)
             })
             .create_option(|option| {

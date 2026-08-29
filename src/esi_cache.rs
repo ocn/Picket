@@ -161,6 +161,18 @@ impl EsiError {
         }
     }
 
+    /// Constructs a `404 Not Found` error (a permanent absence). Public so
+    /// out-of-crate integration tests can script a war id that no longer
+    /// resolves; production paths build errors via [`Self::from_metadata`].
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            status: Some(StatusCode::NOT_FOUND),
+            retry_after: None,
+            metadata: CacheMetadata::cached_for_seconds(0),
+        }
+    }
+
     pub(crate) fn from_metadata(
         message: impl Into<String>,
         status: Option<StatusCode>,

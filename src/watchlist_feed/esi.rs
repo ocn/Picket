@@ -75,8 +75,9 @@
 //!   band/alliance-change state derived from them.
 
 use crate::esi_cache::{cache_metadata, EsiError, EsiResponse};
+use crate::watchlist_feed::model::{WarDetail, WarParty, WatchlistKind};
 use async_trait::async_trait;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::header::IF_NONE_MATCH;
 use reqwest::{Client, StatusCode};
 use std::time::Duration;
@@ -122,6 +123,25 @@ pub trait WatchlistEsi: Send + Sync {
         corporation_id: i64,
         etag: Option<String>,
     ) -> Result<EsiResponse<CorporationInfo>, EsiError>;
+
+    /// Fetches one page of the id-descending war list (`GET /wars/`, ticket
+    /// 10). `max_war_id` pages to ids strictly below it (older wars); `None`
+    /// starts at the head. Conditional via `etag`; the metadata carries the
+    /// shared `killmail` rate-limit bucket the collector records after every
+    /// response including 304s and errors.
+    async fn fetch_wars(
+        &self,
+        max_war_id: Option<i64>,
+        etag: Option<String>,
+    ) -> Result<EsiResponse<Vec<i64>>, EsiError>;
+
+    /// Fetches one war's public detail (`GET /wars/{id}/`, ticket 10), with a
+    /// conditional request for re-fetches of stored open wars.
+    async fn fetch_war(
+        &self,
+        war_id: i64,
+        etag: Option<String>,
+    ) -> Result<EsiResponse<WarDetail>, EsiError>;
 }
 
 pub struct HttpWatchlistEsi {
@@ -280,5 +300,184 @@ impl WatchlistEsi for HttpWatchlistEsi {
             },
             metadata,
         ))
+    }
+
+    async fn fetch_wars(
+        &self,
+        max_war_id: Option<i64>,
+        etag: Option<String>,
+    ) -> Result<EsiResponse<Vec<i64>>, EsiError> {
+        let url = match max_war_id {
+            Some(max_war_id) => format!(
+                "{}wars/?datasource=tranquility&max_war_id={max_war_id}",
+                self.base_url
+            ),
+            None => format!("{}wars/?datasource=tranquility", self.base_url),
+        };
+        let mut request = self
+            .client
+            .get(&url)
+            .header("X-Compatibility-Date", WATCHLIST_COMPATIBILITY_DATE);
+        if let Some(etag) = &etag {
+            request = request.header(IF_NONE_MATCH, etag);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| EsiError::retryable(error.to_string(), None))?;
+        let metadata = cache_metadata(response.headers());
+        if response.status() == StatusCode::NOT_MODIFIED {
+            return Ok(EsiResponse::not_modified(metadata));
+        }
+        if !response.status().is_success() {
+            return Err(war_status_error(response.status(), metadata));
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| EsiError::from_metadata(error.to_string(), None, metadata.clone()))?;
+        let war_ids: Vec<i64> = serde_json::from_slice(&body).map_err(|error| {
+            EsiError::from_metadata(
+                format!("error decoding response body: {error}"),
+                None,
+                metadata.clone(),
+            )
+        })?;
+        Ok(EsiResponse::fresh(war_ids, metadata))
+    }
+
+    async fn fetch_war(
+        &self,
+        war_id: i64,
+        etag: Option<String>,
+    ) -> Result<EsiResponse<WarDetail>, EsiError> {
+        let url = format!("{}wars/{war_id}/?datasource=tranquility", self.base_url);
+        let mut request = self
+            .client
+            .get(&url)
+            .header("X-Compatibility-Date", WATCHLIST_COMPATIBILITY_DATE);
+        if let Some(etag) = &etag {
+            request = request.header(IF_NONE_MATCH, etag);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| EsiError::retryable(error.to_string(), None))?;
+        let metadata = cache_metadata(response.headers());
+        if response.status() == StatusCode::NOT_MODIFIED {
+            return Ok(EsiResponse::not_modified(metadata));
+        }
+        if !response.status().is_success() {
+            return Err(war_status_error(response.status(), metadata));
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| EsiError::from_metadata(error.to_string(), None, metadata.clone()))?;
+        let parsed: WarDetailBody = serde_json::from_slice(&body).map_err(|error| {
+            EsiError::from_metadata(
+                format!("error decoding response body: {error}"),
+                None,
+                metadata.clone(),
+            )
+        })?;
+        let detail = parsed
+            .into_detail(war_id)
+            .map_err(|error| EsiError::from_metadata(error, None, metadata.clone()))?;
+        Ok(EsiResponse::fresh(detail, metadata))
+    }
+}
+
+/// Builds an [`EsiError`] from a non-success war-route status, carrying the
+/// `retry_after` for a 420/429 exactly like the other watchlist routes.
+fn war_status_error(status: StatusCode, metadata: crate::esi_cache::CacheMetadata) -> EsiError {
+    let mut metadata = metadata;
+    metadata.retry_after = metadata.retry_after.or_else(|| {
+        if matches!(status, StatusCode::TOO_MANY_REQUESTS) || status.as_u16() == 420 {
+            metadata
+                .error_limit_reset
+                .map(|seconds| Utc::now() + ChronoDuration::seconds(seconds))
+        } else {
+            None
+        }
+    });
+    EsiError::from_metadata(format!("ESI returned {status}"), Some(status), metadata)
+}
+
+/// One side (aggressor/defender/ally) of a war on the wire: exactly one of
+/// `alliance_id`/`corporation_id` is present.
+#[derive(serde::Deserialize)]
+struct WarPartyBody {
+    #[serde(default)]
+    alliance_id: Option<i64>,
+    #[serde(default)]
+    corporation_id: Option<i64>,
+}
+
+impl WarPartyBody {
+    fn into_party(self) -> Option<WarParty> {
+        match (self.alliance_id, self.corporation_id) {
+            (Some(id), _) => Some(WarParty {
+                kind: WatchlistKind::Alliance,
+                id,
+            }),
+            (None, Some(id)) => Some(WarParty {
+                kind: WatchlistKind::Corporation,
+                id,
+            }),
+            (None, None) => None,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct WarDetailBody {
+    #[serde(default)]
+    aggressor: Option<WarPartyBody>,
+    #[serde(default)]
+    defender: Option<WarPartyBody>,
+    #[serde(default)]
+    allies: Vec<WarPartyBody>,
+    #[serde(default)]
+    declared: Option<DateTime<Utc>>,
+    #[serde(default)]
+    started: Option<DateTime<Utc>>,
+    #[serde(default)]
+    finished: Option<DateTime<Utc>>,
+    #[serde(default)]
+    retracted: Option<DateTime<Utc>>,
+    #[serde(default)]
+    mutual: bool,
+    #[serde(default)]
+    open_for_allies: bool,
+}
+
+impl WarDetailBody {
+    fn into_detail(self, war_id: i64) -> Result<WarDetail, String> {
+        let aggressor = self
+            .aggressor
+            .and_then(WarPartyBody::into_party)
+            .ok_or_else(|| format!("war {war_id} has no aggressor alliance/corporation id"))?;
+        let defender = self
+            .defender
+            .and_then(WarPartyBody::into_party)
+            .ok_or_else(|| format!("war {war_id} has no defender alliance/corporation id"))?;
+        let allies = self
+            .allies
+            .into_iter()
+            .filter_map(WarPartyBody::into_party)
+            .collect();
+        Ok(WarDetail {
+            war_id,
+            aggressor,
+            defender,
+            allies,
+            declared: self.declared,
+            started: self.started,
+            finished: self.finished,
+            retracted: self.retracted,
+            mutual: self.mutual,
+            open_for_allies: self.open_for_allies,
+        })
     }
 }

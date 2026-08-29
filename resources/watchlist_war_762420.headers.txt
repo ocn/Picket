@@ -1,0 +1,25 @@
+HTTP/1.1 200 Connection Established
+
+HTTP/2 200 
+date: Fri, 28 Aug 2026 22:34:14 GMT
+content-type: application/json; charset=UTF-8
+content-length: 360
+access-control-allow-origin: *
+access-control-expose-headers: Etag, Retry-After, X-Compatibility-Date, X-Esi-Error-Limit-Remain, X-Esi-Error-Limit-Reset, X-Pages, X-Ratelimit-Group, X-Ratelimit-Limit, X-Ratelimit-Remaining, X-Ratelimit-Used
+cache-control: public
+content-language: en
+etag: "7511d54769c3b071ce62bc28bf5ba824e6486c32754314ce587f91aa"
+expires: Fri, 28 Aug 2026 22:36:53 GMT
+last-modified: Fri, 28 Aug 2026 21:36:53 GMT
+strict-transport-security: max-age=31536000
+vary: X-Tenant
+vary: Accept-Language
+vary: X-Compatibility-Date
+x-compatibility-date: 2020-01-01
+x-esi-cache-status: HIT
+x-esi-request-id: 9aed5c99-192b-4aac-a65e-055049a781b3
+x-ratelimit-group: killmail
+x-ratelimit-limit: 3600/15m
+x-ratelimit-remaining: 3558
+x-ratelimit-used: 2
+
