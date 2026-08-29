@@ -2144,34 +2144,35 @@ pub async fn build_killmail_embed(
             (None, None)
         };
 
-    let final_blow_display = if let Some(final_blow) = killmail
+    let credited_attacker_display = if let Some(credited_attacker) = killmail
         .attackers
         .iter()
         .find(|attacker| attacker.final_blow)
     {
-        let (identity_name, identity_link) = if let Some(character_id) = final_blow.character_id {
-            (
-                get_name(app_state, character_id)
-                    .await
-                    .unwrap_or_else(|| "Unknown".to_string()),
-                Some(format!("https://zkillboard.com/character/{character_id}/")),
-            )
-        } else {
-            let ship_type_name = if let Some(ship_type_id) = final_blow.ship_type_id {
-                get_name(app_state, ship_type_id as u64)
-                    .await
-                    .unwrap_or_else(|| "Unknown Ship".to_string())
+        let (identity_name, identity_link) =
+            if let Some(character_id) = credited_attacker.character_id {
+                (
+                    get_name(app_state, character_id)
+                        .await
+                        .unwrap_or_else(|| "Unknown".to_string()),
+                    Some(format!("https://zkillboard.com/character/{character_id}/")),
+                )
             } else {
-                "Unknown Ship".to_string()
+                let ship_type_name = if let Some(ship_type_id) = credited_attacker.ship_type_id {
+                    get_name(app_state, ship_type_id as u64)
+                        .await
+                        .unwrap_or_else(|| "Unknown Ship".to_string())
+                } else {
+                    "Unknown Ship".to_string()
+                };
+                (ship_type_name, None)
             };
-            (ship_type_name, None)
-        };
-        let (ticker, affiliation_link) = if let Some(alliance_id) = final_blow.alliance_id {
+        let (ticker, affiliation_link) = if let Some(alliance_id) = credited_attacker.alliance_id {
             (
                 get_ticker(app_state, alliance_id, true).await,
                 Some(format!("https://zkillboard.com/alliance/{alliance_id}/")),
             )
-        } else if let Some(corporation_id) = final_blow.corporation_id {
+        } else if let Some(corporation_id) = credited_attacker.corporation_id {
             (
                 get_ticker(app_state, corporation_id, false).await,
                 Some(format!(
@@ -2402,9 +2403,13 @@ pub async fn build_killmail_embed(
     );
 
     // Victim field
-    embed.field("Victim", victim_display, final_blow_display.is_some());
-    if let Some(final_blow_display) = final_blow_display {
-        embed.field("Final Blow", final_blow_display, true);
+    embed.field(
+        "Victim",
+        victim_display,
+        credited_attacker_display.is_some(),
+    );
+    if let Some(credited_attacker_display) = credited_attacker_display {
+        embed.field("Final Blow", credited_attacker_display, true);
     }
 
     // Footer
