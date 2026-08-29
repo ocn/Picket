@@ -13,12 +13,16 @@
 use crate::esi_cache::{merge_cache_metadata, EsiError, EsiLimiterStore};
 use crate::watchlist_feed::esi::WatchlistEsi;
 use crate::watchlist_feed::model::{
-    evaluate_member_delta, MemberDeltaAlert, MemberDeltaDirection, MemberDeltaOutcome,
-    PreparedWatchlistDelivery, WatchlistDelivery, WatchlistEmbedField, WatchlistEntityResolver,
+    derive_war_events, evaluate_member_delta, scan_war_page, MemberDeltaAlert,
+    MemberDeltaDirection, MemberDeltaOutcome, PreparedWatchlistDelivery, WarDetail, WarEvent,
+    WarParty, WarScanState, WatchlistDelivery, WatchlistEmbedField, WatchlistEntityResolver,
     WatchlistEvent, WatchlistEventKind, WatchlistKind, WatchlistNotificationMessage,
     WatchlistSubscription, MEMBER_DELTA_REFERENCE_WINDOW,
 };
-use crate::watchlist_feed::store::{alliance_resource_key, corp_resource_key, WatchlistStore};
+use crate::watchlist_feed::store::{
+    alliance_resource_key, corp_resource_key, war_resource_key, wars_list_resource_key,
+    WatchlistStore, WAR_FETCH_FAILURE_SKIP_THRESHOLD,
+};
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -33,6 +37,26 @@ use tracing::warn;
 /// route's one-hour TTL) already skips most re-fetches, so this cap only
 /// bites on the first cycles after a large watchlist is configured.
 const MAX_CORP_INFO_FETCHES_PER_CYCLE: usize = 200;
+
+/// The maximum number of war-list pages (`GET /wars/`, 2000 ids each) the
+/// head-scan reads above the high-water mark in one cycle. New wars accumulate
+/// at the head at a rate far below 2000/hour, so a subsequent scan almost
+/// always finishes on page 1; the cap only bounds a pathological backlog and
+/// defers the rest to the next cycle (the mark is not advanced past unread
+/// ids). The first (baseline) scan reads a single page.
+const MAX_WAR_LIST_PAGES_PER_CYCLE: usize = 5;
+
+/// The maximum number of new-war detail fetches (`GET /wars/{id}/`) the
+/// head-scan issues per cycle. New watched wars are rare, so this only bounds
+/// the first baseline scan of a fresh head page; any overflow is deferred (the
+/// mark is not advanced past an unfetched id).
+const MAX_NEW_WAR_DETAIL_FETCHES_PER_CYCLE: usize = 200;
+
+/// The maximum number of stored OPEN wars re-fetched per cycle, ordered
+/// least-recently-fetched first so coverage rotates like the corp-info cap.
+/// Cache freshness (the route's one-hour TTL) skips most re-fetches anyway, so
+/// this only bites with a very large set of concurrently-open watched wars.
+const MAX_OPEN_WAR_REFETCHES_PER_CYCLE: i64 = 200;
 
 pub trait WatchlistClock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
@@ -108,7 +132,67 @@ pub struct WatchlistCollectionReport {
     pub member_delta: usize,
     /// `corp_changed_alliance` deliveries prepared.
     pub corp_changed_alliance: usize,
+    /// Whether the war head-scan completed (established) its silent baseline
+    /// this cycle. The baseline may span several cycles; this is true only on
+    /// the cycle it finally flips.
+    pub war_baseline_established: bool,
+    /// Whether the silent baseline is still in progress after this cycle
+    /// (some head-page ids remain to inspect). Mutually exclusive with the
+    /// established flip.
+    pub war_baseline_pending: bool,
+    /// War ids inspected by the baseline this cycle (a subset of the head page).
+    pub war_baseline_scanned: usize,
+    /// New war ids scanned above the high-water mark this cycle.
+    pub wars_scanned: usize,
+    /// War ids skipped this cycle after the failure ledger quarantined them
+    /// (a 404, or a non-404 error persisting past the threshold). The mark
+    /// advances past a skipped id.
+    pub wars_skipped: usize,
+    /// Wars stored this cycle (every inspected war, watched or not, including
+    /// baseline seeding).
+    pub wars_stored: usize,
+    /// Stored open wars re-fetched (a fresh `200`) this cycle.
+    pub wars_refetched: usize,
+    /// Open watched wars whose re-fetch errored (non-404); counted and rotated
+    /// to the back of the least-recently-fetched order so they retry later.
+    pub wars_refetch_errors: usize,
+    /// Open watched wars removed this cycle because their re-fetch returned a
+    /// `404` (CCP deleted the war); marked finished, no event emitted.
+    pub wars_removed: usize,
+    /// War detail / list conditional requests that returned `304`.
+    pub war_not_modified: usize,
+    /// War detail fetches that errored (isolated per war).
+    pub war_errors: usize,
+    /// `war_declared` deliveries prepared.
+    pub war_declared: usize,
+    /// `war_ally_joined` deliveries prepared.
+    pub war_ally_joined: usize,
+    /// `war_retracted` deliveries prepared.
+    pub war_retracted: usize,
+    /// `war_finished` deliveries prepared.
+    pub war_finished: usize,
     pub deliveries_prepared: usize,
+}
+
+/// The outcome of one war detail fetch (cache/limiter metadata already
+/// persisted). `Failed` carries whether the error was a `404` so the caller
+/// can distinguish a permanent absence from a transient failure.
+enum WarFetch {
+    Body(WarDetail),
+    NotModified,
+    Failed { not_found: bool, message: String },
+}
+
+/// How a post-baseline scanned war affects the contiguous safe prefix that
+/// advances the high-water mark.
+enum WarScanOutcome {
+    /// Fetched and processed (the mark may advance across it).
+    Processed,
+    /// Quarantined and skipped (404, or a non-404 past the threshold); the
+    /// mark advances past it as if it were processed.
+    Skipped,
+    /// A transient failure below the threshold; the mark must freeze below it.
+    Frozen,
 }
 
 pub struct WatchlistCollector {
@@ -118,6 +202,10 @@ pub struct WatchlistCollector {
     delivery: Arc<dyn WatchlistDelivery>,
     resolver: Arc<dyn WatchlistEntityResolver>,
     clock: Arc<dyn WatchlistClock>,
+    /// The per-cycle cap on new-war detail fetches (head-scan and baseline).
+    /// Injectable so tests can force the baseline to span multiple cycles;
+    /// defaults to [`MAX_NEW_WAR_DETAIL_FETCHES_PER_CYCLE`].
+    war_detail_cap: usize,
 }
 
 impl WatchlistCollector {
@@ -135,11 +223,19 @@ impl WatchlistCollector {
             delivery,
             resolver,
             clock: Arc::new(SystemWatchlistClock),
+            war_detail_cap: MAX_NEW_WAR_DETAIL_FETCHES_PER_CYCLE,
         }
     }
 
     pub fn with_clock(mut self, clock: Arc<dyn WatchlistClock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Overrides the per-cycle new-war detail-fetch cap (tests only).
+    #[doc(hidden)]
+    pub fn with_war_detail_cap(mut self, cap: usize) -> Self {
+        self.war_detail_cap = cap;
         self
     }
 
@@ -204,9 +300,19 @@ impl WatchlistCollector {
                 .await?;
         }
 
+        // War head-scan and open-war re-fetch pass (ticket 10). Skipped when an
+        // earlier pass already hit the shared limiter deadline; it resumes next
+        // cycle. Its per-war errors are isolated inside the pass.
+        if report.paused_until.is_none() {
+            self.collect_wars(observed_at, &mut report).await?;
+        }
+
         // Best-effort retention prune; a failure here must not fail the cycle.
         if let Err(error) = self.store.prune_member_snapshots(observed_at).await {
             warn!("watchlist member snapshot prune failed: {error}");
+        }
+        if let Err(error) = self.store.prune_finished_wars(observed_at).await {
+            warn!("watchlist finished-war prune failed: {error}");
         }
 
         self.deliver_claimable(observed_at).await?;
@@ -499,6 +605,802 @@ impl WatchlistCollector {
             .note_corporation(corporation_id, info.name.clone(), info.ticker.clone())
             .await;
         Ok(())
+    }
+
+    /// The war pass (ticket 10): head-scan new war ids above the persisted
+    /// high-water mark and re-fetch stored open wars, both bounded and
+    /// limiter-aware, with per-war error isolation.
+    async fn collect_wars(
+        &self,
+        observed_at: DateTime<Utc>,
+        report: &mut WatchlistCollectionReport,
+    ) -> Result<(), WatchlistCollectionError> {
+        self.head_scan_wars(observed_at, report).await?;
+        if report.paused_until.is_some() {
+            return Ok(());
+        }
+        self.refetch_open_wars(observed_at, report).await?;
+        Ok(())
+    }
+
+    /// Head-scans the id-descending war list. Before the baseline is
+    /// established this runs the multi-cycle silent baseline; afterwards it
+    /// processes new ids above the high-water mark, storing every inspected
+    /// war and emitting events for the watched ones.
+    async fn head_scan_wars(
+        &self,
+        observed_at: DateTime<Utc>,
+        report: &mut WatchlistCollectionReport,
+    ) -> Result<(), WatchlistCollectionError> {
+        let state = self.store.war_scan_state().await.map_err(store_error)?;
+        if state.baseline_established {
+            self.head_scan_new_wars(&state, observed_at, report).await
+        } else {
+            self.run_war_baseline(&state, observed_at, report).await
+        }
+    }
+
+    /// The silent baseline, spanning as many cycles as its detail-fetch cap
+    /// requires to inspect the ids that existed on the head page when it began.
+    ///
+    /// The very first baseline cycle reads the head page fresh to pin
+    /// `baseline_head_max` (the mark set on completion) and `baseline_floor`
+    /// (the bottom id of that original page). Every resume cycle then pages
+    /// strictly DOWNWARD from the persisted cursor (`fetch_wars(Some(cursor))`)
+    /// rather than re-reading the head: new wars enter at the head each hour
+    /// and push the oldest ids out of the ~2000-id window, so an id that was on
+    /// the original page but rolls off the head before the cursor reaches it is
+    /// still reachable below the cursor. Each cycle inspects the next
+    /// [`Self::war_detail_cap`] in-scope ids (`>= floor`, `< cursor`, newest
+    /// first), stores every inspected war silently, and advances the cursor.
+    ///
+    /// The flag flips true (and the mark is set to the head max) only once the
+    /// cursor reaches the floor -- i.e. a page's in-scope ids are exhausted
+    /// without hitting the cap -- meaning every id that existed on the original
+    /// page has been inspected. Ids strictly below the original floor are out
+    /// of scope by design (never on the starting window). A pause or error
+    /// never flips it. New wars declared during the baseline (ids above the
+    /// head max) are ignored here and picked up by the first post-baseline scan.
+    ///
+    /// Cursor pages are plain GETs without `If-None-Match`: a per-cursor ETag is
+    /// useless because the cursor moves every cycle, and storing it under the
+    /// head's list resource key would corrupt the head-scan freshness gate. So
+    /// only the first (head) cycle persists cache metadata under the list key;
+    /// every page still records the limiter/rate-limit metadata after its
+    /// response.
+    #[allow(clippy::explicit_counter_loop)]
+    async fn run_war_baseline(
+        &self,
+        state: &WarScanState,
+        observed_at: DateTime<Utc>,
+        report: &mut WatchlistCollectionReport,
+    ) -> Result<(), WatchlistCollectionError> {
+        if let Some(deadline) = self
+            .limiter
+            .active_esi_limiter_deadline()
+            .await
+            .map_err(store_error)?
+        {
+            report.paused_until = Some(deadline);
+            return Ok(());
+        }
+        let list_key = wars_list_resource_key();
+        let cached = self
+            .store
+            .cache_metadata(&list_key)
+            .await
+            .map_err(store_error)?;
+        // The first cycle reads the head page (no cursor persisted yet) to pin
+        // the head max and floor; later cycles page downward from the cursor.
+        let cursor = state.baseline_cursor;
+        let is_head_cycle = cursor.is_none();
+        // The head cycle forces a fresh fetch (no ETag) so it always sees the
+        // ids; cursor pages are plain GETs (a moving cursor makes an ETag
+        // useless).
+        let response = match self.esi.fetch_wars(cursor, None).await {
+            Ok(response) => response,
+            Err(error) => {
+                if is_head_cycle {
+                    let merged = merge_cache_metadata(&cached, error.metadata.clone());
+                    self.store
+                        .persist_cache_metadata(&list_key, &merged)
+                        .await
+                        .map_err(store_error)?;
+                }
+                self.limiter
+                    .record_esi_limiter_at(&error.metadata, observed_at)
+                    .await
+                    .map_err(store_error)?;
+                report.war_errors += 1;
+                warn!(
+                    "watchlist war baseline list fetch failed; not flipping the baseline: {error}"
+                );
+                return Ok(());
+            }
+        };
+        if is_head_cycle {
+            let merged = merge_cache_metadata(&cached, response.metadata.clone());
+            self.store
+                .persist_cache_metadata(&list_key, &merged)
+                .await
+                .map_err(store_error)?;
+        }
+        self.limiter
+            .record_esi_limiter_at(&response.metadata, observed_at)
+            .await
+            .map_err(store_error)?;
+        if response.not_modified {
+            // A 304 carries no ids; do not flip or advance (the head cycle
+            // needs the ids, and a no-ETag cursor page should not 304).
+            report.war_not_modified += 1;
+            return Ok(());
+        }
+        let ids = response.value.unwrap_or_default();
+        // Pin the head max and floor on the head cycle; preserve them after.
+        let head_max = state
+            .baseline_head_max
+            .unwrap_or_else(|| ids.iter().copied().max().unwrap_or(0));
+        let floor = state
+            .baseline_floor
+            .unwrap_or_else(|| ids.iter().copied().min().unwrap_or(0));
+        // In scope: ids that existed on the original page ([floor, head_max])
+        // and still below the cursor. Ids below the floor are out of scope
+        // (they were never on the starting window).
+        let mut eligible: Vec<i64> = ids
+            .into_iter()
+            .filter(|id| *id <= head_max && *id >= floor && cursor.is_none_or(|c| *id < c))
+            .collect();
+        eligible.sort_unstable_by(|a, b| b.cmp(a)); // newest first
+
+        let mut new_cursor = cursor;
+        let mut fetches = 0usize;
+        let mut incomplete = false; // stopped by cap or pause, not exhaustion
+        for war_id in eligible {
+            if fetches >= self.war_detail_cap {
+                incomplete = true;
+                break;
+            }
+            if let Some(deadline) = self
+                .limiter
+                .active_esi_limiter_deadline()
+                .await
+                .map_err(store_error)?
+            {
+                report.paused_until = Some(deadline);
+                incomplete = true;
+                break;
+            }
+            fetches += 1;
+            self.baseline_store_war(war_id, observed_at, report).await?;
+            new_cursor = Some(war_id); // descending, so this is the lowest seen
+        }
+        report.war_baseline_scanned += fetches;
+
+        if incomplete {
+            // Persist progress (pinning the head max and floor) but never flip.
+            self.store
+                .record_war_baseline_progress(head_max, new_cursor, floor, observed_at)
+                .await
+                .map_err(store_error)?;
+            report.war_baseline_pending = true;
+        } else {
+            // The page's in-scope ids were exhausted without hitting the cap:
+            // the cursor has reached the floor (a downward page always extends
+            // to it, so exhausting it means every original-page id was
+            // inspected). Complete the baseline and set the mark to the head
+            // max so the next scan processes everything above.
+            self.store
+                .complete_war_baseline(head_max, observed_at)
+                .await
+                .map_err(store_error)?;
+            report.war_baseline_established = true;
+        }
+        Ok(())
+    }
+
+    /// Stores one baseline-inspected war silently (no events). A failed or
+    /// unchanged fetch is skipped best-effort; the cursor still advances past
+    /// it so the one-time baseline cannot get stuck on a bad id.
+    async fn baseline_store_war(
+        &self,
+        war_id: i64,
+        observed_at: DateTime<Utc>,
+        report: &mut WatchlistCollectionReport,
+    ) -> Result<(), WatchlistCollectionError> {
+        match self
+            .fetch_and_persist_war(war_id, observed_at, report)
+            .await?
+        {
+            WarFetch::Body(detail) => {
+                self.store
+                    .upsert_war(&detail, observed_at)
+                    .await
+                    .map_err(store_error)?;
+                self.store
+                    .clear_war_fetch_attempts(war_id)
+                    .await
+                    .map_err(store_error)?;
+                report.wars_stored += 1;
+            }
+            WarFetch::NotModified | WarFetch::Failed { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// The post-baseline scan: pages the head above the mark, then processes
+    /// new ids ascending. Every inspected war is stored; the mark advances
+    /// across the contiguous safe prefix (successes and quarantined skips),
+    /// while a transient failure breaks contiguity yet still lets higher ids
+    /// this cycle be processed and posted.
+    #[allow(clippy::explicit_counter_loop)]
+    async fn head_scan_new_wars(
+        &self,
+        state: &WarScanState,
+        observed_at: DateTime<Utc>,
+        report: &mut WatchlistCollectionReport,
+    ) -> Result<(), WatchlistCollectionError> {
+        let mark = state.high_water_mark;
+        let list_key = wars_list_resource_key();
+        let cached = self
+            .store
+            .cache_metadata(&list_key)
+            .await
+            .map_err(store_error)?;
+        // Within the list's one-hour freshness the head cannot have changed.
+        if cached.is_fresh() {
+            return Ok(());
+        }
+
+        let mut new_ids: Vec<i64> = Vec::new();
+        let mut highest_seen: Option<i64> = None;
+        let mut max_war_id: Option<i64> = None;
+        let mut pages = 0usize;
+        loop {
+            if let Some(deadline) = self
+                .limiter
+                .active_esi_limiter_deadline()
+                .await
+                .map_err(store_error)?
+            {
+                report.paused_until = Some(deadline);
+                return Ok(());
+            }
+            // Only page 1 (the head) carries the stored ETag; deeper pages are
+            // distinct URLs fetched fresh.
+            let etag = if max_war_id.is_none() {
+                cached.etag.clone()
+            } else {
+                None
+            };
+            let response = match self.esi.fetch_wars(max_war_id, etag).await {
+                Ok(response) => response,
+                Err(error) => {
+                    if max_war_id.is_none() {
+                        let merged = merge_cache_metadata(&cached, error.metadata.clone());
+                        self.store
+                            .persist_cache_metadata(&list_key, &merged)
+                            .await
+                            .map_err(store_error)?;
+                    }
+                    self.limiter
+                        .record_esi_limiter_at(&error.metadata, observed_at)
+                        .await
+                        .map_err(store_error)?;
+                    report.war_errors += 1;
+                    warn!("watchlist war list scan failed; keeping the high-water mark: {error}");
+                    return Ok(());
+                }
+            };
+            if max_war_id.is_none() {
+                let merged = merge_cache_metadata(&cached, response.metadata.clone());
+                self.store
+                    .persist_cache_metadata(&list_key, &merged)
+                    .await
+                    .map_err(store_error)?;
+            }
+            self.limiter
+                .record_esi_limiter_at(&response.metadata, observed_at)
+                .await
+                .map_err(store_error)?;
+
+            if response.not_modified {
+                report.war_not_modified += 1;
+                break;
+            }
+            let ids = response.value.unwrap_or_default();
+            let scan = scan_war_page(&ids, mark);
+            if highest_seen.is_none() {
+                highest_seen = scan.highest_seen;
+            }
+            new_ids.extend(scan.new_ids);
+            pages += 1;
+            match scan.next_max_war_id {
+                Some(next) if pages < MAX_WAR_LIST_PAGES_PER_CYCLE => {
+                    max_war_id = Some(next);
+                    continue;
+                }
+                _ => break,
+            }
+        }
+
+        report.wars_scanned += new_ids.len();
+        let mark_target = highest_seen.unwrap_or(mark).max(mark);
+
+        new_ids.sort_unstable();
+        let mut contiguous_safe = mark;
+        let mut broke = false; // contiguity broken by a transient (non-quarantined) failure
+        let mut incomplete = false; // stopped early by cap or pause
+        let mut fetches = 0usize;
+        for war_id in new_ids {
+            if fetches >= self.war_detail_cap {
+                incomplete = true;
+                break;
+            }
+            if let Some(deadline) = self
+                .limiter
+                .active_esi_limiter_deadline()
+                .await
+                .map_err(store_error)?
+            {
+                report.paused_until = Some(deadline);
+                incomplete = true;
+                break;
+            }
+            fetches += 1;
+            match self.scan_new_war(war_id, observed_at, report).await? {
+                WarScanOutcome::Processed | WarScanOutcome::Skipped => {
+                    // Successes and quarantined skips extend the safe prefix
+                    // (a skipped id is treated as safe: the mark moves past it).
+                    if !broke {
+                        contiguous_safe = contiguous_safe.max(war_id);
+                    }
+                }
+                WarScanOutcome::Frozen => {
+                    // Transient failure below the skip threshold: freeze the
+                    // mark below it (retried next cycle) but keep processing
+                    // higher ids this cycle.
+                    broke = true;
+                }
+            }
+        }
+        let final_mark = if broke || incomplete {
+            contiguous_safe
+        } else {
+            mark_target
+        };
+        self.store
+            .record_war_scan_mark(final_mark, observed_at)
+            .await
+            .map_err(store_error)?;
+        Ok(())
+    }
+
+    /// Fetches and processes one new (above-the-mark) war: stores it and emits
+    /// its events. On failure, consults the bounded skip ledger and returns
+    /// whether the id is safe to advance the mark past, must be quarantined, or
+    /// must freeze the mark below it.
+    async fn scan_new_war(
+        &self,
+        war_id: i64,
+        observed_at: DateTime<Utc>,
+        report: &mut WatchlistCollectionReport,
+    ) -> Result<WarScanOutcome, WatchlistCollectionError> {
+        match self
+            .fetch_and_persist_war(war_id, observed_at, report)
+            .await?
+        {
+            WarFetch::Body(detail) => {
+                self.store
+                    .clear_war_fetch_attempts(war_id)
+                    .await
+                    .map_err(store_error)?;
+                self.store_and_emit_war(&detail, observed_at, report)
+                    .await?;
+                Ok(WarScanOutcome::Processed)
+            }
+            WarFetch::NotModified => {
+                // A new war carries no stored ETag, so a 304 is unexpected;
+                // treat it as handled and clear any ledger row.
+                self.store
+                    .clear_war_fetch_attempts(war_id)
+                    .await
+                    .map_err(store_error)?;
+                Ok(WarScanOutcome::Processed)
+            }
+            WarFetch::Failed { not_found, message } => {
+                if not_found {
+                    // A permanent absence: skip immediately, mark advances past.
+                    self.store
+                        .clear_war_fetch_attempts(war_id)
+                        .await
+                        .map_err(store_error)?;
+                    report.wars_skipped += 1;
+                    warn!(
+                        "watchlist war {war_id} not found (404); skipping and advancing the mark"
+                    );
+                    return Ok(WarScanOutcome::Skipped);
+                }
+                let attempts = self
+                    .store
+                    .record_war_fetch_attempt(war_id, &message, observed_at)
+                    .await
+                    .map_err(store_error)?;
+                if attempts >= WAR_FETCH_FAILURE_SKIP_THRESHOLD {
+                    self.store
+                        .clear_war_fetch_attempts(war_id)
+                        .await
+                        .map_err(store_error)?;
+                    report.wars_skipped += 1;
+                    warn!("watchlist war {war_id} failed {attempts} cycles; skipping and advancing the mark: {message}");
+                    Ok(WarScanOutcome::Skipped)
+                } else {
+                    // Not yet at the threshold: freeze the mark below it.
+                    Ok(WarScanOutcome::Frozen)
+                }
+            }
+        }
+    }
+
+    /// Stores one inspected war and emits its derived events. Every inspected
+    /// war is stored (watched or not); events for unwatched wars fan out to no
+    /// guilds and produce no deliveries.
+    async fn store_and_emit_war(
+        &self,
+        detail: &WarDetail,
+        observed_at: DateTime<Utc>,
+        report: &mut WatchlistCollectionReport,
+    ) -> Result<(), WatchlistCollectionError> {
+        let previous = self
+            .store
+            .stored_war_observation(detail.war_id)
+            .await
+            .map_err(store_error)?;
+        let events = derive_war_events(previous.as_ref(), detail);
+        self.store
+            .upsert_war(detail, observed_at)
+            .await
+            .map_err(store_error)?;
+        if previous.is_none() {
+            report.wars_stored += 1;
+        }
+        for event in events {
+            self.prepare_war_event(&event, detail, observed_at, report)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Re-fetches currently-watched stored open wars (bounded,
+    /// least-recently-fetched) and emits ally-joined / retracted / finished
+    /// events. "Watched" is derived at query time, so a war whose only
+    /// watching entity was removed drops out (no more re-fetches) and a war
+    /// stored before its party was watched is re-fetched once that party is
+    /// added. Per-war errors are isolated.
+    async fn refetch_open_wars(
+        &self,
+        observed_at: DateTime<Utc>,
+        report: &mut WatchlistCollectionReport,
+    ) -> Result<(), WatchlistCollectionError> {
+        let war_ids = self
+            .store
+            .open_watched_war_ids_least_recently_fetched(
+                MAX_OPEN_WAR_REFETCHES_PER_CYCLE,
+                observed_at,
+            )
+            .await
+            .map_err(store_error)?;
+        for war_id in war_ids {
+            if let Some(deadline) = self
+                .limiter
+                .active_esi_limiter_deadline()
+                .await
+                .map_err(store_error)?
+            {
+                report.paused_until = Some(deadline);
+                break;
+            }
+            // Per-war ESI errors are isolated inside `refetch_open_war`
+            // (counted + warned, returning `Ok`); only a store error
+            // propagates and fails the cycle.
+            self.refetch_open_war(war_id, observed_at, report).await?;
+        }
+        Ok(())
+    }
+
+    async fn refetch_open_war(
+        &self,
+        war_id: i64,
+        observed_at: DateTime<Utc>,
+        report: &mut WatchlistCollectionReport,
+    ) -> Result<(), WatchlistCollectionError> {
+        let key = war_resource_key(war_id);
+        let cached = self.store.cache_metadata(&key).await.map_err(store_error)?;
+        if cached.is_fresh() {
+            return Ok(());
+        }
+        let detail = match self
+            .fetch_and_persist_war(war_id, observed_at, report)
+            .await?
+        {
+            WarFetch::Failed {
+                not_found: true, ..
+            } => {
+                // The war was deleted by CCP: mark it gone so it drops out of
+                // the open-war re-fetch query (otherwise its stale
+                // `last_fetched_at` re-selects it first every cycle forever)
+                // and is pruned later. No event is emitted for the removal.
+                self.store
+                    .mark_war_removed(war_id, observed_at)
+                    .await
+                    .map_err(store_error)?;
+                report.wars_removed += 1;
+                warn!("watchlist war {war_id} not found (404) on re-fetch; marking it removed");
+                return Ok(());
+            }
+            WarFetch::Failed {
+                not_found: false, ..
+            } => {
+                // A transient failure (already warned + counted in
+                // `war_errors`): bump `last_fetched_at` so this war rotates to
+                // the back of the least-recently-fetched order and other open
+                // wars get a turn before it is retried.
+                self.store
+                    .mark_war_fetched(war_id, observed_at)
+                    .await
+                    .map_err(store_error)?;
+                report.wars_refetch_errors += 1;
+                return Ok(());
+            }
+            WarFetch::NotModified => {
+                // 304: content unchanged; rotate the least-recently-fetched
+                // order so other open wars get a turn.
+                self.store
+                    .mark_war_fetched(war_id, observed_at)
+                    .await
+                    .map_err(store_error)?;
+                return Ok(());
+            }
+            WarFetch::Body(detail) => detail,
+        };
+        let previous = self
+            .store
+            .stored_war_observation(war_id)
+            .await
+            .map_err(store_error)?;
+        let events = derive_war_events(previous.as_ref(), &detail);
+        self.store
+            .upsert_war(&detail, observed_at)
+            .await
+            .map_err(store_error)?;
+        report.wars_refetched += 1;
+        for event in events {
+            self.prepare_war_event(&event, &detail, observed_at, report)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Fetches one war's detail, persisting cache and limiter metadata after
+    /// every response (feeding the shared `killmail` bucket the health snapshot
+    /// surfaces). Returns [`WarFetch::Failed`] on an isolated ESI error
+    /// (counted + warned, carrying whether it was a 404), [`WarFetch::NotModified`]
+    /// on a `304`, and [`WarFetch::Body`] on a fresh body.
+    async fn fetch_and_persist_war(
+        &self,
+        war_id: i64,
+        observed_at: DateTime<Utc>,
+        report: &mut WatchlistCollectionReport,
+    ) -> Result<WarFetch, WatchlistCollectionError> {
+        let key = war_resource_key(war_id);
+        let cached = self.store.cache_metadata(&key).await.map_err(store_error)?;
+        let response = match self.esi.fetch_war(war_id, cached.etag.clone()).await {
+            Ok(response) => response,
+            Err(error) => {
+                let merged = merge_cache_metadata(&cached, error.metadata.clone());
+                self.store
+                    .persist_cache_metadata(&key, &merged)
+                    .await
+                    .map_err(store_error)?;
+                self.limiter
+                    .record_esi_limiter_at(&error.metadata, observed_at)
+                    .await
+                    .map_err(store_error)?;
+                report.war_errors += 1;
+                warn!("watchlist war {war_id} detail fetch failed: {error}");
+                return Ok(WarFetch::Failed {
+                    not_found: error.is_not_found(),
+                    message: error.to_string(),
+                });
+            }
+        };
+        let merged = merge_cache_metadata(&cached, response.metadata.clone());
+        self.store
+            .persist_cache_metadata(&key, &merged)
+            .await
+            .map_err(store_error)?;
+        self.limiter
+            .record_esi_limiter_at(&response.metadata, observed_at)
+            .await
+            .map_err(store_error)?;
+        if response.not_modified {
+            report.war_not_modified += 1;
+            return Ok(WarFetch::NotModified);
+        }
+        match response.value {
+            Some(detail) => Ok(WarFetch::Body(detail)),
+            None => Ok(WarFetch::NotModified),
+        }
+    }
+
+    /// Fans one war event out to every subscription that wants it across the
+    /// guilds watching any involved party, rendering the embed once (only when
+    /// a delivery row will be inserted) and storing it verbatim.
+    async fn prepare_war_event(
+        &self,
+        event: &WarEvent,
+        detail: &WarDetail,
+        observed_at: DateTime<Utc>,
+        report: &mut WatchlistCollectionReport,
+    ) -> Result<(), WatchlistCollectionError> {
+        let evidence_key = event.evidence_key();
+        let mut guild_set = BTreeSet::new();
+        for party in detail.involved_parties() {
+            for guild_id in self
+                .store
+                .guilds_watching_entity(party.kind, party.id)
+                .await
+                .map_err(store_error)?
+            {
+                guild_set.insert(guild_id);
+            }
+        }
+        let guilds: Vec<u64> = guild_set.into_iter().collect();
+        let targets = self
+            .delivery_targets(event.kind, event.war_id, &evidence_key, guilds)
+            .await?;
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let message = self.render_war_event(detail, event.kind, event.ally).await;
+        let prepared = self
+            .insert_and_send(
+                targets,
+                event.kind,
+                event.war_id,
+                &evidence_key,
+                &message,
+                observed_at,
+            )
+            .await?;
+        report.deliveries_prepared += prepared;
+        match event.kind {
+            WatchlistEventKind::WarDeclared => report.war_declared += prepared,
+            WatchlistEventKind::WarAllyJoined => report.war_ally_joined += prepared,
+            WatchlistEventKind::WarRetracted => report.war_retracted += prepared,
+            WatchlistEventKind::WarFinished => report.war_finished += prepared,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn party_label(&self, party: WarParty) -> String {
+        match party.kind {
+            WatchlistKind::Alliance => {
+                let alliance = self.resolver.alliance(party.id).await;
+                entity_label(&alliance.name, &alliance.ticker, "Alliance", party.id)
+            }
+            WatchlistKind::Corporation => {
+                let corporation = self.resolver.corporation(party.id).await;
+                entity_label(
+                    &corporation.name,
+                    &corporation.ticker,
+                    "Corporation",
+                    party.id,
+                )
+            }
+        }
+    }
+
+    /// Renders one war event, resolving aggressor/defender (and the ally, for
+    /// an ally-join) identities at prepare time and storing the content
+    /// verbatim (spec "Embed": war id, parties + tickers, mutual/open-for-allies
+    /// flags, relevant timestamps, zKillboard war link; footer names the kind).
+    async fn render_war_event(
+        &self,
+        detail: &WarDetail,
+        kind: WatchlistEventKind,
+        ally: Option<WarParty>,
+    ) -> WatchlistNotificationMessage {
+        let aggressor_label = self.party_label(detail.aggressor).await;
+        let defender_label = self.party_label(detail.defender).await;
+        let title = match kind {
+            WatchlistEventKind::WarDeclared => {
+                format!("War declared: {aggressor_label} vs {defender_label}")
+            }
+            WatchlistEventKind::WarAllyJoined => {
+                format!("Ally joined war {}", detail.war_id)
+            }
+            WatchlistEventKind::WarRetracted => {
+                format!("War retracted: {aggressor_label} vs {defender_label}")
+            }
+            WatchlistEventKind::WarFinished => {
+                format!("War finished: {aggressor_label} vs {defender_label}")
+            }
+            _ => format!("War {}", detail.war_id),
+        };
+        let mut fields = vec![
+            WatchlistEmbedField {
+                name: "War".to_string(),
+                value: format!("[#{0}](https://zkillboard.com/war/{0}/)", detail.war_id),
+                inline: true,
+            },
+            WatchlistEmbedField {
+                name: "Aggressor".to_string(),
+                value: aggressor_label,
+                inline: true,
+            },
+            WatchlistEmbedField {
+                name: "Defender".to_string(),
+                value: defender_label,
+                inline: true,
+            },
+        ];
+        if kind == WatchlistEventKind::WarAllyJoined {
+            if let Some(ally) = ally {
+                fields.push(WatchlistEmbedField {
+                    name: "Ally".to_string(),
+                    value: self.party_label(ally).await,
+                    inline: true,
+                });
+            }
+        }
+        fields.push(WatchlistEmbedField {
+            name: "Flags".to_string(),
+            value: format!(
+                "Mutual: {} | Open for allies: {}",
+                yes_no(detail.mutual),
+                yes_no(detail.open_for_allies)
+            ),
+            inline: false,
+        });
+        let mut timeline = Vec::new();
+        if let Some(declared) = detail.declared {
+            timeline.push(format!(
+                "Declared: {}",
+                declared.format("%Y-%m-%d %H:%M UTC")
+            ));
+        }
+        if let Some(started) = detail.started {
+            timeline.push(format!("Started: {}", started.format("%Y-%m-%d %H:%M UTC")));
+        }
+        if kind == WatchlistEventKind::WarRetracted {
+            if let Some(retracted) = detail.retracted {
+                timeline.push(format!(
+                    "Retracted: {}",
+                    retracted.format("%Y-%m-%d %H:%M UTC")
+                ));
+            }
+        }
+        if kind == WatchlistEventKind::WarFinished {
+            if let Some(finished) = detail.finished {
+                timeline.push(format!(
+                    "Finished: {}",
+                    finished.format("%Y-%m-%d %H:%M UTC")
+                ));
+            }
+        }
+        if !timeline.is_empty() {
+            fields.push(WatchlistEmbedField {
+                name: "Timeline".to_string(),
+                value: timeline.join("\n"),
+                inline: false,
+            });
+        }
+        WatchlistNotificationMessage {
+            title,
+            fields,
+            footer: kind.footer_label().to_string(),
+        }
     }
 
     async fn collect_alliance(
@@ -1217,6 +2119,14 @@ impl WatchlistCollector {
             }
         }
         Ok(())
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
     }
 }
 

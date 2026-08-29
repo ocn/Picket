@@ -18,9 +18,9 @@
 
 use crate::esi_cache::CacheMetadata;
 use crate::watchlist_feed::model::{
-    MemberDeltaDirection, MemberReference, PreparedWatchlistDelivery, WatchedEntity,
-    WatchlistDeliveryError, WatchlistEventKind, WatchlistKind, WatchlistNotificationMessage,
-    WatchlistSubscription,
+    MemberDeltaDirection, MemberReference, PreparedWatchlistDelivery, WarDetail, WarObservation,
+    WarParty, WarScanState, WatchedEntity, WatchlistDeliveryError, WatchlistEventKind,
+    WatchlistKind, WatchlistNotificationMessage, WatchlistSubscription,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rand::Rng;
@@ -49,6 +49,19 @@ pub fn corp_resource_key(corporation_id: i64) -> String {
     format!("watchlist/corporations/{corporation_id}")
 }
 
+/// The `esi_cache_metadata` resource key for the war list head-scan
+/// (`GET /wars/`, ticket 10). The `watchlist/` prefix keeps it visible to the
+/// `watchlist_esi_progress` health check.
+pub fn wars_list_resource_key() -> String {
+    "watchlist/wars".to_string()
+}
+
+/// The `esi_cache_metadata` resource key for one war's detail conditional
+/// request (`GET /wars/{id}/`, ticket 10).
+pub fn war_resource_key(war_id: i64) -> String {
+    format!("watchlist/wars/{war_id}")
+}
+
 /// How many days of member snapshots are retained; older rows are pruned
 /// every cycle (see the migration for the rationale).
 pub const MEMBER_SNAPSHOT_RETENTION: ChronoDuration = ChronoDuration::days(30);
@@ -58,6 +71,16 @@ pub const MEMBER_SNAPSHOT_RETENTION: ChronoDuration = ChronoDuration::days(30);
 /// (ticket-09 finding 3). At three, the aggregate is evaluated without the
 /// stuck member rather than blocked forever.
 pub const CORP_FETCH_FAILURE_EXCLUSION_THRESHOLD: i32 = 3;
+
+/// How long a finished war is retained before [`WatchlistStore::prune_finished_wars`]
+/// drops it, bounding `watchlist_wars` to the open-war population plus wars
+/// finished within this window.
+pub const WAR_RETENTION: ChronoDuration = ChronoDuration::days(30);
+
+/// How many consecutive failed head-scan detail-fetch cycles quarantine a
+/// non-404 war id (the mark then advances past it). A 404 is skipped
+/// immediately regardless.
+pub const WAR_FETCH_FAILURE_SKIP_THRESHOLD: i32 = 3;
 
 /// The outcome of aggregating an alliance's member count from its current
 /// members' latest corporation snapshots.
@@ -953,6 +976,372 @@ impl WatchlistStore {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected())
+    }
+
+    // --- Wars (ticket 10) ---
+
+    /// The head-scan cursor. Defaults to a not-yet-established baseline at
+    /// mark 0 before the first scan.
+    pub async fn war_scan_state(&self) -> Result<WarScanState, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT high_water_mark, baseline_established, baseline_head_max, baseline_cursor, baseline_floor FROM watchlist_war_scan_state WHERE singleton = TRUE",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(row) => WarScanState {
+                high_water_mark: row.get::<i64, _>("high_water_mark"),
+                baseline_established: row.get::<bool, _>("baseline_established"),
+                baseline_head_max: row.get::<Option<i64>, _>("baseline_head_max"),
+                baseline_cursor: row.get::<Option<i64>, _>("baseline_cursor"),
+                baseline_floor: row.get::<Option<i64>, _>("baseline_floor"),
+            },
+            None => WarScanState {
+                high_water_mark: 0,
+                baseline_established: false,
+                baseline_head_max: None,
+                baseline_cursor: None,
+                baseline_floor: None,
+            },
+        })
+    }
+
+    /// Records baseline progress after a cycle inspected part of the original
+    /// head page without completing it. `head_max` and `floor` are stamped once
+    /// (the first baseline cycle) and preserved; `cursor` is the lowest war id
+    /// inspected so far. The high-water mark and `baseline_established` are left
+    /// untouched (a pause or error must never flip the baseline).
+    pub async fn record_war_baseline_progress(
+        &self,
+        head_max: i64,
+        cursor: Option<i64>,
+        floor: i64,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO watchlist_war_scan_state (singleton, high_water_mark, baseline_established, baseline_head_max, baseline_cursor, baseline_floor, updated_at) \
+             VALUES (TRUE, 0, FALSE, $1, $2, $3, $4) \
+             ON CONFLICT (singleton) DO UPDATE SET \
+                 baseline_head_max = COALESCE(watchlist_war_scan_state.baseline_head_max, EXCLUDED.baseline_head_max), \
+                 baseline_cursor = COALESCE(EXCLUDED.baseline_cursor, watchlist_war_scan_state.baseline_cursor), \
+                 baseline_floor = COALESCE(watchlist_war_scan_state.baseline_floor, EXCLUDED.baseline_floor), \
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(head_max)
+        .bind(cursor)
+        .bind(floor)
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Completes the silent baseline: sets `baseline_established`, stamps its
+    /// timestamp, and sets the high-water mark to the head max observed on the
+    /// first baseline cycle so the next scan processes everything above it.
+    pub async fn complete_war_baseline(
+        &self,
+        head_max: i64,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO watchlist_war_scan_state (singleton, high_water_mark, baseline_established, baseline_established_at, baseline_cursor, baseline_floor, updated_at) \
+             VALUES (TRUE, $1, TRUE, $2, NULL, NULL, $2) \
+             ON CONFLICT (singleton) DO UPDATE SET \
+                 high_water_mark = GREATEST(watchlist_war_scan_state.high_water_mark, EXCLUDED.high_water_mark), \
+                 baseline_established = TRUE, \
+                 baseline_established_at = COALESCE(watchlist_war_scan_state.baseline_established_at, EXCLUDED.baseline_established_at), \
+                 baseline_cursor = NULL, \
+                 baseline_floor = NULL, \
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(head_max)
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Advances the high-water mark after a post-baseline scan processed a
+    /// contiguous safe prefix of new ids (monotone via `GREATEST`).
+    pub async fn record_war_scan_mark(
+        &self,
+        high_water_mark: i64,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO watchlist_war_scan_state (singleton, high_water_mark, baseline_established, baseline_established_at, updated_at) \
+             VALUES (TRUE, $1, TRUE, $2, $2) \
+             ON CONFLICT (singleton) DO UPDATE SET \
+                 high_water_mark = GREATEST(watchlist_war_scan_state.high_water_mark, EXCLUDED.high_water_mark), \
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(high_water_mark)
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The stored observation of a war (ally set + whether it was already
+    /// retracted/finished), or `None` when the war is not stored. Drives the
+    /// re-fetch diff.
+    pub async fn stored_war_observation(
+        &self,
+        war_id: i64,
+    ) -> Result<Option<WarObservation>, sqlx::Error> {
+        let row = sqlx::query("SELECT retracted, finished FROM watchlist_wars WHERE war_id = $1")
+            .bind(war_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let allies =
+            sqlx::query("SELECT kind, ally_id FROM watchlist_war_allies WHERE war_id = $1")
+                .bind(war_id)
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    let kind_text: String = row.get("kind");
+                    WatchlistKind::parse(&kind_text)
+                        .map(|kind| WarParty {
+                            kind,
+                            id: row.get::<i64, _>("ally_id"),
+                        })
+                        .map_err(sqlx::Error::Protocol)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(WarObservation {
+            allies,
+            retracted: row.get::<Option<DateTime<Utc>>, _>("retracted").is_some(),
+            finished: row.get::<Option<DateTime<Utc>>, _>("finished").is_some(),
+        }))
+    }
+
+    /// Inserts or updates one stored war and inserts any newly-observed allies
+    /// (never deleting an ally, so its `war_ally_joined` dedup key is stable).
+    /// `first_seen_at` on the war row is preserved across updates.
+    pub async fn upsert_war(
+        &self,
+        war: &WarDetail,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO watchlist_wars (war_id, aggressor_kind, aggressor_id, defender_kind, defender_id, declared, started, finished, retracted, mutual, open_for_allies, first_seen_at, last_fetched_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12) \
+             ON CONFLICT (war_id) DO UPDATE SET \
+                 declared = EXCLUDED.declared, started = EXCLUDED.started, finished = EXCLUDED.finished, \
+                 retracted = EXCLUDED.retracted, mutual = EXCLUDED.mutual, open_for_allies = EXCLUDED.open_for_allies, \
+                 last_fetched_at = EXCLUDED.last_fetched_at",
+        )
+        .bind(war.war_id)
+        .bind(war.aggressor.kind.as_str())
+        .bind(war.aggressor.id)
+        .bind(war.defender.kind.as_str())
+        .bind(war.defender.id)
+        .bind(war.declared)
+        .bind(war.started)
+        .bind(war.finished)
+        .bind(war.retracted)
+        .bind(war.mutual)
+        .bind(war.open_for_allies)
+        .bind(observed_at)
+        .execute(&mut *tx)
+        .await?;
+        for ally in &war.allies {
+            sqlx::query(
+                "INSERT INTO watchlist_war_allies (war_id, kind, ally_id, first_seen_at) VALUES ($1,$2,$3,$4) ON CONFLICT (war_id, kind, ally_id) DO NOTHING",
+            )
+            .bind(war.war_id)
+            .bind(ally.kind.as_str())
+            .bind(ally.id)
+            .bind(observed_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Open stored wars (`finished IS NULL`) that are *currently watched*
+    /// (some party -- aggressor, defender, or ally -- matches a
+    /// `watchlist_entities` row of the same kind in any guild) and were last
+    /// fetched strictly before `before`, ordered least-recently-fetched first,
+    /// capped, for the bounded per-cycle re-fetch pass.
+    ///
+    /// "Watched" is derived here rather than stored, so an entity added after
+    /// a war was stored starts re-fetching that war (its pre-existing open
+    /// wars), and an entity that is unwatched drops out of the re-fetch set.
+    /// The `before` bound excludes wars stored or re-fetched earlier in the
+    /// same cycle (their `last_fetched_at` equals the cycle's `observed_at`),
+    /// so a war seen this cycle is not immediately re-fetched and re-diffed.
+    pub async fn open_watched_war_ids_least_recently_fetched(
+        &self,
+        limit: i64,
+        before: DateTime<Utc>,
+    ) -> Result<Vec<i64>, sqlx::Error> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT w.war_id FROM watchlist_wars w \
+             WHERE w.finished IS NULL AND w.last_fetched_at < $2 \
+               AND ( \
+                 EXISTS (SELECT 1 FROM watchlist_entities e \
+                         WHERE (e.kind = w.aggressor_kind AND e.entity_id = w.aggressor_id) \
+                            OR (e.kind = w.defender_kind AND e.entity_id = w.defender_id)) \
+                 OR EXISTS (SELECT 1 FROM watchlist_war_allies a \
+                            JOIN watchlist_entities e ON e.kind = a.kind AND e.entity_id = a.ally_id \
+                            WHERE a.war_id = w.war_id) \
+               ) \
+             ORDER BY w.last_fetched_at ASC, w.war_id ASC LIMIT $1",
+        )
+        .bind(limit)
+        .bind(before)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Records one failed head-scan detail fetch for a war id, returning the
+    /// new consecutive-failure count. `first_failed_at` is stamped once.
+    pub async fn record_war_fetch_attempt(
+        &self,
+        war_id: i64,
+        error: &str,
+        observed_at: DateTime<Utc>,
+    ) -> Result<i32, sqlx::Error> {
+        let truncated: String = error.chars().take(500).collect();
+        sqlx::query_scalar::<_, i32>(
+            "INSERT INTO watchlist_war_fetch_attempts (war_id, attempts, last_error, first_failed_at, updated_at) \
+             VALUES ($1, 1, $2, $3, $3) \
+             ON CONFLICT (war_id) DO UPDATE SET \
+                 attempts = watchlist_war_fetch_attempts.attempts + 1, \
+                 last_error = EXCLUDED.last_error, \
+                 updated_at = EXCLUDED.updated_at \
+             RETURNING attempts",
+        )
+        .bind(war_id)
+        .bind(truncated)
+        .bind(observed_at)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Clears a war id's failure ledger (called after a successful fetch, or
+    /// once a war id is permanently skipped so the row does not linger).
+    pub async fn clear_war_fetch_attempts(&self, war_id: i64) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM watchlist_war_fetch_attempts WHERE war_id = $1")
+            .bind(war_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Prunes finished wars whose `finished` timestamp is older than the
+    /// retention window and that sit below the current head-scan mark (so a
+    /// war still in the newest window is never dropped). Open wars are never
+    /// pruned, keeping the table bounded to the open-war population plus wars
+    /// finished within the window. Allies cascade.
+    pub async fn prune_finished_wars(
+        &self,
+        observed_at: DateTime<Utc>,
+    ) -> Result<u64, sqlx::Error> {
+        let cutoff = observed_at - WAR_RETENTION;
+        let result = sqlx::query(
+            "DELETE FROM watchlist_wars \
+             WHERE finished IS NOT NULL AND finished < $1 \
+               AND war_id < COALESCE((SELECT high_water_mark FROM watchlist_war_scan_state WHERE singleton = TRUE), 0)",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Bumps a war's `last_fetched_at` without otherwise changing it (used on a
+    /// conditional `304`, so the least-recently-fetched ordering rotates).
+    pub async fn mark_war_fetched(
+        &self,
+        war_id: i64,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE watchlist_wars SET last_fetched_at = $2 WHERE war_id = $1")
+            .bind(war_id)
+            .bind(observed_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Marks a stored open war as gone after its detail re-fetch returned a
+    /// `404` (CCP deleted it): stamps `finished`/`last_fetched_at` to
+    /// `observed_at` so it drops out of the open-war re-fetch query
+    /// (`finished IS NULL`) and becomes eligible for [`Self::prune_finished_wars`]
+    /// once past retention. Reuses the `finished` column rather than adding a
+    /// dedicated `removed_at`: it needs no schema change, the war is genuinely
+    /// no longer open, and the collector emits no event for the removal so no
+    /// spurious `war_finished` fires. Only touches rows still open so a real
+    /// finish observed earlier is never overwritten.
+    pub async fn mark_war_removed(
+        &self,
+        war_id: i64,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE watchlist_wars SET finished = $2, last_fetched_at = $2 WHERE war_id = $1 AND finished IS NULL",
+        )
+        .bind(war_id)
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub async fn war_is_stored_for_test(&self, war_id: i64) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM watchlist_wars WHERE war_id = $1)",
+        )
+        .bind(war_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn war_last_fetched_at_for_test(
+        &self,
+        war_id: i64,
+    ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT last_fetched_at FROM watchlist_wars WHERE war_id = $1",
+        )
+        .bind(war_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn war_is_open_for_test(&self, war_id: i64) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT finished IS NULL FROM watchlist_wars WHERE war_id = $1",
+        )
+        .bind(war_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn war_high_water_mark_for_test(&self) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT high_water_mark FROM watchlist_war_scan_state WHERE singleton = TRUE",
+        )
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn war_baseline_established_for_test(&self) -> Result<bool, sqlx::Error> {
+        Ok(self.war_scan_state().await?.baseline_established)
     }
 
     // --- Subscriptions ---
