@@ -162,6 +162,10 @@ _Avoid_: Attacker summary, ship breakdown
 One "Nx Name" element of a Fleet Composition Tally, counted per Ship Group — or per Ship Type for Type-Tracked Ships, which are counted apart from their Ship Group.
 _Avoid_: Line item
 
+**Final Blow**:
+The finishing attack recorded on a killmail and attributed to one attacker.
+_Avoid_: Final blow attacker, killer
+
 ## Release and communication
 
 **Deployment**:
