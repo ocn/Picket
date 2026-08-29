@@ -104,7 +104,7 @@ fn fields(embed: &CreateEmbed) -> &[serde_json::Value] {
 }
 
 #[tokio::test]
-async fn character_final_blow_renders_beside_victim_with_linked_participants() {
+async fn credited_character_renders_beside_victim_with_linked_participants() {
     let embed = build_embed(load_fixture(FIXTURE)).await;
     let fields = fields(&embed);
     let victim_index = fields
@@ -126,32 +126,32 @@ async fn character_final_blow_renders_beside_victim_with_linked_participants() {
 }
 
 #[tokio::test]
-async fn final_blow_without_character_renders_linked_affiliation_and_unlinked_ship_type() {
+async fn credited_attacker_without_character_renders_affiliation_and_ship_type() {
     let mut zk_data = load_fixture(FIXTURE);
     zk_data.killmail.attackers[0].character_id = None;
     zk_data.killmail.attackers[0].alliance_id = None;
 
     let embed = build_embed(zk_data).await;
-    let final_blow = fields(&embed)
+    let final_blow_field = fields(&embed)
         .iter()
         .find(|field| field["name"] == "Final Blow")
         .expect("Final Blow field");
 
     assert_eq!(
-        final_blow["value"],
+        final_blow_field["value"],
         "[[FLEET]](https://zkillboard.com/corporation/98798876/) Retribution"
     );
-    assert_eq!(final_blow["inline"], true);
+    assert_eq!(final_blow_field["inline"], true);
 }
 
 #[tokio::test]
-async fn final_blow_cardinality_omits_zero_and_uses_first_of_multiple() {
-    let mut no_final_blow = load_fixture(FIXTURE);
-    for attacker in &mut no_final_blow.killmail.attackers {
+async fn marked_attacker_cardinality_omits_zero_and_uses_first_of_multiple() {
+    let mut no_marked_attacker = load_fixture(FIXTURE);
+    for attacker in &mut no_marked_attacker.killmail.attackers {
         attacker.final_blow = false;
     }
 
-    let embed = build_embed(no_final_blow).await;
+    let embed = build_embed(no_marked_attacker).await;
     let embed_fields = fields(&embed);
     assert!(embed_fields
         .iter()
@@ -162,16 +162,16 @@ async fn final_blow_cardinality_omits_zero_and_uses_first_of_multiple() {
         .expect("Victim field");
     assert_eq!(victim["inline"], false);
 
-    let mut multiple_final_blows = load_fixture(FIXTURE);
-    multiple_final_blows.killmail.attackers[1].final_blow = true;
+    let mut multiple_marked_attackers = load_fixture(FIXTURE);
+    multiple_marked_attackers.killmail.attackers[1].final_blow = true;
 
-    let embed = build_embed(multiple_final_blows).await;
-    let final_blow = fields(&embed)
+    let embed = build_embed(multiple_marked_attackers).await;
+    let final_blow_field = fields(&embed)
         .iter()
         .find(|field| field["name"] == "Final Blow")
         .expect("Final Blow field");
     assert_eq!(
-        final_blow["value"],
+        final_blow_field["value"],
         "[[BIGAB]](https://zkillboard.com/alliance/99009927/) [Final Pilot](https://zkillboard.com/character/2116470606/)"
     );
 }
