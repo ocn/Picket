@@ -3437,6 +3437,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn proximity_promotion_ping_inherits_summary_and_preserves_dedupe() {
+        // The in-range Proximity promotion ping is an ordinary prepared delivery
+        // (delivery_kind = 'proximity_promotion') that flows through the shared
+        // `configure_contract_delivery_message` path. Its stored message carries
+        // the in-range embed title, so the phone banner inherits the summary while
+        // the ping token still buzzes and its `ci-{id}` nonce (the delivery dedupe
+        // key) is untouched by the summary text, so a restart cannot re-ping.
+        let delivery = PreparedContractDelivery {
+            nonce: "ci-42".to_string(),
+            enforce_nonce: true,
+            ..contract_delivery_with_title(
+                "@everyone Nyx listed for 22.5B in Jita (The Forge) <@&123456> <@789012>",
+                true,
+                crate::contract_intelligence::ContractPingType::Here,
+            )
+        };
+        let mut builder = CreateMessage::default();
+        configure_contract_delivery_message(&mut builder, &delivery);
+        let content = builder.0["content"].as_str().expect("content is set");
+
+        // Leads with the ping token so the promotion delivery still buzzes.
+        assert!(
+            content.starts_with("@here "),
+            "promotion ping must lead with the ping token: {content:?}"
+        );
+        // Inherits the in-range embed title verbatim as the notification summary,
+        // so no pinging contract delivery ever arrives without context.
+        assert!(
+            content.contains("Nyx listed for 22.5B in Jita (The Forge)"),
+            "promotion ping must inherit the summary verbatim: {content:?}"
+        );
+        // Only the intended @here parses; crafted mention tokens carried in the
+        // summary are neutralized.
+        let after_ping = &content["@here ".len()..];
+        assert!(!after_ping.contains("@everyone"), "content: {content:?}");
+        assert!(!after_ping.contains("@here"), "content: {content:?}");
+        assert!(
+            after_ping
+                .match_indices('@')
+                .all(|(idx, _)| after_ping[idx + 1..].starts_with('\u{200b}')),
+            "every mention sigil in the summary must be escaped: {content:?}"
+        );
+        // Everyone parsing stays enabled so the delivery still buzzes.
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!(["everyone"])
+        );
+        // The summary text does not alter the dedupe/idempotency key: the
+        // `ci-{id}` nonce and its enforcement carry through verbatim.
+        assert_eq!(builder.0["nonce"].as_str(), Some("ci-42"));
+        assert_eq!(builder.0["enforce_nonce"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn proximity_unverified_alert_carries_summary_without_double_pinging() {
+        // The Proximity-Unverified alert is prepared with ping = false. Through the
+        // same shared path it carries the summary as a readable preview with
+        // mentions suppressed, so a quiet alert never buzzes and a later promotion
+        // cannot double-ping.
+        let delivery = PreparedContractDelivery {
+            nonce: "ci-7".to_string(),
+            ..contract_delivery_with_title(
+                "Nyx listed for 22.5B in Jita (The Forge)",
+                false,
+                crate::contract_intelligence::ContractPingType::Here,
+            )
+        };
+        let mut builder = CreateMessage::default();
+        configure_contract_delivery_message(&mut builder, &delivery);
+
+        assert_eq!(
+            builder.0["content"].as_str(),
+            Some("Nyx listed for 22.5B in Jita (The Forge)"),
+            "the unverified alert carries the summary alone"
+        );
+        assert!(
+            !builder.0["content"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with('@'),
+            "a non-pinging unverified alert must not carry a ping token"
+        );
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        // The dedupe key is preserved so the quiet alert stays idempotent.
+        assert_eq!(builder.0["nonce"].as_str(), Some("ci-7"));
+    }
+
     fn discord_http_error(
         status_code: serenity::http::StatusCode,
         code: isize,
