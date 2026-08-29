@@ -19,6 +19,11 @@ use tracing::error;
 
 pub struct SovSubscribeCommand;
 
+/// Owned parse of one invocation's documents, used by the unit tests as the
+/// composition seam (`subscription_from_documents`). Production parses into
+/// [`SovSubscribeInput`] and resolves against the stored subscription
+/// instead (ticket 15).
+#[cfg(test)]
 struct SovSubscriptionDocuments<'a> {
     name: &'a str,
     filter: &'a str,
@@ -50,19 +55,209 @@ struct SovSubscriptionDocuments<'a> {
     tz_shift_enabled: Option<bool>,
 }
 
+/// The convenience-leaf provenance keys stored inside a subscription's
+/// `options` document (ticket 15). The convenience options
+/// (`region_id`/`defender_alliance_id`/`max_jumps`/`allow_frigate_holes`)
+/// compose into the stored `filter` tree with no provenance of their own,
+/// so the effective value is round-tripped here as well. Recording them
+/// alongside the existing `tminus_marks`/`tz_window`/`tz_shift_enabled`
+/// keys lets the same per-key [`SovSubscribeCommand::merge_options`] overlay
+/// carry an omitted convenience option forward on a partial re-subscribe
+/// (instead of silently dropping its leaf), and lets a re-subscribe
+/// recompose the filter from the effective values rather than the previous
+/// composed tree.
+const SOV_REGION_ID_OPTION_KEY: &str = "region_id";
+const SOV_DEFENDER_ALLIANCE_ID_OPTION_KEY: &str = "defender_alliance_id";
+const SOV_MAX_JUMPS_OPTION_KEY: &str = "max_jumps";
+const SOV_ALLOW_FRIGATE_HOLES_OPTION_KEY: &str = "allow_frigate_holes";
+
+/// Provenance key holding the user's *explicit* `filter` JSON (the
+/// `SovFilter` they typed), stored alongside the convenience-option
+/// provenance keys (ticket 15). The persisted `sov_subscriptions.filter`
+/// column always holds the fully *composed* tree (explicit filter ANDed
+/// with the convenience leaves) so evaluation is unchanged; but the
+/// composed tree cannot be decomposed unambiguously, so a partial
+/// re-subscribe recomposes the filter from this recorded explicit filter
+/// plus the effective convenience values rather than from the previous
+/// composed tree. Carrying it forward is what lets `/sov_subscribe name:X
+/// max_jumps:6` (filter omitted) keep the previously-typed filter instead
+/// of failing for want of one.
+///
+/// A subscription persisted before ticket 15 has *none* of these five
+/// provenance keys; such a "legacy" row is detected by
+/// [`is_ticket15_provenance`] and its whole composed `filter` column is
+/// treated as the explicit base (with no convenience provenance), so a
+/// carried-forward re-subscribe reproduces exactly what was stored.
+const SOV_EXPLICIT_FILTER_OPTION_KEY: &str = "explicit_filter";
+
+/// The ticket-15 provenance keys, in the display order the confirmation and
+/// clear-sentinel error messages use.
+const SOV_PROVENANCE_KEYS: &[&str] = &[
+    SOV_EXPLICIT_FILTER_OPTION_KEY,
+    SOV_REGION_ID_OPTION_KEY,
+    SOV_DEFENDER_ALLIANCE_ID_OPTION_KEY,
+    SOV_MAX_JUMPS_OPTION_KEY,
+    SOV_ALLOW_FRIGATE_HOLES_OPTION_KEY,
+];
+
+/// Whether a stored `options` document was written by ticket-15 resolution
+/// (it carries at least one provenance key) versus a legacy row that
+/// predates it (none of the five keys). A legacy row's composed `filter`
+/// column is the only record of its filter, so it is treated as the
+/// explicit base on the first carry-forward re-subscribe.
+fn is_ticket15_provenance(options: &serde_json::Value) -> bool {
+    SOV_PROVENANCE_KEYS
+        .iter()
+        .any(|key| options.get(*key).is_some())
+}
+
+/// How one top-level field's effective value was arrived at while composing
+/// a re-subscribe against the stored subscription (ticket 15). Drives both
+/// the ephemeral confirmation's replaced/preserved/cleared lists and, for
+/// `Preserved`, the "carried forward" wording.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FieldProvenance {
+    /// The invocation supplied this field; it replaced whatever was stored.
+    Replaced,
+    /// The invocation omitted this field and the stored subscription had a
+    /// value, carried forward unchanged.
+    Preserved,
+    /// The `clear` sentinel named this field; its stored value was removed.
+    Cleared,
+    /// The invocation omitted this field and nothing was stored; nothing to
+    /// report.
+    Untouched,
+}
+
+/// A top-level subscription field that the `clear` sentinel can remove on a
+/// re-subscribe (ticket 15). A single `clear:<comma list>` string option is
+/// the clearing mechanism for every field regardless of its Discord option
+/// type: the integer convenience options (`region_id`, `max_jumps`, ...)
+/// cannot carry an in-band sentinel value, and a `Role` option cannot
+/// either, so one string list is the one consistent, discoverable
+/// mechanism across them all while keeping the command within Discord's
+/// 25-option limit.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum SovClearableField {
+    Role,
+    RegionId,
+    DefenderAllianceId,
+    MaxJumps,
+    AllowFrigateHoles,
+}
+
+impl SovClearableField {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "role" => Ok(Self::Role),
+            "region_id" => Ok(Self::RegionId),
+            "defender_alliance_id" => Ok(Self::DefenderAllianceId),
+            "max_jumps" => Ok(Self::MaxJumps),
+            "allow_frigate_holes" => Ok(Self::AllowFrigateHoles),
+            other => Err(format!(
+                "unknown clear field '{other}' (expected one of role, region_id, defender_alliance_id, max_jumps, allow_frigate_holes)"
+            )),
+        }
+    }
+}
+
+/// Parses the `clear` command option: a comma-separated list of top-level
+/// field names to remove from the stored subscription. Empty or
+/// all-whitespace input clears nothing; duplicates collapse; an unknown
+/// name is rejected so a typo never silently clears nothing.
+fn parse_clear_fields(raw: &str) -> Result<Vec<SovClearableField>, String> {
+    let mut fields = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let field = SovClearableField::parse(part)?;
+        if !fields.contains(&field) {
+            fields.push(field);
+        }
+    }
+    Ok(fields)
+}
+
+/// The owned parse of one `/sov_subscribe` invocation, produced before the
+/// (async) store lookup so the resolved documents can be composed against
+/// the previously-stored subscription once it is read.
+struct SovSubscribeInput {
+    name: String,
+    /// The explicit `filter` JSON when supplied; `None` when omitted, in
+    /// which case a re-subscribe carries the stored explicit filter forward
+    /// (ticket 15). Required for a first-time subscribe (enforced when the
+    /// composed filter turns out empty).
+    filter: Option<String>,
+    region_id: Option<i64>,
+    defender_alliance_id: Option<i64>,
+    max_jumps: Option<i64>,
+    allow_frigate_holes: Option<bool>,
+    role_id: Option<u64>,
+    tminus_marks: Option<String>,
+    tz_window: Option<String>,
+    tz_shift_enabled: Option<bool>,
+    clear: Vec<SovClearableField>,
+}
+
+/// The outcome of composing one `/sov_subscribe` invocation against the
+/// previously-stored subscription (ticket 15): the subscription to persist,
+/// plus which top-level fields were supplied/replaced, carried forward
+/// (preserved), or cleared, so the ephemeral confirmation can state exactly
+/// what happened to each.
+struct ResolvedSovSubscription {
+    subscription: SovSubscription,
+    replaced: Vec<&'static str>,
+    preserved: Vec<&'static str>,
+    cleared: Vec<&'static str>,
+}
+
+/// The outcome of reading the previously-stored subscription before
+/// composing a re-subscribe (ticket 15, review finding 1). A store read that
+/// *errors* (pool exhaustion, timeout, restart, or a row that fails to
+/// deserialize) must NOT be collapsed into "no existing subscription" -- that
+/// would compose a first-time subscription and overwrite the stored one,
+/// dropping exactly the fields this ticket carries forward. Only a confirmed
+/// absence is [`Absent`](Self::Absent).
+enum ExistingLookup {
+    /// The store confirmed no subscription exists for this key yet.
+    Absent,
+    /// The store returned the stored subscription.
+    Present(SovSubscription),
+    /// The store could not be read; the carried error message is logged and
+    /// the invocation must abort without changing anything.
+    Unreadable(String),
+}
+
+/// Why a re-subscribe was not persisted, so `execute` can pick the right
+/// ephemeral reply (ticket 15, review finding 1).
+#[derive(Debug)]
+enum ResolveAbort {
+    /// Composition rejected the invocation (bad filter JSON, empty tree,
+    /// validation, a legacy row needing a re-typed filter, ...).
+    Invalid(String),
+    /// The stored subscription could not be read; nothing was changed.
+    Unreadable,
+}
+
 impl SovSubscribeCommand {
-    fn subscription(
-        guild_id: u64,
-        channel_id: u64,
+    /// Parses one `/sov_subscribe` invocation into an owned
+    /// [`SovSubscribeInput`] (before the async store lookup). `filter` is
+    /// optional (ticket 15: a re-subscribe may omit it to carry the stored
+    /// explicit filter forward); the `clear` sentinel is parsed and
+    /// validated here so a typo is rejected before any store access.
+    fn input_from_command(
         command: &ApplicationCommandInteraction,
-    ) -> Result<SovSubscription, String> {
+    ) -> Result<SovSubscribeInput, String> {
         let name = match get_option_value(&command.data.options, "name") {
-            Some(CommandDataOptionValue::String(value)) => value.as_str(),
+            Some(CommandDataOptionValue::String(value)) => value.clone(),
             _ => return Err("missing required option: name".to_string()),
         };
         let filter = match get_option_value(&command.data.options, "filter") {
-            Some(CommandDataOptionValue::String(value)) => value.as_str(),
-            _ => return Err("missing required option: filter".to_string()),
+            Some(CommandDataOptionValue::String(value)) => Some(value.clone()),
+            None => None,
+            _ => return Err("filter must be a string option".to_string()),
         };
         let region_id = match get_option_value(&command.data.options, "region_id") {
             Some(CommandDataOptionValue::Integer(value)) => Some(*value),
@@ -92,12 +287,12 @@ impl SovSubscribeCommand {
             _ => return Err("role must be a role option".to_string()),
         };
         let tminus_marks = match get_option_value(&command.data.options, "tminus_marks") {
-            Some(CommandDataOptionValue::String(value)) => Some(value.as_str()),
+            Some(CommandDataOptionValue::String(value)) => Some(value.clone()),
             None => None,
             _ => return Err("tminus_marks must be a string option".to_string()),
         };
         let tz_window = match get_option_value(&command.data.options, "tz_window") {
-            Some(CommandDataOptionValue::String(value)) => Some(value.as_str()),
+            Some(CommandDataOptionValue::String(value)) => Some(value.clone()),
             None => None,
             _ => return Err("tz_window must be a string option".to_string()),
         };
@@ -106,73 +301,46 @@ impl SovSubscribeCommand {
             None => None,
             _ => return Err("tz_shift_enabled must be a boolean option".to_string()),
         };
-        Self::subscription_from_documents(
-            guild_id,
-            channel_id,
-            SovSubscriptionDocuments {
-                name,
-                filter,
-                region_id,
-                defender_alliance_id,
-                max_jumps,
-                allow_frigate_holes,
-                role_id,
-                tminus_marks,
-                tz_window,
-                tz_shift_enabled,
-            },
-        )
+        let clear = match get_option_value(&command.data.options, "clear") {
+            Some(CommandDataOptionValue::String(value)) => parse_clear_fields(value)?,
+            None => Vec::new(),
+            _ => return Err("clear must be a string option".to_string()),
+        };
+        Ok(SovSubscribeInput {
+            name,
+            filter,
+            region_id,
+            defender_alliance_id,
+            max_jumps,
+            allow_frigate_holes,
+            role_id,
+            tminus_marks,
+            tz_window,
+            tz_shift_enabled,
+            clear,
+        })
     }
 
+    #[cfg(test)]
     fn subscription_from_documents(
         guild_id: u64,
         channel_id: u64,
         documents: SovSubscriptionDocuments<'_>,
     ) -> Result<SovSubscription, String> {
-        let mut filter = serde_json::from_str::<SovFilter>(documents.filter)
+        let explicit = serde_json::from_str::<SovFilter>(documents.filter)
             .map_err(|error| format!("invalid filter JSON: {error}"))?;
-        let mut extra = Vec::new();
-        if let Some(region_id) = documents.region_id {
-            extra.push(SovFilterNode::Condition(SovFilterCondition::Region(vec![
-                region_id,
-            ])));
-        }
-        if let Some(alliance_id) = documents.defender_alliance_id {
-            extra.push(SovFilterNode::Condition(SovFilterCondition::Defender {
-                alliance_ids: vec![alliance_id],
-                watchlist: false,
-            }));
-        }
-        if let Some(max_jumps) = documents.max_jumps {
-            extra.push(SovFilterNode::Condition(SovFilterCondition::Reachable {
-                max_jumps,
-                allow_frigate_holes: documents.allow_frigate_holes.unwrap_or(false),
-            }));
-        } else if documents.allow_frigate_holes.is_some() {
-            return Err("allow_frigate_holes requires max_jumps to also be set".to_string());
-        }
-        if !extra.is_empty() {
-            extra.insert(0, filter.root);
-            filter.root = SovFilterNode::And(extra);
-        }
-        let mut options = serde_json::json!({});
-        if let Some(raw) = documents.tminus_marks {
-            let marks = parse_tminus_marks_minutes(raw)
-                .map_err(|error| format!("invalid tminus_marks: {error}"))?;
-            options[SOV_TMINUS_MARKS_OPTION_KEY] = serde_json::json!(marks);
-        }
-        if let Some(raw) = documents.tz_window {
-            // Validated eagerly (rather than deferred to evaluation time)
-            // so `/sov_subscribe` rejects a malformed window immediately;
-            // the normalized `HH:MM-HH:MM` text is stored, not the raw
-            // input, so extra whitespace never round-trips into `options`.
-            let window =
-                parse_tz_window(raw).map_err(|error| format!("invalid tz_window: {error}"))?;
-            options[SOV_TZ_WINDOW_OPTION_KEY] = serde_json::json!(window.to_option_string());
-        }
-        if let Some(enabled) = documents.tz_shift_enabled {
-            options[SOV_TZ_SHIFT_ENABLED_OPTION_KEY] = serde_json::json!(enabled);
-        }
+        let filter = compose_filter(
+            Some(explicit),
+            documents.region_id,
+            documents.defender_alliance_id,
+            documents.max_jumps,
+            documents.allow_frigate_holes,
+        )?;
+        let options = behavioral_options(
+            documents.tminus_marks,
+            documents.tz_window,
+            documents.tz_shift_enabled,
+        )?;
         let subscription = SovSubscription {
             guild_id,
             channel_id,
@@ -183,6 +351,251 @@ impl SovSubscribeCommand {
         };
         subscription.validate()?;
         Ok(subscription)
+    }
+
+    /// Decides whether to compose a re-subscribe against the store-read
+    /// outcome (ticket 15, review finding 1). An [`ExistingLookup::Unreadable`]
+    /// read aborts *without* resolving or upserting so a transient DB error or
+    /// an undeserializable row can never silently overwrite the stored
+    /// subscription with a first-time one; only a confirmed
+    /// [`ExistingLookup::Absent`] composes as first-time.
+    fn resolve_from_lookup(
+        guild_id: u64,
+        channel_id: u64,
+        input: &SovSubscribeInput,
+        lookup: ExistingLookup,
+    ) -> Result<ResolvedSovSubscription, ResolveAbort> {
+        let existing = match lookup {
+            ExistingLookup::Unreadable(error) => {
+                error!("cannot read existing sov subscription for carry-forward: {error}");
+                return Err(ResolveAbort::Unreadable);
+            }
+            ExistingLookup::Absent => None,
+            ExistingLookup::Present(subscription) => Some(subscription),
+        };
+        Self::resolve_subscription(guild_id, channel_id, input, existing.as_ref())
+            .map_err(ResolveAbort::Invalid)
+    }
+
+    /// Composes one `/sov_subscribe` invocation against the
+    /// previously-stored subscription of the same `(guild, channel, name)`
+    /// and produces the subscription to persist plus the per-field
+    /// provenance the confirmation reports (ticket 15).
+    ///
+    /// Every optional top-level field the invocation omitted is carried
+    /// forward from `existing`; a supplied field replaces; the `clear`
+    /// sentinel removes. The composed `filter` column is always rebuilt
+    /// from the *effective* explicit filter and the *effective* convenience
+    /// values (never decomposed from the stored composed tree), and the
+    /// final subscription is validated so a carried-forward value can never
+    /// bypass validation.
+    fn resolve_subscription(
+        guild_id: u64,
+        channel_id: u64,
+        input: &SovSubscribeInput,
+        existing: Option<&SovSubscription>,
+    ) -> Result<ResolvedSovSubscription, String> {
+        let cleared = |field: SovClearableField| input.clear.contains(&field);
+        let existing_options = existing.map(|found| &found.options);
+        let legacy = existing_options.is_some_and(|options| !is_ticket15_provenance(options));
+
+        // A legacy row's whole composed `filter` is its only record of the
+        // filter, so it is treated as the explicit base. Composing a fresh
+        // convenience leaf (e.g. `region_id:B`) onto that opaque tree would
+        // AND it alongside a leaf of the same type already baked in
+        // (`region(A)`), producing a subscription that silently matches
+        // nothing. Require the caller to re-type the filter once in the same
+        // command; the write then stores provenance and later partial
+        // updates work.
+        if legacy && input.filter.is_none() {
+            let supplies_convenience = input.region_id.is_some()
+                || input.defender_alliance_id.is_some()
+                || input.max_jumps.is_some()
+                || input.allow_frigate_holes.is_some();
+            if supplies_convenience {
+                return Err(
+                    "this subscription predates provenance tracking; re-type its filter in the same command (add filter:...) when changing a convenience option, after which partial updates work"
+                        .to_string(),
+                );
+            }
+        }
+
+        // Stored (provenance) values to carry forward when omitted. A
+        // legacy row carries only its whole composed `filter` as the
+        // explicit base; a ticket-15 row carries each recorded provenance
+        // key independently.
+        let stored_explicit: Option<SovFilter> = match existing {
+            Some(found) if legacy => Some(found.filter.clone()),
+            Some(found) => found
+                .options
+                .get(SOV_EXPLICIT_FILTER_OPTION_KEY)
+                .map(|value| serde_json::from_value::<SovFilter>(value.clone()))
+                .transpose()
+                .map_err(|error| format!("stored explicit filter is corrupt: {error}"))?,
+            None => None,
+        };
+        let stored_region = stored_i64(existing_options, legacy, SOV_REGION_ID_OPTION_KEY);
+        let stored_defender = stored_i64(
+            existing_options,
+            legacy,
+            SOV_DEFENDER_ALLIANCE_ID_OPTION_KEY,
+        );
+        let stored_max_jumps = stored_i64(existing_options, legacy, SOV_MAX_JUMPS_OPTION_KEY);
+        let stored_allow_frigate_holes =
+            stored_bool(existing_options, legacy, SOV_ALLOW_FRIGATE_HOLES_OPTION_KEY);
+
+        // --- Resolve each top-level field to its effective value. ---
+        // The explicit filter is a top-level optional input but is not
+        // clearable (a subscription always needs a filter or a convenience
+        // leaf); omitting it carries the stored explicit filter forward.
+        let (explicit, filter_prov) = match &input.filter {
+            Some(raw) => (
+                Some(
+                    serde_json::from_str::<SovFilter>(raw)
+                        .map_err(|error| format!("invalid filter JSON: {error}"))?,
+                ),
+                FieldProvenance::Replaced,
+            ),
+            None => match stored_explicit {
+                Some(filter) => (Some(filter), FieldProvenance::Preserved),
+                None => (None, FieldProvenance::Untouched),
+            },
+        };
+
+        let (role_id, role_prov) = resolve_field(
+            "role",
+            input.role_id,
+            cleared(SovClearableField::Role),
+            existing.and_then(|found| found.role_id),
+        )?;
+        let (region_id, region_prov) = resolve_field(
+            "region_id",
+            input.region_id,
+            cleared(SovClearableField::RegionId),
+            stored_region,
+        )?;
+        let (defender_alliance_id, defender_prov) = resolve_field(
+            "defender_alliance_id",
+            input.defender_alliance_id,
+            cleared(SovClearableField::DefenderAllianceId),
+            stored_defender,
+        )?;
+        let (max_jumps, max_jumps_prov) = resolve_field(
+            "max_jumps",
+            input.max_jumps,
+            cleared(SovClearableField::MaxJumps),
+            stored_max_jumps,
+        )?;
+        let (mut allow_frigate_holes, mut afh_prov) = resolve_field(
+            "allow_frigate_holes",
+            input.allow_frigate_holes,
+            cleared(SovClearableField::AllowFrigateHoles),
+            stored_allow_frigate_holes,
+        )?;
+        // A carried-forward `allow_frigate_holes` is meaningless once
+        // `max_jumps` is no longer in effect (e.g. the caller cleared it);
+        // drop it silently rather than rejecting the re-subscribe. A value
+        // *supplied this invocation* without `max_jumps` is still the
+        // existing user error, surfaced by `compose_filter`.
+        if max_jumps.is_none() && afh_prov == FieldProvenance::Preserved {
+            allow_frigate_holes = None;
+            afh_prov = FieldProvenance::Untouched;
+        }
+
+        let filter = compose_filter(
+            explicit.clone(),
+            region_id,
+            defender_alliance_id,
+            max_jumps,
+            allow_frigate_holes,
+        )?;
+
+        // --- Build the options document. ---
+        // Behavioral keys (tminus/tz) keep their per-key overlay merge; the
+        // provenance keys are recomputed from the effective values so a
+        // cleared field's key is removed rather than carried forward.
+        let requested = behavioral_options(
+            input.tminus_marks.as_deref(),
+            input.tz_window.as_deref(),
+            input.tz_shift_enabled,
+        )?;
+        let mut options = Self::merge_options(existing_options, requested);
+        // Persist the explicit-filter provenance only when this invocation
+        // actually supplied a filter (`Replaced`) or the row already carried
+        // ticket-15 provenance. A legacy row edited without a re-typed filter
+        // (a role- or behavioural-only change) must stay legacy: writing its
+        // opaque composed tree into `explicit_filter` here would upgrade the
+        // row to ticket-15 status with no convenience provenance, letting a
+        // later `region_id:B` bypass the legacy guard above and compose a
+        // match-nothing `And`. Re-typing the filter is the one path that
+        // records provenance; the composed `filter` column is still written
+        // (unchanged) and the confirmation still reports the filter as
+        // `Preserved`.
+        if matches!(filter_prov, FieldProvenance::Replaced) || !legacy {
+            set_or_remove(
+                &mut options,
+                SOV_EXPLICIT_FILTER_OPTION_KEY,
+                explicit
+                    .map(|filter| serde_json::to_value(&filter))
+                    .transpose()
+                    .map_err(|error| format!("cannot serialize explicit filter: {error}"))?,
+            );
+        }
+        set_or_remove(
+            &mut options,
+            SOV_REGION_ID_OPTION_KEY,
+            region_id.map(|value| serde_json::json!(value)),
+        );
+        set_or_remove(
+            &mut options,
+            SOV_DEFENDER_ALLIANCE_ID_OPTION_KEY,
+            defender_alliance_id.map(|value| serde_json::json!(value)),
+        );
+        set_or_remove(
+            &mut options,
+            SOV_MAX_JUMPS_OPTION_KEY,
+            max_jumps.map(|value| serde_json::json!(value)),
+        );
+        set_or_remove(
+            &mut options,
+            SOV_ALLOW_FRIGATE_HOLES_OPTION_KEY,
+            allow_frigate_holes.map(|value| serde_json::json!(value)),
+        );
+
+        let subscription = SovSubscription {
+            guild_id,
+            channel_id,
+            name: input.name.clone(),
+            filter,
+            options,
+            role_id,
+        };
+        subscription.validate()?;
+
+        let mut replaced = Vec::new();
+        let mut preserved = Vec::new();
+        let mut cleared_fields = Vec::new();
+        for (label, provenance) in [
+            ("filter", filter_prov),
+            ("role", role_prov),
+            ("region_id", region_prov),
+            ("defender_alliance_id", defender_prov),
+            ("max_jumps", max_jumps_prov),
+            ("allow_frigate_holes", afh_prov),
+        ] {
+            match provenance {
+                FieldProvenance::Replaced => replaced.push(label),
+                FieldProvenance::Preserved => preserved.push(label),
+                FieldProvenance::Cleared => cleared_fields.push(label),
+                FieldProvenance::Untouched => {}
+            }
+        }
+        Ok(ResolvedSovSubscription {
+            subscription,
+            replaced,
+            preserved,
+            cleared: cleared_fields,
+        })
     }
 
     /// Merges a freshly-built subscription document's `options` against
@@ -221,6 +634,187 @@ impl SovSubscribeCommand {
     }
 }
 
+/// Composes the persisted `filter` tree from an explicit filter and the
+/// convenience-option values, ANDing each supplied convenience value onto
+/// the explicit root as an extra leaf (the historical order: region,
+/// defender, reachable). When `explicit` is `None` (a first-time subscribe
+/// that supplied only convenience options), the leaves alone form the
+/// filter; with neither an explicit filter nor any convenience leaf there
+/// is nothing to build and the subscribe is rejected.
+fn compose_filter(
+    explicit: Option<SovFilter>,
+    region_id: Option<i64>,
+    defender_alliance_id: Option<i64>,
+    max_jumps: Option<i64>,
+    allow_frigate_holes: Option<bool>,
+) -> Result<SovFilter, String> {
+    let mut extra = Vec::new();
+    if let Some(region_id) = region_id {
+        extra.push(SovFilterNode::Condition(SovFilterCondition::Region(vec![
+            region_id,
+        ])));
+    }
+    if let Some(alliance_id) = defender_alliance_id {
+        extra.push(SovFilterNode::Condition(SovFilterCondition::Defender {
+            alliance_ids: vec![alliance_id],
+            watchlist: false,
+        }));
+    }
+    if let Some(max_jumps) = max_jumps {
+        extra.push(SovFilterNode::Condition(SovFilterCondition::Reachable {
+            max_jumps,
+            allow_frigate_holes: allow_frigate_holes.unwrap_or(false),
+        }));
+    } else if allow_frigate_holes.is_some() {
+        return Err("allow_frigate_holes requires max_jumps to also be set".to_string());
+    }
+    match explicit {
+        Some(mut filter) => {
+            if !extra.is_empty() {
+                extra.insert(0, filter.root);
+                filter.root = SovFilterNode::And(extra);
+            }
+            Ok(filter)
+        }
+        None => {
+            if extra.is_empty() {
+                return Err(
+                    "a sov subscription needs a filter or at least one convenience option"
+                        .to_string(),
+                );
+            }
+            let root = if extra.len() == 1 {
+                extra.into_iter().next().expect("one leaf")
+            } else {
+                SovFilterNode::And(extra)
+            };
+            Ok(SovFilter { root })
+        }
+    }
+}
+
+/// Builds the behavioral (`tminus_marks`/`tz_window`/`tz_shift_enabled`)
+/// slice of a subscription's `options` document from the raw command
+/// options, writing a key only when its option was supplied (so an omitted
+/// key stays absent and evaluation applies its default, and the per-key
+/// [`SovSubscribeCommand::merge_options`] overlay carries an untouched key
+/// forward on a partial re-subscribe). Ticket-15 provenance keys are added
+/// separately by the caller.
+fn behavioral_options(
+    tminus_marks: Option<&str>,
+    tz_window: Option<&str>,
+    tz_shift_enabled: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let mut options = serde_json::json!({});
+    if let Some(raw) = tminus_marks {
+        let marks = parse_tminus_marks_minutes(raw)
+            .map_err(|error| format!("invalid tminus_marks: {error}"))?;
+        options[SOV_TMINUS_MARKS_OPTION_KEY] = serde_json::json!(marks);
+    }
+    if let Some(raw) = tz_window {
+        // Validated eagerly (rather than deferred to evaluation time) so
+        // `/sov_subscribe` rejects a malformed window immediately; the
+        // normalized `HH:MM-HH:MM` text is stored, not the raw input, so
+        // extra whitespace never round-trips into `options`.
+        let window = parse_tz_window(raw).map_err(|error| format!("invalid tz_window: {error}"))?;
+        options[SOV_TZ_WINDOW_OPTION_KEY] = serde_json::json!(window.to_option_string());
+    }
+    if let Some(enabled) = tz_shift_enabled {
+        options[SOV_TZ_SHIFT_ENABLED_OPTION_KEY] = serde_json::json!(enabled);
+    }
+    Ok(options)
+}
+
+/// Resolves one clearable top-level field to its effective value and
+/// provenance (ticket 15): supplying and clearing the same field in one
+/// invocation is rejected; a bare `clear` removes it; a supplied value
+/// replaces; omitting it carries the stored value forward. Clearing a field
+/// that has no stored value (including on a first-time subscribe) is a
+/// no-op reported as [`FieldProvenance::Untouched`], never `Cleared`.
+fn resolve_field<T>(
+    field: &str,
+    supplied: Option<T>,
+    cleared: bool,
+    stored: Option<T>,
+) -> Result<(Option<T>, FieldProvenance), String> {
+    if supplied.is_some() && cleared {
+        return Err(format!(
+            "cannot both set and clear {field} in the same command"
+        ));
+    }
+    if cleared {
+        return match stored {
+            Some(_) => Ok((None, FieldProvenance::Cleared)),
+            None => Ok((None, FieldProvenance::Untouched)),
+        };
+    }
+    if supplied.is_some() {
+        return Ok((supplied, FieldProvenance::Replaced));
+    }
+    match stored {
+        Some(value) => Ok((Some(value), FieldProvenance::Preserved)),
+        None => Ok((None, FieldProvenance::Untouched)),
+    }
+}
+
+/// Reads a carried-forward integer provenance value from a stored `options`
+/// document. Always `None` for a legacy row (which has no provenance keys).
+fn stored_i64(options: Option<&serde_json::Value>, legacy: bool, key: &str) -> Option<i64> {
+    if legacy {
+        return None;
+    }
+    options
+        .and_then(|options| options.get(key))
+        .and_then(|v| v.as_i64())
+}
+
+/// Reads a carried-forward boolean provenance value from a stored `options`
+/// document. Always `None` for a legacy row.
+fn stored_bool(options: Option<&serde_json::Value>, legacy: bool, key: &str) -> Option<bool> {
+    if legacy {
+        return None;
+    }
+    options
+        .and_then(|options| options.get(key))
+        .and_then(|v| v.as_bool())
+}
+
+/// Sets an `options` object key to `value` when `Some`, or removes it when
+/// `None`. Used for the ticket-15 provenance keys so a cleared field's key
+/// is deleted rather than left behind by the per-key overlay merge.
+fn set_or_remove(options: &mut serde_json::Value, key: &str, value: Option<serde_json::Value>) {
+    if let Some(object) = options.as_object_mut() {
+        match value {
+            Some(value) => {
+                object.insert(key.to_string(), value);
+            }
+            None => {
+                object.remove(key);
+            }
+        }
+    }
+}
+
+/// Renders the ephemeral confirmation for a resolved re-subscribe (ticket
+/// 15), appending only the non-empty replaced/preserved/cleared clauses so
+/// a first-time subscribe reads exactly as before.
+fn confirmation_message(resolved: &ResolvedSovSubscription) -> String {
+    let mut message = format!(
+        "Sov subscription '{}' saved for this channel.",
+        resolved.subscription.name
+    );
+    if !resolved.replaced.is_empty() {
+        message.push_str(&format!(" Replaced: {}.", resolved.replaced.join(", ")));
+    }
+    if !resolved.preserved.is_empty() {
+        message.push_str(&format!(" Preserved: {}.", resolved.preserved.join(", ")));
+    }
+    if !resolved.cleared.is_empty() {
+        message.push_str(&format!(" Cleared: {}.", resolved.cleared.join(", ")));
+    }
+    message
+}
+
 #[async_trait]
 impl Command for SovSubscribeCommand {
     fn name(&self) -> String {
@@ -244,9 +838,10 @@ impl Command for SovSubscribeCommand {
             .create_option(|option| {
                 option
                     .name("filter")
-                    .description("Sov filter JSON using condition, and, or, and not nodes.")
+                    .description(
+                        "Sov filter JSON (condition/and/or/not). Omit on re-subscribe to keep the stored filter.",
+                    )
                     .kind(CommandOptionType::String)
-                    .required(true)
             })
             .create_option(|option| {
                 option
@@ -302,6 +897,14 @@ impl Command for SovSubscribeCommand {
                     .description("Alert when a watched hub's vulnerability window enters tz_window.")
                     .kind(CommandOptionType::Boolean)
             })
+            .create_option(|option| {
+                option
+                    .name("clear")
+                    .description(
+                        "Comma list to clear: role, region_id, defender_alliance_id, max_jumps, allow_frigate_holes.",
+                    )
+                    .kind(CommandOptionType::String)
+            })
     }
 
     async fn execute(
@@ -311,15 +914,17 @@ impl Command for SovSubscribeCommand {
         _app_state: &Arc<AppState>,
     ) {
         let store_handle = ctx.data.read().await.get::<SovStoreContainer>().cloned();
-        let response = match command.guild_id {
-            Some(guild_id) => Self::subscription(guild_id.0, command.channel_id.0, command)
+        let parsed = match command.guild_id {
+            Some(guild_id) => Self::input_from_command(command)
+                .map(|input| (guild_id.0, input))
                 .map_err(|error| format!("Invalid sov subscription: {error}")),
             None => Err("Sov subscriptions can only be created in a server channel.".to_string()),
         };
+        let channel_id = command.channel_id.0;
         let mut responder = SerenityContractCommandResponder::new(ctx, command);
         if let Err(error) = defer_then_edit(&mut responder, async move {
-            let mut subscription = match response {
-                Ok(subscription) => subscription,
+            let (guild_id, input) = match parsed {
+                Ok(parsed) => parsed,
                 Err(response) => return response,
             };
             let Some(store_handle) = store_handle else {
@@ -330,23 +935,32 @@ impl Command for SovSubscribeCommand {
                 return "Sov subscriptions are unavailable because the sov database is not connected."
                     .to_string();
             };
-            // Preserve whatever `options` (e.g. custom T-minus marks) an
-            // existing subscription of the same name already has when
-            // this invocation did not touch them (review finding 2).
-            let existing = store
-                .subscription(subscription.guild_id, subscription.channel_id, &subscription.name)
-                .await
-                .ok()
-                .flatten();
-            subscription.options = SovSubscribeCommand::merge_options(
-                existing.as_ref().map(|found| &found.options),
-                subscription.options,
-            );
-            match store.upsert_subscription(&subscription).await {
-                Ok(()) => format!(
-                    "Sov subscription '{}' saved for this channel.",
-                    subscription.name
-                ),
+            // Read the previously-stored subscription (if any) so omitted
+            // top-level fields carry forward, the `clear` sentinel can
+            // remove them, and behavioral options merge per key (ticket 15;
+            // review finding 2 on ticket 03). A store *error* must not be
+            // collapsed into "no existing subscription" -- that would compose
+            // a first-time subscription and overwrite the stored one, dropping
+            // the very fields this ticket carries forward (review finding 1).
+            let lookup = match store.subscription(guild_id, channel_id, &input.name).await {
+                Ok(Some(subscription)) => ExistingLookup::Present(subscription),
+                Ok(None) => ExistingLookup::Absent,
+                Err(error) => ExistingLookup::Unreadable(error.to_string()),
+            };
+            let resolved = match SovSubscribeCommand::resolve_from_lookup(
+                guild_id, channel_id, &input, lookup,
+            ) {
+                Ok(resolved) => resolved,
+                Err(ResolveAbort::Invalid(error)) => {
+                    return format!("Invalid sov subscription: {error}")
+                }
+                Err(ResolveAbort::Unreadable) => {
+                    return "Could not read the existing subscription; nothing was changed."
+                        .to_string()
+                }
+            };
+            match store.upsert_subscription(&resolved.subscription).await {
+                Ok(()) => confirmation_message(&resolved),
                 Err(error) => {
                     error!("cannot persist sov subscription: {error}");
                     "Sov subscription could not be saved.".to_string()
@@ -877,5 +1491,529 @@ mod tests {
                 "tz_shift_enabled": true,
             })
         );
+    }
+
+    // --- Carry-forward of top-level fields on re-subscribe (ticket 15) ---
+
+    const F2: &str = r#"{"root": {"condition": {"system": [30004737]}}}"#;
+
+    fn base_input(name: &str) -> SovSubscribeInput {
+        SovSubscribeInput {
+            name: name.to_string(),
+            filter: None,
+            region_id: None,
+            defender_alliance_id: None,
+            max_jumps: None,
+            allow_frigate_holes: None,
+            role_id: None,
+            tminus_marks: None,
+            tz_window: None,
+            tz_shift_enabled: None,
+            clear: Vec::new(),
+        }
+    }
+
+    fn resolve(
+        input: &SovSubscribeInput,
+        existing: Option<&SovSubscription>,
+    ) -> Result<ResolvedSovSubscription, String> {
+        SovSubscribeCommand::resolve_subscription(42, 77, input, existing)
+    }
+
+    /// A first-time subscribe with an explicit filter and convenience
+    /// options, used as the stored fixture other carry-forward tests
+    /// re-subscribe against.
+    fn stored_with_region_defender_max_jumps() -> SovSubscription {
+        let mut input = base_input("front");
+        input.filter = Some(FILTER.to_string());
+        input.region_id = Some(10_000_060);
+        input.defender_alliance_id = Some(99_000_001);
+        input.max_jumps = Some(6);
+        input.role_id = Some(555);
+        resolve(&input, None)
+            .expect("valid first-time subscribe")
+            .subscription
+    }
+
+    #[test]
+    fn first_time_subscribe_stores_the_explicit_filter_as_provenance() {
+        let mut input = base_input("front");
+        input.filter = Some(FILTER.to_string());
+        let resolved = resolve(&input, None).expect("valid first-time subscribe");
+        assert_eq!(
+            resolved.subscription.options[SOV_EXPLICIT_FILTER_OPTION_KEY],
+            serde_json::from_str::<serde_json::Value>(FILTER).unwrap()
+        );
+        assert_eq!(resolved.replaced, vec!["filter"]);
+        assert!(resolved.preserved.is_empty());
+        assert!(resolved.cleared.is_empty());
+    }
+
+    #[test]
+    fn first_time_subscribe_without_a_filter_or_convenience_is_rejected() {
+        assert!(resolve(&base_input("front"), None).is_err());
+    }
+
+    #[test]
+    fn first_time_subscribe_with_only_convenience_composes_from_leaves_alone() {
+        let mut input = base_input("front");
+        input.region_id = Some(10_000_060);
+        let resolved = resolve(&input, None).expect("convenience-only subscribe");
+        assert!(matches!(
+            resolved.subscription.filter.root,
+            SovFilterNode::Condition(SovFilterCondition::Region(ref ids)) if ids == &vec![10_000_060]
+        ));
+        assert!(resolved
+            .subscription
+            .options
+            .get(SOV_EXPLICIT_FILTER_OPTION_KEY)
+            .is_none());
+    }
+
+    #[test]
+    fn re_subscribe_preserves_role_when_only_the_filter_changes() {
+        let stored = stored_with_region_defender_max_jumps();
+        let mut input = base_input("front");
+        input.filter = Some(F2.to_string());
+        let resolved = resolve(&input, Some(&stored)).expect("valid re-subscribe");
+        assert_eq!(resolved.subscription.role_id, Some(555));
+        assert!(resolved.replaced.contains(&"filter"));
+        assert!(resolved.preserved.contains(&"role"));
+    }
+
+    #[test]
+    fn clear_role_removes_it() {
+        let stored = stored_with_region_defender_max_jumps();
+        let mut input = base_input("front");
+        input.clear = vec![SovClearableField::Role];
+        let resolved = resolve(&input, Some(&stored)).expect("valid re-subscribe clearing role");
+        assert_eq!(resolved.subscription.role_id, None);
+        assert!(resolved.cleared.contains(&"role"));
+    }
+
+    #[test]
+    fn explicit_new_role_replaces_the_stored_one() {
+        let stored = stored_with_region_defender_max_jumps();
+        let mut input = base_input("front");
+        input.role_id = Some(777);
+        let resolved = resolve(&input, Some(&stored)).expect("valid re-subscribe");
+        assert_eq!(resolved.subscription.role_id, Some(777));
+        assert!(resolved.replaced.contains(&"role"));
+    }
+
+    #[test]
+    fn omitted_convenience_and_filter_recompose_an_identical_tree() {
+        let stored = stored_with_region_defender_max_jumps();
+        // Re-subscribe touching only a behavioral option; every top-level
+        // field is carried forward and the composed filter is rebuilt
+        // identically (so it still matches the same campaigns).
+        let mut input = base_input("front");
+        input.tz_shift_enabled = Some(true);
+        let resolved = resolve(&input, Some(&stored)).expect("valid partial re-subscribe");
+        assert_eq!(
+            resolved.subscription.filter, stored.filter,
+            "the recomposed filter must be identical to the stored one"
+        );
+        assert_eq!(resolved.subscription.role_id, Some(555));
+        assert_eq!(
+            resolved.subscription.options[SOV_REGION_ID_OPTION_KEY],
+            serde_json::json!(10_000_060)
+        );
+        assert_eq!(
+            resolved.subscription.options[SOV_MAX_JUMPS_OPTION_KEY],
+            serde_json::json!(6)
+        );
+        assert!(resolved.preserved.contains(&"filter"));
+        assert!(resolved.preserved.contains(&"region_id"));
+        assert!(resolved.preserved.contains(&"max_jumps"));
+    }
+
+    #[test]
+    fn new_filter_with_carried_convenience_composes_the_carried_leaves_onto_the_new_filter() {
+        let stored = stored_with_region_defender_max_jumps();
+        let mut input = base_input("front");
+        input.filter = Some(F2.to_string());
+        let resolved = resolve(&input, Some(&stored)).expect("valid re-subscribe with new filter");
+        // The new explicit filter replaces the old one...
+        assert_eq!(
+            resolved.subscription.options[SOV_EXPLICIT_FILTER_OPTION_KEY],
+            serde_json::from_str::<serde_json::Value>(F2).unwrap()
+        );
+        // ...and the carried convenience leaves compose onto it.
+        match resolved.subscription.filter.root {
+            SovFilterNode::And(nodes) => {
+                assert!(matches!(
+                    nodes[0],
+                    SovFilterNode::Condition(SovFilterCondition::System(ref ids)) if ids == &vec![30_004_737]
+                ));
+                assert!(nodes.iter().any(|node| matches!(
+                    node,
+                    SovFilterNode::Condition(SovFilterCondition::Reachable { max_jumps: 6, .. })
+                )));
+            }
+            other => panic!("expected an And node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn re_subscribe_omitting_the_filter_keeps_the_old_explicit_filter() {
+        let mut first = base_input("front");
+        first.filter = Some(FILTER.to_string());
+        let stored = resolve(&first, None).expect("first subscribe").subscription;
+
+        // Re-subscribe changing only a convenience option, no filter.
+        let mut input = base_input("front");
+        input.max_jumps = Some(8);
+        let resolved = resolve(&input, Some(&stored)).expect("valid re-subscribe");
+        assert_eq!(
+            resolved.subscription.options[SOV_EXPLICIT_FILTER_OPTION_KEY],
+            serde_json::from_str::<serde_json::Value>(FILTER).unwrap()
+        );
+        assert!(resolved.preserved.contains(&"filter"));
+        assert!(resolved.replaced.contains(&"max_jumps"));
+    }
+
+    #[test]
+    fn clearing_a_convenience_field_removes_its_leaf_from_the_composed_filter() {
+        let stored = stored_with_region_defender_max_jumps();
+        let mut input = base_input("front");
+        input.clear = vec![SovClearableField::RegionId];
+        let resolved = resolve(&input, Some(&stored)).expect("valid re-subscribe clearing region");
+        assert!(resolved
+            .subscription
+            .options
+            .get(SOV_REGION_ID_OPTION_KEY)
+            .is_none());
+        assert!(!filter_contains_region(&resolved.subscription.filter.root));
+        assert!(resolved.cleared.contains(&"region_id"));
+    }
+
+    fn filter_contains_region(node: &SovFilterNode) -> bool {
+        match node {
+            SovFilterNode::Condition(SovFilterCondition::Region(_)) => true,
+            SovFilterNode::Condition(_) => false,
+            SovFilterNode::And(nodes) | SovFilterNode::Or(nodes) => {
+                nodes.iter().any(filter_contains_region)
+            }
+            SovFilterNode::Not(inner) => filter_contains_region(inner),
+        }
+    }
+
+    #[test]
+    fn supplying_and_clearing_the_same_field_is_rejected() {
+        let stored = stored_with_region_defender_max_jumps();
+        let mut input = base_input("front");
+        input.region_id = Some(10_000_002);
+        input.clear = vec![SovClearableField::RegionId];
+        assert!(resolve(&input, Some(&stored)).is_err());
+    }
+
+    #[test]
+    fn clearing_max_jumps_drops_a_carried_allow_frigate_holes() {
+        // Store a subscription whose reachable leaf allows frigate holes,
+        // then clear max_jumps: the now-meaningless allow_frigate_holes is
+        // dropped rather than rejected.
+        let mut first = base_input("front");
+        first.filter = Some(FILTER.to_string());
+        first.max_jumps = Some(6);
+        first.allow_frigate_holes = Some(true);
+        let stored = resolve(&first, None).expect("first subscribe").subscription;
+
+        let mut input = base_input("front");
+        input.clear = vec![SovClearableField::MaxJumps];
+        let resolved = resolve(&input, Some(&stored)).expect("clearing max_jumps must succeed");
+        assert!(resolved
+            .subscription
+            .options
+            .get(SOV_MAX_JUMPS_OPTION_KEY)
+            .is_none());
+        assert!(resolved
+            .subscription
+            .options
+            .get(SOV_ALLOW_FRIGATE_HOLES_OPTION_KEY)
+            .is_none());
+    }
+
+    #[test]
+    fn validation_rejects_a_carried_forward_out_of_range_value() {
+        // A max_jumps provenance value stored some other way (out of the
+        // command's 1..=11 bound) must be caught when it is carried forward
+        // and recomposed, not silently persisted.
+        let existing = SovSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            name: "front".to_string(),
+            filter: serde_json::from_str::<SovFilter>(FILTER).unwrap(),
+            options: serde_json::json!({
+                SOV_EXPLICIT_FILTER_OPTION_KEY:
+                    serde_json::from_str::<serde_json::Value>(FILTER).unwrap(),
+                SOV_MAX_JUMPS_OPTION_KEY: 99,
+            }),
+            role_id: None,
+        };
+        let mut input = base_input("front");
+        input.tz_shift_enabled = Some(true);
+        assert!(resolve(&input, Some(&existing)).is_err());
+    }
+
+    #[test]
+    fn a_legacy_subscription_carries_its_composed_filter_forward() {
+        // A row stored before ticket 15 has no provenance keys; its whole
+        // composed `filter` column is treated as the explicit base so a
+        // carried-forward re-subscribe reproduces it exactly.
+        let legacy_filter = serde_json::from_str::<SovFilter>(FILTER).unwrap();
+        let existing = SovSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            name: "front".to_string(),
+            filter: legacy_filter.clone(),
+            options: serde_json::json!({}),
+            role_id: Some(321),
+        };
+        let mut input = base_input("front");
+        input.tz_shift_enabled = Some(true);
+        let resolved = resolve(&input, Some(&existing)).expect("legacy carry-forward");
+        assert_eq!(resolved.subscription.filter, legacy_filter);
+        assert_eq!(resolved.subscription.role_id, Some(321));
+        assert!(resolved.preserved.contains(&"filter"));
+    }
+
+    #[test]
+    fn parse_clear_fields_rejects_an_unknown_name_and_dedupes() {
+        assert!(parse_clear_fields("role,not_a_field").is_err());
+        assert_eq!(
+            parse_clear_fields("role, role, max_jumps").unwrap(),
+            vec![SovClearableField::Role, SovClearableField::MaxJumps]
+        );
+        assert!(parse_clear_fields("").unwrap().is_empty());
+    }
+
+    // --- Review finding 1: an unreadable store read must abort. ---
+
+    #[test]
+    fn resolve_from_lookup_aborts_on_an_unreadable_lookup() {
+        // A transient DB error (or an undeserializable row) must never be
+        // collapsed into a first-time subscribe: it aborts without yielding
+        // a subscription to upsert.
+        let mut input = base_input("front");
+        input.filter = Some(FILTER.to_string());
+        let outcome = SovSubscribeCommand::resolve_from_lookup(
+            42,
+            77,
+            &input,
+            ExistingLookup::Unreadable("connection reset".to_string()),
+        );
+        assert!(matches!(outcome, Err(ResolveAbort::Unreadable)));
+    }
+
+    #[test]
+    fn resolve_from_lookup_composes_a_first_time_subscribe_only_on_a_confirmed_absence() {
+        let mut input = base_input("front");
+        input.filter = Some(FILTER.to_string());
+        let resolved =
+            SovSubscribeCommand::resolve_from_lookup(42, 77, &input, ExistingLookup::Absent)
+                .expect("a confirmed absence composes a first-time subscribe");
+        assert_eq!(resolved.replaced, vec!["filter"]);
+    }
+
+    #[test]
+    fn resolve_from_lookup_carries_forward_against_a_present_subscription() {
+        let stored = stored_with_region_defender_max_jumps();
+        let mut input = base_input("front");
+        input.filter = Some(F2.to_string());
+        let resolved = SovSubscribeCommand::resolve_from_lookup(
+            42,
+            77,
+            &input,
+            ExistingLookup::Present(stored),
+        )
+        .expect("a present subscription carries omitted fields forward");
+        assert_eq!(resolved.subscription.role_id, Some(555));
+    }
+
+    // --- Review finding 2: legacy rows and convenience options. ---
+
+    /// A row stored before ticket 15: no provenance keys, its whole composed
+    /// `filter` is the only record of its filter.
+    fn legacy_stored() -> SovSubscription {
+        SovSubscription {
+            guild_id: 42,
+            channel_id: 77,
+            name: "front".to_string(),
+            filter: serde_json::from_str::<SovFilter>(FILTER).unwrap(),
+            options: serde_json::json!({}),
+            role_id: Some(321),
+        }
+    }
+
+    #[test]
+    fn legacy_row_rejects_a_convenience_option_without_a_filter() {
+        // region_id:B over a legacy tree that already bakes in region(A)
+        // would compose a contradictory And that silently matches nothing;
+        // reject it and leave the row unchanged.
+        let mut input = base_input("front");
+        input.region_id = Some(10_000_002);
+        assert!(resolve(&input, Some(&legacy_stored())).is_err());
+    }
+
+    #[test]
+    fn legacy_row_with_convenience_and_a_filter_composes_without_a_duplicate_leaf() {
+        // Supplying the filter re-types provenance, so the convenience leaf
+        // composes onto the freshly-typed filter (not the opaque old tree)
+        // and provenance is stored for future partial updates.
+        let mut input = base_input("front");
+        input.filter = Some(F2.to_string());
+        input.region_id = Some(10_000_002);
+        let resolved = resolve(&input, Some(&legacy_stored())).expect("re-typed legacy row");
+        assert_eq!(
+            resolved.subscription.options[SOV_EXPLICIT_FILTER_OPTION_KEY],
+            serde_json::from_str::<serde_json::Value>(F2).unwrap()
+        );
+        assert_eq!(
+            resolved.subscription.options[SOV_REGION_ID_OPTION_KEY],
+            serde_json::json!(10_000_002)
+        );
+        // Exactly one region leaf: F2 (a system filter) ANDed with region(B).
+        match resolved.subscription.filter.root {
+            SovFilterNode::And(ref nodes) => {
+                let regions = nodes
+                    .iter()
+                    .filter(|node| filter_contains_region(node))
+                    .count();
+                assert_eq!(regions, 1);
+            }
+            other => panic!("expected an And node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_row_with_only_a_role_change_carries_the_filter_forward() {
+        // Role is not a convenience leaf, so a legacy row can change it
+        // without re-typing the filter: today's plain carry-forward.
+        let mut input = base_input("front");
+        input.role_id = Some(999);
+        let resolved = resolve(&input, Some(&legacy_stored())).expect("legacy role change");
+        assert_eq!(resolved.subscription.role_id, Some(999));
+        assert_eq!(
+            resolved.subscription.filter,
+            serde_json::from_str::<SovFilter>(FILTER).unwrap()
+        );
+        assert!(resolved.preserved.contains(&"filter"));
+        // The row must stay legacy: a role-only edit must not write the
+        // opaque composed tree into explicit_filter and upgrade the row.
+        assert!(!is_ticket15_provenance(&resolved.subscription.options));
+    }
+
+    #[test]
+    fn a_legacy_row_role_only_edit_stays_legacy_and_keeps_guarding_convenience() {
+        // A role-only edit to a legacy row must leave it legacy: if its
+        // opaque composed tree leaked into explicit_filter the row would
+        // count as ticket-15 with no convenience provenance, letting a later
+        // region_id:B bypass the guard and compose a match-nothing And.
+        let mut role_edit = base_input("front");
+        role_edit.role_id = Some(999);
+        let after_role = resolve(&role_edit, Some(&legacy_stored()))
+            .expect("legacy role change")
+            .subscription;
+        assert!(!is_ticket15_provenance(&after_role.options));
+        assert_eq!(
+            after_role.filter,
+            serde_json::from_str::<SovFilter>(FILTER).unwrap()
+        );
+
+        // Still legacy, so a convenience-only edit is still rejected by the
+        // guard rather than composing a contradictory tree.
+        let mut convenience = base_input("front");
+        convenience.region_id = Some(10_000_002);
+        assert!(resolve(&convenience, Some(&after_role)).is_err());
+    }
+
+    #[test]
+    fn a_legacy_row_behavioural_only_edit_stays_legacy_and_merges_the_key() {
+        // A behavioural-only edit (tminus_marks) must not upgrade a legacy
+        // row either; the behavioural key merges as before and the composed
+        // filter column is unchanged.
+        let mut input = base_input("front");
+        input.tminus_marks = Some("120".to_string());
+        let resolved = resolve(&input, Some(&legacy_stored()))
+            .expect("legacy behavioural change")
+            .subscription;
+        assert!(!is_ticket15_provenance(&resolved.options));
+        assert_eq!(
+            resolved.options[SOV_TMINUS_MARKS_OPTION_KEY],
+            serde_json::json!([120])
+        );
+        assert_eq!(
+            resolved.filter,
+            serde_json::from_str::<SovFilter>(FILTER).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_legacy_row_upgrades_only_once_the_filter_is_retyped_then_updates_partially() {
+        // Re-typing the filter alongside region_id:B records provenance and
+        // upgrades the row; a subsequent max_jumps-only edit then composes
+        // cleanly (one region leaf, one reachable leaf).
+        let mut retype = base_input("front");
+        retype.filter = Some(F2.to_string());
+        retype.region_id = Some(10_000_002);
+        let upgraded = resolve(&retype, Some(&legacy_stored()))
+            .expect("re-typed legacy row")
+            .subscription;
+        assert!(is_ticket15_provenance(&upgraded.options));
+
+        let mut partial = base_input("front");
+        partial.max_jumps = Some(5);
+        let resolved = resolve(&partial, Some(&upgraded))
+            .expect("partial update on the upgraded row")
+            .subscription;
+        match resolved.filter.root {
+            SovFilterNode::And(ref nodes) => {
+                let regions = nodes
+                    .iter()
+                    .filter(|node| filter_contains_region(node))
+                    .count();
+                assert_eq!(regions, 1, "exactly one region leaf");
+                let reachable = nodes
+                    .iter()
+                    .filter(|node| {
+                        matches!(
+                            node,
+                            SovFilterNode::Condition(SovFilterCondition::Reachable { .. })
+                        )
+                    })
+                    .count();
+                assert_eq!(reachable, 1, "exactly one reachable leaf");
+            }
+            other => panic!("expected an And node, got {other:?}"),
+        }
+    }
+
+    // --- Review finding 3: clearing a field with no stored value. ---
+
+    #[test]
+    fn clearing_a_field_with_no_stored_value_is_not_reported_as_cleared() {
+        // The stored subscription has no role; clear:role is a no-op, not a
+        // "Cleared: role".
+        let mut first = base_input("front");
+        first.filter = Some(FILTER.to_string());
+        let stored = resolve(&first, None).expect("first subscribe").subscription;
+        assert_eq!(stored.role_id, None);
+
+        let mut input = base_input("front");
+        input.clear = vec![SovClearableField::Role];
+        let resolved = resolve(&input, Some(&stored)).expect("clearing an absent field is a no-op");
+        assert_eq!(resolved.subscription.role_id, None);
+        assert!(!resolved.cleared.contains(&"role"));
+    }
+
+    #[test]
+    fn first_time_subscribe_with_clear_role_is_not_an_error_and_not_cleared() {
+        let mut input = base_input("front");
+        input.filter = Some(FILTER.to_string());
+        input.clear = vec![SovClearableField::Role];
+        let resolved = resolve(&input, None).expect("clear on a first-time subscribe is a no-op");
+        assert_eq!(resolved.subscription.role_id, None);
+        assert!(!resolved.cleared.contains(&"role"));
     }
 }

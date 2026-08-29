@@ -2055,6 +2055,163 @@ async fn re_persisting_a_subscription_with_the_previously_read_options_preserves
     database.destroy().await;
 }
 
+#[tokio::test]
+async fn re_subscribe_carrying_role_and_convenience_provenance_preserves_them_and_the_filter_match()
+{
+    // The database side of ticket 15's carry-forward contract (the pure
+    // decision -- `SovSubscribeCommand::resolve_subscription` -- is
+    // unit-tested in `src/commands/sov_subscribe.rs`). Persist a
+    // subscription with a ping role plus the ticket-15 provenance keys and
+    // a composed filter, then perform the exact write the command performs
+    // when a later `/sov_subscribe` changes only the filter while carrying
+    // the role and convenience leaves forward, and prove: the role_id
+    // column survives, the provenance options round-trip through JSONB, and
+    // the recomposed filter still matches the same campaign it did before.
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let target = campaign(
+        1,
+        30_004_737,
+        99_000_001,
+        observed_at + ChronoDuration::hours(2),
+    );
+
+    // A composed filter equivalent to `filter:<vulnerable_within 12h>`
+    // plus `region_id`/`defender_alliance_id` convenience leaves.
+    let region_leaf = SovFilterNode::Condition(SovFilterCondition::Region(vec![10_000_060]));
+    let defender_leaf = SovFilterNode::Condition(SovFilterCondition::Defender {
+        alliance_ids: vec![99_000_001],
+        watchlist: false,
+    });
+    let explicit = SovFilterNode::Condition(SovFilterCondition::VulnerableWithin { hours: 12 });
+    let composed = SovFilter {
+        root: SovFilterNode::And(vec![
+            explicit.clone(),
+            region_leaf.clone(),
+            defender_leaf.clone(),
+        ]),
+    };
+    let region_of = |system_id: i64| (system_id == 30_004_737).then_some(10_000_060);
+    assert!(composed
+        .root
+        .matches(&target, observed_at, &region_of, &|_, _| None));
+
+    let provenance = serde_json::json!({
+        "explicit_filter": {"root": {"condition": {"vulnerable_within": {"hours": 12}}}},
+        "region_id": 10_000_060,
+        "defender_alliance_id": 99_000_001,
+    });
+    subscribe_with_options(
+        &store,
+        "front",
+        composed.clone(),
+        Some(555),
+        provenance.clone(),
+    )
+    .await;
+
+    // Simulate the command's carry-forward: read the stored row, keep its
+    // role_id and provenance options, apply only a filter change that
+    // recomposes the SAME convenience leaves onto a new explicit filter.
+    let existing = store
+        .subscription(1, 2, "front")
+        .await
+        .expect("lookup before re-subscribing")
+        .expect("subscription exists");
+    assert_eq!(existing.role_id, Some(555));
+    assert_eq!(existing.options, provenance);
+
+    let new_explicit = SovFilterNode::Condition(SovFilterCondition::EventType(vec![
+        "ihub_defense".to_string(),
+    ]));
+    let recomposed = SovFilter {
+        root: SovFilterNode::And(vec![new_explicit, region_leaf, defender_leaf]),
+    };
+    let mut carried_options = existing.options.clone();
+    carried_options["explicit_filter"] =
+        serde_json::json!({"root": {"condition": {"event_type": ["ihub_defense"]}}});
+    subscribe_with_options(
+        &store,
+        "front",
+        recomposed.clone(),
+        existing.role_id,
+        carried_options,
+    )
+    .await;
+
+    let after = store
+        .subscription(1, 2, "front")
+        .await
+        .expect("lookup after re-subscribing")
+        .expect("subscription still exists");
+    assert_eq!(
+        after.role_id,
+        Some(555),
+        "the ping role must survive a filter-only re-subscribe"
+    );
+    assert_eq!(
+        after.options["region_id"],
+        serde_json::json!(10_000_060),
+        "convenience provenance must round-trip through JSONB"
+    );
+    assert!(
+        after
+            .filter
+            .root
+            .matches(&target, observed_at, &region_of, &|_, _| None),
+        "the recomposed filter must still match the same campaign"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn subscription_returns_err_for_a_row_whose_filter_json_is_corrupt() {
+    // Ticket 15 review finding 1: `/sov_subscribe` must distinguish a store
+    // read *error* from a confirmed absence, so it never composes a
+    // first-time subscription (dropping the stored role/convenience) over a
+    // row it merely failed to read. Prove the read seam it relies on --
+    // `subscription()` -- surfaces an undeserializable row as `Err`, not
+    // `Ok(None)`, so the command's `ExistingLookup::Unreadable` branch is
+    // reachable in production.
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+
+    subscribe(
+        &store,
+        "front",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::VulnerableWithin { hours: 6 }),
+        },
+        Some(555),
+    )
+    .await;
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to corrupt the stored filter directly");
+    // Valid JSONB, but not a valid `SovFilter` (no `root`): deserialization
+    // fails when the row is read back.
+    sqlx::query("UPDATE sov_subscriptions SET filter = $1 WHERE name = 'front'")
+        .bind(serde_json::json!({"not_a_filter": true}))
+        .execute(&pool)
+        .await
+        .expect("corrupt the stored filter directly, bypassing validate()");
+    pool.close().await;
+
+    let result = store.subscription(1, 2, "front").await;
+    assert!(
+        result.is_err(),
+        "a row that fails to deserialize must surface as Err, not Ok(None)"
+    );
+
+    database.destroy().await;
+}
+
 // --- Second fix round test (ticket 03 review: VulnerableWithin hours ceiling) ---
 
 #[tokio::test]

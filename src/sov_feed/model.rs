@@ -725,9 +725,16 @@ impl SovFilter {
 }
 
 /// A channel's sovereignty campaign subscription. `options` is an opaque,
-/// forward-compatible JSON document: later tickets (T-minus marks,
-/// timezone window) add fields there without a schema migration; this
-/// ticket neither reads nor writes any option.
+/// forward-compatible JSON document that grows without a schema migration.
+/// Two families of keys live there:
+/// - Behavioural keys read by the feed at evaluation time:
+///   `tminus_marks_minutes`, `tz_window`, `tz_shift_enabled`.
+/// - Provenance keys written and read only by `/sov_subscribe` (ticket 15)
+///   so a partial re-subscribe can carry omitted top-level fields forward:
+///   `explicit_filter` (the user's typed filter) plus the effective
+///   convenience values `region_id`, `defender_alliance_id`, `max_jumps`,
+///   `allow_frigate_holes`. The persisted `filter` column always holds the
+///   fully composed tree, so the feed ignores the provenance keys.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SovSubscription {
     pub guild_id: u64,
