@@ -2057,6 +2057,24 @@ fn format_datetime_to_timestamp(date: &DateTime<FixedOffset>) -> String {
     format!("{}00", date_utc.format("%Y%m%d%H"))
 }
 
+fn format_killmail_participant(
+    identity_name: String,
+    identity_link: Option<String>,
+    ticker: Option<String>,
+    affiliation_link: Option<String>,
+) -> String {
+    let identity = match identity_link {
+        Some(link) => format!("[{identity_name}]({link})"),
+        None => identity_name,
+    };
+
+    match (ticker, affiliation_link) {
+        (Some(ticker), Some(link)) => format!("[[{ticker}]]({link}) {identity}"),
+        (Some(ticker), None) => format!("[{ticker}] {identity}"),
+        (None, _) => identity,
+    }
+}
+
 pub async fn build_killmail_embed(
     app_state: &Arc<AppState>,
     zk_data: &ZkData,
@@ -2125,6 +2143,54 @@ pub async fn build_killmail_embed(
         } else {
             (None, None)
         };
+
+    let final_blow_display = if let Some(final_blow) = killmail
+        .attackers
+        .iter()
+        .find(|attacker| attacker.final_blow)
+    {
+        let (identity_name, identity_link) = if let Some(character_id) = final_blow.character_id {
+            (
+                get_name(app_state, character_id)
+                    .await
+                    .unwrap_or_else(|| "Unknown".to_string()),
+                Some(format!("https://zkillboard.com/character/{character_id}/")),
+            )
+        } else {
+            let ship_type_name = if let Some(ship_type_id) = final_blow.ship_type_id {
+                get_name(app_state, ship_type_id as u64)
+                    .await
+                    .unwrap_or_else(|| "Unknown Ship".to_string())
+            } else {
+                "Unknown Ship".to_string()
+            };
+            (ship_type_name, None)
+        };
+        let (ticker, affiliation_link) = if let Some(alliance_id) = final_blow.alliance_id {
+            (
+                get_ticker(app_state, alliance_id, true).await,
+                Some(format!("https://zkillboard.com/alliance/{alliance_id}/")),
+            )
+        } else if let Some(corporation_id) = final_blow.corporation_id {
+            (
+                get_ticker(app_state, corporation_id, false).await,
+                Some(format!(
+                    "https://zkillboard.com/corporation/{corporation_id}/"
+                )),
+            )
+        } else {
+            (None, None)
+        };
+
+        Some(format_killmail_participant(
+            identity_name,
+            identity_link,
+            ticker,
+            affiliation_link,
+        ))
+    } else {
+        None
+    };
 
     // --- Determine Display Ship Type for Title ---
     // Type-Tracked Ship (Green, matched hull is in the subscription's ShipType set):
@@ -2265,20 +2331,12 @@ pub async fn build_killmail_embed(
     let attackers_content = format!("{}\n```\n{}```", overall_fleet_comp, alliance_breakdown);
 
     // --- Victim Field with zkillboard links ---
-    let victim_display = {
-        // Format character name with link if available
-        let char_display = match victim_char_link {
-            Some(link) => format!("[{}]({})", victim_char_name, link),
-            None => victim_char_name,
-        };
-
-        // Format ticker with link if available
-        match (victim_ticker, victim_affiliation_link) {
-            (Some(ticker), Some(link)) => format!("[[{}]]({}) {}", ticker, link, char_display),
-            (Some(ticker), None) => format!("[{}] {}", ticker, char_display),
-            (None, _) => char_display,
-        }
-    };
+    let victim_display = format_killmail_participant(
+        victim_char_name,
+        victim_char_link,
+        victim_ticker,
+        victim_affiliation_link,
+    );
 
     // --- Footer (alliance logo of matched entity) ---
     let footer_icon = match best_match.as_ref() {
@@ -2344,7 +2402,10 @@ pub async fn build_killmail_embed(
     );
 
     // Victim field
-    embed.field("Victim", victim_display, false);
+    embed.field("Victim", victim_display, final_blow_display.is_some());
+    if let Some(final_blow_display) = final_blow_display {
+        embed.field("Final Blow", final_blow_display, true);
+    }
 
     // Footer
     embed.footer(|f| {
