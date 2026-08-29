@@ -3751,7 +3751,10 @@ impl Default for ContractPingType {
 }
 
 impl ContractPingType {
-    pub fn content(self) -> &'static str {
+    /// The bare mention token prepended to a pinging delivery's `content`.
+    /// The full notification `content` (ping token plus summary) is assembled
+    /// in `configure_contract_delivery_message`.
+    pub fn ping_token(self) -> &'static str {
         match self {
             Self::Here => "@here",
             Self::Everyone => "@everyone",
@@ -15081,6 +15084,20 @@ fn sanitize_contract_text(value: &str) -> String {
     sanitize_contract_visible_text(value, false)
 }
 
+/// Neutralize any stray Discord mention sigil in an already-composed contract
+/// notification summary so that a `@here`, `@everyone`, `<@…>`, or `<@&…>`
+/// token carried in item, issuer, or player-supplied contract-title text
+/// cannot parse as a mention. The summary's user-controlled segments are
+/// already routed through [`sanitize_contract_text`] at construction; this
+/// reuses that helper's exact zero-width-space escape but preserves every
+/// other character verbatim (decimals, parentheses, bullets) so the plain-text
+/// banner still matches the embed title. This matters on pinging deliveries,
+/// where `ParseValue::Everyone` is enabled and only the intended prefixed ping
+/// token may parse.
+pub(crate) fn neutralize_contract_summary_mentions(summary: &str) -> String {
+    summary.replace('@', "@\u{200b}")
+}
+
 fn sanitize_contract_identity(value: &str) -> String {
     sanitize_contract_visible_text(value, true)
 }
@@ -16764,7 +16781,12 @@ mod embed_tests {
             Some("https://images.evetech.net/types/22852/icon?size=64")
         );
         let outbound = configured_contract_delivery_payload_for_test(delivery);
-        assert!(outbound.get("content").is_none());
+        // A non-pinging delivery carries the embed title verbatim as its
+        // readable summary while keeping allowed mentions suppressed.
+        assert_eq!(
+            outbound["content"].as_str(),
+            Some(delivery.message.title.as_str())
+        );
         assert_eq!(outbound["allowed_mentions"]["parse"], serde_json::json!([]));
         assert_eq!(
             outbound["nonce"].as_str(),

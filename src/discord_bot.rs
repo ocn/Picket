@@ -5,9 +5,10 @@ use crate::config::{
     PingType, SimpleFilter, StandingSource, Subscription, System,
 };
 use crate::contract_intelligence::{
-    parse_contract_discord_message_id, ContractDelivery, ContractDeliveryError,
-    ContractMessageEdit, ContractNotificationMessage, HealthDiscordPublisher, HealthPublishError,
-    PreparedContractDelivery, ShipGroupLookup, ShipGroupResolver,
+    neutralize_contract_summary_mentions, parse_contract_discord_message_id, ContractDelivery,
+    ContractDeliveryError, ContractMessageEdit, ContractNotificationMessage,
+    HealthDiscordPublisher, HealthPublishError, PreparedContractDelivery, ShipGroupLookup,
+    ShipGroupResolver,
 };
 use crate::esi::Celestial;
 use crate::models::{Attacker, ZkData};
@@ -566,9 +567,7 @@ fn configure_contract_delivery_message<'a, 'builder>(
     builder: &'builder mut CreateMessage<'a>,
     delivery: &PreparedContractDelivery,
 ) -> &'builder mut CreateMessage<'a> {
-    if delivery.ping {
-        builder.content(delivery.ping_type.content());
-    }
+    builder.content(contract_delivery_content(delivery));
     let builder = builder
         .allowed_mentions(|mentions| {
             let mentions = mentions.empty_parse();
@@ -586,6 +585,22 @@ fn configure_contract_delivery_message<'a, 'builder>(
         .0
         .insert("enforce_nonce", Value::Bool(delivery.enforce_nonce));
     builder
+}
+
+/// Assemble the plain-text `content` for a contract delivery: an optional ping
+/// prefix followed by the notification summary. The summary is the embed title
+/// verbatim so the phone banner and the opened embed never drift, with stray
+/// mention sigils neutralized so that only the intended ping token parses. A
+/// pinging delivery leads with `@here`/`@everyone` (and keeps
+/// `ParseValue::Everyone` enabled so it still buzzes); a non-pinging delivery
+/// carries the summary alone with allowed mentions left empty.
+fn contract_delivery_content(delivery: &PreparedContractDelivery) -> String {
+    let summary = neutralize_contract_summary_mentions(&delivery.message.title);
+    if delivery.ping {
+        format!("{} {summary}", delivery.ping_type.ping_token())
+    } else {
+        summary
+    }
 }
 
 #[cfg(test)]
@@ -3272,7 +3287,10 @@ mod tests {
         };
         let mut ping_builder = CreateMessage::default();
         configure_contract_delivery_message(&mut ping_builder, &delivery);
-        assert_eq!(ping_builder.0["content"].as_str(), Some("@here"));
+        assert_eq!(
+            ping_builder.0["content"].as_str(),
+            Some("@here @\u{200b}everyone cannot notify anyone")
+        );
         assert_eq!(ping_builder.0["nonce"].as_str(), Some("ci-1"));
         assert_eq!(ping_builder.0["enforce_nonce"].as_bool(), Some(true));
         assert_eq!(
@@ -3289,7 +3307,10 @@ mod tests {
                 ..delivery.clone()
             },
         );
-        assert!(non_pinging_builder.0.get("content").is_none());
+        assert_eq!(
+            non_pinging_builder.0["content"].as_str(),
+            Some("@\u{200b}everyone cannot notify anyone")
+        );
         assert_eq!(
             non_pinging_builder.0["enforce_nonce"].as_bool(),
             Some(false)
@@ -3307,10 +3328,112 @@ mod tests {
                 ..delivery
             },
         );
-        assert_eq!(everyone_builder.0["content"].as_str(), Some("@everyone"));
+        assert_eq!(
+            everyone_builder.0["content"].as_str(),
+            Some("@everyone @\u{200b}everyone cannot notify anyone")
+        );
         assert_eq!(
             everyone_builder.0["allowed_mentions"]["parse"],
             serde_json::json!(["everyone"])
+        );
+    }
+
+    fn contract_delivery_with_title(
+        title: &str,
+        ping: bool,
+        ping_type: crate::contract_intelligence::ContractPingType,
+    ) -> PreparedContractDelivery {
+        PreparedContractDelivery {
+            delivery_id: 1,
+            guild_id: 2,
+            channel_id: 3,
+            subscription_id: "ships".to_string(),
+            contract_id: 4,
+            event_kind: crate::contract_intelligence::ContractEventKind::Listed,
+            ping,
+            ping_type,
+            nonce: "ci-summary".to_string(),
+            enforce_nonce: true,
+            message: ContractNotificationMessage {
+                title: title.to_string(),
+                description: None,
+                fields: vec![],
+                presentation_revision:
+                    crate::contract_intelligence::CONTRACT_NOTIFICATION_PRESENTATION_REVISION,
+                author: None,
+                thumbnail_url: None,
+                footer: None,
+                timestamp: None,
+            },
+            delivery_claim_token: None,
+        }
+    }
+
+    #[test]
+    fn pinging_contract_delivery_content_leads_with_ping_and_neutralizes_injection() {
+        // A crafted item/issuer/title carrying its own mention tokens must not
+        // introduce a parsed mention beyond the intended @here.
+        let delivery = contract_delivery_with_title(
+            "@everyone Nyx listed for 22.5B in Jita (The Forge) <@&123456> <@789012>",
+            true,
+            crate::contract_intelligence::ContractPingType::Here,
+        );
+        let mut builder = CreateMessage::default();
+        configure_contract_delivery_message(&mut builder, &delivery);
+        let content = builder.0["content"].as_str().expect("content is set");
+
+        assert!(
+            content.starts_with("@here "),
+            "content must lead with the ping token: {content:?}"
+        );
+        // The verbatim summary (decimals and parentheses preserved) survives.
+        assert!(
+            content.contains("Nyx listed for 22.5B in Jita (The Forge)"),
+            "summary must carry the embed title verbatim: {content:?}"
+        );
+        // Only the leading @here may parse. No bare @here/@everyone survives,
+        // and every remaining mention sigil is escaped with a zero-width space
+        // so no <@…>/<@&…> token can resolve either.
+        let after_ping = &content["@here ".len()..];
+        assert!(!after_ping.contains("@everyone"), "content: {content:?}");
+        assert!(!after_ping.contains("@here"), "content: {content:?}");
+        assert!(
+            after_ping
+                .match_indices('@')
+                .all(|(idx, _)| after_ping[idx + 1..].starts_with('\u{200b}')),
+            "every mention sigil must be escaped: {content:?}"
+        );
+        // Everyone parsing stays enabled so the delivery still buzzes.
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!(["everyone"])
+        );
+    }
+
+    #[test]
+    fn non_pinging_contract_delivery_carries_summary_with_mentions_suppressed() {
+        let delivery = contract_delivery_with_title(
+            "Nyx listed for 22.5B in Jita (The Forge)",
+            false,
+            crate::contract_intelligence::ContractPingType::Here,
+        );
+        let mut builder = CreateMessage::default();
+        configure_contract_delivery_message(&mut builder, &delivery);
+
+        assert_eq!(
+            builder.0["content"].as_str(),
+            Some("Nyx listed for 22.5B in Jita (The Forge)")
+        );
+        assert!(
+            !builder.0["content"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with('@'),
+            "a non-pinging summary must not begin with a ping token"
+        );
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!([])
         );
     }
 
