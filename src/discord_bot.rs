@@ -5,7 +5,7 @@ use crate::config::{
     PingType, SimpleFilter, StandingSource, Subscription, System,
 };
 use crate::contract_intelligence::{
-    neutralize_contract_summary_mentions, parse_contract_discord_message_id, ContractDelivery,
+    neutralize_summary_mentions, parse_contract_discord_message_id, ContractDelivery,
     ContractDeliveryError, ContractMessageEdit, ContractNotificationMessage,
     HealthDiscordPublisher, HealthPublishError, PreparedContractDelivery, ShipGroupLookup,
     ShipGroupResolver,
@@ -286,7 +286,18 @@ pub struct PreparedDispatch {
     pub subscription: Subscription,
     pub zk_data: ZkData,
     pub embed: CreateEmbed,
+    pub ping_summary: String,
     pub filter_result: NamedFilterResult,
+}
+
+/// A rendered killmail embed together with the plain-text `ping_summary`
+/// derived from it at render time: the embed title verbatim plus the
+/// `in {system} ({region})` location suffix. Carrying the summary alongside
+/// the embed keeps the phone banner and the opened embed from drifting, since
+/// both come from a single computation in [`render_killmail_embed`].
+pub struct KillmailEmbed {
+    pub embed: CreateEmbed,
+    pub ping_summary: String,
 }
 
 pub struct DiscordContractDelivery {
@@ -595,7 +606,7 @@ fn configure_contract_delivery_message<'a, 'builder>(
 /// `ParseValue::Everyone` enabled so it still buzzes); a non-pinging delivery
 /// carries the summary alone with allowed mentions left empty.
 fn contract_delivery_content(delivery: &PreparedContractDelivery) -> String {
-    let summary = neutralize_contract_summary_mentions(&delivery.message.title);
+    let summary = neutralize_summary_mentions(&delivery.message.title);
     if delivery.ping {
         format!("{} {summary}", delivery.ping_type.ping_token())
     } else {
@@ -1769,9 +1780,17 @@ pub(crate) fn configure_killmail_notification_message(
     builder: &mut CreateMessage<'_>,
     notification: PreparedKillmailNotification,
     embed: CreateEmbed,
+    ping_summary: &str,
 ) {
-    if let Some(content) = notification.content {
-        builder.content(content);
+    // Only pinging alerts carry `content`. When present, lead with the ping
+    // token and append the neutralized summary so the phone banner states what
+    // was killed and where while only the intended ping token parses. Non-ping
+    // alerts leave `content` absent, exactly as before.
+    if let Some(ping_token) = notification.content {
+        builder.content(format!(
+            "{ping_token} {}",
+            neutralize_summary_mentions(ping_summary)
+        ));
     }
     builder
         .allowed_mentions(|mentions| {
@@ -1804,7 +1823,10 @@ pub async fn send_killmail_message(
             return Err(KillmailSendError::Other("Invalid channel ID".into()));
         }
     };
-    let embed = build_killmail_embed(app_state, zk_data, &filter_result, subscription).await;
+    let KillmailEmbed {
+        embed,
+        ping_summary,
+    } = render_killmail_embed(app_state, zk_data, &filter_result, subscription).await;
     let notification = prepare_killmail_notification_for_delivery(
         app_state,
         subscription,
@@ -1815,7 +1837,7 @@ pub async fn send_killmail_message(
 
     let result = channel
         .send_message(http, |m| {
-            configure_killmail_notification_message(m, notification, embed);
+            configure_killmail_notification_message(m, notification, embed, &ping_summary);
             m
         })
         .await;
@@ -2075,12 +2097,26 @@ fn format_killmail_participant(
     }
 }
 
+/// Thin wrapper returning only the [`CreateEmbed`], used by integration embed
+/// tests that do not need the ping summary. Production send paths call
+/// [`render_killmail_embed`] and carry the summary to the message-assembly seam.
 pub async fn build_killmail_embed(
     app_state: &Arc<AppState>,
     zk_data: &ZkData,
     named_filter_result: &NamedFilterResult,
     subscription: &Subscription,
 ) -> CreateEmbed {
+    render_killmail_embed(app_state, zk_data, named_filter_result, subscription)
+        .await
+        .embed
+}
+
+pub async fn render_killmail_embed(
+    app_state: &Arc<AppState>,
+    zk_data: &ZkData,
+    named_filter_result: &NamedFilterResult,
+    subscription: &Subscription,
+) -> KillmailEmbed {
     let mut embed = CreateEmbed::default();
     let filter_result = &named_filter_result.filter_result;
     let killmail = &zk_data.killmail;
@@ -2362,6 +2398,12 @@ pub async fn build_killmail_embed(
         }
     };
 
+    // Derive the ping summary once, before `embed.title(title)` moves the
+    // title: the embed title verbatim (backticks preserved) plus the same
+    // `in {system} ({region})` location grammar used by the author line, so the
+    // phone banner and the opened embed share a single source of truth.
+    let ping_summary = format!("{title} in {system_name} ({region_name})");
+
     // --- Build the Embed ---
     embed.title(title);
     embed.url(killmail_url);
@@ -2426,7 +2468,10 @@ pub async fn build_killmail_embed(
         embed.timestamp(timestamp.to_rfc3339());
     }
 
-    embed
+    KillmailEmbed {
+        embed,
+        ping_summary,
+    }
 }
 
 /// Ship category groups for fleet composition display
@@ -2921,8 +2966,16 @@ mod tests {
         );
 
         let mut builder = CreateMessage::default();
-        configure_killmail_notification_message(&mut builder, notification, CreateEmbed::default());
-        assert_eq!(builder.0["content"].as_str(), Some("@here"));
+        configure_killmail_notification_message(
+            &mut builder,
+            notification,
+            CreateEmbed::default(),
+            "`Nyx` died to 5x `Dreadnought` in Jita (The Forge)",
+        );
+        assert_eq!(
+            builder.0["content"].as_str(),
+            Some("@here `Nyx` died to 5x `Dreadnought` in Jita (The Forge)")
+        );
         assert_eq!(
             builder.0["allowed_mentions"]["parse"],
             serde_json::json!(["everyone"])
@@ -2951,7 +3004,12 @@ mod tests {
         );
 
         let mut builder = CreateMessage::default();
-        configure_killmail_notification_message(&mut builder, notification, CreateEmbed::default());
+        configure_killmail_notification_message(
+            &mut builder,
+            notification,
+            CreateEmbed::default(),
+            "",
+        );
         assert!(builder.0.get("content").is_none());
         assert_eq!(
             builder.0["allowed_mentions"]["parse"],
@@ -2982,10 +3040,15 @@ mod tests {
         );
 
         let mut builder = CreateMessage::default();
-        configure_killmail_notification_message(&mut builder, notification, CreateEmbed::default());
+        configure_killmail_notification_message(
+            &mut builder,
+            notification,
+            CreateEmbed::default(),
+            "`Nyx` died to 5x `Dreadnought` in Jita (The Forge)",
+        );
         assert_eq!(
             builder.0["content"].as_str(),
-            Some("<@&987654321098765432>")
+            Some("<@&987654321098765432> `Nyx` died to 5x `Dreadnought` in Jita (The Forge)")
         );
         assert_eq!(
             builder.0["allowed_mentions"]["parse"],
@@ -3012,7 +3075,12 @@ mod tests {
             true,
         );
         let mut builder = CreateMessage::default();
-        configure_killmail_notification_message(&mut builder, notification, CreateEmbed::default());
+        configure_killmail_notification_message(
+            &mut builder,
+            notification,
+            CreateEmbed::default(),
+            "",
+        );
 
         assert!(builder.0.get("content").is_none());
         assert_eq!(
@@ -3042,8 +3110,16 @@ mod tests {
         );
 
         let mut builder = CreateMessage::default();
-        configure_killmail_notification_message(&mut builder, notification, CreateEmbed::default());
-        assert_eq!(builder.0["content"].as_str(), Some("@everyone"));
+        configure_killmail_notification_message(
+            &mut builder,
+            notification,
+            CreateEmbed::default(),
+            "`Nyx` died to 5x `Dreadnought` in Jita (The Forge)",
+        );
+        assert_eq!(
+            builder.0["content"].as_str(),
+            Some("@everyone `Nyx` died to 5x `Dreadnought` in Jita (The Forge)")
+        );
         assert_eq!(
             builder.0["allowed_mentions"]["parse"],
             serde_json::json!(["everyone"])
@@ -3065,7 +3141,7 @@ mod tests {
         let mut embed = CreateEmbed::default();
         embed.title("matched @everyone killmail");
         let mut builder = CreateMessage::default();
-        configure_killmail_notification_message(&mut builder, notification, embed);
+        configure_killmail_notification_message(&mut builder, notification, embed, "");
 
         assert!(builder.0.get("content").is_none());
         assert_eq!(
@@ -3094,7 +3170,7 @@ mod tests {
         let mut embed = CreateEmbed::default();
         embed.title("matched role killmail");
         let mut builder = CreateMessage::default();
-        configure_killmail_notification_message(&mut builder, notification, embed);
+        configure_killmail_notification_message(&mut builder, notification, embed, "");
 
         assert!(builder.0.get("content").is_none());
         assert_eq!(
@@ -3118,7 +3194,111 @@ mod tests {
             true,
         );
         let mut builder = CreateMessage::default();
-        configure_killmail_notification_message(&mut builder, notification, CreateEmbed::default());
+        configure_killmail_notification_message(
+            &mut builder,
+            notification,
+            CreateEmbed::default(),
+            "",
+        );
+
+        assert!(builder.0.get("content").is_none());
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn pinging_killmail_content_appends_summary_and_keeps_everyone_parsing() {
+        // A pinging alert's `content` must be the ping token followed by the
+        // embed-derived summary (`{title} in {system} ({region})`), while the
+        // intended @here still parses so the push still buzzes.
+        let notification = PreparedKillmailNotification {
+            content: Some("@here".to_string()),
+            allowed_mentions: KillmailAllowedMentions::Everyone,
+        };
+        let ping_summary = "`Nyx` died to 5x `Dreadnought` in Jita (The Forge)";
+        let mut builder = CreateMessage::default();
+        configure_killmail_notification_message(
+            &mut builder,
+            notification,
+            CreateEmbed::default(),
+            ping_summary,
+        );
+
+        assert_eq!(
+            builder.0["content"].as_str(),
+            Some("@here `Nyx` died to 5x `Dreadnought` in Jita (The Forge)")
+        );
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!(["everyone"])
+        );
+    }
+
+    #[test]
+    fn pinging_killmail_summary_neutralizes_injection_so_only_ping_token_parses() {
+        // A crafted title carrying its own mention tokens must not introduce a
+        // parsed mention beyond the intended @here.
+        let notification = PreparedKillmailNotification {
+            content: Some("@here".to_string()),
+            allowed_mentions: KillmailAllowedMentions::Everyone,
+        };
+        let ping_summary =
+            "@everyone `Nyx` died to 5x `Dreadnought` in Jita (The Forge) <@&123456> <@789012>";
+        let mut builder = CreateMessage::default();
+        configure_killmail_notification_message(
+            &mut builder,
+            notification,
+            CreateEmbed::default(),
+            ping_summary,
+        );
+        let content = builder.0["content"].as_str().expect("content is set");
+
+        assert!(
+            content.starts_with("@here "),
+            "content must lead with the ping token: {content:?}"
+        );
+        // The verbatim summary (backticks and parentheses preserved) survives.
+        assert!(
+            content.contains("`Nyx` died to 5x `Dreadnought` in Jita (The Forge)"),
+            "summary must carry the embed title verbatim: {content:?}"
+        );
+        // Only the leading @here may parse. No bare @here/@everyone survives,
+        // and every remaining mention sigil is escaped with a zero-width space
+        // so no <@…>/<@&…> token can resolve either.
+        let after_ping = &content["@here ".len()..];
+        assert!(!after_ping.contains("@everyone"), "content: {content:?}");
+        assert!(!after_ping.contains("@here"), "content: {content:?}");
+        assert!(
+            after_ping
+                .match_indices('@')
+                .all(|(idx, _)| after_ping[idx + 1..].starts_with('\u{200b}')),
+            "every mention sigil must be escaped: {content:?}"
+        );
+        // Everyone parsing stays enabled so the alert still buzzes.
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!(["everyone"])
+        );
+    }
+
+    #[test]
+    fn non_pinging_killmail_ignores_summary_and_sets_no_content() {
+        // A non-pinging alert must set no `content` even when a summary is
+        // available, so behavior is unchanged where no ping was requested.
+        let notification = PreparedKillmailNotification {
+            content: None,
+            allowed_mentions: KillmailAllowedMentions::None,
+        };
+        let ping_summary = "`Nyx` died to 5x `Dreadnought` in Jita (The Forge)";
+        let mut builder = CreateMessage::default();
+        configure_killmail_notification_message(
+            &mut builder,
+            notification,
+            CreateEmbed::default(),
+            ping_summary,
+        );
 
         assert!(builder.0.get("content").is_none());
         assert_eq!(
