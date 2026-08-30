@@ -104,15 +104,18 @@ async fn process_work_item(work_item: WorkItem, app_state: Arc<AppState>) -> Pro
             "[Kill: {}] Matched subscription '{}' for channel {}, filter: {}",
             kill_id, subscription.description, subscription.action.channel_id, filter_result.name
         );
-        let embed =
-            discord_bot::build_killmail_embed(&app_state, &zk_data, &filter_result, &subscription)
-                .await;
+        let discord_bot::KillmailEmbed {
+            embed,
+            ping_summary,
+        } = discord_bot::render_killmail_embed(&app_state, &zk_data, &filter_result, &subscription)
+            .await;
 
         dispatches.push(PreparedDispatch {
             guild_id,
             subscription,
             zk_data: zk_data.clone(),
             embed,
+            ping_summary,
             filter_result,
         });
     }
@@ -373,7 +376,12 @@ async fn send_prepared_dispatch(
 
     let result = channel
         .send_message(http_client, |m| {
-            discord_bot::configure_killmail_notification_message(m, notification, dispatch.embed);
+            discord_bot::configure_killmail_notification_message(
+                m,
+                notification,
+                dispatch.embed,
+                &dispatch.ping_summary,
+            );
             m
         })
         .await;

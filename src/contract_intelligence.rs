@@ -15084,17 +15084,17 @@ fn sanitize_contract_text(value: &str) -> String {
     sanitize_contract_visible_text(value, false)
 }
 
-/// Neutralize any stray Discord mention sigil in an already-composed contract
+/// Neutralize any stray Discord mention sigil in an already-composed
 /// notification summary so that a `@here`, `@everyone`, `<@…>`, or `<@&…>`
-/// token carried in item, issuer, or player-supplied contract-title text
-/// cannot parse as a mention. The summary's user-controlled segments are
-/// already routed through [`sanitize_contract_text`] at construction; this
-/// reuses that helper's exact zero-width-space escape but preserves every
-/// other character verbatim (decimals, parentheses, bullets) so the plain-text
-/// banner still matches the embed title. This matters on pinging deliveries,
-/// where `ParseValue::Everyone` is enabled and only the intended prefixed ping
-/// token may parse.
-pub(crate) fn neutralize_contract_summary_mentions(summary: &str) -> String {
+/// token carried in user-controlled text (contract item/issuer/title, or a
+/// killmail embed title) cannot parse as a mention. Shared by the contract and
+/// killfeed feeds so both neutralize identically. It escapes only the `@`
+/// sigil with a zero-width space and preserves every other character verbatim
+/// (decimals, parentheses, backticks, bullets) so the plain-text banner still
+/// matches the embed. This matters on pinging deliveries, where
+/// `ParseValue::Everyone` is enabled and only the intended prefixed ping token
+/// may parse.
+pub(crate) fn neutralize_summary_mentions(summary: &str) -> String {
     summary.replace('@', "@\u{200b}")
 }
 
