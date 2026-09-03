@@ -15,6 +15,7 @@ use serenity::model::prelude::command::CommandOptionType;
 use serenity::model::prelude::interaction::application_command::{
     ApplicationCommandInteraction, CommandDataOption, CommandDataOptionValue,
 };
+use serenity::model::Permissions;
 use serenity::prelude::Context;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -145,12 +146,20 @@ impl Command for WatchCommand {
         "watch".to_string()
     }
 
+    // `default_member_permissions` gates the entire `/watch` command group,
+    // so the read-only `/watch list` subcommand also requires MANAGE_GUILD
+    // (ticket 16): Discord has no per-subcommand default permission, and
+    // splitting `list` into its own top-level command was judged not worth
+    // it. Server admins can still loosen this per role via Integrations ->
+    // Command permissions.
     fn register<'a>(
         &self,
         command: &'a mut CreateApplicationCommand,
     ) -> &'a mut CreateApplicationCommand {
         command
             .name("watch")
+            .default_member_permissions(Permissions::MANAGE_GUILD)
+            .dm_permission(false)
             .description("Manage this server's watchlist of alliances and corporations.")
             .create_option(|option| {
                 option

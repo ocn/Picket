@@ -6,6 +6,7 @@ use serenity::model::prelude::command::CommandOptionType;
 use serenity::model::prelude::interaction::application_command::{
     ApplicationCommandInteraction, CommandDataOptionValue,
 };
+use serenity::model::Permissions;
 use serenity::prelude::Context;
 use std::sync::Arc;
 use tracing::error;
@@ -24,6 +25,8 @@ impl Command for SyncRemoveCommand {
     ) -> &'a mut CreateApplicationCommand {
         command
             .name("sync_remove")
+            .default_member_permissions(Permissions::MANAGE_GUILD)
+            .dm_permission(false)
             .description("Remove a standing synchronization from a subscription.")
             .create_option(|option| {
                 option

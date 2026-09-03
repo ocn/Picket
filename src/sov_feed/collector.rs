@@ -20,13 +20,13 @@ use crate::sov_feed::model::{
 };
 use crate::sov_feed::store::{
     SovReachabilityTransition, SovStore, SovTzWindowTransition, SOV_CAMPAIGNS_RESOURCE_KEY,
-    SOV_MAP_RESOURCE_KEY, SOV_STRUCTURES_RESOURCE_KEY,
+    SOV_MAP_RESOURCE_KEY, SOV_RETENTION, SOV_STRUCTURES_RESOURCE_KEY,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Supplies a guild's currently-watched alliance ids so a sov
 /// `Defender { watchlist: true }` leaf can be resolved against that guild's
@@ -533,7 +533,35 @@ impl SovCollector {
         let campaigns = response.value.unwrap_or_default();
         let report = self.diff_and_alert(campaigns, observed_at).await?;
         self.deliver_claimable(observed_at).await?;
+        // Best-effort retention prune (ticket 16), mirroring where the
+        // watchlist collector prunes: a failure here must never fail the
+        // collection cycle.
+        self.prune_retention(observed_at).await;
         Ok(report)
+    }
+
+    /// Runs one [`SovStore::prune_expired_sov_data`] pass over the fixed
+    /// [`SOV_RETENTION`] window and logs a single summary line when anything
+    /// was removed (ticket 16). Best-effort: a prune failure is logged and
+    /// swallowed so it can never abort the collection cycle.
+    async fn prune_retention(&self, observed_at: DateTime<Utc>) {
+        match self
+            .store
+            .prune_expired_sov_data(observed_at, SOV_RETENTION)
+            .await
+        {
+            Ok(counts) => {
+                if !counts.is_empty() {
+                    info!(
+                        "sov retention prune: {} sent deliveries, {} campaigns, {} reachability-state rows removed",
+                        counts.deliveries_deleted,
+                        counts.campaigns_deleted,
+                        counts.reachability_state_deleted
+                    );
+                }
+            }
+            Err(error) => warn!("sov retention prune failed: {error}"),
+        }
     }
 
     /// Polls `GET /sovereignty/structures/` at its own `max-age=300`

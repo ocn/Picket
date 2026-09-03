@@ -7,6 +7,7 @@ use serenity::builder::CreateApplicationCommand;
 use serenity::builder::{CreateActionRow, CreateButton, CreateSelectMenu};
 use serenity::model::prelude::command::CommandOptionType;
 use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
+use serenity::model::Permissions;
 use serenity::prelude::Context;
 use std::sync::Arc;
 use tracing::error;
@@ -33,6 +34,8 @@ impl Command for SyncStandingsCommand {
     ) -> &'a mut CreateApplicationCommand {
         command
             .name("sync_standings")
+            .default_member_permissions(Permissions::MANAGE_GUILD)
+            .dm_permission(false)
             .description("Sync a subscription with your EVE contacts to ignore blues.")
             .create_option(|option| {
                 option

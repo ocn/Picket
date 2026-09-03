@@ -9,6 +9,7 @@ use serenity::model::prelude::command::CommandOptionType;
 use serenity::model::prelude::interaction::application_command::{
     ApplicationCommandInteraction, CommandDataOptionValue,
 };
+use serenity::model::Permissions;
 use serenity::prelude::Context;
 use std::sync::Arc;
 use tracing::error;
@@ -225,6 +226,8 @@ impl Command for SubscribeCommand {
     ) -> &'a mut CreateApplicationCommand {
         command
             .name("subscribe")
+            .default_member_permissions(Permissions::MANAGE_GUILD)
+            .dm_permission(false)
             .description("Create a new subscription for killmail notifications.")
             .create_option(|option| {
                 option

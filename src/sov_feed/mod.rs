@@ -58,9 +58,9 @@ pub use model::{
     SOV_VULNERABLE_WITHIN_MAX_HOURS,
 };
 pub use store::{
-    available_sov_store, new_sov_store_handle, SovReachabilityTransition, SovStore, SovStoreHandle,
-    SovTzWindowTransition, SOV_CAMPAIGNS_RESOURCE_KEY, SOV_MAP_RESOURCE_KEY,
-    SOV_STRUCTURES_RESOURCE_KEY,
+    available_sov_store, new_sov_store_handle, SovPruneCounts, SovReachabilityTransition, SovStore,
+    SovStoreHandle, SovTzWindowTransition, SOV_CAMPAIGNS_RESOURCE_KEY, SOV_MAP_RESOURCE_KEY,
+    SOV_RETENTION, SOV_STRUCTURES_RESOURCE_KEY,
 };
 pub use wanderer::{
     WandererChainSource, WandererClient, WandererConfig, WandererConnection,
