@@ -100,10 +100,19 @@ Active slash commands registered in runtime command map:
 - `subscribe`
 - `unsubscribe`
 - `diag`
+- `health`
 - `sync_standings`
 - `sync_remove`
 - `sync_clear`
 - `find_unsubscribed`
+- `contract_subscribe`
+- `contract_unsubscribe`
+- `sov_subscribe`
+- `sov_unsubscribe`
+- `sov_timers`
+- `watch`
+- `watch_subscribe`
+- `watch_unsubscribe`
 
 Notes:
 - Command names use underscores (not hyphens).
