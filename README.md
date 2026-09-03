@@ -27,6 +27,8 @@ The bot operates by subscribing to a data feed from zkillboard.com and processes
 - [Advanced Examples](#advanced-examples)                                                                                                                                    
 - [Manual Configuration](#manual-configuration)
 - [Global Public Contract Intelligence](#global-public-contract-intelligence)
+- [Sovereignty Timer Feed](#sovereignty-timer-feed)
+- [Watchlist feed](#watchlist-feed)
 - [Development](#development)
 - [Contact](#contact)
 - [License](#license)
@@ -96,7 +98,7 @@ Contract subscriptions are PostgreSQL-backed and are separate from killmail subs
 | `/contract_subscribe` | `id`, `description`, `filter`, `event_actions` | `ly_ranges_json`, `ping_type` | Creates or replaces this channel's public-contract subscription with the same `id`. |
 | `/contract_unsubscribe` | `id` | None | Removes this channel's contract subscription with that `id`. |
 
-Both `/contract_subscribe` and `/contract_unsubscribe` require the Manage Server (`MANAGE_GUILD`) permission and cannot be used in DMs; server admins can loosen this per role under Server Settings → Integrations → the bot → Command permissions.
+Both `/contract_subscribe` and `/contract_unsubscribe` require the Manage Server (`MANAGE_GUILD`) permission and cannot be used in DMs; server admins can loosen this per role under Server Settings → Integrations → the bot → Command permissions. The [sov and watchlist runbook](docs/sov-and-watchlist-feeds.md#permissions) collects the full gated-command list and the same loosening steps.
 
 `filter` is JSON with one `root` node. Nodes are `condition`, `and`, `or`, and `not`; the examples below use the deployed syntax. `event_actions` is JSON keyed by `listed`, `sale_confirmed`, `purchase_confirmed`, `expired`, and `closed_outcome_unknown`. Each value is `ignore`, `post`, or `post_and_ping`; omitted actions default to `ignore`.
 
@@ -214,6 +216,14 @@ The sov timer feed watches public sovereignty campaigns and posts to subscribed 
 
 `/sov_subscribe` and `/sov_unsubscribe` require the Manage Server (`MANAGE_GUILD`) permission and cannot be used in DMs, while `/sov_timers` stays open to every member.
 
+| Command | Required arguments | Optional arguments | Result |
+| --- | --- | --- | --- |
+| `/sov_subscribe` | `name` | `filter`, `region_id`, `defender_alliance_id`, `max_jumps` (1-11), `allow_frigate_holes`, `role`, `tminus_marks`, `tz_window`, `tz_shift_enabled`, `clear` | Creates a sov subscription, or partially updates the existing one with that `name` in this channel (omitted fields are carried forward; see the partial-update note below). |
+| `/sov_unsubscribe` | `name` | None | Removes this channel's sov subscription with that `name`. |
+| `/sov_timers` | None | None | Lists the live sov campaigns matching this channel's subscriptions on demand. |
+
+`name` is the stable per-channel subscription name. `filter` is required to create a brand-new subscription (or at least one convenience option), and is optional on a re-subscribe. `region_id`, `defender_alliance_id`, `max_jumps`, and `allow_frigate_holes` are convenience options ANDed onto the filter root; `allow_frigate_holes` requires `max_jumps`. `tminus_marks` (default `120,30`), `tz_window` (default `00:00-04:00`), and `tz_shift_enabled` (default `false`) are behavioural options. `clear` removes stored fields. See the [operator runbook](docs/sov-and-watchlist-feeds.md) for the walkthrough and operations, and the option details below.
+
 Reachability is computed by breadth-first search over `config/stargates.json`, a static undirected stargate adjacency map generated from the SDE `mapSolarSystemJumps` table and committed to the repository. The home system defaults to Turnur (30002086) and is overridden with `SOV_HOME_SYSTEM_ID`. If the file is missing or fails to parse, the bot logs an error and keeps running: `Reachable` filter leaves never match and `/sov_timers` reports the graph as unavailable, rather than the process failing to start.
 
 ### Wanderer chain reachability
@@ -271,7 +281,17 @@ Each server keeps a watchlist of alliances and corporations and receives an embe
 
 `/watch` (all subcommands, including `list`), `/watch_subscribe`, and `/watch_unsubscribe` require the Manage Server (`MANAGE_GUILD`) permission and cannot be used in DMs.
 
-- `/watch add kind:<alliance|corporation> ticker:<text>` adds an entity. The `ticker` option is resolved through the bot's ticker cache first, then an ESI name lookup (`POST /universe/ids/`). Note ESI's ids endpoint resolves *names*, not tickers, so a bare ticker only works when it is already in the bot's cache; otherwise supply the full alliance/corporation name. The reply confirms the resolved name and id ephemerally. Adding the same entity twice is idempotent.
+| Command | Required arguments | Optional arguments | Result |
+| --- | --- | --- | --- |
+| `/watch add` | `kind` (`alliance` or `corporation`), `ticker` | None | Adds an alliance or corporation to this server's watchlist. |
+| `/watch remove` | `kind` (`alliance` or `corporation`), `ticker` | None | Removes an alliance or corporation from this server's watchlist. |
+| `/watch list` | None | None | Lists the watched alliances and corporations. |
+| `/watch_subscribe` | `name` | `event_kinds`, `role` | Subscribes this channel to watchlist alerts (defaults to all event kinds). |
+| `/watch_unsubscribe` | `name` | None | Removes this channel's watchlist subscription with that `name`. |
+
+See the [operator runbook](docs/sov-and-watchlist-feeds.md) for the enable-and-verify walkthrough, retention, and day-to-day operation.
+
+- `/watch add kind:<alliance|corporation> ticker:<text>` adds an entity. The `ticker` option is resolved through the bot's ticker cache first, then an ESI name lookup (`POST /universe/ids/`). Note ESI's ids endpoint resolves *names*, not tickers, so a bare ticker only works when it is already in the bot's cache; otherwise supply the full alliance/corporation name. For example, seed the five pilot alliances by full name: Snuffed Out, Shadow Cartel, Minmatar Fleet Alliance, Brotherhood of Spacers, and Legion of xXDEATHXx. The reply confirms the resolved name and id ephemerally. Adding the same entity twice is idempotent.
 - `/watch remove kind:<...> ticker:<...>` removes an entity; `/watch list` shows the current watchlist.
 - `/watch_subscribe name:<...> event_kinds:<comma list>` subscribes the current channel; `event_kinds` defaults to all kinds (`corp_joined`, `corp_left`, `member_delta`, `corp_changed_alliance`, `war_declared`, `war_ally_joined`, `war_retracted`, `war_finished`) and takes an optional `role` to ping. `/watch_unsubscribe name:<...>` removes a channel subscription.
 
