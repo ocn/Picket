@@ -53,6 +53,36 @@ pub const SOV_MAP_RESOURCE_KEY: &str = "sovereignty/map";
 
 const SOV_NONCE_ENFORCEMENT_WINDOW: ChronoDuration = ChronoDuration::minutes(5);
 const SOV_DELIVERY_LEASE: ChronoDuration = ChronoDuration::minutes(2);
+
+/// How long sov data is retained before [`SovStore::prune_expired_sov_data`]
+/// removes it (ticket 16, grill Q3 decision (b), 2026-09-03): sent campaign
+/// alert deliveries whose campaign is gone, campaigns not listed by ESI, and
+/// the reachability state those pruned campaigns leave behind. Chosen to
+/// comfortably outlast any real sov campaign (days) plus a wide operator
+/// audit window, while still bounding unbounded table growth. Ninety days
+/// is measured from a row's own last-observed timestamp
+/// (`sov_campaigns.last_seen_at`, `sov_alert_deliveries.sent_at`), never
+/// from wall-clock start-up.
+pub const SOV_RETENTION: ChronoDuration = ChronoDuration::days(90);
+
+/// The three row counts one [`SovStore::prune_expired_sov_data`] pass
+/// removed (ticket 16), logged as a single summary line by the collector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SovPruneCounts {
+    pub deliveries_deleted: u64,
+    pub campaigns_deleted: u64,
+    pub reachability_state_deleted: u64,
+}
+
+impl SovPruneCounts {
+    /// True when nothing was pruned, so the collector can skip the summary
+    /// log line entirely on the common no-op cycle.
+    pub fn is_empty(self) -> bool {
+        self.deliveries_deleted == 0
+            && self.campaigns_deleted == 0
+            && self.reachability_state_deleted == 0
+    }
+}
 /// Cap on the exponential backoff applied to a transient delivery
 /// failure's retry lease, so `attempt_count` growth cannot push a stuck
 /// delivery's next retry arbitrarily far into the future (review finding
@@ -279,6 +309,73 @@ impl SovStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Retention prune for the sov tables (ticket 16, grill Q3 decision
+    /// (b)). Runs once per collection cycle, in a single transaction so the
+    /// three deletes commit together:
+    ///
+    /// 1. Delete `sov_campaigns` rows not listed by ESI for `retention`
+    ///    (their `last_seen_at` -- bumped on every `upsert_campaign` -- is
+    ///    older than `now - retention`). This is the only signal that
+    ///    unbounds the campaigns table, since `mark_ended` only soft-ends.
+    /// 2. Delete `sov_reachability_state` rows orphaned by step 1 (their
+    ///    `campaign_id` no longer exists). There is no foreign key from that
+    ///    table to `sov_campaigns` -- only to `sov_subscriptions` -- so this
+    ///    explicit cleanup is required; `sov_tz_window_state` is keyed by
+    ///    `structure_id` and cascades from `sov_structures`, so it is left
+    ///    untouched here.
+    /// 3. Delete `sov_alert_deliveries` rows for a `campaign` subject that
+    ///    are `status = 'sent'`, sent more than `retention` ago, and whose
+    ///    campaign no longer exists (after step 1). Only `'sent'` rows are
+    ///    ever removed, so `'prepared'` deliveries and `'failed'` permanent
+    ///    failures are never touched, and nothing referencing a still-listed
+    ///    campaign is deleted (grill Q3 constraints).
+    ///
+    /// Returns the three counts for a single summary log line.
+    pub async fn prune_expired_sov_data(
+        &self,
+        now: DateTime<Utc>,
+        retention: ChronoDuration,
+    ) -> Result<SovPruneCounts, sqlx::Error> {
+        let cutoff = now - retention;
+        let mut tx = self.pool.begin().await?;
+
+        let campaigns_deleted = sqlx::query("DELETE FROM sov_campaigns WHERE last_seen_at < $1")
+            .bind(cutoff)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+        let reachability_state_deleted = sqlx::query(
+            "DELETE FROM sov_reachability_state WHERE campaign_id NOT IN (SELECT campaign_id FROM sov_campaigns)",
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        let deliveries_deleted = sqlx::query(
+            "DELETE FROM sov_alert_deliveries WHERE subject_kind = 'campaign' AND status = 'sent' AND sent_at < $1 AND subject_id NOT IN (SELECT campaign_id FROM sov_campaigns)",
+        )
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        tx.commit().await?;
+        Ok(SovPruneCounts {
+            deliveries_deleted,
+            campaigns_deleted,
+            reachability_state_deleted,
+        })
+    }
+
+    #[doc(hidden)]
+    pub async fn campaign_exists_for_test(&self, campaign_id: i64) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sov_campaigns WHERE campaign_id = $1)")
+            .bind(campaign_id)
+            .fetch_one(&self.pool)
+            .await
     }
 
     // --- Campaigns and Sov Baseline ---

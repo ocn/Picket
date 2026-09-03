@@ -12,6 +12,7 @@ use serenity::model::prelude::command::CommandOptionType;
 use serenity::model::prelude::interaction::application_command::{
     ApplicationCommandInteraction, CommandDataOptionValue,
 };
+use serenity::model::Permissions;
 use serenity::prelude::Context;
 use std::sync::Arc;
 use tracing::error;
@@ -153,6 +154,8 @@ impl Command for ContractSubscribeCommand {
     ) -> &'a mut CreateApplicationCommand {
         command
             .name("contract_subscribe")
+            .default_member_permissions(Permissions::MANAGE_GUILD)
+            .dm_permission(false)
             .description("Create or replace a public contract subscription for this channel.")
             .create_option(|option| {
                 option

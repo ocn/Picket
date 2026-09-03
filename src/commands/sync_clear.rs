@@ -3,6 +3,7 @@ use crate::config::{save_user_standings, AppState};
 use serenity::async_trait;
 use serenity::builder::CreateApplicationCommand;
 use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
+use serenity::model::Permissions;
 use serenity::prelude::Context;
 use std::sync::Arc;
 use tracing::error;
@@ -21,6 +22,8 @@ impl Command for SyncClearCommand {
     ) -> &'a mut CreateApplicationCommand {
         command
             .name("sync_clear")
+            .default_member_permissions(Permissions::MANAGE_GUILD)
+            .dm_permission(false)
             .description("Clears all of your saved EVE character data and contact lists.")
     }
 

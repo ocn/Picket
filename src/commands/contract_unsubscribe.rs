@@ -9,6 +9,7 @@ use serenity::model::prelude::command::CommandOptionType;
 use serenity::model::prelude::interaction::application_command::{
     ApplicationCommandInteraction, CommandDataOptionValue,
 };
+use serenity::model::Permissions;
 use serenity::prelude::Context;
 use std::sync::Arc;
 use tracing::error;
@@ -27,6 +28,8 @@ impl Command for ContractUnsubscribeCommand {
     ) -> &'a mut CreateApplicationCommand {
         command
             .name("contract_unsubscribe")
+            .default_member_permissions(Permissions::MANAGE_GUILD)
+            .dm_permission(false)
             .description("Remove a public contract subscription from this channel.")
             .create_option(|option| {
                 option

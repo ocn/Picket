@@ -1306,6 +1306,10 @@ async fn sov_runtime_recovers_the_shared_store_after_postgres_becomes_available(
         directory,
         tickers,
         reachability,
+        killbot_rust::SovFeedStartupSummary {
+            home_system_id: 30_002_086,
+            graph: None,
+        },
     );
 
     let (processing_started, processing_complete) = tokio::sync::oneshot::channel();
@@ -6083,6 +6087,317 @@ async fn defender_watchlist_leaf_matches_a_watched_alliance_and_stops_after_remo
     let report = collector.collect_cycle().await.expect("campaign B cycle");
     assert_eq!(report.alerts_prepared, 0);
     assert_eq!(delivery.sent_count(), 1);
+
+    database.destroy().await;
+}
+
+// --- Sov retention prune (ticket 16) ---
+
+/// Prepares and immediately sends one `appeared` campaign delivery so its
+/// `status` is `'sent'` and `sent_at` is the wall clock now. Retention tests
+/// then pass a `now` far in the future to the prune so this row counts as
+/// older than the retention window without any clock plumbing.
+async fn prepare_and_send_campaign_delivery(
+    store: &SovStore,
+    subscription: &SovSubscription,
+    subject_id: i64,
+) {
+    let message = SovNotificationMessage {
+        title: "title".to_string(),
+        fields: vec![],
+        footer: "Appeared".to_string(),
+    };
+    let fresh = store
+        .prepare_delivery(
+            subscription,
+            "campaign",
+            subject_id,
+            SovAlertStage::Appeared,
+            &message,
+        )
+        .await
+        .expect("prepare delivery");
+    assert!(fresh);
+    let id = *store
+        .prepared_delivery_ids()
+        .await
+        .expect("prepared ids")
+        .iter()
+        .max()
+        .expect("one prepared delivery");
+    let claim = store
+        .begin_delivery_attempt(id, Utc::now())
+        .await
+        .expect("claim delivery")
+        .expect("delivery claimed");
+    store
+        .mark_delivery_sent(&claim, "discord-msg")
+        .await
+        .expect("mark delivery sent");
+}
+
+async fn subscription_fixture(store: &SovStore) -> SovSubscription {
+    subscribe(store, "watch-all", all_campaigns_filter(), None).await;
+    store
+        .subscription(1, 2, "watch-all")
+        .await
+        .expect("read subscription")
+        .expect("subscription exists")
+}
+
+#[tokio::test]
+async fn prune_removes_old_sent_deliveries_whose_campaign_is_gone() {
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    let subscription = subscription_fixture(&store).await;
+    // No campaign 777 is ever inserted: the delivery is orphaned.
+    prepare_and_send_campaign_delivery(&store, &subscription, 777).await;
+
+    let counts = store
+        .prune_expired_sov_data(
+            Utc::now() + ChronoDuration::days(200),
+            ChronoDuration::days(90),
+        )
+        .await
+        .expect("prune");
+    assert_eq!(counts.deliveries_deleted, 1);
+    assert_eq!(
+        store
+            .count_deliveries_for(777, SovAlertStage::Appeared)
+            .await
+            .expect("count"),
+        0
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn prune_keeps_old_sent_deliveries_whose_campaign_is_still_listed() {
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    let subscription = subscription_fixture(&store).await;
+
+    let recent = Utc::now() + ChronoDuration::days(200);
+    let listed = campaign(888, 30_005_174, 99_006_751, recent);
+    store
+        .upsert_campaign(&listed, false, recent)
+        .await
+        .expect("upsert campaign");
+    prepare_and_send_campaign_delivery(&store, &subscription, 888).await;
+
+    let counts = store
+        .prune_expired_sov_data(recent, ChronoDuration::days(90))
+        .await
+        .expect("prune");
+    assert_eq!(counts.deliveries_deleted, 0);
+    assert_eq!(counts.campaigns_deleted, 0);
+    assert_eq!(
+        store
+            .count_deliveries_for(888, SovAlertStage::Appeared)
+            .await
+            .expect("count"),
+        1,
+        "a delivery for a still-listed campaign is never pruned"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn prune_never_removes_prepared_deliveries() {
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    let subscription = subscription_fixture(&store).await;
+    // Prepared (never sent) and orphaned: still must survive the prune.
+    let message = SovNotificationMessage {
+        title: "title".to_string(),
+        fields: vec![],
+        footer: "Appeared".to_string(),
+    };
+    let fresh = store
+        .prepare_delivery(
+            &subscription,
+            "campaign",
+            999,
+            SovAlertStage::Appeared,
+            &message,
+        )
+        .await
+        .expect("prepare delivery");
+    assert!(fresh);
+
+    let counts = store
+        .prune_expired_sov_data(
+            Utc::now() + ChronoDuration::days(200),
+            ChronoDuration::days(90),
+        )
+        .await
+        .expect("prune");
+    assert_eq!(counts.deliveries_deleted, 0);
+    assert_eq!(
+        store
+            .count_deliveries_for(999, SovAlertStage::Appeared)
+            .await
+            .expect("count"),
+        1,
+        "a prepared delivery is never pruned regardless of age"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn prune_never_removes_permanent_failure_deliveries() {
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    let subscription = subscription_fixture(&store).await;
+    let message = SovNotificationMessage {
+        title: "title".to_string(),
+        fields: vec![],
+        footer: "Appeared".to_string(),
+    };
+    let fresh = store
+        .prepare_delivery(
+            &subscription,
+            "campaign",
+            1010,
+            SovAlertStage::Appeared,
+            &message,
+        )
+        .await
+        .expect("prepare delivery");
+    assert!(fresh);
+    let id = *store
+        .prepared_delivery_ids()
+        .await
+        .expect("prepared ids")
+        .iter()
+        .max()
+        .expect("one prepared delivery");
+    let claim = store
+        .begin_delivery_attempt(id, Utc::now())
+        .await
+        .expect("claim")
+        .expect("claimed");
+    store
+        .record_delivery_failure(
+            &claim,
+            &SovDeliveryError::permanent("simulated permanent failure"),
+            Utc::now(),
+        )
+        .await
+        .expect("record permanent failure");
+
+    let counts = store
+        .prune_expired_sov_data(
+            Utc::now() + ChronoDuration::days(200),
+            ChronoDuration::days(90),
+        )
+        .await
+        .expect("prune");
+    assert_eq!(counts.deliveries_deleted, 0);
+    assert_eq!(
+        store
+            .count_deliveries_for(1010, SovAlertStage::Appeared)
+            .await
+            .expect("count"),
+        1,
+        "a permanent-failure delivery is never pruned regardless of age"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn prune_keeps_campaigns_listed_within_retention_and_drops_older_ones_with_their_state() {
+    let database = TemporaryDatabase::new().await;
+    let (store, _limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let now = Utc::now();
+    // Campaign 201 was last listed 89 days ago (inside the window); 202 was
+    // last listed 91 days ago (outside it).
+    let kept = campaign(201, 30_005_174, 99_006_751, now);
+    let dropped = campaign(202, 30_005_174, 99_006_751, now);
+    store
+        .upsert_campaign(&kept, false, now - ChronoDuration::days(89))
+        .await
+        .expect("upsert kept campaign");
+    store
+        .upsert_campaign(&dropped, false, now - ChronoDuration::days(91))
+        .await
+        .expect("upsert dropped campaign");
+
+    // A reachability-state row for each campaign; the dropped campaign's row
+    // must be pruned alongside it, the kept campaign's row must survive.
+    store
+        .record_reachability_observation(1, 2, "watch-all", 201, true, now)
+        .await
+        .expect("state for kept campaign");
+    store
+        .record_reachability_observation(1, 2, "watch-all", 202, true, now)
+        .await
+        .expect("state for dropped campaign");
+
+    let counts = store
+        .prune_expired_sov_data(now, ChronoDuration::days(90))
+        .await
+        .expect("prune");
+    assert_eq!(counts.campaigns_deleted, 1);
+    assert_eq!(counts.reachability_state_deleted, 1);
+
+    assert!(store
+        .campaign_exists_for_test(201)
+        .await
+        .expect("kept campaign exists"));
+    assert!(!store
+        .campaign_exists_for_test(202)
+        .await
+        .expect("dropped campaign gone"));
+    assert!(store
+        .reachability_state_for_test(1, 2, "watch-all", 201)
+        .await
+        .expect("read kept state")
+        .is_some());
+    assert!(store
+        .reachability_state_for_test(1, 2, "watch-all", 202)
+        .await
+        .expect("read dropped state")
+        .is_none());
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn collect_cycle_triggers_the_retention_prune() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    let subscription = subscription_fixture(&store).await;
+    // An old, sent, orphaned delivery that only a prune can remove.
+    prepare_and_send_campaign_delivery(&store, &subscription, 777).await;
+
+    // Drive one full collection cycle with a clock 200 days ahead, so the
+    // cycle's own `prune_retention(observed_at)` treats the just-sent
+    // delivery as older than the 90-day retention window.
+    let clock_now = Utc::now() + ChronoDuration::days(200);
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![],
+        fresh_metadata(clock_now, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(clock_now);
+    let collector = collector(store.clone(), limiter, esi, delivery, clock);
+    collector.collect_cycle().await.expect("collect cycle");
+
+    assert_eq!(
+        store
+            .count_deliveries_for(777, SovAlertStage::Appeared)
+            .await
+            .expect("count"),
+        0,
+        "collect_cycle must run the retention prune"
+    );
 
     database.destroy().await;
 }

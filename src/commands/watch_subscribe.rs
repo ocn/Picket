@@ -13,6 +13,7 @@ use serenity::model::prelude::command::CommandOptionType;
 use serenity::model::prelude::interaction::application_command::{
     ApplicationCommandInteraction, CommandDataOptionValue,
 };
+use serenity::model::Permissions;
 use serenity::prelude::Context;
 use std::sync::Arc;
 use tracing::error;
@@ -66,6 +67,8 @@ impl Command for WatchSubscribeCommand {
     ) -> &'a mut CreateApplicationCommand {
         command
             .name("watch_subscribe")
+            .default_member_permissions(Permissions::MANAGE_GUILD)
+            .dm_permission(false)
             .description("Subscribe this channel to watchlist corporation join/leave alerts.")
             .create_option(|option| {
                 option

@@ -13,6 +13,7 @@ use serenity::model::prelude::command::CommandOptionType;
 use serenity::model::prelude::interaction::application_command::{
     ApplicationCommandInteraction, CommandDataOptionValue,
 };
+use serenity::model::Permissions;
 use serenity::prelude::Context;
 use std::sync::Arc;
 use tracing::error;
@@ -827,6 +828,8 @@ impl Command for SovSubscribeCommand {
     ) -> &'a mut CreateApplicationCommand {
         command
             .name("sov_subscribe")
+            .default_member_permissions(Permissions::MANAGE_GUILD)
+            .dm_permission(false)
             .description("Create or replace a sovereignty campaign subscription for this channel.")
             .create_option(|option| {
                 option

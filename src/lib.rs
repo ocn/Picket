@@ -144,19 +144,83 @@ const WATCHLIST_COLLECTION_INTERVAL: Duration = Duration::from_secs(3600);
 /// origin: Turnur (configurable by environment)").
 const SOV_DEFAULT_HOME_SYSTEM_ID: i64 = 30_002_086;
 
-/// Reads `SOV_HOME_SYSTEM_ID`, falling back to Turnur when unset or not a
-/// valid integer. Never panics: a malformed override just logs a warning
-/// and keeps the default rather than taking down start-up.
-fn sov_home_system_id() -> i64 {
-    match std::env::var("SOV_HOME_SYSTEM_ID") {
-        Ok(value) => value.trim().parse::<i64>().unwrap_or_else(|_| {
-            warn!(
-                "SOV_HOME_SYSTEM_ID '{value}' is not a valid integer; using the default (Turnur, {SOV_DEFAULT_HOME_SYSTEM_ID})"
-            );
-            SOV_DEFAULT_HOME_SYSTEM_ID
-        }),
-        Err(_) => SOV_DEFAULT_HOME_SYSTEM_ID,
+/// Facts the sov campaign feed's one-time start-up log line needs (ticket
+/// 16): the reachability origin, and -- when `config/stargates.json`
+/// loaded -- the loaded graph's `(systems, edges)` size. `graph == None`
+/// means the file was missing or malformed and reachability degraded to
+/// stargate-unavailable.
+#[derive(Clone, Copy, Debug)]
+pub struct SovFeedStartupSummary {
+    pub home_system_id: i64,
+    pub graph: Option<(usize, usize)>,
+}
+
+/// Builds the sov campaign feed's start-up log message (ticket 16). Pure so
+/// it can be unit-tested without a tracing subscriber; the loop passes the
+/// built string straight to `info!`. `reconnected` selects the
+/// later-reconnect wording emitted after a database outage rather than the
+/// once-per-process start wording.
+fn sov_campaign_feed_start_message(summary: SovFeedStartupSummary, reconnected: bool) -> String {
+    let lead = if reconnected {
+        "sov campaign feed reconnected"
+    } else {
+        "sov campaign feed started"
+    };
+    match summary.graph {
+        Some((systems, edges)) => format!(
+            "{lead} (home system {}, stargate graph {systems} systems / {edges} edges)",
+            summary.home_system_id
+        ),
+        None => format!(
+            "{lead} (home system {}, stargate graph unavailable)",
+            summary.home_system_id
+        ),
     }
+}
+
+/// Builds the Wanderer chain reachability start-up log message (ticket 16).
+/// The map slug is safe to log; the API key never is and is not accepted
+/// here. `reconnected` selects the later-reconnect wording.
+fn sov_chain_reachability_start_message(map: &str, poll_secs: u64, reconnected: bool) -> String {
+    let lead = if reconnected {
+        "sov chain reachability reconnected"
+    } else {
+        "sov chain reachability enabled"
+    };
+    format!("{lead} (map {map}, poll every {poll_secs} s)")
+}
+
+/// Builds the watchlist feed's start-up log message (ticket 16).
+fn watchlist_feed_start_message(reconnected: bool) -> String {
+    if reconnected {
+        "watchlist feed reconnected".to_string()
+    } else {
+        "watchlist feed started".to_string()
+    }
+}
+
+/// Reads `SOV_HOME_SYSTEM_ID`, falling back to Turnur when unset or not a
+/// valid integer. An empty or whitespace-only value is treated exactly like
+/// an unset variable (silent fallback to the default) so a Compose
+/// passthrough of the form `SOV_HOME_SYSTEM_ID: ${SOV_HOME_SYSTEM_ID:-}`
+/// -- which resolves to `""` when the operator leaves it unset -- is not a
+/// misconfiguration (ticket 16). Never panics: any other malformed override
+/// just logs a warning and keeps the default rather than taking down
+/// start-up.
+fn sov_home_system_id() -> i64 {
+    let Ok(value) = std::env::var("SOV_HOME_SYSTEM_ID") else {
+        return SOV_DEFAULT_HOME_SYSTEM_ID;
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return SOV_DEFAULT_HOME_SYSTEM_ID;
+    }
+    trimmed.parse::<i64>().unwrap_or_else(|_| {
+        warn!(
+            "SOV_HOME_SYSTEM_ID '{value}' is not a valid integer; using the default (Turnur, {SOV_DEFAULT_HOME_SYSTEM_ID})"
+        );
+        SOV_DEFAULT_HOME_SYSTEM_ID
+    })
 }
 
 /// Loads `config/stargates.json` and computes reachability from the
@@ -182,32 +246,47 @@ fn sov_reachability_source(
 ) -> (
     Arc<dyn sov_feed::SovReachabilitySource>,
     Option<Arc<sov_feed::DynamicChainSovReachability>>,
+    SovFeedStartupSummary,
 ) {
     if !enabled {
-        return (Arc::new(sov_feed::StaticSovReachability(None)), None);
+        // The summary is never consumed on the disabled path (the campaign
+        // collection loop is not spawned), so avoid reading the environment
+        // here and keep the historical no-op behaviour exactly.
+        return (
+            Arc::new(sov_feed::StaticSovReachability(None)),
+            None,
+            SovFeedStartupSummary {
+                home_system_id: SOV_DEFAULT_HOME_SYSTEM_ID,
+                graph: None,
+            },
+        );
     }
     let home_system_id = sov_home_system_id();
     let path = std::path::Path::new(sov_feed::DEFAULT_STARGATE_GRAPH_PATH);
     match sov_feed::load_stargate_graph_file(path) {
         Ok(file) => {
             let graph = sov_feed::StargateGraph::from_file(file);
+            let (systems, edges) = (graph.system_count(), graph.edge_count());
             info!(
-                "Loaded stargate graph: sde_version={}, systems={}, edges={}, home_system_id={home_system_id}",
+                "Loaded stargate graph: sde_version={}, systems={systems}, edges={edges}, home_system_id={home_system_id}",
                 graph.sde_version,
-                graph.system_count(),
-                graph.edge_count()
             );
+            let summary = SovFeedStartupSummary {
+                home_system_id,
+                graph: Some((systems, edges)),
+            };
             if wanderer_configured {
                 let dynamic = Arc::new(sov_feed::DynamicChainSovReachability::new(
                     graph,
                     home_system_id,
                 ));
-                (dynamic.clone(), Some(dynamic))
+                (dynamic.clone(), Some(dynamic), summary)
             } else {
                 let reachability = sov_feed::Reachability::compute(&graph, home_system_id, &[]);
                 (
                     Arc::new(sov_feed::StaticSovReachability(Some(reachability))),
                     None,
+                    summary,
                 )
             }
         }
@@ -216,7 +295,14 @@ fn sov_reachability_source(
                 "Sov reachability disabled: could not load {}: {error}. The sov feed runs without reachability: Reachable filter leaves never match and /sov_timers reports the graph as unavailable.",
                 path.display()
             );
-            (Arc::new(sov_feed::StaticSovReachability(None)), None)
+            (
+                Arc::new(sov_feed::StaticSovReachability(None)),
+                None,
+                SovFeedStartupSummary {
+                    home_system_id,
+                    graph: None,
+                },
+            )
         }
     }
 }
@@ -428,7 +514,7 @@ pub async fn run() {
         .is_some()
         .then(sov_feed::WandererConfig::from_environment)
         .flatten();
-    let (sov_reachability, dynamic_chain_reachability) =
+    let (sov_reachability, dynamic_chain_reachability, sov_startup_summary) =
         sov_reachability_source(contract_runtime.is_some(), wanderer_config.is_some());
 
     // --- Start Discord Bot ---
@@ -482,6 +568,7 @@ pub async fn run() {
                     directory.clone(),
                     tickers.clone(),
                     sov_reachability.clone(),
+                    sov_startup_summary,
                 );
                 // Sovereignty Hub structures and sovereignty map (ticket
                 // 07): two more independently-reconnecting loops at their
@@ -597,6 +684,7 @@ pub async fn run() {
                     SOV_CHAIN_POLL_INTERVAL,
                     chain_source,
                     dynamic_chain.clone(),
+                    wanderer_config.map.clone(),
                 );
             }
             Err(error) => {
@@ -807,6 +895,7 @@ pub fn spawn_sov_collection_loop(
     directory: Arc<dyn sov_feed::SovSystemDirectory>,
     tickers: Arc<dyn sov_feed::SovTickerResolver>,
     reachability: Arc<dyn sov_feed::SovReachabilitySource>,
+    startup_summary: SovFeedStartupSummary,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_sov_collection_loop(
         database_url,
@@ -817,6 +906,7 @@ pub fn spawn_sov_collection_loop(
         directory,
         tickers,
         reachability,
+        startup_summary,
     ))
 }
 
@@ -830,8 +920,15 @@ async fn run_sov_collection_loop(
     directory: Arc<dyn sov_feed::SovSystemDirectory>,
     tickers: Arc<dyn sov_feed::SovTickerResolver>,
     reachability: Arc<dyn sov_feed::SovReachabilitySource>,
+    startup_summary: SovFeedStartupSummary,
 ) {
     let mut consecutive_failures = 0_u32;
+    // Once-per-process start-up log flags (ticket 16): `started` gates the
+    // one-time "started" line to the first successful connect + migration
+    // check; `failed_since_start` makes a later success after a database
+    // outage log the distinct "reconnected" variant instead.
+    let mut started = false;
+    let mut failed_since_start = false;
     loop {
         let mut delay = interval;
         // Reconnect every iteration, like the contract feed's own loop
@@ -845,6 +942,16 @@ async fn run_sov_collection_loop(
                 Ok(store) => {
                     let store = Arc::new(store);
                     *store_handle.write().await = Some(store.clone());
+                    if !started {
+                        info!(
+                            "{}",
+                            sov_campaign_feed_start_message(startup_summary, false)
+                        );
+                        started = true;
+                    } else if failed_since_start {
+                        info!("{}", sov_campaign_feed_start_message(startup_summary, true));
+                        failed_since_start = false;
+                    }
                     let watchlist_source = connect_sov_watchlist_source(&database_url).await;
                     let collector = sov_feed::SovCollector::new(
                         (*store).clone(),
@@ -890,6 +997,7 @@ async fn run_sov_collection_loop(
                         consecutive_failures,
                     );
                     *store_handle.write().await = None;
+                    failed_since_start = true;
                     warn!(
                         "sov campaign feed database unavailable; retrying without an in-memory fallback: {error}"
                     );
@@ -903,6 +1011,7 @@ async fn run_sov_collection_loop(
                     consecutive_failures,
                 );
                 *store_handle.write().await = None;
+                failed_since_start = true;
                 warn!("sov campaign feed migrations unavailable; retrying: {error}");
             }
         }
@@ -1129,12 +1238,14 @@ fn spawn_sov_chain_loop(
     interval: Duration,
     source: Arc<dyn sov_feed::WandererChainSource>,
     reachability: Arc<sov_feed::DynamicChainSovReachability>,
+    map: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_sov_chain_loop(
         database_url,
         interval,
         source,
         reachability,
+        map,
     ))
 }
 
@@ -1143,7 +1254,15 @@ async fn run_sov_chain_loop(
     interval: Duration,
     source: Arc<dyn sov_feed::WandererChainSource>,
     reachability: Arc<sov_feed::DynamicChainSovReachability>,
+    map: String,
 ) {
+    // Once-per-process start-up log flags (ticket 16), mirroring
+    // `run_sov_collection_loop`: the first successful connect + migration
+    // check logs the "enabled" line; a later success after a database outage
+    // logs the distinct "reconnected" variant.
+    let mut started = false;
+    let mut failed_since_start = false;
+    let poll_secs = interval.as_secs();
     // Seed the in-memory chain from the last persisted snapshot before the
     // first fetch (ticket 05 blocker), so a restart during a Wanderer outage
     // serves the last known chain instead of dropping to stargate-only until
@@ -1172,6 +1291,19 @@ async fn run_sov_chain_loop(
         match contract_intelligence::ContractCollectionStore::connect(&database_url).await {
             Ok(_limiter_store) => match sov_feed::SovStore::connect(&database_url).await {
                 Ok(store) => {
+                    if !started {
+                        info!(
+                            "{}",
+                            sov_chain_reachability_start_message(&map, poll_secs, false)
+                        );
+                        started = true;
+                    } else if failed_since_start {
+                        info!(
+                            "{}",
+                            sov_chain_reachability_start_message(&map, poll_secs, true)
+                        );
+                        failed_since_start = false;
+                    }
                     let collector = sov_feed::SovChainCollector::new(
                         store,
                         source.clone(),
@@ -1194,9 +1326,15 @@ async fn run_sov_chain_loop(
                         Err(error) => warn!("sov chain collection cycle failed: {error}"),
                     }
                 }
-                Err(error) => warn!("sov chain feed database unavailable: {error}"),
+                Err(error) => {
+                    failed_since_start = true;
+                    warn!("sov chain feed database unavailable: {error}");
+                }
             },
-            Err(error) => warn!("sov chain feed migrations unavailable: {error}"),
+            Err(error) => {
+                failed_since_start = true;
+                warn!("sov chain feed migrations unavailable: {error}");
+            }
         }
     }
 }
@@ -1233,6 +1371,10 @@ async fn run_watchlist_collection_loop(
     resolver: Arc<dyn watchlist_feed::WatchlistEntityResolver>,
 ) {
     let mut consecutive_failures = 0_u32;
+    // Once-per-process start-up log flags (ticket 16), mirroring
+    // `run_sov_collection_loop`.
+    let mut started = false;
+    let mut failed_since_start = false;
     loop {
         let mut delay = interval;
         match contract_intelligence::ContractCollectionStore::connect(&database_url).await {
@@ -1241,6 +1383,13 @@ async fn run_watchlist_collection_loop(
                 Ok(store) => {
                     let store = Arc::new(store);
                     *store_handle.write().await = Some(store.clone());
+                    if !started {
+                        info!("{}", watchlist_feed_start_message(false));
+                        started = true;
+                    } else if failed_since_start {
+                        info!("{}", watchlist_feed_start_message(true));
+                        failed_since_start = false;
+                    }
                     let collector = watchlist_feed::WatchlistCollector::new(
                         (*store).clone(),
                         esi.clone(),
@@ -1282,6 +1431,7 @@ async fn run_watchlist_collection_loop(
                         consecutive_failures,
                     );
                     *store_handle.write().await = None;
+                    failed_since_start = true;
                     warn!(
                         "watchlist feed database unavailable; retrying without an in-memory fallback: {error}"
                     );
@@ -1295,6 +1445,7 @@ async fn run_watchlist_collection_loop(
                     consecutive_failures,
                 );
                 *store_handle.write().await = None;
+                failed_since_start = true;
                 warn!("watchlist feed migrations unavailable; retrying: {error}");
             }
         }
@@ -1361,5 +1512,77 @@ mod sov_cycle_isolation_tests {
         let result: Result<(), String> =
             run_sov_cycle_isolated(async { Err::<(), _>("boom".to_string()) }).await;
         assert_eq!(result, Err("boom".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod startup_log_message_tests {
+    use super::{
+        sov_campaign_feed_start_message, sov_chain_reachability_start_message,
+        watchlist_feed_start_message, SovFeedStartupSummary,
+    };
+
+    #[test]
+    fn sov_campaign_started_reports_home_system_and_graph_size() {
+        let summary = SovFeedStartupSummary {
+            home_system_id: 30_002_086,
+            graph: Some((8_035, 26_942)),
+        };
+        assert_eq!(
+            sov_campaign_feed_start_message(summary, false),
+            "sov campaign feed started (home system 30002086, stargate graph 8035 systems / 26942 edges)"
+        );
+    }
+
+    #[test]
+    fn sov_campaign_reconnected_uses_the_reconnected_lead() {
+        let summary = SovFeedStartupSummary {
+            home_system_id: 30_002_086,
+            graph: Some((8_035, 26_942)),
+        };
+        assert_eq!(
+            sov_campaign_feed_start_message(summary, true),
+            "sov campaign feed reconnected (home system 30002086, stargate graph 8035 systems / 26942 edges)"
+        );
+    }
+
+    #[test]
+    fn sov_campaign_started_reports_graph_unavailable_when_not_loaded() {
+        let summary = SovFeedStartupSummary {
+            home_system_id: 30_000_142,
+            graph: None,
+        };
+        assert_eq!(
+            sov_campaign_feed_start_message(summary, false),
+            "sov campaign feed started (home system 30000142, stargate graph unavailable)"
+        );
+    }
+
+    #[test]
+    fn sov_chain_enabled_names_the_map_slug_and_poll_cadence() {
+        assert_eq!(
+            sov_chain_reachability_start_message("home-chain", 120, false),
+            "sov chain reachability enabled (map home-chain, poll every 120 s)"
+        );
+    }
+
+    #[test]
+    fn sov_chain_reconnected_uses_the_reconnected_lead() {
+        assert_eq!(
+            sov_chain_reachability_start_message("home-chain", 120, true),
+            "sov chain reachability reconnected (map home-chain, poll every 120 s)"
+        );
+    }
+
+    #[test]
+    fn watchlist_feed_started_and_reconnected_variants() {
+        assert_eq!(
+            watchlist_feed_start_message(false),
+            "watchlist feed started"
+        );
+        assert_eq!(
+            watchlist_feed_start_message(true),
+            "watchlist feed reconnected"
+        );
     }
 }

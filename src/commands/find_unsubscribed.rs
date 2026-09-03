@@ -4,6 +4,7 @@ use serenity::async_trait;
 use serenity::builder::CreateApplicationCommand;
 use serenity::model::channel::ChannelType;
 use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
+use serenity::model::Permissions;
 use serenity::prelude::Context;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -23,6 +24,8 @@ impl Command for FindUnsubscribedChannelsCommand {
     ) -> &'a mut CreateApplicationCommand {
         command
             .name("find_unsubscribed")
+            .default_member_permissions(Permissions::MANAGE_GUILD)
+            .dm_permission(false)
             .description("Finds all channels in this server that have no active subscriptions.")
     }
 

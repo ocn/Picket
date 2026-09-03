@@ -55,6 +55,8 @@ When you create your first subscription in a server, the bot will automatically 
 ### `/subscribe`
 Creates or updates a killmail subscription for the current channel. All filter options are optional except for `id` and `description`.
 
+Both `/subscribe` and `/unsubscribe` require the Manage Server (`MANAGE_GUILD`) permission and cannot be used in DMs.
+
 -   `id` (Required): A unique name for the subscription (e.g., `my-first-filter`).
 -   `description` (Required): A brief explanation of what the subscription does.
 -   `min_value`: Minimum total ISK value.
@@ -93,6 +95,8 @@ Contract subscriptions are PostgreSQL-backed and are separate from killmail subs
 | --- | --- | --- | --- |
 | `/contract_subscribe` | `id`, `description`, `filter`, `event_actions` | `ly_ranges_json`, `ping_type` | Creates or replaces this channel's public-contract subscription with the same `id`. |
 | `/contract_unsubscribe` | `id` | None | Removes this channel's contract subscription with that `id`. |
+
+Both `/contract_subscribe` and `/contract_unsubscribe` require the Manage Server (`MANAGE_GUILD`) permission and cannot be used in DMs; server admins can loosen this per role under Server Settings → Integrations → the bot → Command permissions.
 
 `filter` is JSON with one `root` node. Nodes are `condition`, `and`, `or`, and `not`; the examples below use the deployed syntax. `event_actions` is JSON keyed by `listed`, `sale_confirmed`, `purchase_confirmed`, `expired`, and `closed_outcome_unknown`. Each value is `ignore`, `post`, or `post_and_ping`; omitted actions default to `ignore`.
 
@@ -208,6 +212,8 @@ Use `/contract_unsubscribe id:<id>` in that feed's channel to stop one of these 
 
 The sov timer feed watches public sovereignty campaigns and posts to subscribed channels when one appears, when a configured T-minus mark is reached, and computes whether the campaign's system is reachable from a home system (Turnur by default) over stargates and, optionally, the current Wanderer wormhole chain. It also watches Sovereignty Hub vulnerability windows and alerts when one shifts into a subscription's preferred timezone. It shares the contract feed's PostgreSQL database and only starts when `CONTRACT_DATABASE_URL` is configured. Subscriptions use `/sov_subscribe` (with `max_jumps`, 1-11, `allow_frigate_holes`, `tz_window`, and `tz_shift_enabled` convenience options) and `/sov_unsubscribe`; `/sov_timers` lists the live campaigns matching a channel's subscriptions on demand.
 
+`/sov_subscribe` and `/sov_unsubscribe` require the Manage Server (`MANAGE_GUILD`) permission and cannot be used in DMs, while `/sov_timers` stays open to every member.
+
 Reachability is computed by breadth-first search over `config/stargates.json`, a static undirected stargate adjacency map generated from the SDE `mapSolarSystemJumps` table and committed to the repository. The home system defaults to Turnur (30002086) and is overridden with `SOV_HOME_SYSTEM_ID`. If the file is missing or fails to parse, the bot logs an error and keeps running: `Reachable` filter leaves never match and `/sov_timers` reports the graph as unavailable, rather than the process failing to start.
 
 ### Wanderer chain reachability
@@ -262,6 +268,8 @@ For a subscription with `tz_shift_enabled:true`, the `tz_window_entered` Alert S
 ### Watchlist feed
 
 Each server keeps a watchlist of alliances and corporations and receives an embed whenever a corporation joins or leaves a watched alliance, a watched entity's member count swings sharply, a watched corporation changes alliance, or a war is declared by or against a watched entity (and as that war gains allies, is retracted, or ends). It shares the contract feed's PostgreSQL database and only starts when `CONTRACT_DATABASE_URL` is configured.
+
+`/watch` (all subcommands, including `list`), `/watch_subscribe`, and `/watch_unsubscribe` require the Manage Server (`MANAGE_GUILD`) permission and cannot be used in DMs.
 
 - `/watch add kind:<alliance|corporation> ticker:<text>` adds an entity. The `ticker` option is resolved through the bot's ticker cache first, then an ESI name lookup (`POST /universe/ids/`). Note ESI's ids endpoint resolves *names*, not tickers, so a bare ticker only works when it is already in the bot's cache; otherwise supply the full alliance/corporation name. The reply confirms the resolved name and id ephemerally. Adding the same entity twice is idempotent.
 - `/watch remove kind:<...> ticker:<...>` removes an entity; `/watch list` shows the current watchlist.
