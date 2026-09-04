@@ -280,3 +280,89 @@ Send the map maintainer a short request for the three inputs and a dedicated key
 - No Dotlan scraping; the feed only uses public ESI and, when configured, the Wanderer map API.
 - Wars older than the initial window that the head-scan established are never inspected: ids below the baseline floor were never on the starting page and are out of scope by design.
 - No retroactive `war_declared`: a war stored before its party was watched becomes a silent baseline for that entity.
+
+## Pilot and go-live
+
+The first enablement of these feeds on the main-server deployment runs as a
+seven-day, non-pinging pilot in `#sandbox`, gated on explicit evidence, before
+the three production channels are created. The interactive checklist
+`scripts/esi-intel-feeds-pilot.sh` (generated with the `wizard` skill) prompts
+each human step (backup, deploy, `/watch add` ×5, the sandbox `/watch_subscribe`
+and two `/sov_subscribe`, the day-2 and day-5 restarts, the Dotlan click-check,
+and the Wanderer variables when they arrive), runs the machine checks it can
+(migration count, start-up log grep, `psql` counts, the duplicate-delivery
+query, a limiter-row sample), and appends every result to the tracked artifact
+`docs/rollouts/esi-intel-feeds-pilot.md`. The script is read-only against
+PostgreSQL — `SELECT` only, plus the one read-only `pg_dump` backup — never
+sends Discord messages, never calls ESI, never edits `.env` or
+`docker-compose.yaml`, and never runs `docker compose up/down/restart` itself:
+it tells you to run those and then verifies.
+
+### Running the wizard
+
+From the repository root:
+
+```sh
+./scripts/esi-intel-feeds-pilot.sh          # menu: pick a step, see each step's recorded status
+./scripts/esi-intel-feeds-pilot.sh 5        # run one step non-interactively (0-11)
+./scripts/esi-intel-feeds-pilot.sh sample   # append one limiter sample row (used by the hourly cron)
+```
+
+State persists in `docs/rollouts/.esi-intel-feeds-pilot.state`, so a re-run
+resumes where you left off and every gate step is re-runnable. The steps are
+not a straight line — the pilot spans seven days with deliberate restarts on
+days 2 and 5 — so the menu is the normal entry point. If neither the Compose
+`postgres` service is up nor `CONTRACT_TEST_DATABASE_URL` is set, database
+checks degrade with a clear message and a non-zero exit rather than proceeding.
+
+### The gates (from ticket 11)
+
+- **G1 (start-up):** both runtimes' start-up lines present; `sov_esi_progress`
+  and `watchlist_esi_progress` report within two cycles; stargate graph loaded
+  (system/edge counts logged); sandbox subscriptions listed.
+- **G2 (day 1):** watchlist baselines silent (zero `watchlist_deliveries`);
+  every `appeared` alert in `#sandbox` corresponds to a campaign in
+  `/sov_timers` and in `GET /sovereignty/campaigns/`.
+- **G3 (restarts, days 2 and 5):** after each restart, zero duplicate
+  deliveries — the query over both delivery tables grouped by their dedup keys
+  with `count(*) > 1`, expected empty — and prepared rows drained.
+- **G4 (day 7):** at least one real watchlist event delivered exactly once;
+  `member_delta` history present for every seeded alliance (snapshots ≥ 6.5 days
+  old) even if no delta fired; hourly limiter samples show no pause attributable
+  to the new collectors; `/sov_timers` parity re-checked; Dotlan numeric
+  corporation URLs click-checked from a real embed; the deferred demos from
+  tickets 08–10 recorded.
+- **G5 (chain):** after the `WANDERER_*` variables are set,
+  `sov chain reachability enabled` logged, `sov_chain_progress` reports, and one
+  chain-driven `reachable` transition observed and delivered once. May complete
+  after day 7 if the key arrives late; it does not block G1–G4 sign-off.
+
+A failed gate pauses go-live until the cause is fixed and the gate re-run; it
+does not abort the pilot. The wizard records each step as `PASS`, `FAIL`, or
+`PAUSED`, and a `FAIL` prints that go-live is paused until the gate passes.
+
+### Restart days and limiter sampling
+
+Restart the bot deliberately on day 2 and day 5 (`docker compose restart
+discordbot`) and run step 7 (G3) after each; the wizard writes a separate dated
+entry per restart. For the limiter, step 8 takes one sample immediately and
+prints the exact hourly `crontab` line to add for the pilot's duration:
+
+```
+0 * * * * cd <repo> && ./scripts/esi-intel-feeds-pilot.sh sample >/dev/null 2>&1
+```
+
+Remove that line with `crontab -e` at the end of the pilot (the wizard reminds
+you again at go-live). Each sample appends a `- [limiter]` line to the artifact;
+step 9 (G4) summarises them (minimum remaining, any pause).
+
+### Go-live
+
+Step 11 prints the three production invocations from the walkthrough above with
+the roamers-role placeholder, has you confirm one non-pinging cycle per channel
+before adding `role`, and records the three channels' final subscription rows as
+JSON and the handoff note into the artifact. Write the member announcement only
+after a successful go-live, and re-triage tickets 12 and 13 against the artifact's
+limiter samples.
+
+The evidence artifact lives at `docs/rollouts/esi-intel-feeds-pilot.md`.
