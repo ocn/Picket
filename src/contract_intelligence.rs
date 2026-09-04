@@ -154,6 +154,8 @@ const HEALTH_ENVIRONMENT_VARIABLES: &[&str] = &[
     "HEALTH_CONTRACT_PROGRESS_CRITICAL_SECS",
     "HEALTH_ESI_PROGRESS_DEGRADED_SECS",
     "HEALTH_ESI_PROGRESS_CRITICAL_SECS",
+    "HEALTH_WATCHLIST_PROGRESS_DEGRADED_SECS",
+    "HEALTH_WATCHLIST_PROGRESS_CRITICAL_SECS",
     "HEALTH_PREPARED_DELIVERY_DEGRADED_SECS",
     "HEALTH_PREPARED_DELIVERY_CRITICAL_SECS",
     "HEALTH_BACKLOG_DEGRADED_SECS",
@@ -486,6 +488,8 @@ pub struct HealthThresholds {
     pub contract_progress_critical: ChronoDuration,
     pub esi_progress_degraded: ChronoDuration,
     pub esi_progress_critical: ChronoDuration,
+    pub watchlist_progress_degraded: ChronoDuration,
+    pub watchlist_progress_critical: ChronoDuration,
     pub prepared_delivery_degraded: ChronoDuration,
     pub prepared_delivery_critical: ChronoDuration,
     pub backlog_degraded: ChronoDuration,
@@ -507,6 +511,13 @@ impl Default for HealthThresholds {
             contract_progress_critical: ChronoDuration::minutes(30),
             esi_progress_degraded: ChronoDuration::minutes(15),
             esi_progress_critical: ChronoDuration::minutes(30),
+            // The watchlist collector runs on a 3600 s cadence and skips the
+            // request (leaving the `watchlist/%` cache rows untouched) while
+            // its listing is still fresh, so its progress check is sized at
+            // 2x and 3x the cadence rather than the contract feed's 5-minute
+            // budget (ticket 18).
+            watchlist_progress_degraded: ChronoDuration::hours(2),
+            watchlist_progress_critical: ChronoDuration::hours(3),
             prepared_delivery_degraded: ChronoDuration::minutes(5),
             prepared_delivery_critical: ChronoDuration::minutes(15),
             backlog_degraded: ChronoDuration::minutes(30),
@@ -591,6 +602,16 @@ impl HealthRuntimeConfig {
             "HEALTH_ESI_PROGRESS_CRITICAL_SECS",
             thresholds.esi_progress_critical,
         )?;
+        thresholds.watchlist_progress_degraded = health_duration_from_settings(
+            &mut lookup,
+            "HEALTH_WATCHLIST_PROGRESS_DEGRADED_SECS",
+            thresholds.watchlist_progress_degraded,
+        )?;
+        thresholds.watchlist_progress_critical = health_duration_from_settings(
+            &mut lookup,
+            "HEALTH_WATCHLIST_PROGRESS_CRITICAL_SECS",
+            thresholds.watchlist_progress_critical,
+        )?;
         thresholds.prepared_delivery_degraded = health_duration_from_settings(
             &mut lookup,
             "HEALTH_PREPARED_DELIVERY_DEGRADED_SECS",
@@ -650,6 +671,11 @@ impl HealthRuntimeConfig {
             "ESI progress",
             thresholds.esi_progress_degraded,
             thresholds.esi_progress_critical,
+        )?;
+        validate_threshold_order(
+            "watchlist progress",
+            thresholds.watchlist_progress_degraded,
+            thresholds.watchlist_progress_critical,
         )?;
         validate_threshold_order(
             "prepared delivery",
@@ -2724,8 +2750,12 @@ fn sov_esi_progress_health_check(
 
 /// The watchlist feed's ESI progress signal (ticket 08). Mirrors
 /// [`sov_esi_progress_health_check`]: neutral (Healthy) until the feed first
-/// reports, then shares the contract feed's ESI-progress staleness
-/// thresholds. `watchlist_esi_progress_at` is `max(updated_at)` across
+/// reports, then applies its own cadence-sized staleness thresholds
+/// (`watchlist_progress_degraded` / `watchlist_progress_critical`, defaults
+/// 2x and 3x the 3600 s `WATCHLIST_COLLECTION_INTERVAL`; ticket 18) rather
+/// than the contract feed's 5-minute ESI-progress budget, because a
+/// fresh-cache cycle skips the request without touching the `watchlist/%`
+/// rows. `watchlist_esi_progress_at` is `max(updated_at)` across
 /// `esi_cache_metadata` rows whose `resource_key` matches `watchlist/%`
 /// (each watched alliance's corporation-list conditional request), and is
 /// `None` in exactly the "never reported" state (feed not started, or no
@@ -2750,8 +2780,8 @@ fn watchlist_esi_progress_health_check(
         "watchlist_esi_progress",
         Some(progress_at),
         observed_at,
-        thresholds.esi_progress_degraded,
-        thresholds.esi_progress_critical,
+        thresholds.watchlist_progress_degraded,
+        thresholds.watchlist_progress_critical,
         "watchlist ESI progress",
     )
 }

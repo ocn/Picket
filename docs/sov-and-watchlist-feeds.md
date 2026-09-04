@@ -102,7 +102,7 @@ If `CONTRACT_DATABASE_URL` is absent, the sov runtime logs `Sov campaign feed di
 | Key | Neutral state (Healthy) | Degraded | Critical |
 | --- | --- | --- | --- |
 | `sov_esi_progress` | `no sov campaign ESI progress reported yet (feed not started or not enabled)` | sov campaign ESI progress older than `HEALTH_ESI_PROGRESS_DEGRADED_SECS` | older than `HEALTH_ESI_PROGRESS_CRITICAL_SECS` |
-| `watchlist_esi_progress` | `no watchlist ESI progress reported yet (feed not started or no alliance watched)` | watchlist ESI progress older than `HEALTH_ESI_PROGRESS_DEGRADED_SECS` | older than `HEALTH_ESI_PROGRESS_CRITICAL_SECS` |
+| `watchlist_esi_progress` | `no watchlist ESI progress reported yet (feed not started or no alliance watched)` | watchlist ESI progress older than `HEALTH_WATCHLIST_PROGRESS_DEGRADED_SECS` (default 7200 s) | older than `HEALTH_WATCHLIST_PROGRESS_CRITICAL_SECS` (default 10800 s) |
 | `sov_chain_progress` | `no wanderer chain snapshot fetched yet (feature not configured or not started)` | snapshot older than the fixed 10-minute chain staleness | no Critical tier |
 | `sov_permanent_delivery_failure` | `no unresolved permanent Discord delivery failures` | none | one or more unresolved permanent delivery failures |
 | `watchlist_permanent_delivery_failure` | `no unresolved permanent Discord delivery failures` | none | one or more unresolved permanent delivery failures |
@@ -111,6 +111,7 @@ Notes:
 
 - The three progress checks are neutral (Healthy) until the feed first reports, so a fresh or disabled feed never degrades the snapshot.
 - `HEALTH_ESI_PROGRESS_DEGRADED_SECS` and `HEALTH_ESI_PROGRESS_CRITICAL_SECS` default to 900 and 1800 seconds (15 and 30 minutes). They are shared with the contract feed's ESI-progress check.
+- `HEALTH_WATCHLIST_PROGRESS_DEGRADED_SECS` and `HEALTH_WATCHLIST_PROGRESS_CRITICAL_SECS` default to 7200 and 10800 seconds (2 and 3 hours) because the watchlist collector runs on an hourly (`WATCHLIST_COLLECTION_INTERVAL` = 3600 s) cadence and a fresh-cache cycle skips the request without touching the `watchlist/%` progress rows, so the thresholds are sized at 2x and 3x the cadence rather than reusing the contract feed's 5-minute budget.
 - `sov_chain_progress` has no configurable threshold and no Critical tier: a Wanderer outage degrades the board `/sov_timers` shows, it is not escalated like a stalled pipeline.
 - The two permanent-delivery-failure checks are binary: any unresolved permanent Discord delivery failure is Critical, otherwise Healthy.
 
