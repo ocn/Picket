@@ -114,3 +114,7 @@ _The wizard appends dated entries below this line._
   - `112095 ihub_defense system 30001532 defender 1411711376 starts 2026-09-04 17:29:40+00`
   - `112098 ihub_defense system 30001544 defender 1411711376 starts 2026-09-05 00:53:26+00`
 - **Result:** recorded (G2 is signed on day 1)
+
+### 2026-09-04T19:30Z — Production watchlist channel created early (operator decision)
+- The operator judged the hostile-group watch ready and asked for it in channel 1545561704438431854 (`#corp-watch`). Row written as `/watch_subscribe name:corp-watch` with all eight event kinds and no role. The five alliances' baselines are already established (silent), so this channel only ever sees real joins/leaves, alliance changes, member deltas (from ~09-11), and wars.
+- The sov timer feed stays sandbox-only pending the embed/noise rework (tickets 19/20) and the FC feedback round.
