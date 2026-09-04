@@ -29783,6 +29783,64 @@ fn health_configuration_rejects_malformed_zero_and_misordered_thresholds() {
     );
 }
 
+#[test]
+fn health_watchlist_progress_thresholds_default_override_and_reject_malformed() {
+    // Ticket 18: the watchlist progress check has its own cadence-sized
+    // thresholds (2x and 3x the hourly collection interval), parsed with the
+    // same validation path as the other HEALTH_* duration variables.
+    let defaults = HealthRuntimeConfig::from_settings(&HashMap::new())
+        .expect("absent settings use the accepted defaults")
+        .thresholds;
+    assert_eq!(
+        defaults.watchlist_progress_degraded.num_seconds(),
+        7200,
+        "the watchlist progress degraded threshold defaults to 2x the hourly cadence"
+    );
+    assert_eq!(
+        defaults.watchlist_progress_critical.num_seconds(),
+        10800,
+        "the watchlist progress critical threshold defaults to 3x the hourly cadence"
+    );
+
+    let overridden = HealthRuntimeConfig::from_settings(&HashMap::from([
+        (
+            "HEALTH_WATCHLIST_PROGRESS_DEGRADED_SECS".to_string(),
+            "5400".to_string(),
+        ),
+        (
+            "HEALTH_WATCHLIST_PROGRESS_CRITICAL_SECS".to_string(),
+            "9000".to_string(),
+        ),
+    ]))
+    .expect("valid overrides are accepted")
+    .thresholds;
+    assert_eq!(overridden.watchlist_progress_degraded.num_seconds(), 5400);
+    assert_eq!(overridden.watchlist_progress_critical.num_seconds(), 9000);
+
+    assert!(
+        HealthRuntimeConfig::from_settings(&HashMap::from([(
+            "HEALTH_WATCHLIST_PROGRESS_DEGRADED_SECS".to_string(),
+            "not-a-number".to_string(),
+        )]))
+        .is_err(),
+        "a malformed watchlist progress threshold disables health instead of silently defaulting"
+    );
+    assert!(
+        HealthRuntimeConfig::from_settings(&HashMap::from([
+            (
+                "HEALTH_WATCHLIST_PROGRESS_DEGRADED_SECS".to_string(),
+                "7200".to_string(),
+            ),
+            (
+                "HEALTH_WATCHLIST_PROGRESS_CRITICAL_SECS".to_string(),
+                "7200".to_string(),
+            ),
+        ]))
+        .is_err(),
+        "equal watchlist degraded and critical thresholds are rejected"
+    );
+}
+
 fn synthetic_migrator(migrations: Vec<Migration>) -> Migrator {
     Migrator {
         migrations: Cow::Owned(migrations),
@@ -31701,6 +31759,160 @@ async fn sov_esi_progress_health_check_is_independent_of_contract_esi_progress()
         .checks
         .iter()
         .any(|check| check.key == "sov_esi_progress" && check.status == HealthStatus::Healthy));
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchlist_esi_progress_health_check_is_healthy_within_the_hourly_cadence() {
+    // Ticket 18: the watchlist collector runs hourly and skips the request
+    // (leaving the `watchlist/%` rows untouched) while its listing is fresh,
+    // so a 59-minute-old progress row is still well within the 2-hour
+    // degraded threshold and must stay Healthy.
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to the watchlist ESI health-evidence database");
+    let now = database.now().await;
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed a current heartbeat");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('watchlist/alliances/99', $1)",
+    )
+    .bind(now - chrono::Duration::minutes(59))
+    .execute(&pool)
+    .await
+    .expect("persist a 59-minute-old watchlist ESI progress row");
+
+    let snapshot = HealthCycle::new(store, clock)
+        .run_once()
+        .await
+        .expect("evaluate health with fresh watchlist evidence");
+    assert!(snapshot.checks.iter().any(
+        |check| check.key == "watchlist_esi_progress" && check.status == HealthStatus::Healthy
+    ));
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchlist_esi_progress_health_check_degrades_after_two_hours() {
+    // Ticket 18: 2x the hourly cadence (7200 s) is the degraded threshold.
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to the watchlist ESI health-evidence database");
+    let now = database.now().await;
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed a current heartbeat");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('watchlist/alliances/99', $1)",
+    )
+    .bind(now - chrono::Duration::hours(2))
+    .execute(&pool)
+    .await
+    .expect("persist a 2-hour-old watchlist ESI progress row");
+
+    let snapshot = HealthCycle::new(store, clock)
+        .run_once()
+        .await
+        .expect("evaluate health with a 2-hour-old watchlist row");
+    assert!(snapshot.checks.iter().any(
+        |check| check.key == "watchlist_esi_progress" && check.status == HealthStatus::Degraded
+    ));
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchlist_esi_progress_health_check_goes_critical_after_three_hours() {
+    // Ticket 18: 3x the hourly cadence (10800 s) is the critical threshold.
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to the watchlist ESI health-evidence database");
+    let now = database.now().await;
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed a current heartbeat");
+    sqlx::query(
+        "INSERT INTO esi_cache_metadata (resource_key, updated_at) VALUES ('watchlist/alliances/99', $1)",
+    )
+    .bind(now - chrono::Duration::hours(3))
+    .execute(&pool)
+    .await
+    .expect("persist a 3-hour-old watchlist ESI progress row");
+
+    let snapshot = HealthCycle::new(store, clock)
+        .run_once()
+        .await
+        .expect("evaluate health with a 3-hour-old watchlist row");
+    assert!(snapshot.checks.iter().any(
+        |check| check.key == "watchlist_esi_progress" && check.status == HealthStatus::Critical
+    ));
+
+    pool.close().await;
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn watchlist_esi_progress_health_check_is_neutral_when_never_reported() {
+    // Ticket 18: neutral-until-first-report is unchanged -- with no
+    // `watchlist/%` row the check is Healthy (feed not started or no
+    // alliance watched).
+    let database = TemporaryDatabase::new().await;
+    let store = database.store().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database.url)
+        .await
+        .expect("connect to the watchlist ESI health-evidence database");
+    let now = database.now().await;
+    let clock = Arc::new(FixedHealthClock(StdMutex::new(now)));
+    sqlx::query(
+        "INSERT INTO bot_heartbeats (component, observed_at, started_at) VALUES ('bot', $1, $1)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed a current heartbeat");
+
+    let snapshot = HealthCycle::new(store, clock)
+        .run_once()
+        .await
+        .expect("evaluate health with no watchlist evidence");
+    assert!(snapshot.checks.iter().any(
+        |check| check.key == "watchlist_esi_progress" && check.status == HealthStatus::Healthy
+    ));
 
     pool.close().await;
     database.destroy().await;
