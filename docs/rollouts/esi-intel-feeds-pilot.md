@@ -104,3 +104,13 @@ _The wizard appends dated entries below this line._
 - Regression run of the contract file with the build in flight (846 s, load 31–47): 301/303; the two failures are pacing/backoff mock-window tests outside ticket 14's set; one passed serially, the other passed twice once the build finished — logged on ticket 14.
 - Watchlist state after the first collection cycle with the seed in place: 1411711376 Legion of xXDEATHXx baseline 2026-09-04 18:17:19.885989+00 corps 34; 495729389 Shadow Cartel baseline 2026-09-04 18:17:19.885989+00 corps 28; 99004901 Snuffed Out baseline 2026-09-04 18:17:19.885989+00 corps 17; 99007887 Brotherhood of Spacers baseline 2026-09-04 18:17:19.885989+00 corps 36; 99011978 Minmatar Fleet Alliance baseline 2026-09-04 18:17:19.885989+00 corps 9; member snapshots: alliance=5, corporation=124; deliveries: watchlist 0, sov 2.
 - **Result:** PASS
+
+### 2026-09-04T18:25Z — Early G2 evidence (day 0)
+- Watchlist: silent baselines established 18:17:19Z for all five alliances (Snuffed Out 17 corps, Brotherhood of Spacers 36, Minmatar Fleet Alliance 9, Shadow Cartel 28, Legion of xXDEATHXx 34); 124 corporation + 5 alliance member snapshots; `watchlist_deliveries` = 0.
+- Sov: first live `appeared` alerts delivered once each to `#sandbox`:
+  - `hostile-tz campaign 112095 stage appeared sent at 2026-09-04 17:45:40.228096+00 msg 1545490043534319757`
+  - `hostile-tz campaign 112098 stage appeared sent at 2026-09-04 17:45:40.383457+00 msg 1545490044251279412`
+- Campaigns behind them (for the `/sov_timers` / campaigns-route parity check by the operator):
+  - `112095 ihub_defense system 30001532 defender 1411711376 starts 2026-09-04 17:29:40+00`
+  - `112098 ihub_defense system 30001544 defender 1411711376 starts 2026-09-05 00:53:26+00`
+- **Result:** recorded (G2 is signed on day 1)
