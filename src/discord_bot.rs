@@ -810,10 +810,12 @@ fn sov_delivery_error(error: serenity::Error) -> sov_feed::SovDeliveryError {
     sov_feed::SovDeliveryError::transient(message)
 }
 
-/// Synchronous system/region lookups for the sov feed, backed by the
-/// killfeed's `config/systems.json` cache. No ESI fallback: sov campaigns
-/// only ever reference known k-space systems already present in that
-/// cache.
+/// System/region lookups for the sov feed, backed by the killfeed's
+/// `config/systems.json` cache. `resolve` is a synchronous cache read;
+/// `ensure_resolved` (ticket 19) falls back to ESI through the killfeed's
+/// [`get_system`] helper for a system that has never appeared in a
+/// processed killmail, persisting the result into the same cache so a
+/// later `resolve` (and every `region_of`) sees it.
 pub struct DiscordSovSystemDirectory {
     app_state: Arc<AppState>,
 }
@@ -824,6 +826,7 @@ impl DiscordSovSystemDirectory {
     }
 }
 
+#[async_trait]
 impl sov_feed::SovSystemDirectory for DiscordSovSystemDirectory {
     fn resolve(&self, solar_system_id: i64) -> Option<sov_feed::SovSystemInfo> {
         let system_id = u32::try_from(solar_system_id).ok()?;
@@ -835,6 +838,29 @@ impl sov_feed::SovSystemDirectory for DiscordSovSystemDirectory {
                 region_name: system.region.clone(),
                 region_id: system.region_id as i64,
             })
+    }
+
+    /// Ticket 19: resolve a system the cache misses through ESI. `get_system`
+    /// performs the killfeed's existing `universe/systems` ->
+    /// `constellations` -> `regions` walk and writes the result into
+    /// `AppState.systems` and `config/systems.json` under the shared
+    /// `systems_file_lock`, so the next `resolve` returns it. Note the
+    /// killfeed's `EsiClient` does not participate in the shared sov
+    /// `EsiLimiterStore` (its `fetch` discards response headers), so no
+    /// limiter metadata is recorded here; the collector bounds these calls
+    /// per cycle and honours the shared limiter deadline before invoking
+    /// this (see `SovCollector::warm_system_cache`).
+    async fn ensure_resolved(&self, solar_system_id: i64) -> Option<sov_feed::SovSystemInfo> {
+        if let Some(info) = self.resolve(solar_system_id) {
+            return Some(info);
+        }
+        let system_id = u32::try_from(solar_system_id).ok()?;
+        let system = get_system(&self.app_state, system_id).await?;
+        Some(sov_feed::SovSystemInfo {
+            name: system.name,
+            region_name: system.region,
+            region_id: system.region_id as i64,
+        })
     }
 }
 

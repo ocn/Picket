@@ -30,7 +30,7 @@ use killbot_rust::sov_feed::{
 use killbot_rust::spawn_sov_collection_loop;
 use sqlx::Row;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
@@ -244,6 +244,88 @@ impl SovSystemDirectory for FakeSovSystemDirectory {
     fn resolve(&self, solar_system_id: i64) -> Option<SovSystemInfo> {
         self.resolve_calls.fetch_add(1, Ordering::SeqCst);
         self.systems.get(&solar_system_id).cloned()
+    }
+}
+
+/// Ticket 19: a system directory whose `resolve` is a synchronous read of
+/// an in-memory cache and whose `ensure_resolved` pulls from a separate
+/// fake "ESI source" map and writes the result into that cache -- the
+/// in-test analogue of the production directory's `EsiClient::get_system`
+/// fallback, with no real network call. `available` simulates an ESI
+/// outage or an active limiter pause: while it is `false`, `ensure_resolved`
+/// resolves nothing, so a campaign in an uncached system holds. `fetches`
+/// counts genuine ESI resolutions so the per-cycle cap can be observed.
+struct ResolvingFakeSovSystemDirectory {
+    cache: Mutex<HashMap<i64, SovSystemInfo>>,
+    esi_source: Mutex<HashMap<i64, SovSystemInfo>>,
+    available: AtomicBool,
+    fetches: AtomicUsize,
+}
+
+impl ResolvingFakeSovSystemDirectory {
+    fn new() -> Self {
+        Self {
+            cache: Mutex::new(HashMap::new()),
+            esi_source: Mutex::new(HashMap::new()),
+            available: AtomicBool::new(true),
+            fetches: AtomicUsize::new(0),
+        }
+    }
+
+    /// Makes `id` resolvable through the fake ESI source (a cache miss will
+    /// fetch and cache it, once `available`).
+    fn with_esi_system(self, id: i64, info: SovSystemInfo) -> Self {
+        self.esi_source.lock().unwrap().insert(id, info);
+        self
+    }
+
+    fn set_available(&self, available: bool) {
+        self.available.store(available, Ordering::SeqCst);
+    }
+
+    fn fetch_count(&self) -> usize {
+        self.fetches.load(Ordering::SeqCst)
+    }
+
+    fn is_cached(&self, id: i64) -> bool {
+        self.cache.lock().unwrap().contains_key(&id)
+    }
+}
+
+#[async_trait]
+impl SovSystemDirectory for ResolvingFakeSovSystemDirectory {
+    fn resolve(&self, solar_system_id: i64) -> Option<SovSystemInfo> {
+        self.cache.lock().unwrap().get(&solar_system_id).cloned()
+    }
+
+    async fn ensure_resolved(&self, solar_system_id: i64) -> Option<SovSystemInfo> {
+        if let Some(info) = self.resolve(solar_system_id) {
+            return Some(info);
+        }
+        if !self.available.load(Ordering::SeqCst) {
+            return None;
+        }
+        let fetched = self
+            .esi_source
+            .lock()
+            .unwrap()
+            .get(&solar_system_id)
+            .cloned()?;
+        self.fetches.fetch_add(1, Ordering::SeqCst);
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(solar_system_id, fetched.clone());
+        Some(fetched)
+    }
+}
+
+/// A resolved system fixture for the ticket-19 tests.
+fn sys_info(name: &str, region: &str, region_id: i64) -> SovSystemInfo {
+    SovSystemInfo {
+        name: name.to_string(),
+        region_name: region.to_string(),
+        region_id,
     }
 }
 
@@ -3131,9 +3213,13 @@ async fn a_subscription_without_reachable_is_unaffected_by_dynamic_chain_reachab
         Arc::new(DynamicChainSovReachability::new(graph, 1));
 
     let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    // Turnur (30_005_174) is in the directory cache and, with the empty
+    // synthetic stargate graph, is unreachable via the dynamic chain -- so
+    // the system resolves (ticket 19: an unresolved system would hold) while
+    // still exercising "unreachable under dynamic chain reachability".
     let unreachable_campaign = campaign(
         1,
-        30_009_999,
+        30_005_174,
         99_006_751,
         observed_at + ChronoDuration::hours(2),
     );
@@ -5754,10 +5840,15 @@ async fn an_already_prepared_tminus_mark_is_not_re_rendered_on_a_later_pass() {
         .expect("first stage pass renders and prepares both marks");
     assert_eq!(report.tminus_prepared, 2);
     let after_pass1 = directory.resolve_calls();
+    // Ticket 19: each stage cycle also reads the cache once per campaign
+    // system to decide whether to ESI-resolve it (the campaign's system is
+    // already cached here, so that read is the only warm cost), on top of
+    // the one resolve per rendered mark. So the first pass is
+    // 1 (warm) + 2 (renders) = 3.
     assert_eq!(
         after_pass1 - before_pass1,
-        2,
-        "the first pass renders each due mark exactly once"
+        3,
+        "the first pass warms the cache once and renders each due mark once"
     );
 
     let report = collector
@@ -5765,10 +5856,12 @@ async fn an_already_prepared_tminus_mark_is_not_re_rendered_on_a_later_pass() {
         .await
         .expect("second stage pass over already-prepared marks");
     assert_eq!(report.tminus_prepared, 0, "already prepared, nothing new");
+    // The second pass still warms the cache once (the +1 read) but performs
+    // no render, so it costs exactly the single warm read and nothing more.
     assert_eq!(
-        directory.resolve_calls(),
-        after_pass1,
-        "an already-prepared mark performs no render on a later pass"
+        directory.resolve_calls() - after_pass1,
+        1,
+        "an already-prepared mark performs no render on a later pass -- only the cache warm read"
     );
 
     database.destroy().await;
@@ -6398,6 +6491,369 @@ async fn collect_cycle_triggers_the_retention_prune() {
         0,
         "collect_cycle must run the retention prune"
     );
+
+    database.destroy().await;
+}
+
+// --- Ticket 19: resolve the system and region before posting a sov alert ---
+
+#[tokio::test]
+async fn an_uncached_campaign_system_resolves_through_esi_and_posts_once_with_name_and_region() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    // A system the killfeed has never seen: absent from the directory cache
+    // but resolvable through the fake ESI source.
+    let fresh_system = 30_009_999;
+    let directory = Arc::new(
+        ResolvingFakeSovSystemDirectory::new()
+            .with_esi_system(fresh_system, sys_info("Nalvula", "Lonetrek", 10_000_016)),
+    );
+    let new_campaign = campaign(
+        1,
+        fresh_system,
+        99_006_751,
+        observed_at + ChronoDuration::hours(3),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![new_campaign.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock.clone())
+        .with_directory(directory.clone());
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    clock.advance(ChronoDuration::seconds(10));
+    let report = collector.collect_cycle().await.expect("second cycle");
+
+    assert_eq!(report.alerts_prepared, 1);
+    assert_eq!(delivery.sent_count(), 1);
+    let sent = delivery.sent();
+    assert!(
+        sent[0].message.title.contains("Nalvula (Lonetrek)"),
+        "title carries the ESI-resolved name and region, got {:?}",
+        sent[0].message.title
+    );
+    assert!(
+        !sent[0].message.title.contains("Unknown Region"),
+        "the removed fallback never appears"
+    );
+    assert!(
+        directory.is_cached(fresh_system),
+        "the resolution is written into the systems cache"
+    );
+    assert_eq!(
+        directory.fetch_count(),
+        1,
+        "resolved through ESI exactly once, then cached"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn an_unresolvable_campaign_system_holds_then_posts_once_after_it_resolves() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let fresh_system = 30_009_999;
+    let directory = Arc::new(
+        ResolvingFakeSovSystemDirectory::new()
+            .with_esi_system(fresh_system, sys_info("Nalvula", "Lonetrek", 10_000_016)),
+    );
+    // ESI unavailable at first (outage or an active limiter pause): the
+    // system cannot be resolved, so the alert must hold.
+    directory.set_available(false);
+
+    let new_campaign = campaign(
+        1,
+        fresh_system,
+        99_006_751,
+        observed_at + ChronoDuration::hours(3),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![new_campaign.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![new_campaign.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(20), "etag-3"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![new_campaign.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(30), "etag-4"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock.clone())
+        .with_directory(directory.clone());
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    clock.advance(ChronoDuration::seconds(10));
+    let held = collector.collect_cycle().await.expect("hold cycle");
+
+    assert_eq!(
+        held.newly_appeared, 1,
+        "the campaign matched the twelve-hour window"
+    );
+    assert_eq!(
+        held.alerts_prepared, 0,
+        "but no alert was prepared while the system was unresolved"
+    );
+    assert_eq!(delivery.sent_count(), 0);
+    assert_eq!(
+        store
+            .count_deliveries_for(new_campaign.campaign_id, SovAlertStage::Appeared)
+            .await
+            .expect("count"),
+        0,
+        "no delivery row is inserted while the system holds"
+    );
+
+    // ESI recovers: the campaign is re-evaluated, now resolves, and posts.
+    directory.set_available(true);
+    clock.advance(ChronoDuration::seconds(10));
+    let posted = collector.collect_cycle().await.expect("resolve cycle");
+    assert_eq!(posted.alerts_prepared, 1);
+    assert_eq!(delivery.sent_count(), 1);
+
+    // A further cycle must not double-post: the dedup key is unchanged.
+    clock.advance(ChronoDuration::seconds(10));
+    collector.collect_cycle().await.expect("idempotent cycle");
+    assert_eq!(
+        store
+            .count_deliveries_for(new_campaign.campaign_id, SovAlertStage::Appeared)
+            .await
+            .expect("count"),
+        1,
+        "the alert posts exactly once, even after being held"
+    );
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_held_tminus_mark_posts_late_with_the_same_stage_key_after_the_system_resolves() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let fresh_system = 30_009_999;
+    let directory = Arc::new(
+        ResolvingFakeSovSystemDirectory::new()
+            .with_esi_system(fresh_system, sys_info("Nalvula", "Lonetrek", 10_000_016)),
+    );
+    directory.set_available(false);
+
+    // 25 minutes out: both the T-120 and T-30 default marks are already due,
+    // so their mark times have passed -- exactly the "time passes while
+    // held" case. Held now, they must still post late (same stage keys) once
+    // the system resolves, as long as the campaign has not yet started.
+    let due_campaign = campaign(
+        1,
+        fresh_system,
+        99_006_751,
+        observed_at + ChronoDuration::minutes(25),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![Ok(EsiResponse::fresh(
+        vec![due_campaign.clone()],
+        fresh_metadata(observed_at, "etag-1"),
+    ))]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock.clone())
+        .with_directory(directory.clone());
+
+    collector
+        .collect_cycle()
+        .await
+        .expect("baseline establishes the campaign");
+
+    let held = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("held stage pass");
+    assert_eq!(
+        held.tminus_prepared, 0,
+        "the due marks are held while the system is unresolved"
+    );
+    assert_eq!(delivery.sent_count(), 0);
+
+    // Time passes while held (still before start), then ESI recovers.
+    clock.advance(ChronoDuration::minutes(10));
+    directory.set_available(true);
+    let posted = collector
+        .evaluate_stage_cycle()
+        .await
+        .expect("late stage pass");
+    assert_eq!(
+        posted.tminus_prepared, 2,
+        "both still-due marks post late once the system resolves"
+    );
+    assert_eq!(delivery.sent_count(), 2);
+
+    for minutes in [120_i64, 30] {
+        assert_eq!(
+            store
+                .count_deliveries_for(due_campaign.campaign_id, SovAlertStage::TMinus(minutes))
+                .await
+                .expect("count"),
+            1,
+            "the T-{minutes} mark posts exactly once, late, under its own stage key"
+        );
+    }
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_region_leaf_matches_an_uncached_system_after_esi_resolution() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    // Region-only subscription for Lonetrek (10_000_016). It can only match a
+    // campaign whose system resolves to that region.
+    subscribe(
+        &store,
+        "lonetrek",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Region(vec![10_000_016])),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let fresh_system = 30_009_999; // resolves to Lonetrek
+    let directory = Arc::new(
+        ResolvingFakeSovSystemDirectory::new()
+            .with_esi_system(fresh_system, sys_info("Nalvula", "Lonetrek", 10_000_016)),
+    );
+    let new_campaign = campaign(
+        1,
+        fresh_system,
+        99_006_751,
+        observed_at + ChronoDuration::hours(3),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![new_campaign.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock.clone())
+        .with_directory(directory.clone());
+
+    collector.collect_cycle().await.expect("baseline");
+    clock.advance(ChronoDuration::seconds(10));
+    let report = collector.collect_cycle().await.expect("second cycle");
+
+    // The Region leaf could only match because the uncached system was
+    // resolved to region 10_000_016 during the warm pass.
+    assert_eq!(
+        report.alerts_prepared, 1,
+        "the region leaf matched the uncached system after resolution"
+    );
+    assert_eq!(delivery.sent_count(), 1);
+    assert!(delivery.sent()[0].message.title.contains("Lonetrek"));
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn the_per_cycle_system_lookup_cap_defers_excess_resolutions_to_the_next_cycle() {
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(&store, "watch-all", all_campaigns_filter(), None).await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    // 21 campaigns, each in a distinct uncached-but-resolvable system: one
+    // more than the SOV_SYSTEM_LOOKUPS_PER_CYCLE cap of 20.
+    let count = 21usize;
+    let mut directory = ResolvingFakeSovSystemDirectory::new();
+    let mut campaigns = Vec::new();
+    for i in 0..count {
+        let system_id = 30_100_000 + i as i64;
+        directory = directory.with_esi_system(
+            system_id,
+            sys_info(&format!("Sys{i}"), "Lonetrek", 10_000_016),
+        );
+        campaigns.push(campaign(
+            i as i64 + 1,
+            system_id,
+            99_006_751,
+            observed_at + ChronoDuration::hours(3),
+        ));
+    }
+    let directory = Arc::new(directory);
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            campaigns.clone(),
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+        Ok(EsiResponse::fresh(
+            campaigns.clone(),
+            fresh_metadata(observed_at + ChronoDuration::seconds(20), "etag-3"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let collector = collector(store.clone(), limiter, esi, delivery.clone(), clock.clone())
+        .with_directory(directory.clone());
+
+    collector.collect_cycle().await.expect("baseline");
+    clock.advance(ChronoDuration::seconds(10));
+    let first = collector.collect_cycle().await.expect("first alert cycle");
+
+    // Exactly the cap resolves this cycle; the excess holds.
+    assert_eq!(
+        directory.fetch_count(),
+        20,
+        "capped at SOV_SYSTEM_LOOKUPS_PER_CYCLE resolutions"
+    );
+    assert_eq!(
+        first.alerts_prepared, 20,
+        "the twenty resolved systems post; the twenty-first holds"
+    );
+
+    clock.advance(ChronoDuration::seconds(10));
+    let second = collector.collect_cycle().await.expect("second alert cycle");
+    // The deferred system resolves now; the cached twenty cost no budget.
+    assert_eq!(
+        directory.fetch_count(),
+        21,
+        "the deferred system resolves on the next cycle"
+    );
+    assert_eq!(second.alerts_prepared, 1, "the previously-held alert posts");
+    assert_eq!(delivery.sent_count(), 21);
 
     database.destroy().await;
 }

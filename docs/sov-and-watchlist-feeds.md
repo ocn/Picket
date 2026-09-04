@@ -202,6 +202,7 @@ All ESI requests go through the shared limiter and are conditional, so most re-p
 - The war baseline inspects every id on the newest wars page when it began but fetches at most 200 details per cycle, so it spans about ten hourly cycles before the first live `war_declared` can post.
 - An entity added after a war was already stored gets no retroactive `war_declared`; that war becomes a silent baseline for the entity, but its ally joins, retraction, and finish are tracked from then on.
 - Removing and re-adding an entity resets its baselines: the next successful cycle re-establishes a silent membership and corporation-info baseline for it.
+- A sov alert for a system the bot has never seen in a killmail waits until the system name and region resolve through ESI (normally the same cycle, at most 20 fresh systems per cycle); if a system cannot be resolved (ESI error or an active limiter pause) the alert is held rather than posted with a placeholder, and you can grep for the hold with `docker compose logs discordbot | grep "holding alert; system"`.
 
 ## Main-server walkthrough
 
