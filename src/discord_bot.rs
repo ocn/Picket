@@ -2143,7 +2143,7 @@ pub async fn render_killmail_embed(
 
     let killmail_url = format!("https://zkillboard.com/kill/{}/", killmail.killmail_id);
     let related_br = format!(
-        "https://br.evetools.org/related/{}/{}",
+        "https://warbeacon.net/br/related/{}/{}/",
         system_id,
         format_datetime_to_timestamp(&killmail_time)
     );
