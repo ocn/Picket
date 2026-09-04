@@ -157,6 +157,18 @@ pub fn init_tracing() {
 
 static TEMPORARY_DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Serialises `CREATE DATABASE` / `DROP DATABASE` admin operations across every
+/// test in this binary. PostgreSQL takes a lock on the template database for the
+/// duration of each CREATE/DROP; running many of them concurrently (the default
+/// test-thread count) contends on that lock and, under machine load, the admin
+/// connection or the statement itself can intermittently fail. Holding this
+/// process-wide async mutex only around the short admin section removes that
+/// contention while every test still provisions its own uniquely named database
+/// and runs its body in parallel. A plain async mutex (rather than a Postgres
+/// advisory lock) is sufficient because the contention is between tokio tasks
+/// inside this single test process.
+static DATABASE_ADMIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// A throwaway PostgreSQL database, created against `CONTRACT_TEST_DATABASE_URL`
 /// and dropped in `destroy()`. Generic across feeds (contract, sov, ...): each
 /// test file connects its own store type(s) against `url` and is responsible
@@ -198,6 +210,7 @@ impl TemporaryDatabase {
     }
 
     pub async fn create(&self) {
+        let _admin_guard = DATABASE_ADMIN_LOCK.lock().await;
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect(&self.admin_url)
@@ -211,6 +224,7 @@ impl TemporaryDatabase {
     }
 
     pub async fn destroy(self) {
+        let _admin_guard = DATABASE_ADMIN_LOCK.lock().await;
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect(&self.admin_url)
