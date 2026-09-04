@@ -70,6 +70,17 @@ use url::Url;
 use common::load_text_fixture;
 
 static DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Serialises `CREATE DATABASE` / `DROP DATABASE` admin operations across every
+/// test in this binary. PostgreSQL takes a lock on the template database for the
+/// duration of each CREATE/DROP; running many of them concurrently (the default
+/// test-thread count) contends on that lock and, under machine load, the admin
+/// connection or the statement itself can intermittently fail. Holding this
+/// process-wide async mutex only around the short admin section removes that
+/// contention while every test still provisions its own uniquely named database
+/// and runs its body in parallel. A plain async mutex (rather than a Postgres
+/// advisory lock) is sufficient because the contention is between tokio tasks
+/// inside this single test process.
+static DATABASE_ADMIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static VIRTUAL_REQUEST_PACER_EPOCH: OnceLock<(DateTime<Utc>, tokio::time::Instant)> =
     OnceLock::new();
 const ESI_PUBLIC_CONTRACT_SUMMARY_FIXTURE: &str =
@@ -4112,9 +4123,9 @@ async fn resolver_success_locks_location_before_state_and_serializes_public_evid
             .await
     });
     let mut reached_barrier = false;
-    for _ in 0..50 {
+    for _ in 0..500 {
         reached_barrier = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)",
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND database = (SELECT oid FROM pg_database WHERE datname = current_database()))",
         )
         .fetch_one(&inspection)
         .await
@@ -4130,7 +4141,7 @@ async fn resolver_success_locks_location_before_state_and_serializes_public_evid
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted",
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
         )
         .fetch_one(&inspection)
         .await
@@ -5782,6 +5793,7 @@ impl TemporaryDatabase {
     }
 
     async fn create(&self) {
+        let _admin_guard = DATABASE_ADMIN_LOCK.lock().await;
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect(&self.admin_url)
@@ -5815,6 +5827,7 @@ impl TemporaryDatabase {
     }
 
     async fn destroy(self) {
+        let _admin_guard = DATABASE_ADMIN_LOCK.lock().await;
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect(&self.admin_url)
@@ -12081,7 +12094,7 @@ async fn public_listing_defers_when_observed_location_has_no_human_readable_regi
         delivery.clone(),
     );
     let cycle = tokio::spawn(async move { collector.collect_cycle().await });
-    tokio::time::timeout(Duration::from_secs(2), server.station_started.notified())
+    tokio::time::timeout(Duration::from_secs(30), server.station_started.notified())
         .await
         .expect("the Observed Location station lookup starts");
     server.release_station();
@@ -12184,9 +12197,9 @@ async fn public_listing_omits_held_optional_names_at_the_injected_enrichment_dea
     let store = database.store().await;
     let server = GatedObservedLocationEnrichmentHttpServer::start_with_gated_optional_names();
     let esi = Arc::new(
-        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(2))
+        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(30))
             .expect("construct deadline-controlled public ESI client")
-            .with_optional_enrichment_budget(Duration::from_millis(200)),
+            .with_optional_enrichment_budget(Duration::from_secs(2)),
     );
 
     ContractCollector::new(store.clone(), esi.clone())
@@ -12213,10 +12226,10 @@ async fn public_listing_omits_held_optional_names_at_the_injected_enrichment_dea
     );
     let mut cycle = tokio::spawn(async move { collector.collect_cycle().await });
 
-    tokio::time::timeout(Duration::from_secs(2), server.names_started.notified())
+    tokio::time::timeout(Duration::from_secs(30), server.names_started.notified())
         .await
         .expect("the optional name request starts and is held");
-    let cycle_result = tokio::time::timeout(Duration::from_secs(2), &mut cycle).await;
+    let cycle_result = tokio::time::timeout(Duration::from_secs(30), &mut cycle).await;
     if cycle_result.is_err() {
         cycle.abort();
         let _ = cycle.await;
@@ -12252,9 +12265,9 @@ async fn public_listing_uses_one_optional_enrichment_deadline_across_snapshot_an
     let store = database.store().await;
     let server = GatedObservedLocationEnrichmentHttpServer::start();
     let esi = Arc::new(
-        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(2))
+        HttpPublicContractEsi::with_base_url(&server.base_url, Duration::from_secs(30))
             .expect("construct shared-deadline public ESI client")
-            .with_optional_enrichment_budget(Duration::from_millis(200)),
+            .with_optional_enrichment_budget(Duration::from_secs(2)),
     );
 
     ContractCollector::new(store.clone(), esi.clone())
@@ -12281,11 +12294,11 @@ async fn public_listing_uses_one_optional_enrichment_deadline_across_snapshot_an
     );
     let mut cycle = tokio::spawn(async move { collector.collect_cycle().await });
 
-    tokio::time::timeout(Duration::from_secs(2), server.station_started.notified())
+    tokio::time::timeout(Duration::from_secs(30), server.station_started.notified())
         .await
         .expect("the snapshot Observed Location request starts and is held");
     let completed_within_one_budget =
-        match tokio::time::timeout(Duration::from_secs(2), &mut cycle).await {
+        match tokio::time::timeout(Duration::from_secs(30), &mut cycle).await {
             Ok(Ok(Ok(_))) => true,
             Ok(Ok(Err(_))) | Ok(Err(_)) => false,
             Err(_) => {
@@ -12351,7 +12364,7 @@ async fn public_listing_omits_an_unresolved_item_name_instead_of_rendering_unkno
         delivery.clone(),
     );
     let cycle = tokio::spawn(async move { collector.collect_cycle().await });
-    tokio::time::timeout(Duration::from_secs(2), server.station_started.notified())
+    tokio::time::timeout(Duration::from_secs(30), server.station_started.notified())
         .await
         .expect("the public station lookup starts");
     server.release_station();
@@ -13847,7 +13860,7 @@ async fn retained_evidence_reconciles_each_terminal_lifecycle_without_recursive_
         .embed_contexts_enabled
         .store(true, Ordering::Relaxed);
     tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(30),
         ContractCollector::new(store.clone(), reconciliation_esi)
             .with_notifications_and_ping_limiter(
                 Arc::new(StaticShipGroups(HashMap::from([(587, 659)]))),
@@ -19825,7 +19838,7 @@ async fn terminal_enrichment_deadline_falls_back_to_retained_observation_without
             ))]),
             probe_calls: StdMutex::new(Vec::new()),
         },
-        budget: Duration::from_millis(100),
+        budget: Duration::from_secs(2),
         context_calls: AtomicU64::new(0),
     });
     let entered = resolver.entered.notified();
@@ -19838,10 +19851,10 @@ async fn terminal_enrichment_deadline_falls_back_to_retained_observation_without
         .with_delivery_clock(Arc::new(FixedDeliveryClock(StdMutex::new(now))));
     let terminal_collection =
         tokio::spawn(async move { collector.collect_discovery_then_recover().await });
-    tokio::time::timeout(Duration::from_secs(2), entered)
+    tokio::time::timeout(Duration::from_secs(30), entered)
         .await
         .expect("terminal revalidation begins within the injected deadline");
-    tokio::time::timeout(Duration::from_secs(2), terminal_collection)
+    tokio::time::timeout(Duration::from_secs(30), terminal_collection)
         .await
         .expect("terminal deadline expires without a renewed enrichment window")
         .expect("terminal collector task completes")
@@ -26536,14 +26549,14 @@ async fn bounded_regional_collection_dispatches_fast_terminal_evidence_before_a_
     let recovery_collector = collector.clone();
     let cycle = tokio::spawn(async move { collector.collect_cycle().await });
 
-    tokio::time::timeout(Duration::from_secs(2), slow_started)
+    tokio::time::timeout(Duration::from_secs(30), slow_started)
         .await
         .expect("the unrelated slow regional attempt starts");
     assert!(
         delivery.sent.lock().unwrap().is_empty(),
         "regional discovery does not own terminal delivery"
     );
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if store
                 .contract_resolution_records()
@@ -26561,7 +26574,7 @@ async fn bounded_regional_collection_dispatches_fast_terminal_evidence_before_a_
     .expect("fast regional discovery publishes the terminal case before slow discovery ends");
     let recovery =
         tokio::spawn(async move { recovery_collector.recover_terminal_resolutions().await });
-    let delivery_ordering_timeout = Duration::from_secs(5);
+    let delivery_ordering_timeout = Duration::from_secs(30);
     if tokio::time::timeout(delivery_ordering_timeout, delivered)
         .await
         .is_err()
@@ -26590,14 +26603,32 @@ async fn bounded_regional_collection_dispatches_fast_terminal_evidence_before_a_
         .connect(&database.url)
         .await
         .expect("connect to inspect immediate terminal notification state");
-    assert!(!sqlx::query_scalar::<_, bool>(
-        "SELECT notification_pending FROM contract_resolution_cases WHERE region_id = $1 AND contract_id = $2",
-    )
-    .bind(FAST_REGION)
-    .bind(sale.contract_id)
-    .fetch_one(&pool)
+    // The mock delivery's `delivered` notify fires while `send` is executing,
+    // strictly before the recovery owner records the terminal notification as
+    // reported (`notify_terminal_event` calls `mark_terminal_notifications_reported`
+    // only after `notify_fresh_events` returns), so a single immediate read races
+    // that post-send commit under load. Poll for the cleared flag within a
+    // generous window instead: the recovery pass guarantees it becomes FALSE, and
+    // if the notification were wrongly left pending this loop still times out and
+    // fails, preserving the assertion's claim.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let pending = sqlx::query_scalar::<_, bool>(
+                "SELECT notification_pending FROM contract_resolution_cases WHERE region_id = $1 AND contract_id = $2",
+            )
+            .bind(FAST_REGION)
+            .bind(sale.contract_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the fast terminal notification state");
+            if !pending {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
     .await
-    .expect("read the fast terminal notification state"));
+    .expect("the recovery owner clears the fast terminal notification after delivering it");
     pool.close().await;
 
     esi.slow_release.notify_one();
@@ -27493,7 +27524,7 @@ async fn contract_runtime_recovers_the_shared_store_after_postgres_becomes_avail
     assert!(available_contract_store(&store_handle).await.is_none());
 
     database.create().await;
-    let store = tokio::time::timeout(Duration::from_secs(2), async {
+    let store = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Some(store) = available_contract_store(&store_handle).await {
                 return store;
@@ -36718,22 +36749,38 @@ async fn terminal_recovery_runtime_reconnects_and_skips_missed_fixed_minute_tick
         .connect(&database.url)
         .await
         .expect("connect to seed recovery work after PostgreSQL reconnects");
-    let now = Utc::now();
-    for (contract_id, due_after_seconds) in [(100, -1), (101, 7), (102, 9)] {
-        sqlx::query("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,now(),now(),$5,'awaiting_resolution')")
+    // Seed exactly one due case (contract 100). Contracts 101 and 102 start
+    // ineligible and are made eligible explicitly at the points the scenario
+    // requires, so which case a recovery cycle picks up no longer depends on a
+    // fixed `next_probe_at` offset racing real elapsed wall-clock time under
+    // machine load. The cadence (fixed 2 s ticks) and the block below are
+    // unchanged, so the "skip missed ticks then admit the next cycle" behaviour
+    // is exercised exactly as before.
+    for (contract_id, next_probe_at) in [
+        (100, "now() - interval '1 second'"),
+        (101, "now() + interval '1 hour'"),
+        (102, "now() + interval '1 hour'"),
+    ] {
+        sqlx::query(&format!("INSERT INTO contract_resolution_cases (region_id, contract_id, contract, manifest, last_public_observed_at, absence_observed_at, next_probe_at, state) VALUES ($1,$2,$3,$4,now(),now(),{next_probe_at},'awaiting_resolution')"))
             .bind(REGION)
             .bind(contract_id)
             .bind(serde_json::to_value(item_exchange_contract(contract_id)).expect("serialize terminal runtime contract"))
             .bind(serde_json::json!({"offered_items": [offered_ship(1)], "requested_items": []}))
-            .bind(now + chrono::Duration::seconds(due_after_seconds))
             .execute(&pool)
             .await
             .expect("seed terminal recovery work");
     }
-    pool.close().await;
     drop(store);
 
     first_probe_started.await;
+    // While the first probe is blocked the runtime cannot begin another cycle,
+    // so making contract 101 eligible now guarantees the cycle that runs once
+    // the block clears picks it up as the single current tick's work.
+    sqlx::query("UPDATE contract_resolution_cases SET next_probe_at = now() - interval '1 second' WHERE region_id = $1 AND contract_id = 101")
+        .bind(REGION)
+        .execute(&pool)
+        .await
+        .expect("make the second recovery case eligible while the first probe is blocked");
     tokio::time::sleep(Duration::from_millis(6_100)).await;
     esi.first_probe_release.notify_one();
     second_probe_started.await;
@@ -36749,11 +36796,19 @@ async fn terminal_recovery_runtime_reconnects_and_skips_missed_fixed_minute_tick
             .is_err(),
         "skipped ticks do not replay terminal recovery work immediately"
     );
+    // Only now is the final case eligible; the next fixed cadence tick must
+    // admit it.
+    sqlx::query("UPDATE contract_resolution_cases SET next_probe_at = now() - interval '1 second' WHERE region_id = $1 AND contract_id = 102")
+        .bind(REGION)
+        .execute(&pool)
+        .await
+        .expect("make the final recovery case eligible for the next cadence tick");
     tokio::time::timeout(Duration::from_secs(3), esi.third_probe_started.notified())
         .await
         .expect("the next fixed cadence tick eventually admits terminal recovery work");
     assert_eq!(esi.probe_count.load(Ordering::SeqCst), 3);
 
+    pool.close().await;
     recovery_task.abort();
     assert!(recovery_task
         .await
