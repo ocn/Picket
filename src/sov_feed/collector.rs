@@ -24,7 +24,7 @@ use crate::sov_feed::store::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -59,6 +59,19 @@ impl SovWatchlistSource for NoSovWatchlist {
 /// hours").
 const SOV_APPEARED_WINDOW: ChronoDuration = ChronoDuration::hours(12);
 
+/// Ticket 19: how many never-before-seen systems the sov feed submits for
+/// ESI resolution in a single cycle. The killfeed's systems cache
+/// (`config/systems.json`) only holds systems that have appeared in a
+/// processed killmail, so a campaign in any quiet system misses it; this
+/// bounds how many such systems each cycle warms through ESI so a burst of
+/// campaigns in fresh systems cannot fan out into an unbounded number of
+/// `universe/systems` + `constellations` + `regions` calls. Already-cached
+/// systems return immediately without an ESI call, so in steady state the
+/// warm pass costs nothing; a system left unresolved (cap reached, ESI
+/// error, or limiter pause) simply holds and is retried next cycle, with
+/// dedup keys unchanged so nothing double-posts once it resolves.
+const SOV_SYSTEM_LOOKUPS_PER_CYCLE: usize = 20;
+
 pub trait SovClock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 }
@@ -80,12 +93,31 @@ pub struct SovSystemInfo {
     pub region_id: i64,
 }
 
-/// Synchronous system/region lookups, backed by the killfeed's systems
-/// cache (`config/systems.json`); no ESI fallback is needed because sov
-/// campaigns only ever reference known k-space systems already present in
-/// that cache.
+/// System/region lookups for embed rendering and the `Region` filter
+/// leaf. [`resolve`](SovSystemDirectory::resolve) is a synchronous read of
+/// the killfeed's systems cache (`config/systems.json`);
+/// [`ensure_resolved`](SovSystemDirectory::ensure_resolved) is the
+/// ticket-19 ESI fallback that warms that cache for a system which has
+/// never appeared in a processed killmail, so a sov alert for it carries a
+/// real name and region instead of "Unknown Region".
+#[async_trait]
 pub trait SovSystemDirectory: Send + Sync {
+    /// Cache-only lookup: `Some` iff the system is already in the shared
+    /// systems cache. Cheap and non-blocking; used in the synchronous
+    /// `region_of` closure and immediately before each render.
     fn resolve(&self, solar_system_id: i64) -> Option<SovSystemInfo>;
+
+    /// Resolve a system that [`resolve`](SovSystemDirectory::resolve)
+    /// misses through ESI and write it into the shared systems cache, so a
+    /// subsequent `resolve` (and every `region_of`) sees it this same
+    /// cycle. The default performs no ESI call -- it returns whatever
+    /// `resolve` already knows -- preserving every directory that predates
+    /// ticket 19. The production `DiscordSovSystemDirectory` overrides it
+    /// to fetch name/constellation/region through the killfeed's
+    /// `EsiClient::get_system`, which persists to `config/systems.json`.
+    async fn ensure_resolved(&self, solar_system_id: i64) -> Option<SovSystemInfo> {
+        self.resolve(solar_system_id)
+    }
 }
 
 /// Alliance/corporation ticker and faction name lookup, with an ESI
@@ -420,6 +452,14 @@ impl SovCollector {
 
     pub fn with_clock(mut self, clock: Arc<dyn SovClock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Overrides the system directory after construction (ticket 19 tests),
+    /// so a test can inject an ESI-backed resolving directory in place of
+    /// the default cache-only one.
+    pub fn with_directory(mut self, directory: Arc<dyn SovSystemDirectory>) -> Self {
+        self.directory = directory;
         self
     }
 
@@ -782,6 +822,24 @@ impl SovCollector {
         // subscription list, and it is small (one row per channel
         // subscription).
         let subscriptions = self.subscriptions_with_watchlist_resolved().await?;
+        // Ticket 19: warm the systems cache for every open campaign's system
+        // before evaluating filters or rendering, so the synchronous
+        // `region_of` closure below matches `Region` leaves for systems that
+        // have never appeared in a killmail, and each render finds a real
+        // name/region. Bounded per cycle; unresolved systems hold. Skipped
+        // entirely when nothing needs the campaign passes.
+        if !campaigns.is_empty() {
+            let system_ids: Vec<i64> = campaigns
+                .iter()
+                .map(|campaign| campaign.solar_system_id)
+                .collect();
+            self.warm_system_cache(system_ids).await;
+        }
+        // Ticket 19: campaign ids whose alert was held this cycle because
+        // the system could not be resolved, so the hold is logged at most
+        // once per campaign per cycle rather than once per matching
+        // subscription.
+        let mut held_campaigns: HashSet<i64> = HashSet::new();
         let region_of =
             |system_id: i64| self.directory.resolve(system_id).map(|info| info.region_id);
         if !campaigns.is_empty() {
@@ -880,9 +938,33 @@ impl SovCollector {
                             {
                                 continue;
                             }
+                            // Ticket 19: hold the mark when the system is
+                            // still unresolved (warm above could not reach
+                            // it: cap, ESI error, or limiter pause). The
+                            // delivery row is not prepared this cycle, so the
+                            // mark stays "due" and re-evaluates next cycle;
+                            // its `SovAlertStage::TMinus(minutes)` dedup key
+                            // is unchanged, so it posts exactly once, late,
+                            // whenever the system resolves -- provided the
+                            // campaign has not yet started (this whole
+                            // T-minus block only runs for `start_time > now`,
+                            // so a mark still held when the campaign starts is
+                            // dropped, matching the existing "no T-minus after
+                            // start" rule rather than posting a stale mark).
+                            let Some(system) = self.directory.resolve(campaign.solar_system_id)
+                            else {
+                                if held_campaigns.insert(campaign.campaign_id) {
+                                    warn!(
+                                        "sov campaign {}: holding alert; system {} not yet resolved (ESI miss/limiter); retrying next cycle",
+                                        campaign.campaign_id, campaign.solar_system_id
+                                    );
+                                }
+                                continue;
+                            };
                             let message = self
                                 .render_stage_message(
                                     campaign,
+                                    &system,
                                     stage,
                                     subscription.filter.root.allows_frigate_holes_anywhere(),
                                 )
@@ -981,9 +1063,27 @@ impl SovCollector {
                         {
                             false
                         } else {
+                            // Ticket 19: hold the announcement when the
+                            // system is still unresolved -- skip preparing
+                            // and marking announced so `pending_announcement`
+                            // stays true and this transition (its
+                            // `Reachable(transition_sequence)` dedup key
+                            // unchanged) re-attempts next pass, posting
+                            // exactly once when the system resolves.
+                            let Some(system) = self.directory.resolve(campaign.solar_system_id)
+                            else {
+                                if held_campaigns.insert(campaign.campaign_id) {
+                                    warn!(
+                                        "sov campaign {}: holding alert; system {} not yet resolved (ESI miss/limiter); retrying next cycle",
+                                        campaign.campaign_id, campaign.solar_system_id
+                                    );
+                                }
+                                continue;
+                            };
                             let message = self
                                 .render_stage_message(
                                     campaign,
+                                    &system,
                                     stage,
                                     subscription.filter.root.allows_frigate_holes_anywhere(),
                                 )
@@ -1048,6 +1148,20 @@ impl SovCollector {
         } else {
             Vec::new()
         };
+        // Ticket 19: warm the systems cache for hub systems too, so
+        // `matches_structure`'s `Region`/`System` leaves and the hub embed
+        // resolve a real name/region for a hub in a never-seen system.
+        // Bounded per cycle; unresolved hubs hold.
+        if !structures.is_empty() {
+            let system_ids: Vec<i64> = structures
+                .iter()
+                .map(|structure| structure.solar_system_id)
+                .collect();
+            self.warm_system_cache(system_ids).await;
+        }
+        // Ticket 19: hub structure ids whose alert was held this cycle,
+        // logged at most once per structure per cycle.
+        let mut held_structures: HashSet<i64> = HashSet::new();
         if !structures.is_empty() {
             for structure in &structures {
                 for subscription in &subscriptions {
@@ -1122,8 +1236,24 @@ impl SovCollector {
                     {
                         false
                     } else {
+                        // Ticket 19: hold the announcement when the hub's
+                        // system is still unresolved -- skip preparing and
+                        // marking announced so `pending_announcement` stays
+                        // true and this transition
+                        // (`TzWindowEntered(transition_sequence)` dedup key
+                        // unchanged) re-attempts and posts exactly once when
+                        // the system resolves.
+                        let Some(system) = self.directory.resolve(structure.solar_system_id) else {
+                            if held_structures.insert(structure.structure_id) {
+                                warn!(
+                                    "sov hub {}: holding alert; system {} not yet resolved (ESI miss/limiter); retrying next cycle",
+                                    structure.structure_id, structure.solar_system_id
+                                );
+                            }
+                            continue;
+                        };
                         let message = self
-                            .render_tz_window_message(structure, window, stage)
+                            .render_tz_window_message(structure, &system, window, stage)
                             .await;
                         self.store
                             .prepare_delivery(
@@ -1215,6 +1345,18 @@ impl SovCollector {
         let mut alerts_prepared = 0usize;
         if !alert_candidates.is_empty() {
             let subscriptions = self.subscriptions_with_watchlist_resolved().await?;
+            // Ticket 19: warm the systems cache for every candidate's system
+            // before matching, so a `Region` leaf matches a never-seen
+            // system and each `appeared` render finds a real name/region.
+            // Bounded per cycle; unresolved systems hold and re-alert next
+            // cycle (the `Appeared` dedup key is unchanged, so no double
+            // post).
+            let system_ids: Vec<i64> = alert_candidates
+                .iter()
+                .map(|campaign| campaign.solar_system_id)
+                .collect();
+            self.warm_system_cache(system_ids).await;
+            let mut held_campaigns: HashSet<i64> = HashSet::new();
             let region_of =
                 |system_id: i64| self.directory.resolve(system_id).map(|info| info.region_id);
             let reachable_jumps = |system_id: i64, allow_frigate_holes: bool| {
@@ -1249,9 +1391,24 @@ impl SovCollector {
                         {
                             continue;
                         }
+                        // Ticket 19: hold the `appeared` alert when the
+                        // system is still unresolved. The delivery row is not
+                        // prepared, so the campaign re-matches next cycle
+                        // (still inside its twelve-hour window) and posts
+                        // exactly once when the system resolves.
+                        let Some(system) = self.directory.resolve(campaign.solar_system_id) else {
+                            if held_campaigns.insert(campaign.campaign_id) {
+                                warn!(
+                                    "sov campaign {}: holding alert; system {} not yet resolved (ESI miss/limiter); retrying next cycle",
+                                    campaign.campaign_id, campaign.solar_system_id
+                                );
+                            }
+                            continue;
+                        };
                         let message = self
                             .render_stage_message(
                                 campaign,
+                                &system,
                                 SovAlertStage::Appeared,
                                 subscription.filter.root.allows_frigate_holes_anywhere(),
                             )
@@ -1285,27 +1442,80 @@ impl SovCollector {
         })
     }
 
+    /// Ticket 19: warms the shared systems cache for every system id in
+    /// `system_ids` that is not already cached, so the synchronous
+    /// `region_of` closure and each render see a real name/region for a
+    /// system that has never appeared in a processed killmail. Deduplicated
+    /// and bounded to [`SOV_SYSTEM_LOOKUPS_PER_CYCLE`] cache *misses* per
+    /// cycle; already-cached systems are skipped for free, so steady state
+    /// costs nothing. A system left unresolved (cap reached, ESI error, or
+    /// limiter pause) holds and retries next cycle.
+    ///
+    /// Limiter discipline: the production directory's `ensure_resolved` is
+    /// backed by the killfeed's `EsiClient::get_system`, which does *not*
+    /// go through the shared `EsiLimiterStore` -- `src/esi.rs`'s `fetch`
+    /// discards the response headers, so there is no cache/limiter metadata
+    /// to record for these calls. The minimal correct discipline is
+    /// therefore to read the shared sovereignty limiter deadline before
+    /// spending any budget and skip resolution entirely while that bucket
+    /// is paused (below), and to bound the lookups per cycle (the cap
+    /// above). Per-response header recording is intentionally omitted
+    /// because the killfeed client does not expose it, and rewriting that
+    /// client is out of scope for this ticket.
+    async fn warm_system_cache<I>(&self, system_ids: I)
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        // Respect the shared limiter: if the sovereignty bucket is paused,
+        // spend no budget this cycle. On a limiter read error, be
+        // conservative and skip warming too -- unresolved systems simply
+        // hold.
+        if !matches!(self.limiter.active_esi_limiter_deadline().await, Ok(None)) {
+            return;
+        }
+        let mut budget = SOV_SYSTEM_LOOKUPS_PER_CYCLE;
+        let mut attempted: HashSet<i64> = HashSet::new();
+        for system_id in system_ids {
+            if budget == 0 {
+                break;
+            }
+            if !attempted.insert(system_id) {
+                continue;
+            }
+            // Cache hits are free -- only genuine misses spend budget, so a
+            // cycle whose candidate list is mostly already-cached systems
+            // still has budget left to resolve the few fresh ones (and a
+            // never-resolving system does not starve a later fresh one on
+            // the next cycle).
+            if self.directory.resolve(system_id).is_some() {
+                continue;
+            }
+            budget -= 1;
+            let _ = self.directory.ensure_resolved(system_id).await;
+        }
+    }
+
     /// Renders one campaign's notification for the given stage. Assembled
     /// once and stored verbatim (spec, `SovNotificationMessage` doc
     /// comment) so a restart replays identical content; the footer is the
     /// only part that varies by stage (spec "Embed": "Footer names the
     /// stage"; e.g. `Appeared` or `T-120m`), so this single builder is
     /// reused for every stage rather than duplicated per stage.
+    ///
+    /// Ticket 19: the resolved `system` is passed in rather than looked up
+    /// here, so an unresolved system is structurally unrenderable -- the
+    /// caller must hold the alert (skip preparing the delivery this cycle)
+    /// when the system cannot be resolved, and this builder can never emit
+    /// a bare system id or "Unknown Region".
     async fn render_stage_message(
         &self,
         campaign: &SovCampaign,
+        system: &SovSystemInfo,
         stage: SovAlertStage,
         allow_frigate_holes: bool,
     ) -> SovNotificationMessage {
-        let system_info = self.directory.resolve(campaign.solar_system_id);
-        let (system_name, region_name) = system_info
-            .map(|info| (info.name, info.region_name))
-            .unwrap_or_else(|| {
-                (
-                    campaign.solar_system_id.to_string(),
-                    "Unknown Region".to_string(),
-                )
-            });
+        let system_name = system.name.clone();
+        let region_name = system.region_name.clone();
         let defender_ticker = match campaign.defender_id {
             Some(alliance_id) => self
                 .tickers
@@ -1419,21 +1629,20 @@ impl SovCollector {
     /// from the sovereignty map, and zKillboard/Dotlan links. Footer:
     /// `"vuln window entered <window>"` (the subscription's own window,
     /// not the hub's vulnerability window).
+    ///
+    /// Ticket 19: like [`render_stage_message`](SovCollector::render_stage_message),
+    /// the resolved `system` is passed in, so an unresolved hub system is
+    /// structurally unrenderable and the caller holds the alert rather than
+    /// emitting a bare system id or "Unknown Region".
     async fn render_tz_window_message(
         &self,
         structure: &SovStructure,
+        system: &SovSystemInfo,
         window: crate::sov_feed::model::TzWindow,
         stage: SovAlertStage,
     ) -> SovNotificationMessage {
-        let system_info = self.directory.resolve(structure.solar_system_id);
-        let (system_name, region_name) = system_info
-            .map(|info| (info.name, info.region_name))
-            .unwrap_or_else(|| {
-                (
-                    structure.solar_system_id.to_string(),
-                    "Unknown Region".to_string(),
-                )
-            });
+        let system_name = system.name.clone();
+        let region_name = system.region_name.clone();
         let hub_owner_ticker = match structure.alliance_id {
             Some(alliance_id) => self
                 .tickers
