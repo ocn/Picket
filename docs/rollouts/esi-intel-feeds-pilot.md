@@ -128,3 +128,12 @@ _The wizard appends dated entries below this line._
 ### 2026-09-04T23:43Z — Redeploy for ticket 19 (resolve system/region before posting)
 - Ticket 19 (`5cc9fc3`): sov alerts now resolve the campaign's system through ESI (bounded, limiter-gated) and are held rather than rendered with "Unknown Region"; the renderers require a resolved system. Image rebuilt; `discordbot` recreated (swap ~4 s; watchdog unchanged). Start-up lines present; killfeed resumed from its checkpoint; feed health keys healthy on the first cycle; duplicate-delivery queries empty for both feeds after the restart; no prepared rows outstanding.
 - **Result:** PASS
+- [limiter] sampled_at=2026-09-06 18:08:09.851161+00 group=sovereignty remaining=582 used=1 error_remain=100 error_reset=58 pause_until=2026-08-21 18:56:00.758394+00 pacing=f
+
+### 2026-09-06T18:08Z — Step 7 · Gate G3, day 2 (restart check)
+- Restart used: the operator's own `discordbot` restart at 2026-09-05T17:11:54.632431876Z (container up since then; both feeds' start-up lines were verified after the Sep 4 deploys and the feed health keys are healthy now).
+- Duplicate-delivery query: watchlist 0, sov 0 (expected 0/0). Prepared rows outstanding: watchlist/sov 0|0 (expected 0|0). Delivery totals: 8 watchlist / 0 sov (no new events since day 0; `#corp-watch` carries the eight historical samples).
+- Watchlist state: Brotherhood of Spacers 36 corps; Legion of xXDEATHXx 34 corps; Minmatar Fleet Alliance 9 corps; Shadow Cartel 28 corps; Snuffed Out 17 corps; 250 snapshots, oldest 2026-09-04 18:17:19.885989+00.
+- Limiter now: sovereignty 582/600/15m err_remain=100 pause_until=2026-08-21 18:56:00.758394+00 pacing=false. Hourly cron sample was not installed by the operator; samples are taken at each check instead (this is the second).
+- Sov ESI returned 504 three times around 11:00Z today; the collector paused and recovered (sov_esi_progress healthy).
+- **Result:** PASS
