@@ -17,10 +17,15 @@ A picket is the ship you leave on a gate to call what comes through. That's the 
 
 Picket is built and run by an EVE Online Partner. If it earns a place in your server, use creator code DRAC at eveonline.com/checkout.
 
-<p float="left">
-  <img src="https://i.imgur.com/gTIwRwx.png"  style="width: 49%; max-width: 500px;" />
-  <img src="https://i.imgur.com/xFL3aoh.png"  style="width: 49%; max-width: 500px;" /> 
-</p>
+| Loss (structure Subscription, victim side) | Kill (ship group Subscription, attacker side) |
+| --- | --- |
+| ![A Keepstar loss embed](docs/screenshots/01-killfeed-loss-structure.png) | ![Dreadnoughts killing a Phoenix](docs/screenshots/02-killfeed-kill-dreads.png) |
+
+| Radar ping (light-year range, @here) | Type-Tracked Ship (title names the hull) |
+| --- | --- |
+| ![A radar ping with @here](docs/screenshots/03-killfeed-radar-ping.png) | ![A type-tracked Thanatos kill](docs/screenshots/04-killfeed-type-tracked.png) |
+
+The screenshots are rendered from the bot's real message payloads (see `scripts/render-screenshots.mjs`), so they match what the bot sends; the Discord chrome around them is a faithful web component, not the client itself.
 
 ---
 
