@@ -1808,15 +1808,22 @@ pub(crate) fn configure_killmail_notification_message(
     embed: CreateEmbed,
     ping_summary: &str,
 ) {
-    // Only pinging alerts carry `content`. When present, lead with the ping
-    // token and append the neutralized summary so the phone banner states what
-    // was killed and where while only the intended ping token parses. Non-ping
-    // alerts leave `content` absent, exactly as before.
-    if let Some(ping_token) = notification.content {
-        builder.content(format!(
-            "{ping_token} {}",
-            neutralize_summary_mentions(ping_summary)
-        ));
+    // Every alert carries the summary as `content` so desktop/native
+    // notifications — which surface message text and do not render embed
+    // content — state what was killed and where. A pinging alert leads with the
+    // ping token and keeps its mention parsing; a non-pinging alert carries the
+    // summary alone with mentions suppressed, so it shows text without buzzing.
+    // Stray mention tokens in the summary are neutralized so only the intended
+    // ping (if any) parses.
+    let summary = neutralize_summary_mentions(ping_summary);
+    let content = match (notification.content, summary.is_empty()) {
+        (Some(ping_token), true) => ping_token,
+        (Some(ping_token), false) => format!("{ping_token} {summary}"),
+        (None, true) => String::new(),
+        (None, false) => summary,
+    };
+    if !content.is_empty() {
+        builder.content(content);
     }
     builder
         .allowed_mentions(|mentions| {
@@ -3310,9 +3317,10 @@ mod tests {
     }
 
     #[test]
-    fn non_pinging_killmail_ignores_summary_and_sets_no_content() {
-        // A non-pinging alert must set no `content` even when a summary is
-        // available, so behavior is unchanged where no ping was requested.
+    fn non_pinging_killmail_carries_summary_content_without_pinging() {
+        // A non-pinging alert carries the summary as `content` so desktop/native
+        // notifications (which read message text, not the embed) are useful, but
+        // mentions stay suppressed so it never buzzes.
         let notification = PreparedKillmailNotification {
             content: None,
             allowed_mentions: KillmailAllowedMentions::None,
@@ -3326,7 +3334,38 @@ mod tests {
             ping_summary,
         );
 
-        assert!(builder.0.get("content").is_none());
+        assert_eq!(builder.0["content"].as_str(), Some(ping_summary));
+        assert_eq!(
+            builder.0["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn non_pinging_killmail_neutralizes_injected_mentions_in_summary() {
+        // Even without a ping, a crafted summary must not introduce a parseable
+        // mention: the `@` sigils are neutralized and mentions stay empty.
+        let notification = PreparedKillmailNotification {
+            content: None,
+            allowed_mentions: KillmailAllowedMentions::None,
+        };
+        let ping_summary = "@everyone `Nyx` died in Jita (The Forge) <@&123456>";
+        let mut builder = CreateMessage::default();
+        configure_killmail_notification_message(
+            &mut builder,
+            notification,
+            CreateEmbed::default(),
+            ping_summary,
+        );
+
+        let content = builder.0["content"].as_str().unwrap();
+        assert!(!content.contains("@everyone"), "content: {content:?}");
+        assert!(
+            content
+                .match_indices('@')
+                .all(|(idx, _)| content[idx + 1..].starts_with('\u{200b}')),
+            "every mention sigil must be escaped: {content:?}"
+        );
         assert_eq!(
             builder.0["allowed_mentions"]["parse"],
             serde_json::json!([])
