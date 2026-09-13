@@ -17,6 +17,8 @@ A picket is the ship you leave on a gate to call what comes through. That's the 
 
 Picket is built and run by an EVE Online Partner. If it earns a place in your server, use creator code DRAC at eveonline.com/checkout.
 
+<p align="center"><img alt="EVE Online Partner" src="docs/brand/eve-online-partner.png" height="120"></p>
+
 | Loss (structure Subscription, victim side) | Kill (ship group Subscription, attacker side) |
 | --- | --- |
 | ![A Keepstar loss embed](docs/screenshots/01-killfeed-loss-structure.png) | ![Dreadnoughts killing a Phoenix](docs/screenshots/02-killfeed-kill-dreads.png) |
