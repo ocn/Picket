@@ -14,3 +14,8 @@ config-old/
 
 # Generated SDE stargate graph used by the sov timer feed (see README: Refreshing the stargate graph)
 !config/stargates.json
+/backups/
+
+# Local issue tracker and deployment rollout records: kept out of the public repo
+.scratch/
+docs/rollouts/
