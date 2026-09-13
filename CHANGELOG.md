@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Rename the project to Picket. Documentation and the repository change now;
+  the crate, binaries, Docker image, and container names follow at the next
+  planned deployment.
+
 ### Added
 
 - Support named Discord role pings for killmail subscriptions with explicit

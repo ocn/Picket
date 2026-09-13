@@ -1,3 +1,5 @@
+> This is the V2 announcement from before the project was renamed to Picket. It is kept as a record; the current description lives in the README.
+
 # Announcing zk-activity V2: The EVE Online Killmail Bot, Reborn in Rust!
 
 Hello everyone,

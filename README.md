@@ -1,17 +1,21 @@
-# zk-activity
+# Picket
+
+Picket: EVE Online intel feeds for Discord.
 
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 <img alt="Github License" src="https://img.shields.io/github/license/ocn/zk-activity" />
 <img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ocn/zk-activity" />
 <img alt="GitHub Commit Activity (Month)" src="https://img.shields.io/github/commit-activity/m/ocn/zk-activity" />
 
-<div style="display: flex; justify-content: center;">
-  <img src="https://i.imgur.com/QmHC1Yx.png"  style="height: 100%; max-height: 150px;" /> 
-</div>
+<img alt="Picket: a small ship holding beside a stargate, wood-engraving style" src="docs/brand/banner.jpg" width="100%" />
 
-**zk-activity** is a Discord bot, written in Rust, that brings EVE Online killmails from zkillboard.com into your Discord channels. It provides a powerful and flexible filtering system to ensure you only see the activity that matters to you.
+Picket watches zKillboard killmails, ESI sov campaigns, public contracts, and corp or alliance rosters, and posts only what a channel's filters ask for.
 
-The bot operates by subscribing to a data feed from zkillboard.com and processes incoming killmails against a set of rules you define. This allows for precise monitoring of specific regions, alliances, ship classes, or even fleet compositions.
+The setup that gets used most: @here when a dread, carrier, FAX, or Rorqual lands on a killmail within a few light-years of your staging, @everyone when it's a super or titan, anyone you've set blue skipped, and no ping at all once the kill is more than five minutes old.
+
+A picket is the ship you leave on a gate to call what comes through. That's the whole idea here. You say what counts as worth calling, per channel, and the bot holds the gate.
+
+Picket is built and run by an EVE Online Partner. If it earns a place in your server, use creator code DRAC at eveonline.com/checkout.
 
 <p float="left">
   <img src="https://i.imgur.com/gTIwRwx.png"  style="width: 49%; max-width: 500px;" />
@@ -40,7 +44,7 @@ The primary way to use the bot is by inviting it to your Discord server and usin
 ### 1. Invite the Bot
 Use the following link to add the bot to your server. The owner of the bot will need to replace `YOUR_CLIENT_ID` with their bot's actual client ID.
 
-[**Invite zk-activity Bot**](https://discordapp.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=149504&scope=bot) 
+[**Invite Picket**](https://discordapp.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=149504&scope=bot) 
 
 ### 2. Create a Subscription
 In the channel where you want to receive killmails, use the `/subscribe` command. This command allows you to combine multiple filter options to create a specific alert. All specified filters are combined with an "AND" logic—the killmail must match **all** of them to be posted.
@@ -352,10 +356,12 @@ DISCORD_CLIENT_ID=your_discord_client_id
 
 ## Contact
 
-This bot is a derivative of [hazardous-killbot](https://github.com/SvenBrnn/hazardous-killbot).
+Picket is a derivative of [hazardous-killbot](https://github.com/SvenBrnn/hazardous-killbot).
 
 For any inquiries, please contact the developer at [this public email address](mailto:wands.larch.0y@icloud.com?subject=[GitHub]).
 
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE.md](LICENSE.md) file for details.
+
+"EVE", "EVE Online", "CCP", and all related logos and images are trademarks or registered trademarks of CCP hf. Picket is a third-party tool and is not endorsed by CCP.
