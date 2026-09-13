@@ -1,19 +1,27 @@
 Privacy Policy
 ===
 
-The use of this application ("Bot") in a server requires the collection of some specific user data ("Data"). The Data collected includes, but is not limited to Discord server and channel ID values. Use of the Bot is considered an agreement to the terms of this Policy.
+Using Picket ("the Bot") in a server requires collecting some data ("Data"). Using the Bot is considered agreement to this policy.
+
+What is collected
+---
+
+- Discord server, channel, role, and user IDs needed to deliver subscriptions and pings.
+- The subscription filters you configure.
+- If you use `/sync_standings`: the EVE Online SSO access and refresh tokens for the character you authorise, and the corporation and alliance contact lists read with them. These are used only to evaluate standings filters. `/sync_remove` and `/sync_clear` delete them.
+- Public EVE Online data the Bot observes to run its feeds (killmails, sovereignty campaigns, public contracts, corporation and alliance membership counts, wars). This data is public and is not about you.
 
 Access to Data
 ---
 
-Access to Data is only permitted to Bot's developer, and only in the scope required for the development, testing, and implementation of features for Bot. Data is not sold, provided to, or shared with any third party, except where required by law or a Terms of Service agreement. You can view the data upon request from @svenbrnn.
+Only the Bot's operator can access Data, and only as far as needed to run, test, and develop the Bot. Data is not sold, provided to, or shared with any third party, except where required by law. You can ask to see the Data held for your server or account by contacting the operator.
 
 Storage of Data
 ---
 
-Data is stored in JSON-config files. The files are secured to prevent external access, however no guarantee is provided and the Bot owners assume no liability for the unintentional or malicious breach of Data.
+Data is stored in configuration files and a database on the operator's server. They are secured against external access, but no guarantee is given, and the operator assumes no liability for unintentional or malicious breach of Data.
 
 Questions
 ---
 
-If you have any questions or are concerned about what data might be being stored from your account contact @svenbrnn. For more information check the [Discord Terms Of Service](https://discord.com/terms).
+Picket is operated by ocn. Contact [wands.larch.0y@icloud.com](mailto:wands.larch.0y@icloud.com?subject=[Picket]) with any question about what is stored. For more information see the [Discord Terms of Service](https://discord.com/terms).

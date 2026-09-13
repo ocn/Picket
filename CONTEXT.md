@@ -2,6 +2,24 @@
 
 This context describes the bot's observation and reporting of publicly visible EVE Online item-exchange contracts across all configured regions. One operator-managed character authorization may resolve accessible player structures, but the system does not request private character or corporation contract history.
 
+## Product language
+
+**Feed**:
+A kind of EVE Online event the bot can watch and deliver to Discord, such as the Killfeed, the Contract Feed, the Sov Timer Feed, or the Watchlist Feed.
+_Avoid_: Stream, tracker, module, monitor
+
+**Subscription**:
+One filter paired with one action, bound to one Discord channel within a Feed.
+_Avoid_: Alert, rule, feed (for a single binding)
+
+**Radar**:
+A Subscription whose filter is bounded by a light-year range from one or more solar systems. A Radar is a shape of Subscription, not a Feed and not the product.
+_Avoid_: Proximity feed, range alert, activity radar (as a Feed name)
+
+**Intel**:
+The user-facing word for what Feeds deliver. "Intelligence" remains only in the formal context name Contract Intelligence.
+_Avoid_ (in user-facing copy): Intelligence, monitoring, tracking
+
 ## Language
 
 **Global Public Contract Intelligence**:

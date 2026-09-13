@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**zk-activity** (`killbot-rust`) is a Rust Discord bot that streams EVE Online killmails from zkillboard RedisQ to Discord channels using configurable subscription filters.
+**Picket** (crate `killbot-rust` until the next deployment) is a Rust Discord bot that delivers EVE Online intel feeds to Discord channels: zKillboard killmails, ESI sov campaigns, public contracts, and corporation or alliance watchlists, each filtered per channel by subscriptions.
 
 At runtime, the bot:
 1. Long-polls RedisQ for a killmail envelope.
