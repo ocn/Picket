@@ -152,4 +152,5 @@ README screenshots are renders of the bot's real payloads, not client captures: 
 | GitHub repo description and topics | description above; topics `eve-online`, `discord-bot`, `esi`, `zkillboard`, `rust` |
 | Discord application | name Picket, avatar from deliverable 2, About = tagline + repo link |
 | Forum thread (Third-Party Developers) | title = tagline, body = README intro |
+| Partner badge | `docs/brand/eve-online-partner.png` under the partner line in the README. It is CCP's asset, unmodified; the repo copy only bakes in the ink background because the original is white-on-transparent and vanishes on GitHub's light theme. The transparent original sits beside it. Always paired with the creator-code sentence, never used as Picket's own mark. |
 | Embeds | unchanged; state colours only |
