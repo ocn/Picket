@@ -18,6 +18,8 @@ pub mod models;
 pub mod pipeline;
 pub mod presentation;
 pub mod processor;
+#[cfg(test)]
+mod screenshot_payloads;
 pub mod sov_feed;
 pub mod structure_resolver;
 pub mod watchlist_feed;

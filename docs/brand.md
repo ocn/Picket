@@ -140,6 +140,10 @@ colour, gradient, glow, bloom, 3D render, photorealistic, digital painting, smoo
 
 Still owed: a hand-simplified mark that reads at 32 px, and a transparent-background mark. The current `mark.png` is a crop of the plate and goes muddy below about 64 px.
 
+## Screenshots
+
+README screenshots are renders of the bot's real payloads, not client captures: `cargo test --lib screenshot_payloads -- --ignored` dumps the JSON, `scripts/render-screenshots.mjs` draws it with Discord-styled web components in headless Chrome. Keep them under `docs/screenshots/`, 2x scale, 680 px wide viewport, dark theme, and re-run both steps whenever an embed changes. State colours (green kill, red loss, orange contract) are the bot's own and must never be recoloured.
+
 ## Where the brand shows up
 
 | Surface | Uses |
