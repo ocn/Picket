@@ -3,9 +3,9 @@
 Picket: EVE Online intel feeds for Discord.
 
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
-<img alt="Github License" src="https://img.shields.io/github/license/ocn/zk-activity" />
-<img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ocn/zk-activity" />
-<img alt="GitHub Commit Activity (Month)" src="https://img.shields.io/github/commit-activity/m/ocn/zk-activity" />
+<img alt="Github License" src="https://img.shields.io/github/license/ocn/Picket" />
+<img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ocn/Picket" />
+<img alt="GitHub Commit Activity (Month)" src="https://img.shields.io/github/commit-activity/m/ocn/Picket" />
 
 <img alt="Picket: a small ship holding beside a stargate, wood-engraving style" src="docs/brand/banner.jpg" width="100%" />
 
