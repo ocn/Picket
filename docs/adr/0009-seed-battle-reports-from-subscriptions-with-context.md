@@ -1,0 +1,3 @@
+# Seed battle reports from subscriptions while retaining contextual evidence
+
+Existing killmail subscriptions will opt into battle discovery with an explicit priority designation independent of Discord mention policy, preserving their filter semantics and consuming internal matches independently of message delivery. Once a match seeds a report, observed killmails within its stated membership can contribute labeled context even when they fail those source filters, because a filtered discovery feed can otherwise omit relevant battle losses. Preserve match provenance and inclusion reasons, and keep contextual inclusion separate from eligibility to issue a new discovery alert.

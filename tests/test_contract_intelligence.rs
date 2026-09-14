@@ -2935,7 +2935,7 @@ async fn deferred_listing_keeps_observation_time_structure_after_failed_revalida
         .connect(&database.url)
         .await
         .expect("connect to seed durable deferred observation state");
-    sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,$4)")
+    sqlx::query("INSERT INTO contract_observed_embed_contexts (region_id, contract_id, context, observed_at) VALUES ($1,$2,$3,$4) ON CONFLICT (region_id, contract_id) DO UPDATE SET context = EXCLUDED.context, observed_at = EXCLUDED.observed_at")
         .bind(region_id)
         .bind(contract.contract_id)
         .bind(serde_json::to_value(snapshot).expect("serialize observation-time snapshot"))

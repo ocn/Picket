@@ -18,9 +18,20 @@ services:
       retries: 10
 
   discordbot:
+    entrypoint: ["/bin/sh", "-c", 'umask 077; exec "$$@"', "--"]
+    command: ["./killbot-rust"]
     container_name: discordbot
     image: ocn-killbot-rust:latest
     restart: always
+    user: "${KILLBOT_UID:-501}:${KILLBOT_GID:-20}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev
+    pids_limit: 512
     build:
       context: .
       dockerfile: ./Dockerfile
@@ -69,9 +80,19 @@ services:
       - ./config:/app/config:delegated
 
   health-watchdog:
+    entrypoint: ["/bin/sh", "-c", 'umask 077; exec "$$@"', "--"]
     container_name: killbot-health-watchdog
     image: ocn-killbot-rust:latest
     restart: unless-stopped
+    user: "${KILLBOT_UID:-501}:${KILLBOT_GID:-20}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev
+    pids_limit: 512
     build:
       context: .
       dockerfile: ./Dockerfile

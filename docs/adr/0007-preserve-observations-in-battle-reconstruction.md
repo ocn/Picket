@@ -1,0 +1,5 @@
+# Preserve observations in battle reconstruction
+
+The fleet-intelligence product will initially reconstruct observed loss positions and encounter timelines, with fleet continuity represented as an explicit inference based on recurring pilots, elapsed time and plausible travel; affiliation alone will not establish continuity. This prioritizes evidence users can inspect when deciding where to deploy over a continuous animation of unobserved ship motion, because killmails cannot uniquely recover that motion or a complete fleet roster. Individual encounter reports and roaming-session recaps will retain this distinction, allowing uncertain links to be reconsidered as reports arrive instead of treating inferred movements as historical facts.
+
+The user subsequently clarified that Encounters must remain separate: associations cannot implicitly merge fleet rosters, establish travel paths, or assert continuous presence. Comparisons and recap collections must expose their supporting observations and assumptions.
