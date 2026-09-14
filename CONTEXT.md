@@ -139,7 +139,7 @@ A subscription choice to ignore, post, or post-and-ping each supported contract 
 _Avoid_: Alert action, lifecycle action
 
 **Contract Address**:
-The raw `contract:0//<contract-id>` address that a user can paste into EVE to create an in-game contract link.
+The raw `contract:0//<contract-id>` address that a user can paste into EVE to create an in-game contract link. Opening the link in the game client shows the contract's full details, including its status and Acceptor, to any character regardless of party involvement.
 _Avoid_: Contract URL, Discord link
 
 **Observation History**:
@@ -184,6 +184,50 @@ _Avoid_: Line item
 The finishing attack recorded on a killmail and attributed to one attacker.
 _Avoid_: Final blow attacker, killer
 
+**After-Action Recap**:
+A generated visual summary of reported battle activity that helps readers catch up on a long chain of killfeed alerts. Its coverage is limited to the evidence included in the report.
+_Avoid_: Complete battle record
+
+**Encounter**:
+A grouping of reported combat events treated as one engagement. Its boundaries are derived from available evidence and may change as additional reports arrive.
+_Avoid_: Killmail, roaming session
+
+**Battle Report**:
+An evolving summary of the explicitly included killmails for one Encounter, with observed participants, losses, locations and timing. It remains separate from other reports even when comparisons show shared pilots.
+_Avoid_: Persistent fleet, complete fleet roster
+
+**Fleet Track**:
+An explicitly qualified association between separate Encounters, supported by recurring pilots, timing and plausible travel. It does not merge their rosters or establish continuous fleet presence; shared affiliation alone is insufficient.
+_Avoid_: Confirmed fleet roster, live fleet position
+
+**Roaming Session**:
+A collection of separate Encounters summarized together with the evidence for their association stated. It does not establish that one unchanged fleet traveled between the locations or remained assembled throughout.
+_Avoid_: Single battle, channel digest
+
+**Provisional Closure**:
+An Encounter or Roaming Session's transition to recap after a configured interval without newly evidenced activity while collection remains healthy. It remains revisable and does not establish that participating pilots departed.
+_Avoid_: Confirmed battle end, fleet departure
+
+**System Activity**:
+Reported movement and destruction counts for a solar system over a stated observation interval. These counts describe activity, not the number or identities of pilots currently present.
+_Avoid_: Live population, fleet count
+
+**Discovery Source**:
+An existing killmail subscription explicitly enabled to seed Battle Reports. Its filter retains its existing meaning; optional battle priority is independent of its Discord mention policy.
+_Avoid_: Discord message history, implicit priority feed
+
+**Contextual Killmail**:
+An observed killmail included under a Battle Report's stated membership rules even when it did not match a Discovery Source. Its inclusion adds report evidence without independently authorizing a discovery alert.
+_Avoid_: New discovery, complete battle coverage
+
+**Discovery Area**:
+The configurable set of systems eligible for automatic new-Battle-Report discovery. Geographic predicates may use security classes, regions, systems and light-year ranges; overlapping coverage counts once. Named deployment areas are configuration presets, not a fixed product boundary.
+_Avoid_: Source channel regions, universe-wide alerts
+
+**Ship Cache**:
+A stock of ships positioned for future fleet deployment or reshipping near an area of interest.
+_Avoid_: Active fleet
+
 ## Release and communication
 
 **Deployment**:
@@ -219,9 +263,93 @@ A recurring four-week checkpoint for drafting and publishing a release when the 
 _Avoid_: Release date
 
 **Changelog**:
-The human-authored factual source accumulated under Unreleased and converted into a versioned section for a GitHub Release.
+The agent-prepared, human-reviewed factual source of user-visible changes, accumulated under Unreleased and converted into a versioned section for a GitHub Release.
 _Avoid_: Git log, generated release notes
 
 **Operator**:
 The recipient configured to receive a health incident.
 _Avoid_: Guild Administrator
+
+**Guild Administrator**:
+The person who configures zk-activity for a Discord guild.
+_Avoid_: Operator
+
+**Public Interface**:
+The slash commands, configuration formats, and deployment requirements on which Guild Administrators rely.
+_Avoid_: Internal implementation
+
+**Release Candidate**:
+A proposed deployable version tied to one exact revision, with its GitHub Release draft and reviewed release material.
+_Avoid_: Published release, Deployment
+
+**Release Review**:
+The single human review of a Release Candidate's Changelog, GitHub Release draft, and Release Announcement Draft before the first public action.
+_Avoid_: Per-entry approval
+
+**Release Announcement Draft**:
+A non-public proposed Release Announcement prepared for every Release Candidate. It may remain unpublished.
+_Avoid_: Release Announcement
+
+**Skipped Release Window**:
+A Release Window without an eligible user-visible, human-reviewed Changelog entry. It is recorded outside the Changelog.
+_Avoid_: Empty release
+
+**Manual Rollback**:
+A human-authorized Deployment of an earlier verified production version after failed Production Verification. It never proceeds automatically.
+_Avoid_: Automatic rollback
+
+**Failed Release Candidate**:
+A Release Candidate whose Production Verification fails. Its public release and announcement remain unpublished while a human chooses Manual Rollback, a fix-forward Deployment, or cancellation.
+_Avoid_: Failed release
+
+**Release Verification**:
+The required successful build, test, Compose configuration, and production evidence for a Release Candidate. Credentialed ignored visual tests supplement this evidence but do not routinely block it.
+_Avoid_: Release Review
+
+**External EVE Post**:
+A human-approved message for a specifically selected EVE community, used only when a release offers prospective users a concrete reason to care.
+_Avoid_: Routine release announcement
+
+**Stable Public Interface**:
+The Public Interface declared at v1.0.0 and thereafter versioned for compatibility.
+_Avoid_: Internal implementation
+
+**Release Pilot**:
+The first successful Release Candidate after playbook approval. It publishes v1.0.0.
+_Avoid_: Test release
+
+**Cancelled Release Candidate**:
+A Failed Release Candidate that a human cancels. Its GitHub Release draft remains unpublished, its tag remains an abandoned record, and any correction uses a new patch version.
+_Avoid_: Reused release
+
+**Release Cadence Log**:
+The version-controlled record of every Release Window, stating its date, published version or skip, and reason.
+_Avoid_: Changelog
+
+## Feed diagnostics
+
+**Feed Diagnostic Snapshot**:
+A view of feed configuration, effective behavior, and timestamped operational evidence for a selected channel or server scope. Missing evidence remains explicit, and silence alone does not establish a cause.
+_Avoid_: Subscription Inventory, live feed state
+
+**Subscription Inventory**:
+The configuration portion of a Feed Diagnostic Snapshot, identifying the subscriptions and their configured rules and actions within its scope.
+_Avoid_: Feed Diagnostic Snapshot, runtime health
+
+**Subscription Platform Binding**:
+The association of a subscription instance and configuration revision with its platform, server, channel, and platform resource identity, used to reconcile configuration and diagnostic evidence.
+_Avoid_: Subscription name, Discord member
+
+## Local chat narrative language
+
+**Local Message History**:
+The retained, sanitized record of messages observed from live EVE Local chat logs, preserving in-game speakers, subjects, and available attribution evidence.
+_Avoid_: Observation History, Discord message history
+
+**Local Narrative**:
+A summary of who spoke about whom and what in Local, informed by timestamped observations of character arrivals and departures, Local count changes, and corporation and alliance composition changes when available. Reported claims remain distinct from observed events.
+_Avoid_: Verified intelligence, raw transcript
+
+**Downtime Session**:
+The downtime-to-downtime observation period over which Local conversation and presence changes are considered together.
+_Avoid_: Client login session, calendar day

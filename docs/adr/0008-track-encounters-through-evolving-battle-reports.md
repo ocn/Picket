@@ -1,0 +1,3 @@
+# Track encounters through evolving battle reports
+
+Each Encounter will have an evolving Battle Report built from the live killmail feed, with inclusion rules and revisions visible; separate encounters retain separate reports. Cross-report comparisons will expose participant overlap, locations and elapsed time without assigning an inferred fleet a persistence timer, because those observations cannot establish how long a group remained assembled. This replaces the proposed size-dependent fleet expiry model while retaining historical comparisons, five-minute alert freshness, provisional encounter recaps and corrections for late evidence; outside-region notification relevance requires its own explicit rule.

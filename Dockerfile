@@ -27,4 +27,6 @@ COPY --from=builder /app/killbot-rust /app/health_watchdog ./
 # No need to copy it here.
 
 # Set the command to run the application
+COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/killbot-entrypoint
+ENTRYPOINT ["/usr/local/bin/killbot-entrypoint"]
 CMD ["./killbot-rust"]
