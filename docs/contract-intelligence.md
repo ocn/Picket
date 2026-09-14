@@ -71,10 +71,10 @@ Create or replace a subscription in the target guild channel with `/contract_sub
 /contract_subscribe id:super-sales description:public super sales filter:{"root":{"and":[{"condition":{"event_kinds":["listed","sale_confirmed"]}},{"condition":{"item_types":{"direction":"offered","ids":[12345]}}}]}} event_actions:{"listed":"post","sale_confirmed":"post_and_ping"} ping_type:here
 ```
 
-For a proximity feed, pass the same compact `ly_ranges_json` shape as `/subscribe`. The supplied ranges are combined with the required `filter` root using `AND`; multiple centers are a union. This exact example matches contracts within 8.0 light-years of Turnur or Kurniainen:
+For a proximity feed, pass the same compact `ly_ranges_json` shape as `/subscribe`. The supplied ranges are combined with the required `filter` root using `AND`; multiple centers are a union. This exact example matches contracts within 8.0 light-years of your staging systems:
 
 ```text
-/contract_subscribe id:supercaps-near-turnur description:Supercapital contracts near Turnur or Kurniainen filter:{"root":{"or":[{"condition":{"ship_groups":{"direction":"offered","ids":[30,659]}}},{"condition":{"ship_groups":{"direction":"requested","ids":[30,659]}}}]}} event_actions:{"listed":"post","sale_confirmed":"post","purchase_confirmed":"post"} ly_ranges_json:[{"system_id":30002086,"range":8.0},{"system_id":30003089,"range":8.0}]
+/contract_subscribe id:supercaps-near-staging description:Supercapital contracts near staging filter:{"root":{"or":[{"condition":{"ship_groups":{"direction":"offered","ids":[30,659]}}},{"condition":{"ship_groups":{"direction":"requested","ids":[30,659]}}}]}} event_actions:{"listed":"post","sale_confirmed":"post","purchase_confirmed":"post"} ly_ranges_json:[{"system_id":YOUR_SYSTEM_ID,"range":8.0},{"system_id":YOUR_SECOND_SYSTEM_ID,"range":8.0}]
 ```
 
 `ly_ranges_json` must be a non-empty JSON array of positive system IDs and finite positive ranges. Contract proximity uses the ESI solar-system Cartesian position in metres and includes a distance exactly on the boundary. If an observation-time event position or a center position is unavailable after all non-location predicates match, the system emits one durable, non-pinging Proximity-Unverified Alert. Filter nodes are `condition`, `and`, `or`, and `not`. Conditions support event kinds, offered/requested item presence, item type, ship group, ISK bounds, region, solar system, light-year ranges, security range, location ID, issuer character/corporation, observed issuer alliance, issuance type, and title fragment. IDs must be positive. The maximum filter depth is 16 and the maximum node count is 128.
@@ -144,3 +144,71 @@ This release has no authenticated-contract feed, counterparty tracking, provisio
 - [Serenity HTTP rate limiter](https://docs.rs/serenity/0.11.7/serenity/http/struct.Ratelimiter.html)
 - [Docker Compose variable interpolation](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/)
 - [PostgreSQL connection strings](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING)
+
+## Slash command reference
+
+Contract subscriptions are PostgreSQL-backed and are separate from killmail subscriptions. Run these commands in the channel that should receive the contract feed.
+
+| Command | Required arguments | Optional arguments | Result |
+| --- | --- | --- | --- |
+| `/contract_subscribe` | `id`, `description`, `filter`, `event_actions` | `ly_ranges_json`, `ping_type` | Creates or replaces this channel's public-contract subscription with the same `id`. |
+| `/contract_unsubscribe` | `id` | None | Removes this channel's contract subscription with that `id`. |
+
+Both `/contract_subscribe` and `/contract_unsubscribe` require the Manage Server (`MANAGE_GUILD`) permission and cannot be used in DMs; server admins can loosen this per role under Server Settings → Integrations → the bot → Command permissions. The [sov and watchlist runbook](docs/sov-and-watchlist-feeds.md#permissions) collects the full gated-command list and the same loosening steps.
+
+`filter` is JSON with one `root` node. Nodes are `condition`, `and`, `or`, and `not`; the examples below use the deployed syntax. `event_actions` is JSON keyed by `listed`, `sale_confirmed`, `purchase_confirmed`, `expired`, and `closed_outcome_unknown`. Each value is `ignore`, `post`, or `post_and_ping`; omitted actions default to `ignore`.
+
+`ly_ranges_json` is a non-empty array of system ranges, such as `[{"system_id":YOUR_SYSTEM_ID,"range":8.0}]`. It is combined with `filter` using `AND`; multiple systems are alternatives. `ping_type:here` sends `@here` for every `post_and_ping` action in the subscription, while `ping_type:everyone` sends `@everyone`.
+
+### Category model
+
+The contract feed follows the same category model as the kill feeds: global feeds watch the configured class everywhere, and a light-year-bounded feed watches the configured class within range of your staging. It is an optional PostgreSQL-backed feed and does not migrate or replace the JSON-backed killmail configuration.
+
+### What contract feeds monitor
+
+These feeds do not show every contract listing. They monitor public `item_exchange` contracts whose offered or requested ship items match the configured ship groups, lifecycle action, and, where configured, location and light-year range. The source is the public [EVE Swagger Interface (ESI)](https://developers.eveonline.com/docs/services/esi/overview/).
+
+They do not monitor private personal, corporation, or alliance contracts, or contract types other than public item exchanges. The collector scans the 114 region IDs returned by ESI and does not exclude wormhole regions. Public ESI does not provide a counterparty for these records, so the feed does not infer or display one.
+
+The lifecycle actions are:
+
+| Action | Meaning |
+| --- | --- |
+| `listed` | A matching public contract was observed. |
+| `sale_confirmed` | Acceptance of an offered-item contract was confirmed with public ESI evidence. |
+| `purchase_confirmed` | Acceptance of a requested-item contract was confirmed with public ESI evidence. |
+| `expired` | The contract expired without confirmed acceptance evidence. |
+| `closed_outcome_unknown` | The contract is no longer public, but the collector could not confirm why it closed. |
+
+`sale_confirmed` and `purchase_confirmed` are not sent just because a listing disappears. The collector requires acceptance evidence. A `closed_outcome_unknown` post only says that the listing stopped being public.
+
+### Example configurations
+
+The following are the three active feeds. The JSON is the current deployed configuration, formatted for direct slash-command use.
+
+#### Global supercaps
+
+Posts all lifecycle actions for public titan and supercarrier contracts in every ESI region the collector scans. It does not ping.
+
+```text
+/contract_subscribe id:supercap-global description:Global public titan and supercarrier contracts filter:{"root":{"and":[{"condition":{"event_kinds":["listed","sale_confirmed","purchase_confirmed","expired","closed_outcome_unknown"]}},{"or":[{"condition":{"ship_groups":{"ids":[30,659],"direction":"offered"}}},{"condition":{"ship_groups":{"ids":[30,659],"direction":"requested"}}}]}]}} event_actions:{"listed":"post","sale_confirmed":"post","purchase_confirmed":"post","expired":"post","closed_outcome_unknown":"post"}
+```
+
+#### Global capitals
+
+Posts all lifecycle actions for public contracts containing the configured capital ship groups in every ESI region the collector scans. It does not ping.
+
+```text
+/contract_subscribe id:capital-global description:Global public capital contracts filter:{"root":{"and":[{"condition":{"event_kinds":["listed","sale_confirmed","purchase_confirmed","expired","closed_outcome_unknown"]}},{"or":[{"condition":{"ship_groups":{"ids":[4594,485,1538,547,883,902,513],"direction":"offered"}}},{"condition":{"ship_groups":{"ids":[4594,485,1538,547,883,902,513],"direction":"requested"}}}]}]}} event_actions:{"listed":"post","sale_confirmed":"post","purchase_confirmed":"post","expired":"post","closed_outcome_unknown":"post"}
+```
+
+#### Supercaps within 8 LY of staging
+
+Posts the same lifecycle actions for public titan and supercarrier contracts within 8 LY of one of two staging systems. Only confirmed sale and purchase actions ping `@here`.
+
+```text
+/contract_subscribe id:supercap-staging-8ly description:Public supercapital contracts within 8 ly of staging filter:{"root":{"and":[{"condition":{"event_kinds":["listed","sale_confirmed","purchase_confirmed","expired","closed_outcome_unknown"]}},{"or":[{"condition":{"ship_groups":{"ids":[30,659],"direction":"offered"}}},{"condition":{"ship_groups":{"ids":[30,659],"direction":"requested"}}}]}]}} event_actions:{"listed":"post","sale_confirmed":"post_and_ping","purchase_confirmed":"post_and_ping","expired":"post","closed_outcome_unknown":"post"} ly_ranges_json:[{"system_id":YOUR_SYSTEM_ID,"range":8.0},{"system_id":YOUR_SECOND_SYSTEM_ID,"range":8.0}] ping_type:here
+```
+
+Use `/contract_unsubscribe id:<id>` in that feed's channel to stop one of these feeds. See [the operator runbook](docs/contract-intelligence.md) for the complete filter grammar and operations details.
+
