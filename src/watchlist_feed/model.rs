@@ -11,6 +11,7 @@
 //! without a schema migration.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// The two kinds of entity a guild can watch (spec "Watchlist feed":
@@ -167,17 +168,32 @@ impl WatchlistEventKind {
 /// comma list cannot store an unbounded array.
 pub const WATCHLIST_EVENT_KINDS_MAX_COUNT: usize = 16;
 
+/// The default event kinds a subscription receives when `event_kinds` is
+/// omitted (ticket 20 "Wars opt-in"): the four membership-change kinds
+/// only. Wars are opt-in, selected explicitly by naming a war kind or by
+/// the `all` keyword. `#corp-watch` already carries only these kinds, so
+/// this default matches the deployed subscription.
+pub const WATCHLIST_DEFAULT_EVENT_KINDS: &[WatchlistEventKind] = &[
+    WatchlistEventKind::CorpJoined,
+    WatchlistEventKind::CorpLeft,
+    WatchlistEventKind::MemberDelta,
+    WatchlistEventKind::CorpChangedAlliance,
+];
+
 /// Parses the `/watch_subscribe event_kinds` command option: a
 /// comma-separated list of event-kind tokens. An empty (or all-whitespace)
-/// input parses to *every* known kind (spec: "default all"). Every listed
-/// token must be a recognized kind; unknown tokens are rejected here (at
-/// subscribe time the user is telling us exactly what they want, unlike the
-/// forward-compatible read path). Kinds are deduplicated preserving
+/// input parses to the four membership-change kinds only
+/// ([`WATCHLIST_DEFAULT_EVENT_KINDS`], ticket 20 "Wars opt-in"): wars are
+/// opt-in. The single keyword `all` (case-insensitive, alone or in the
+/// list) selects *every* known kind, including the war kinds. Every other
+/// listed token must be a recognized kind; unknown tokens are rejected here
+/// (at subscribe time the user is telling us exactly what they want, unlike
+/// the forward-compatible read path). Kinds are deduplicated preserving
 /// first-occurrence order.
 pub fn parse_event_kinds(raw: &str) -> Result<Vec<WatchlistEventKind>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(WATCHLIST_EVENT_KINDS.to_vec());
+        return Ok(WATCHLIST_DEFAULT_EVENT_KINDS.to_vec());
     }
     let mut seen = std::collections::HashSet::new();
     let mut kinds = Vec::new();
@@ -185,6 +201,9 @@ pub fn parse_event_kinds(raw: &str) -> Result<Vec<WatchlistEventKind>, String> {
         let token = part.trim();
         if token.is_empty() {
             continue;
+        }
+        if token.eq_ignore_ascii_case("all") {
+            return Ok(WATCHLIST_EVENT_KINDS.to_vec());
         }
         let kind = WatchlistEventKind::parse(token)
             .ok_or_else(|| format!("unknown watchlist event kind: '{token}'"))?;
@@ -198,7 +217,7 @@ pub fn parse_event_kinds(raw: &str) -> Result<Vec<WatchlistEventKind>, String> {
         }
     }
     if kinds.is_empty() {
-        return Ok(WATCHLIST_EVENT_KINDS.to_vec());
+        return Ok(WATCHLIST_DEFAULT_EVENT_KINDS.to_vec());
     }
     Ok(kinds)
 }
@@ -213,6 +232,10 @@ pub struct WatchlistSubscription {
     pub name: String,
     pub event_kinds: Vec<WatchlistEventKind>,
     pub role_id: Option<u64>,
+    /// Optional Discord user snowflake pinged in the message content beside
+    /// (or instead of) `role_id` (ticket 20). `/watch_subscribe` replaces a
+    /// subscription wholesale, so this is re-supplied on every re-subscribe.
+    pub ping_user_id: Option<u64>,
     pub options: serde_json::Value,
 }
 
@@ -237,10 +260,20 @@ impl WatchlistSubscription {
 /// (spec: "Resolve corporation names/tickers for the embed"). Cached into
 /// the killfeed tickers/names caches by the resolver so a later poll does
 /// not re-fetch.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct WatchlistCorporation {
     pub name: Option<String>,
     pub ticker: Option<String>,
+    /// Current member head count from `GET /corporations/{id}/`
+    /// (ticket 20 dense embed: "124 members"). `None` when the resolver
+    /// could not fetch the corporation's public info.
+    pub member_count: Option<i64>,
+    /// Founding date from `GET /corporations/{id}/` (ticket 20: "founded
+    /// 2015"); only the year is rendered.
+    pub date_founded: Option<DateTime<Utc>>,
+    /// The corporation's current alliance from `GET /corporations/{id}/`
+    /// (ticket 20 `corp_left`: "now in <alliance>" / "now unaffiliated").
+    pub alliance_id: Option<i64>,
 }
 
 /// One alliance's identity for embed rendering.
@@ -291,11 +324,40 @@ pub struct WatchlistEmbedField {
 /// A fully-rendered notification, assembled once at prepare time and stored
 /// verbatim (mirrors [`crate::sov_feed::SovNotificationMessage`]) so a
 /// restart renders identical content.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+///
+/// Ticket 20 added the dense-embed parts alongside the original
+/// `title`/`fields`/`footer`, each an `Option` with `#[serde(default)]` so a
+/// delivery row persisted before this ticket still deserializes and renders
+/// in the old shape (title, fields, and footer text only).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct WatchlistNotificationMessage {
     pub title: String,
     pub fields: Vec<WatchlistEmbedField>,
     pub footer: String,
+    /// Plain-text phone-banner summary rendered into the message `content`
+    /// (the killfeed's `ping_summary` mechanism). Already neutralized of
+    /// stray mention sigils at prepare time. `None` for a pre-ticket-20 row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Embed colour as a 24-bit RGB integer (`Colour`'s wire form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer_icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
 /// A delivery claimed and ready to send, or already sent (mirrors
@@ -310,6 +372,10 @@ pub struct PreparedWatchlistDelivery {
     pub entity_id: i64,
     pub evidence_key: String,
     pub role_id: Option<u64>,
+    /// Optional Discord user snowflake to ping in the message content
+    /// (ticket 20). Read back from the subscription at claim time (the
+    /// delivery row has no user-ping column).
+    pub ping_user_id: Option<u64>,
     pub message: WatchlistNotificationMessage,
     pub nonce: String,
     pub enforce_nonce: bool,
@@ -771,14 +837,51 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
-    fn event_kinds_parse_default_all_on_empty_input() {
+    fn event_kinds_default_to_membership_kinds_only_on_empty_input() {
+        // Ticket 20 "Wars opt-in": an omitted `event_kinds` selects the four
+        // membership-change kinds, never the war kinds.
         assert_eq!(
             parse_event_kinds("").unwrap(),
-            WATCHLIST_EVENT_KINDS.to_vec()
+            WATCHLIST_DEFAULT_EVENT_KINDS.to_vec()
         );
         assert_eq!(
             parse_event_kinds("   ").unwrap(),
+            WATCHLIST_DEFAULT_EVENT_KINDS.to_vec()
+        );
+    }
+
+    #[test]
+    fn default_event_kinds_exclude_wars() {
+        let default = parse_event_kinds("").unwrap();
+        assert!(!default.contains(&WatchlistEventKind::WarDeclared));
+        assert!(!default.contains(&WatchlistEventKind::WarAllyJoined));
+        assert!(!default.contains(&WatchlistEventKind::WarRetracted));
+        assert!(!default.contains(&WatchlistEventKind::WarFinished));
+    }
+
+    #[test]
+    fn the_all_keyword_selects_every_kind_including_wars() {
+        assert_eq!(
+            parse_event_kinds("all").unwrap(),
             WATCHLIST_EVENT_KINDS.to_vec()
+        );
+        // `all` anywhere in the list still selects everything.
+        assert_eq!(
+            parse_event_kinds("corp_joined, all").unwrap(),
+            WATCHLIST_EVENT_KINDS.to_vec()
+        );
+        let all = parse_event_kinds("ALL").unwrap();
+        assert!(all.contains(&WatchlistEventKind::WarDeclared));
+    }
+
+    #[test]
+    fn wars_are_selectable_by_explicit_kind() {
+        assert_eq!(
+            parse_event_kinds("war_declared, war_finished").unwrap(),
+            vec![
+                WatchlistEventKind::WarDeclared,
+                WatchlistEventKind::WarFinished
+            ]
         );
     }
 
@@ -815,10 +918,12 @@ mod tests {
     }
 
     #[test]
-    fn default_all_event_kinds_includes_the_new_kinds() {
-        let all = parse_event_kinds("").unwrap();
-        assert!(all.contains(&WatchlistEventKind::MemberDelta));
-        assert!(all.contains(&WatchlistEventKind::CorpChangedAlliance));
+    fn default_event_kinds_include_the_membership_change_kinds() {
+        let default = parse_event_kinds("").unwrap();
+        assert!(default.contains(&WatchlistEventKind::MemberDelta));
+        assert!(default.contains(&WatchlistEventKind::CorpChangedAlliance));
+        assert!(default.contains(&WatchlistEventKind::CorpJoined));
+        assert!(default.contains(&WatchlistEventKind::CorpLeft));
     }
 
     // --- member_delta pure function ---
@@ -1003,6 +1108,7 @@ mod tests {
             name: "watch".to_string(),
             event_kinds: vec![WatchlistEventKind::CorpJoined],
             role_id: None,
+            ping_user_id: None,
             options: serde_json::json!({}),
         };
         assert!(subscription.validate().is_ok());
@@ -1061,8 +1167,10 @@ mod tests {
     }
 
     #[test]
-    fn default_all_event_kinds_includes_the_war_kinds() {
-        let all = parse_event_kinds("").unwrap();
+    fn the_all_keyword_includes_the_war_kinds() {
+        // Ticket 20 "Wars opt-in": wars come from the `all` keyword (or an
+        // explicit war kind), not from an omitted `event_kinds`.
+        let all = parse_event_kinds("all").unwrap();
         for kind in [
             WatchlistEventKind::WarDeclared,
             WatchlistEventKind::WarAllyJoined,
@@ -1070,6 +1178,16 @@ mod tests {
             WatchlistEventKind::WarFinished,
         ] {
             assert!(all.contains(&kind));
+        }
+        // ...and an omitted list excludes every war kind.
+        let default = parse_event_kinds("").unwrap();
+        for kind in [
+            WatchlistEventKind::WarDeclared,
+            WatchlistEventKind::WarAllyJoined,
+            WatchlistEventKind::WarRetracted,
+            WatchlistEventKind::WarFinished,
+        ] {
+            assert!(!default.contains(&kind));
         }
     }
 

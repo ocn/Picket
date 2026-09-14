@@ -24,6 +24,15 @@ pub struct Celestial {
     pub distance: f64,
 }
 
+/// Public corporation facts the watchlist dense embed renders at prepare
+/// time (ticket 20), from `GET /corporations/{id}/`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CorporationDetails {
+    pub member_count: Option<i64>,
+    pub alliance_id: Option<i64>,
+    pub date_founded: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[derive(Clone)]
 pub struct EsiClient {
     client: Client,
@@ -191,6 +200,47 @@ impl EsiClient {
         };
         let entity: EsiEntity = self.fetch(&endpoint).await?;
         Ok(entity.ticker)
+    }
+
+    /// The subset of `GET /corporations/{id}/` the watchlist dense embed
+    /// needs at prepare time (ticket 20): the current member head count, the
+    /// founding date (only the year is rendered), and the current alliance
+    /// (absent when the corporation is unaffiliated). Public route, no
+    /// scopes. Every field is optional on the wire and degrades to `None`.
+    pub async fn get_corporation_details(
+        &self,
+        corporation_id: u64,
+    ) -> Result<CorporationDetails, Box<dyn Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        struct Body {
+            #[serde(default)]
+            member_count: Option<i64>,
+            #[serde(default)]
+            alliance_id: Option<i64>,
+            // Parsed leniently as a raw string, not a typed timestamp: a
+            // malformed `date_founded` must degrade to `None` rather than
+            // failing the whole deserialization and losing member_count /
+            // alliance_id (ticket 20 review finding).
+            #[serde(default)]
+            date_founded: Option<String>,
+        }
+        let body: Body = self
+            .fetch(&format!("corporations/{corporation_id}/"))
+            .await?;
+        let date_founded = body.date_founded.and_then(|raw| {
+            raw.parse::<chrono::DateTime<chrono::Utc>>()
+                .map_err(|error| {
+                    tracing::warn!(
+                        "corporation {corporation_id}: ignoring malformed date_founded {raw:?}: {error}"
+                    );
+                })
+                .ok()
+        });
+        Ok(CorporationDetails {
+            member_count: body.member_count,
+            alliance_id: body.alliance_id,
+            date_founded,
+        })
     }
 
     /// Resolves a full alliance/corporation *name* to its id via
@@ -504,7 +554,7 @@ mod tests {
 //             Self {
 //                 config: EveSsoConfig {
 //                     client_id: "96e9cea503904a089b64568845c34cb4".to_string(),
-//                     client_secret: "9KpvVjBUiL39bEHHofFp7NNxIj9U46UyLG6xl7Lb".to_string(),
+//                     client_secret: "SET_VIA_EVE_CLIENT_SECRET".to_string(),
 //                     auth_url: "https://login.eveonline.com/v2/oauth/authorize".to_string(),
 //                     token_url: "https://login.eveonline.com/v2/oauth/token".to_string(),
 //                     redirect_url: "https://pyfa-org.github.io/Pyfa/callback".to_string(),

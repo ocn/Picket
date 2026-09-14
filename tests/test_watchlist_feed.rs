@@ -19,8 +19,9 @@ use killbot_rust::esi_cache::{CacheMetadata, EsiError, EsiLimiterStore, EsiRespo
 use killbot_rust::watchlist_feed::{
     alliance_resource_key, CorporationInfo, PreparedWatchlistDelivery, WarDetail, WarParty,
     WatchedEntity, WatchlistAlliance, WatchlistClock, WatchlistCollector, WatchlistCorporation,
-    WatchlistDelivery, WatchlistDeliveryError, WatchlistEntityResolver, WatchlistEsi,
-    WatchlistEventKind, WatchlistKind, WatchlistStore, WatchlistSubscription,
+    WatchlistDelivery, WatchlistDeliveryError, WatchlistEmbedField, WatchlistEntityResolver,
+    WatchlistEsi, WatchlistEventKind, WatchlistKind, WatchlistNotificationMessage, WatchlistStore,
+    WatchlistSubscription,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -230,6 +231,48 @@ impl WatchlistEntityResolver for FakeResolver {
         WatchlistCorporation {
             name: Some(format!("Corp {corporation_id}")),
             ticker: Some("CORP".to_string()),
+            // Ticket 20 dense embed inputs; `alliance_id: None` exercises the
+            // `corp_left` "now unaffiliated" branch.
+            member_count: Some(124),
+            date_founded: Some(
+                chrono::Utc
+                    .with_ymd_and_hms(2015, 6, 1, 0, 0, 0)
+                    .single()
+                    .expect("valid founding date"),
+            ),
+            alliance_id: None,
+        }
+    }
+
+    async fn alliance(&self, alliance_id: i64) -> WatchlistAlliance {
+        WatchlistAlliance {
+            name: Some(format!("Alliance {alliance_id}")),
+            ticker: Some("ALLY".to_string()),
+        }
+    }
+}
+
+/// Like [`FakeResolver`] but every corporation currently belongs to a fixed
+/// alliance, so the `corp_left` "now in <alliance>" branch is exercised
+/// (ticket 20).
+struct FakeResolverWithDestination {
+    destination_alliance_id: i64,
+}
+
+#[async_trait]
+impl WatchlistEntityResolver for FakeResolverWithDestination {
+    async fn corporation(&self, corporation_id: i64) -> WatchlistCorporation {
+        WatchlistCorporation {
+            name: Some(format!("Corp {corporation_id}")),
+            ticker: Some("CORP".to_string()),
+            member_count: Some(124),
+            date_founded: Some(
+                chrono::Utc
+                    .with_ymd_and_hms(2015, 6, 1, 0, 0, 0)
+                    .single()
+                    .expect("valid founding date"),
+            ),
+            alliance_id: Some(self.destination_alliance_id),
         }
     }
 
@@ -466,6 +509,17 @@ fn make_collector(
     WatchlistCollector::new(store, esi, limiter, delivery, Arc::new(FakeResolver)).with_clock(clock)
 }
 
+fn make_collector_with_resolver(
+    store: WatchlistStore,
+    limiter: Arc<ContractCollectionStore>,
+    esi: Arc<FakeWatchlistEsi>,
+    delivery: Arc<FakeWatchlistDelivery>,
+    clock: Arc<VirtualWatchlistClock>,
+    resolver: Arc<dyn WatchlistEntityResolver>,
+) -> WatchlistCollector {
+    WatchlistCollector::new(store, esi, limiter, delivery, resolver).with_clock(clock)
+}
+
 async fn watch_alliance(store: &WatchlistStore, guild_id: u64, alliance_id: i64) {
     store
         .add_entity(
@@ -490,6 +544,7 @@ async fn subscribe(store: &WatchlistStore, name: &str) {
         name: name.to_string(),
         event_kinds: killbot_rust::watchlist_feed::WATCHLIST_EVENT_KINDS.to_vec(),
         role_id: None,
+        ping_user_id: None,
         options: serde_json::json!({}),
     };
     store
@@ -632,6 +687,46 @@ async fn a_join_and_a_leave_each_post_exactly_once() {
     assert_eq!(sent[0].event_kind, "corp_joined");
     assert_eq!(sent[0].entity_id, ALLIANCE);
     assert!(sent[0].evidence_key.starts_with("1003:"));
+    // Ticket 20 dense embed (exact golden for `corp_joined`): a
+    // plain-language title, a phone-banner content line with the
+    // never-abbreviated member count, the "Watching" author line, the
+    // founding year and aggregate clause in the description, the ordered
+    // Corporation/Alliance fields, a green colour, and the corp/alliance
+    // logos and links. Fired at the join cycle (01:00 EVE).
+    let joined_observed = observed_at + ChronoDuration::hours(1);
+    let corp_logo = "https://images.evetech.net/corporations/1003/logo?size=64".to_string();
+    let ally_logo = "https://images.evetech.net/alliances/99004901/logo?size=64".to_string();
+    let expected_joined = WatchlistNotificationMessage {
+        title: "Corp 1003 [CORP] joined Alliance 99004901".to_string(),
+        content: Some("Corp 1003 [CORP] (124 members) joined Alliance 99004901 [ALLY]".to_string()),
+        description: Some(
+            "124 members \u{b7} founded 2015 \u{b7} [Dotlan](https://evemaps.dotlan.net/corp/1003) \u{b7} [zKillboard](https://zkillboard.com/corporation/1003/)\n\
+             Alliance 99004901 is now 3 corps (+124 this cycle)"
+                .to_string(),
+        ),
+        fields: vec![
+            WatchlistEmbedField {
+                name: "Corporation".to_string(),
+                value: "Corp 1003 [CORP]".to_string(),
+                inline: true,
+            },
+            WatchlistEmbedField {
+                name: "Alliance".to_string(),
+                value: "Alliance 99004901 [ALLY]".to_string(),
+                inline: true,
+            },
+        ],
+        footer: "Corporation Joined \u{2022} EVETime 28/08/2026, 01:00".to_string(),
+        author: Some("Watching Alliance 99004901 \u{b7} 3 corps".to_string()),
+        author_url: Some("https://zkillboard.com/alliance/99004901/".to_string()),
+        author_icon: Some(ally_logo.clone()),
+        thumbnail_url: Some(corp_logo),
+        url: Some("https://zkillboard.com/corporation/1003/".to_string()),
+        color: Some(0x2E_CC_71),
+        footer_icon: Some(ally_logo),
+        timestamp: Some(joined_observed),
+    };
+    assert_eq!(sent[0].message, expected_joined);
 
     clock.advance(ChronoDuration::hours(1));
     let leave = collector.collect_cycle().await.expect("leave cycle");
@@ -640,6 +735,45 @@ async fn a_join_and_a_leave_each_post_exactly_once() {
     let sent = delivery.sent();
     assert_eq!(sent[1].event_kind, "corp_left");
     assert!(sent[1].evidence_key.starts_with("1001:"));
+    // Ticket 20 exact golden for `corp_left`: the fake resolver reports no
+    // current alliance for the departing corp, so the description's final
+    // line reads "now unaffiliated"; the colour is red. Fired at the leave
+    // cycle (02:00 EVE); after 1001 leaves the alliance is 2 corps.
+    let left_observed = observed_at + ChronoDuration::hours(2);
+    let corp_left_logo = "https://images.evetech.net/corporations/1001/logo?size=64".to_string();
+    let ally_logo = "https://images.evetech.net/alliances/99004901/logo?size=64".to_string();
+    let expected_left = WatchlistNotificationMessage {
+        title: "Corp 1001 [CORP] left Alliance 99004901".to_string(),
+        content: Some("Corp 1001 [CORP] (124 members) left Alliance 99004901 [ALLY]".to_string()),
+        description: Some(
+            "124 members \u{b7} founded 2015 \u{b7} [Dotlan](https://evemaps.dotlan.net/corp/1001) \u{b7} [zKillboard](https://zkillboard.com/corporation/1001/)\n\
+             Alliance 99004901 is now 2 corps (-124 this cycle)\n\
+             now unaffiliated"
+                .to_string(),
+        ),
+        fields: vec![
+            WatchlistEmbedField {
+                name: "Corporation".to_string(),
+                value: "Corp 1001 [CORP]".to_string(),
+                inline: true,
+            },
+            WatchlistEmbedField {
+                name: "Alliance".to_string(),
+                value: "Alliance 99004901 [ALLY]".to_string(),
+                inline: true,
+            },
+        ],
+        footer: "Corporation Left \u{2022} EVETime 28/08/2026, 02:00".to_string(),
+        author: Some("Watching Alliance 99004901 \u{b7} 2 corps".to_string()),
+        author_url: Some("https://zkillboard.com/alliance/99004901/".to_string()),
+        author_icon: Some(ally_logo.clone()),
+        thumbnail_url: Some(corp_left_logo),
+        url: Some("https://zkillboard.com/corporation/1001/".to_string()),
+        color: Some(0xE7_4C_3C),
+        footer_icon: Some(ally_logo),
+        timestamp: Some(left_observed),
+    };
+    assert_eq!(sent[1].message, expected_left);
 
     // Steady state: no new deliveries.
     clock.advance(ChronoDuration::hours(1));
@@ -647,6 +781,92 @@ async fn a_join_and_a_leave_each_post_exactly_once() {
     assert_eq!(steady.corp_joined, 0);
     assert_eq!(steady.corp_left, 0);
     assert_eq!(delivery.sent_count(), 2);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_corp_left_shows_the_new_alliance_when_the_corp_reaffiliated() {
+    // Ticket 20 exact golden for the `corp_left` "now in <alliance>" branch:
+    // the resolver reports the departing corp's current alliance, so the
+    // description's final line names where it went rather than "now
+    // unaffiliated".
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    watch_alliance(&store, GUILD, ALLIANCE).await;
+    subscribe(&store, "watch").await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 28, 0, 0, 0).unwrap();
+    let esi = Arc::new(FakeWatchlistEsi::new().with_alliance(
+        ALLIANCE,
+        vec![
+            Ok(EsiResponse::fresh(
+                vec![1001, 1002],
+                fresh_metadata(observed_at, "etag-1"),
+            )),
+            // 1001 leaves.
+            Ok(EsiResponse::fresh(
+                vec![1002],
+                fresh_metadata(observed_at + ChronoDuration::hours(1), "etag-2"),
+            )),
+        ],
+    ));
+    let delivery = Arc::new(FakeWatchlistDelivery::new());
+    let clock = VirtualWatchlistClock::new(observed_at);
+    let destination_alliance = 99_009_999;
+    let collector = make_collector_with_resolver(
+        store.clone(),
+        limiter,
+        esi.clone(),
+        delivery.clone(),
+        clock.clone(),
+        Arc::new(FakeResolverWithDestination {
+            destination_alliance_id: destination_alliance,
+        }),
+    );
+
+    collector.collect_cycle().await.expect("baseline");
+    assert_eq!(delivery.sent_count(), 0);
+    clock.advance(ChronoDuration::hours(1));
+    let leave = collector.collect_cycle().await.expect("leave cycle");
+    assert_eq!(leave.corp_left, 1);
+
+    let sent = delivery.sent();
+    let left_observed = observed_at + ChronoDuration::hours(1);
+    let corp_logo = "https://images.evetech.net/corporations/1001/logo?size=64".to_string();
+    let ally_logo = "https://images.evetech.net/alliances/99004901/logo?size=64".to_string();
+    let expected = WatchlistNotificationMessage {
+        title: "Corp 1001 [CORP] left Alliance 99004901".to_string(),
+        content: Some("Corp 1001 [CORP] (124 members) left Alliance 99004901 [ALLY]".to_string()),
+        description: Some(
+            "124 members \u{b7} founded 2015 \u{b7} [Dotlan](https://evemaps.dotlan.net/corp/1001) \u{b7} [zKillboard](https://zkillboard.com/corporation/1001/)\n\
+             Alliance 99004901 is now 1 corps (-124 this cycle)\n\
+             now in Alliance 99009999 [ALLY]"
+                .to_string(),
+        ),
+        fields: vec![
+            WatchlistEmbedField {
+                name: "Corporation".to_string(),
+                value: "Corp 1001 [CORP]".to_string(),
+                inline: true,
+            },
+            WatchlistEmbedField {
+                name: "Alliance".to_string(),
+                value: "Alliance 99004901 [ALLY]".to_string(),
+                inline: true,
+            },
+        ],
+        footer: "Corporation Left \u{2022} EVETime 28/08/2026, 01:00".to_string(),
+        author: Some("Watching Alliance 99004901 \u{b7} 1 corps".to_string()),
+        author_url: Some("https://zkillboard.com/alliance/99004901/".to_string()),
+        author_icon: Some(ally_logo.clone()),
+        thumbnail_url: Some(corp_logo),
+        url: Some("https://zkillboard.com/corporation/1001/".to_string()),
+        color: Some(0xE7_4C_3C),
+        footer_icon: Some(ally_logo),
+        timestamp: Some(left_observed),
+    };
+    assert_eq!(sent[0].message, expected);
 
     database.destroy().await;
 }
@@ -881,6 +1101,7 @@ async fn a_subscription_only_receives_its_selected_event_kinds() {
             name: "leaves-only".to_string(),
             event_kinds: vec![WatchlistEventKind::CorpLeft],
             role_id: None,
+            ping_user_id: None,
             options: serde_json::json!({}),
         })
         .await
@@ -1197,6 +1418,44 @@ async fn a_watched_corporation_alliance_change_posts_once() {
     assert_eq!(delivery.sent()[0].event_kind, "corp_changed_alliance");
     assert_eq!(delivery.sent()[0].entity_id, CORP_A);
 
+    // Ticket 20 exact golden for `corp_changed_alliance` (orange): the title
+    // names both the old and new alliance, the From/To fields carry the
+    // labels, and the corp logo/links round it out. Fired at 01:00 EVE.
+    let change_observed = observed_at + ChronoDuration::hours(1);
+    let corp_logo = "https://images.evetech.net/corporations/98077439/logo?size=64".to_string();
+    let expected = WatchlistNotificationMessage {
+        title: "Corp 98077439 [CORP] left Alliance 1 [ALLY], joined Alliance 2 [ALLY]".to_string(),
+        content: Some(
+            "Corp 98077439 [CORP] left Alliance 1 [ALLY], joined Alliance 2 [ALLY]".to_string(),
+        ),
+        description: Some(
+            "[Dotlan](https://evemaps.dotlan.net/corp/98077439) \u{b7} [zKillboard](https://zkillboard.com/corporation/98077439/)"
+                .to_string(),
+        ),
+        fields: vec![
+            WatchlistEmbedField {
+                name: "From".to_string(),
+                value: "Alliance 1 [ALLY]".to_string(),
+                inline: true,
+            },
+            WatchlistEmbedField {
+                name: "To".to_string(),
+                value: "Alliance 2 [ALLY]".to_string(),
+                inline: true,
+            },
+        ],
+        footer: "Corporation Changed Alliance \u{2022} EVETime 01/08/2026, 01:00".to_string(),
+        author: Some("Watching Corp 98077439 [CORP]".to_string()),
+        author_url: Some("https://zkillboard.com/corporation/98077439/".to_string()),
+        author_icon: Some(corp_logo.clone()),
+        thumbnail_url: Some(corp_logo),
+        url: Some("https://zkillboard.com/corporation/98077439/".to_string()),
+        color: Some(0xE6_7E_22),
+        footer_icon: None,
+        timestamp: Some(change_observed),
+    };
+    assert_eq!(delivery.sent()[0].message, expected);
+
     clock.advance(ChronoDuration::hours(1));
     let steady = collector.collect_cycle().await.expect("steady cycle");
     assert_eq!(steady.corp_changed_alliance, 0);
@@ -1294,6 +1553,46 @@ async fn an_alliance_member_delta_fires_on_a_drop() {
     assert_eq!(drop.member_delta, 1);
     assert_eq!(delivery.sent_count(), 1);
     assert_eq!(delivery.sent()[0].event_kind, "member_delta");
+
+    // Ticket 20 exact golden for `member_delta` (a drop, blue): the title
+    // reads "lost 10% of members (100 → 90)", the Since field/description
+    // reference the baseline snapshot 7 days earlier, and the colour is the
+    // membership-swing blue.
+    let ref_unix = observed_at.timestamp();
+    let drop_observed = observed_at + ChronoDuration::days(7);
+    let ally_logo = "https://images.evetech.net/alliances/99004901/logo?size=64".to_string();
+    let expected = WatchlistNotificationMessage {
+        title: "Alliance 99004901 [ALLY] lost 10% of members (100 \u{2192} 90)".to_string(),
+        content: Some(
+            "Alliance 99004901 [ALLY] lost 10% of members (100 \u{2192} 90)".to_string(),
+        ),
+        description: Some(format!(
+            "since <t:{ref_unix}:R> (<t:{ref_unix}:f>)\n\
+             [zKillboard](https://zkillboard.com/alliance/99004901/) | [Dotlan](https://evemaps.dotlan.net/alliance/99004901)"
+        )),
+        fields: vec![
+            WatchlistEmbedField {
+                name: "Members".to_string(),
+                value: "100 \u{2192} 90 (down 10%)".to_string(),
+                inline: true,
+            },
+            WatchlistEmbedField {
+                name: "Since".to_string(),
+                value: format!("<t:{ref_unix}:f>"),
+                inline: true,
+            },
+        ],
+        footer: "Member Count Change \u{2022} EVETime 08/08/2026, 00:00".to_string(),
+        author: Some("Watching Alliance 99004901 [ALLY]".to_string()),
+        author_url: Some("https://zkillboard.com/alliance/99004901/".to_string()),
+        author_icon: Some(ally_logo.clone()),
+        thumbnail_url: Some(ally_logo),
+        url: Some("https://zkillboard.com/alliance/99004901/".to_string()),
+        color: Some(0x34_98_DB),
+        footer_icon: None,
+        timestamp: Some(drop_observed),
+    };
+    assert_eq!(delivery.sent()[0].message, expected);
 
     database.destroy().await;
 }
@@ -1831,6 +2130,7 @@ async fn a_subscription_selecting_only_member_delta_ignores_alliance_changes() {
             name: "deltas-only".to_string(),
             event_kinds: vec![WatchlistEventKind::MemberDelta],
             role_id: None,
+            ping_user_id: None,
             options: serde_json::json!({}),
         })
         .await
@@ -1899,6 +2199,7 @@ async fn subscribe_kinds(store: &WatchlistStore, name: &str, kinds: Vec<Watchlis
             name: name.to_string(),
             event_kinds: kinds,
             role_id: None,
+            ping_user_id: None,
             options: serde_json::json!({}),
         })
         .await

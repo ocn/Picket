@@ -38,6 +38,7 @@ struct SovSubscriptionDocuments<'a> {
     /// in `subscription_from_documents`.
     allow_frigate_holes: Option<bool>,
     role_id: Option<u64>,
+    ping_user_id: Option<u64>,
     /// Raw `tminus_marks` command option: a comma-separated list of
     /// minutes, or an empty string to disable marks. `None` when the
     /// option was omitted, which leaves the stored `options` document
@@ -141,6 +142,7 @@ enum FieldProvenance {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum SovClearableField {
     Role,
+    User,
     RegionId,
     DefenderAllianceId,
     MaxJumps,
@@ -151,12 +153,13 @@ impl SovClearableField {
     fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim() {
             "role" => Ok(Self::Role),
+            "user" => Ok(Self::User),
             "region_id" => Ok(Self::RegionId),
             "defender_alliance_id" => Ok(Self::DefenderAllianceId),
             "max_jumps" => Ok(Self::MaxJumps),
             "allow_frigate_holes" => Ok(Self::AllowFrigateHoles),
             other => Err(format!(
-                "unknown clear field '{other}' (expected one of role, region_id, defender_alliance_id, max_jumps, allow_frigate_holes)"
+                "unknown clear field '{other}' (expected one of role, user, region_id, defender_alliance_id, max_jumps, allow_frigate_holes)"
             )),
         }
     }
@@ -196,6 +199,9 @@ struct SovSubscribeInput {
     max_jumps: Option<i64>,
     allow_frigate_holes: Option<bool>,
     role_id: Option<u64>,
+    /// The `user:` option: an optional direct Discord user ping, a top-level
+    /// carry-forward/clear field (ticket 20).
+    ping_user_id: Option<u64>,
     tminus_marks: Option<String>,
     tz_window: Option<String>,
     tz_shift_enabled: Option<bool>,
@@ -287,6 +293,11 @@ impl SovSubscribeCommand {
             None => None,
             _ => return Err("role must be a role option".to_string()),
         };
+        let ping_user_id = match get_option_value(&command.data.options, "user") {
+            Some(CommandDataOptionValue::User(user, _member)) => Some(user.id.0),
+            None => None,
+            _ => return Err("user must be a user option".to_string()),
+        };
         let tminus_marks = match get_option_value(&command.data.options, "tminus_marks") {
             Some(CommandDataOptionValue::String(value)) => Some(value.clone()),
             None => None,
@@ -315,6 +326,7 @@ impl SovSubscribeCommand {
             max_jumps,
             allow_frigate_holes,
             role_id,
+            ping_user_id,
             tminus_marks,
             tz_window,
             tz_shift_enabled,
@@ -349,6 +361,7 @@ impl SovSubscribeCommand {
             filter,
             options,
             role_id: documents.role_id,
+            ping_user_id: documents.ping_user_id,
         };
         subscription.validate()?;
         Ok(subscription)
@@ -469,6 +482,12 @@ impl SovSubscribeCommand {
             cleared(SovClearableField::Role),
             existing.and_then(|found| found.role_id),
         )?;
+        let (ping_user_id, user_prov) = resolve_field(
+            "user",
+            input.ping_user_id,
+            cleared(SovClearableField::User),
+            existing.and_then(|found| found.ping_user_id),
+        )?;
         let (region_id, region_prov) = resolve_field(
             "region_id",
             input.region_id,
@@ -570,6 +589,7 @@ impl SovSubscribeCommand {
             filter,
             options,
             role_id,
+            ping_user_id,
         };
         subscription.validate()?;
 
@@ -579,6 +599,7 @@ impl SovSubscribeCommand {
         for (label, provenance) in [
             ("filter", filter_prov),
             ("role", role_prov),
+            ("user", user_prov),
             ("region_id", region_prov),
             ("defender_alliance_id", defender_prov),
             ("max_jumps", max_jumps_prov),
@@ -880,6 +901,12 @@ impl Command for SovSubscribeCommand {
             })
             .create_option(|option| {
                 option
+                    .name("user")
+                    .description("User to ping directly on alerts from this subscription.")
+                    .kind(CommandOptionType::User)
+            })
+            .create_option(|option| {
+                option
                     .name("tminus_marks")
                     .description(
                         "Comma-separated T-minus marks, minutes (default 120,30; empty disables; capped by VulnerableWithin).",
@@ -904,7 +931,7 @@ impl Command for SovSubscribeCommand {
                 option
                     .name("clear")
                     .description(
-                        "Comma list to clear: role, region_id, defender_alliance_id, max_jumps, allow_frigate_holes.",
+                        "Comma list to clear: role, user, region_id, defender_alliance_id, max_jumps, allow_frigate_holes.",
                     )
                     .kind(CommandOptionType::String)
             })
@@ -1003,6 +1030,7 @@ mod tests {
                 max_jumps: None,
                 allow_frigate_holes: None,
                 role_id: None,
+                ping_user_id: None,
                 tminus_marks: None,
                 tz_window: None,
                 tz_shift_enabled: None,
@@ -1028,6 +1056,7 @@ mod tests {
                 max_jumps: None,
                 allow_frigate_holes: None,
                 role_id: Some(555),
+                ping_user_id: None,
                 tminus_marks: None,
                 tz_window: None,
                 tz_shift_enabled: None,
@@ -1065,6 +1094,7 @@ mod tests {
                 max_jumps: Some(11),
                 allow_frigate_holes: None,
                 role_id: None,
+                ping_user_id: None,
                 tminus_marks: None,
                 tz_window: None,
                 tz_shift_enabled: None,
@@ -1099,6 +1129,7 @@ mod tests {
                 max_jumps: Some(6),
                 allow_frigate_holes: Some(true),
                 role_id: None,
+                ping_user_id: None,
                 tminus_marks: None,
                 tz_window: None,
                 tz_shift_enabled: None,
@@ -1132,6 +1163,7 @@ mod tests {
                 max_jumps: None,
                 allow_frigate_holes: Some(true),
                 role_id: None,
+                ping_user_id: None,
                 tminus_marks: None,
                 tz_window: None,
                 tz_shift_enabled: None,
@@ -1154,6 +1186,7 @@ mod tests {
                     max_jumps: Some(max_jumps),
                     allow_frigate_holes: None,
                     role_id: None,
+                    ping_user_id: None,
                     tminus_marks: None,
                     tz_window: None,
                     tz_shift_enabled: None,
@@ -1182,6 +1215,7 @@ mod tests {
                     max_jumps: None,
                     allow_frigate_holes: None,
                     role_id: None,
+                    ping_user_id: None,
                     tminus_marks: None,
                     tz_window: None,
                     tz_shift_enabled: None,
@@ -1204,6 +1238,7 @@ mod tests {
                 max_jumps: None,
                 allow_frigate_holes: None,
                 role_id: None,
+                ping_user_id: None,
                 tminus_marks: Some("120, 45, 120"),
                 tz_window: None,
                 tz_shift_enabled: None,
@@ -1229,6 +1264,7 @@ mod tests {
                 max_jumps: None,
                 allow_frigate_holes: None,
                 role_id: None,
+                ping_user_id: None,
                 tminus_marks: Some(""),
                 tz_window: None,
                 tz_shift_enabled: None,
@@ -1254,6 +1290,7 @@ mod tests {
                 max_jumps: None,
                 allow_frigate_holes: None,
                 role_id: None,
+                ping_user_id: None,
                 tminus_marks: None,
                 tz_window: None,
                 tz_shift_enabled: None,
@@ -1277,6 +1314,7 @@ mod tests {
                     max_jumps: None,
                     allow_frigate_holes: None,
                     role_id: None,
+                    ping_user_id: None,
                     tminus_marks: Some(raw),
                     tz_window: None,
                     tz_shift_enabled: None,
@@ -1410,6 +1448,7 @@ mod tests {
                 max_jumps: None,
                 allow_frigate_holes: None,
                 role_id: None,
+                ping_user_id: None,
                 tminus_marks: None,
                 tz_window: Some(" 06:00-10:00 "),
                 tz_shift_enabled: Some(true),
@@ -1435,6 +1474,7 @@ mod tests {
                 max_jumps: None,
                 allow_frigate_holes: None,
                 role_id: None,
+                ping_user_id: None,
                 tminus_marks: None,
                 tz_window: None,
                 tz_shift_enabled: None,
@@ -1458,6 +1498,7 @@ mod tests {
                     max_jumps: None,
                     allow_frigate_holes: None,
                     role_id: None,
+                    ping_user_id: None,
                     tminus_marks: None,
                     tz_window: Some(raw),
                     tz_shift_enabled: None,
@@ -1480,6 +1521,7 @@ mod tests {
                 max_jumps: None,
                 allow_frigate_holes: None,
                 role_id: None,
+                ping_user_id: None,
                 tminus_marks: Some("120"),
                 tz_window: Some("22:00-02:00"),
                 tz_shift_enabled: Some(true),
@@ -1509,6 +1551,7 @@ mod tests {
             max_jumps: None,
             allow_frigate_holes: None,
             role_id: None,
+            ping_user_id: None,
             tminus_marks: None,
             tz_window: None,
             tz_shift_enabled: None,
@@ -1753,6 +1796,7 @@ mod tests {
                 SOV_MAX_JUMPS_OPTION_KEY: 99,
             }),
             role_id: None,
+            ping_user_id: None,
         };
         let mut input = base_input("front");
         input.tz_shift_enabled = Some(true);
@@ -1772,6 +1816,7 @@ mod tests {
             filter: legacy_filter.clone(),
             options: serde_json::json!({}),
             role_id: Some(321),
+            ping_user_id: None,
         };
         let mut input = base_input("front");
         input.tz_shift_enabled = Some(true);
@@ -1846,6 +1891,7 @@ mod tests {
             filter: serde_json::from_str::<SovFilter>(FILTER).unwrap(),
             options: serde_json::json!({}),
             role_id: Some(321),
+            ping_user_id: None,
         }
     }
 

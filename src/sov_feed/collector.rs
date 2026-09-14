@@ -15,8 +15,8 @@ use crate::esi_cache::{merge_cache_metadata, EsiError, EsiLimiterStore};
 use crate::sov_feed::model::{
     effective_tminus_marks_minutes, effective_tz_shift_enabled, effective_tz_window,
     tz_window_overlap_minutes, PreparedSovDelivery, SovAlertStage, SovCampaign, SovDelivery,
-    SovEmbedField, SovNotificationMessage, SovStructure, SOV_HUB_STRUCTURE_TYPE_IDS,
-    SOV_TZ_WINDOW_MIN_OVERLAP_MINUTES,
+    SovEmbedField, SovNotificationMessage, SovStructure, SovSubscription,
+    SOV_HUB_STRUCTURE_TYPE_IDS, SOV_TZ_WINDOW_MIN_OVERLAP_MINUTES,
 };
 use crate::sov_feed::store::{
     SovReachabilityTransition, SovStore, SovTzWindowTransition, SOV_CAMPAIGNS_RESOURCE_KEY,
@@ -965,8 +965,9 @@ impl SovCollector {
                                 .render_stage_message(
                                     campaign,
                                     &system,
+                                    subscription,
                                     stage,
-                                    subscription.filter.root.allows_frigate_holes_anywhere(),
+                                    observed_at,
                                 )
                                 .await;
                             let freshly_prepared = self
@@ -1084,8 +1085,9 @@ impl SovCollector {
                                 .render_stage_message(
                                     campaign,
                                     &system,
+                                    subscription,
                                     stage,
-                                    subscription.filter.root.allows_frigate_holes_anywhere(),
+                                    observed_at,
                                 )
                                 .await;
                             self.store
@@ -1253,7 +1255,14 @@ impl SovCollector {
                             continue;
                         };
                         let message = self
-                            .render_tz_window_message(structure, &system, window, stage)
+                            .render_tz_window_message(
+                                structure,
+                                &system,
+                                subscription,
+                                window,
+                                stage,
+                                observed_at,
+                            )
                             .await;
                         self.store
                             .prepare_delivery(
@@ -1409,8 +1418,9 @@ impl SovCollector {
                             .render_stage_message(
                                 campaign,
                                 &system,
+                                subscription,
                                 SovAlertStage::Appeared,
-                                subscription.filter.root.allows_frigate_holes_anywhere(),
+                                observed_at,
                             )
                             .await;
                         let freshly_prepared = self
@@ -1511,113 +1521,209 @@ impl SovCollector {
         &self,
         campaign: &SovCampaign,
         system: &SovSystemInfo,
+        subscription: &SovSubscription,
         stage: SovAlertStage,
-        allow_frigate_holes: bool,
+        observed_at: DateTime<Utc>,
     ) -> SovNotificationMessage {
+        let allow_frigate_holes = subscription.filter.root.allows_frigate_holes_anywhere();
         let system_name = system.name.clone();
         let region_name = system.region_name.clone();
+        // The defender alliance ticker, kept as `Option` so an unresolved
+        // defender never prints "Unknown" (ticket 20 hard rule): the title
+        // simply drops the ticker prefix instead.
         let defender_ticker = match campaign.defender_id {
-            Some(alliance_id) => self
-                .tickers
-                .alliance_ticker(alliance_id)
-                .await
-                .unwrap_or_else(|| "Unknown".to_string()),
-            None => "Unknown".to_string(),
+            Some(alliance_id) => self.tickers.alliance_ticker(alliance_id).await,
+            None => None,
         };
-        let title = format!(
-            "{system_name} ({region_name}) \u{2014} {} \u{2014} {defender_ticker}",
-            event_type_label(&campaign.event_type)
-        );
+        let (subject, predicate) = sov_event_phrase(&campaign.event_type);
+        // "X.I.X hub in 5LAJ-8 (The Spire)" (defender ticker present) or
+        // "Hub in 5LAJ-8 (The Spire)" (unresolved defender).
+        let subject_display = match &defender_ticker {
+            Some(ticker) => format!("{ticker} {subject}"),
+            None => capitalize_first(subject),
+        };
+        let base_location = format!("{subject_display} in {system_name} ({region_name})");
+
+        // Reachability facts, resolved once for the title (reachable stage),
+        // the description, and the distance/route field.
+        let reachability_info = self
+            .reachability
+            .reachable(campaign.solar_system_id, allow_frigate_holes);
+        let home_name = reachability_info
+            .as_ref()
+            .and_then(|info| info.route.first().copied())
+            .and_then(|home_id| self.directory.resolve(home_id).map(|info| info.name))
+            .unwrap_or_else(|| "home".to_string());
+
+        // Plain-language, stage-specific title (never an ESI enum).
+        let title = match stage {
+            SovAlertStage::Appeared => format!("{base_location} {predicate}"),
+            SovAlertStage::TMinus(minutes) => format!(
+                "{base_location} {predicate}, fight opens in {}",
+                humanize_minutes(minutes)
+            ),
+            SovAlertStage::Reachable(_) => match &reachability_info {
+                Some(info) => format!(
+                    "{base_location} is now {} from {home_name} via {}",
+                    jumps_phrase(info.jumps),
+                    if info.via_chain { "the chain" } else { "gates" }
+                ),
+                None => format!("{base_location} is now reachable"),
+            },
+            SovAlertStage::TzWindowEntered(_) => {
+                format!("{base_location} is vulnerable during our timezone tonight")
+            }
+        };
+
+        // Plain-text phone banner: the under-attack line plus the fight
+        // countdown, neutralized so a stray sigil cannot ping.
+        let content = crate::contract_intelligence::neutralize_summary_mentions(&format!(
+            "{base_location} {predicate}, fight opens in {}",
+            humanize_minutes_from(observed_at, campaign.start_time)
+        ));
 
         let unix = campaign.start_time.timestamp();
-        let start_value = format!(
-            "{} EVE\n<t:{unix}:R>",
-            campaign.start_time.format("%Y-%m-%d %H:%M:%S")
-        );
-        let mut fields = vec![SovEmbedField {
-            name: "Start Time".to_string(),
-            value: start_value,
-            inline: false,
-        }];
 
-        // Only present when the system is reachable (spec "Embed": "jumps
-        // and route summary ... omitted for gate-only routes" -- and, by
-        // the same "presentation, not a filter" spirit, omitted entirely
-        // rather than shown as a placeholder for an unreachable system or
-        // an unavailable graph, ticket 04). `allow_frigate_holes` picks
-        // which of the subscription's two cached routes to show (ticket
-        // 05); see `SovFilterNode::allows_frigate_holes_anywhere`.
-        if let Some(info) = self
-            .reachability
-            .reachable(campaign.solar_system_id, allow_frigate_holes)
-        {
-            fields.push(SovEmbedField {
-                name: "Reachability".to_string(),
-                value: format!(
-                    "{} jump{} from home\n{}",
-                    info.jumps,
-                    if info.jumps == 1 { "" } else { "s" },
-                    self.route_summary(&info.route)
-                ),
-                inline: false,
-            });
-            // Path Risk (ticket 05, spec "Embed"): one line, only when the
-            // chosen route crosses at least one wormhole -- `path_risk` is
-            // `None` by construction for a gate-only route (see
-            // `SovReachabilityInfo`'s doc comment), so this needs no
-            // separate "is it gate-only" check.
-            if let Some(risk) = &info.path_risk {
-                fields.push(SovEmbedField {
-                    name: "Path Risk".to_string(),
-                    value: format!("worst hole: {}", risk.describe()),
-                    inline: true,
-                });
-            }
-        }
-
+        // --- Dense embed description (ticket 20) ---
+        // Everything the killfeed-style description carries lives here
+        // exactly once (spec mock): the fight-opens countdown, the entosis
+        // line (scores only when non-zero), then the single location line
+        // (system, region, owner, distance-from-home, Dotlan/zKillboard).
+        // The hub-vulnerability window and the distance/route are carried by
+        // the inline fields below, never duplicated in the description.
+        let owner_display = self.owner_field_value(campaign.solar_system_id).await;
+        let mut description_lines = vec![format!("Fight opens <t:{unix}:F> (<t:{unix}:R>)")];
         if let (Some(defender_score), Some(attackers_score)) =
             (campaign.defender_score, campaign.attackers_score)
         {
             if defender_score != 0.0 || attackers_score != 0.0 {
+                description_lines.push(format!(
+                    "Entosis: defenders {:.0}% \u{b7} attackers {:.0}%",
+                    defender_score * 100.0,
+                    attackers_score * 100.0
+                ));
+            }
+        }
+        let mut location_parts = vec![system_name.clone(), region_name.clone()];
+        if let Some(owner) = &owner_display {
+            location_parts.push(format!("owner {owner}"));
+        }
+        if let Some(info) = &reachability_info {
+            location_parts.push(format!("{} from {home_name}", jumps_phrase(info.jumps)));
+        }
+        location_parts.push(format!(
+            "[Dotlan](https://evemaps.dotlan.net/system/{0}) \u{b7} [zKillboard](https://zkillboard.com/system/{0}/)",
+            campaign.solar_system_id
+        ));
+        description_lines.push(location_parts.join(" \u{b7} "));
+
+        // --- Dense embed inline fields (ticket 20, spec mock's trio) ---
+        // "Starts" (absolute EVE time), "Hub vulnerable" (the hub's own
+        // window, omitted when unknown), and "Distance" / "Route".
+        let mut fields = vec![SovEmbedField {
+            name: "Starts".to_string(),
+            value: format!("<t:{unix}:f>"),
+            inline: true,
+        }];
+        // The hub's own vulnerability window, when the feed has observed the
+        // structure (ticket 20: omitted otherwise).
+        if let Ok(Some(structure)) = self.store.structure(campaign.structure_id).await {
+            if let (Some(start), Some(end)) = (
+                structure.vulnerable_start_time,
+                structure.vulnerable_end_time,
+            ) {
                 fields.push(SovEmbedField {
-                    name: "Scores".to_string(),
+                    name: "Hub vulnerable".to_string(),
                     value: format!(
-                        "Defender {:.0}% / Attackers {:.0}%",
-                        defender_score * 100.0,
-                        attackers_score * 100.0
+                        "<t:{}:t> to <t:{}:t> EVE",
+                        start.timestamp(),
+                        end.timestamp()
                     ),
                     inline: true,
                 });
             }
         }
-
-        // Current system owner from the sovereignty map (ticket 07, spec
-        // "Embed": "current owner from the sovereignty map"), applied to
-        // every stage from this ticket on -- omitted entirely when the map
-        // has not loaded this system yet, rather than shown as a
-        // placeholder (mirrors the Reachability field's "omit, don't
-        // placeholder" convention above).
-        if let Some(owner) = self.owner_field_value(campaign.solar_system_id).await {
-            fields.push(SovEmbedField {
-                name: "System Owner".to_string(),
-                value: owner,
-                inline: true,
-            });
+        // Distance is a plain jump count from home via gates or the chain
+        // (whichever the reachability source reports); omitted entirely when
+        // the graph has no path (spec "Embed": omit, don't placeholder). The
+        // route summary replaces it only when the subscription has a
+        // `Reachable` leaf and the hub is within its `max_jumps` -- the route
+        // belongs to what that subscription asked to reach, so Path Risk
+        // (which describes that route) rides along in that case only.
+        if let Some(info) = &reachability_info {
+            let in_range = subscription
+                .filter
+                .root
+                .reachable_leaf_max_jumps()
+                .is_some_and(|max_jumps| info.jumps <= max_jumps);
+            if in_range {
+                // Ticket 19 review note: warm the route's intermediate hop
+                // ids through the directory before rendering (bounded by the
+                // per-cycle cap) so an unresolved hop -- dropped as "\u{2026}"
+                // by `route_summary`, never printed as a raw id -- is rare.
+                self.warm_system_cache(info.route.iter().copied()).await;
+                fields.push(SovEmbedField {
+                    name: "Route".to_string(),
+                    value: self.route_summary(&info.route),
+                    inline: true,
+                });
+                if let Some(risk) = &info.path_risk {
+                    fields.push(SovEmbedField {
+                        name: "Path Risk".to_string(),
+                        value: format!("worst hole: {}", risk.describe()),
+                        inline: true,
+                    });
+                }
+            } else {
+                fields.push(SovEmbedField {
+                    name: "Distance".to_string(),
+                    value: jumps_phrase(info.jumps),
+                    inline: true,
+                });
+            }
         }
 
-        fields.push(SovEmbedField {
-            name: "Links".to_string(),
-            value: format!(
-                "[zKillboard](https://zkillboard.com/system/{}/) | [Dotlan](https://evemaps.dotlan.net/system/{})",
-                campaign.solar_system_id, campaign.solar_system_id
-            ),
-            inline: true,
-        });
+        // Author line: a defender-scoped subscription reads "Watched
+        // alliance <ticker> · <name>"; any other subscription "Subscription
+        // <name>".
+        let (author, author_url, author_icon) = if subscription.filter.root.has_defender_leaf()
+            || subscription.filter.root.references_watchlist()
+        {
+            match (&defender_ticker, campaign.defender_id) {
+                (Some(ticker), Some(alliance_id)) => (
+                    format!("Watched alliance {ticker} \u{b7} {}", subscription.name),
+                    Some(format!("https://zkillboard.com/alliance/{alliance_id}/")),
+                    Some(sov_alliance_logo(alliance_id)),
+                ),
+                _ => (format!("Subscription {}", subscription.name), None, None),
+            }
+        } else {
+            (format!("Subscription {}", subscription.name), None, None)
+        };
+        let thumbnail_url = campaign.defender_id.map(sov_alliance_logo);
+        let footer_icon = campaign.defender_id.map(sov_alliance_logo);
 
         SovNotificationMessage {
             title,
             fields,
-            footer: stage.footer_label(),
+            footer: format!(
+                "{} \u{2022} EVETime {}",
+                sov_stage_footer_phrase(stage),
+                observed_at.format("%d/%m/%Y, %H:%M")
+            ),
+            content: Some(content),
+            author: Some(author),
+            author_url,
+            author_icon,
+            description: Some(description_lines.join("\n")),
+            thumbnail_url,
+            url: Some(format!(
+                "https://evemaps.dotlan.net/system/{}",
+                campaign.solar_system_id
+            )),
+            color: Some(sov_stage_color(stage)),
+            footer_icon,
+            timestamp: Some(campaign.start_time),
         }
     }
 
@@ -1638,61 +1744,146 @@ impl SovCollector {
         &self,
         structure: &SovStructure,
         system: &SovSystemInfo,
+        subscription: &SovSubscription,
         window: crate::sov_feed::model::TzWindow,
         stage: SovAlertStage,
+        observed_at: DateTime<Utc>,
     ) -> SovNotificationMessage {
         let system_name = system.name.clone();
         let region_name = system.region_name.clone();
         let hub_owner_ticker = match structure.alliance_id {
-            Some(alliance_id) => self
-                .tickers
-                .alliance_ticker(alliance_id)
-                .await
-                .unwrap_or_else(|| "Unknown".to_string()),
-            None => "Unknown".to_string(),
+            Some(alliance_id) => self.tickers.alliance_ticker(alliance_id).await,
+            None => None,
+        };
+        let owner_prefix = match &hub_owner_ticker {
+            Some(ticker) => format!("{ticker} hub"),
+            None => "Hub".to_string(),
         };
         let title = format!(
-            "{system_name} ({region_name}) \u{2014} Vulnerability Window Shift \u{2014} {hub_owner_ticker}"
+            "{owner_prefix} in {system_name} ({region_name}) is vulnerable during our timezone tonight"
         );
+        let content = crate::contract_intelligence::neutralize_summary_mentions(&format!(
+            "{owner_prefix} in {system_name} ({region_name}) is vulnerable during our timezone ({})",
+            window.display()
+        ));
 
+        // Reachability facts (ticket 20: the tz-window embed carries the
+        // same Distance/Route field as the campaign embed). `None` when the
+        // hub's system is unreachable or the graph is unavailable.
+        let allow_frigate_holes = subscription.filter.root.allows_frigate_holes_anywhere();
+        let reachability_info = self
+            .reachability
+            .reachable(structure.solar_system_id, allow_frigate_holes);
+        let home_name = reachability_info
+            .as_ref()
+            .and_then(|info| info.route.first().copied())
+            .and_then(|home_id| self.directory.resolve(home_id).map(|info| info.name))
+            .unwrap_or_else(|| "home".to_string());
+
+        // --- Dense embed description (ticket 20) ---
+        // The hub-vulnerability window and the distance/route ride the
+        // inline fields below; the description carries only the timezone
+        // window and the single location line (no duplicated owner/links).
+        let owner_display = self.owner_field_value(structure.solar_system_id).await;
+        let mut description_lines = vec![format!("Our timezone window: {}", window.display())];
+        let mut location_parts = vec![system_name.clone(), region_name.clone()];
+        if let Some(owner) = &owner_display {
+            location_parts.push(format!("owner {owner}"));
+        }
+        if let Some(info) = &reachability_info {
+            location_parts.push(format!("{} from {home_name}", jumps_phrase(info.jumps)));
+        }
+        location_parts.push(format!(
+            "[Dotlan](https://evemaps.dotlan.net/system/{0}) \u{b7} [zKillboard](https://zkillboard.com/system/{0}/)",
+            structure.solar_system_id
+        ));
+        description_lines.push(location_parts.join(" \u{b7} "));
+
+        // --- Dense embed inline fields (ticket 20) ---
+        // "Vulnerable" (the hub's own window, omitted when unknown) and
+        // "Distance" / "Route" on the same rule as the campaign embed.
         let mut fields = Vec::new();
         if let (Some(start), Some(end)) = (
             structure.vulnerable_start_time,
             structure.vulnerable_end_time,
         ) {
-            let unix = start.timestamp();
             fields.push(SovEmbedField {
-                name: "Vulnerability Window".to_string(),
+                name: "Vulnerable".to_string(),
                 value: format!(
-                    "{} \u{2013} {} EVE\n<t:{unix}:R>",
-                    start.format("%Y-%m-%d %H:%M:%S"),
-                    end.format("%H:%M:%S")
+                    "<t:{}:t> to <t:{}:t> EVE",
+                    start.timestamp(),
+                    end.timestamp()
                 ),
-                inline: false,
-            });
-        }
-
-        if let Some(owner) = self.owner_field_value(structure.solar_system_id).await {
-            fields.push(SovEmbedField {
-                name: "System Owner".to_string(),
-                value: owner,
                 inline: true,
             });
         }
+        if let Some(info) = &reachability_info {
+            let in_range = subscription
+                .filter
+                .root
+                .reachable_leaf_max_jumps()
+                .is_some_and(|max_jumps| info.jumps <= max_jumps);
+            if in_range {
+                self.warm_system_cache(info.route.iter().copied()).await;
+                fields.push(SovEmbedField {
+                    name: "Route".to_string(),
+                    value: self.route_summary(&info.route),
+                    inline: true,
+                });
+                if let Some(risk) = &info.path_risk {
+                    fields.push(SovEmbedField {
+                        name: "Path Risk".to_string(),
+                        value: format!("worst hole: {}", risk.describe()),
+                        inline: true,
+                    });
+                }
+            } else {
+                fields.push(SovEmbedField {
+                    name: "Distance".to_string(),
+                    value: jumps_phrase(info.jumps),
+                    inline: true,
+                });
+            }
+        }
 
-        fields.push(SovEmbedField {
-            name: "Links".to_string(),
-            value: format!(
-                "[zKillboard](https://zkillboard.com/system/{}/) | [Dotlan](https://evemaps.dotlan.net/system/{})",
-                structure.solar_system_id, structure.solar_system_id
-            ),
-            inline: true,
-        });
+        let (author, author_url, author_icon) = if subscription.filter.root.has_defender_leaf()
+            || subscription.filter.root.references_watchlist()
+        {
+            match (&hub_owner_ticker, structure.alliance_id) {
+                (Some(ticker), Some(alliance_id)) => (
+                    format!("Watched alliance {ticker} \u{b7} {}", subscription.name),
+                    Some(format!("https://zkillboard.com/alliance/{alliance_id}/")),
+                    Some(sov_alliance_logo(alliance_id)),
+                ),
+                _ => (format!("Subscription {}", subscription.name), None, None),
+            }
+        } else {
+            (format!("Subscription {}", subscription.name), None, None)
+        };
+        let thumbnail_url = structure.alliance_id.map(sov_alliance_logo);
+        let footer_icon = structure.alliance_id.map(sov_alliance_logo);
 
         SovNotificationMessage {
             title,
             fields,
-            footer: format!("{} {}", stage.footer_label(), window.display()),
+            footer: format!(
+                "Vuln window shift {} \u{2022} EVETime {}",
+                window.display(),
+                observed_at.format("%d/%m/%Y, %H:%M")
+            ),
+            content: Some(content),
+            author: Some(author),
+            author_url,
+            author_icon,
+            description: Some(description_lines.join("\n")),
+            thumbnail_url,
+            url: Some(format!(
+                "https://evemaps.dotlan.net/system/{}",
+                structure.solar_system_id
+            )),
+            color: Some(sov_stage_color(stage)),
+            footer_icon,
+            timestamp: structure.vulnerable_start_time,
         }
     }
 
@@ -1733,27 +1924,32 @@ impl SovCollector {
     /// Renders a route (home-to-target system IDs, in travel order) as a
     /// display string, resolving each ID to its system name and truncating
     /// to eight systems with `…` (spec "Embed": "route summary truncated
-    /// to eight systems"). A system this directory cannot resolve falls
-    /// back to its raw ID rather than dropping it from the route.
+    /// to eight systems"). A system this directory cannot resolve is
+    /// *dropped* and its gap shown as `…` (ticket 19 review note: never
+    /// print a bare system id), consecutive unresolved hops collapsing into
+    /// a single marker. Callers warm the route's hop ids first (bounded by
+    /// the per-cycle cap) so an unresolved hop is rare.
     const SOV_ROUTE_SUMMARY_MAX_SYSTEMS: usize = 8;
 
     fn route_summary(&self, route: &[i64]) -> String {
-        let names: Vec<String> = route
-            .iter()
-            .map(|system_id| {
-                self.directory
-                    .resolve(*system_id)
-                    .map(|info| info.name)
-                    .unwrap_or_else(|| system_id.to_string())
-            })
-            .collect();
-        if names.len() > Self::SOV_ROUTE_SUMMARY_MAX_SYSTEMS {
+        let mut tokens: Vec<String> = Vec::new();
+        for system_id in route {
+            match self.directory.resolve(*system_id) {
+                Some(info) => tokens.push(info.name),
+                None => {
+                    if tokens.last().map(String::as_str) != Some("\u{2026}") {
+                        tokens.push("\u{2026}".to_string());
+                    }
+                }
+            }
+        }
+        if tokens.len() > Self::SOV_ROUTE_SUMMARY_MAX_SYSTEMS {
             format!(
                 "{} \u{2192} \u{2026}",
-                names[..Self::SOV_ROUTE_SUMMARY_MAX_SYSTEMS].join(" \u{2192} ")
+                tokens[..Self::SOV_ROUTE_SUMMARY_MAX_SYSTEMS].join(" \u{2192} ")
             )
         } else {
-            names.join(" \u{2192} ")
+            tokens.join(" \u{2192} ")
         }
     }
 
@@ -1819,12 +2015,134 @@ impl SovCollector {
     }
 }
 
-fn event_type_label(event_type: &str) -> String {
+/// Plain-language `(subject, predicate)` for an ESI sov event type
+/// (ticket 20 hard rule: never print a raw ESI enum). An unrecognized future
+/// event type degrades to the generic "structure is contested" rather than
+/// echoing the wire value.
+fn sov_event_phrase(event_type: &str) -> (&'static str, &'static str) {
     match event_type {
-        "tcu_defense" => "TCU Defense".to_string(),
-        "ihub_defense" => "IHub Defense".to_string(),
-        "station_defense" => "Station Defense".to_string(),
-        "station_freeport" => "Station Freeport".to_string(),
-        other => other.to_string(),
+        "ihub_defense" => ("hub", "is under attack"),
+        "tcu_defense" => ("TCU", "is under attack"),
+        "station_defense" => ("station", "is under attack"),
+        "station_freeport" => ("station", "freeport event"),
+        _ => ("structure", "is contested"),
+    }
+}
+
+/// Capitalizes the first ASCII letter of a lowercase subject word so a
+/// title with no defender ticker prefix still reads as a sentence
+/// ("Hub in ...").
+fn capitalize_first(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// "6 jumps" / "1 jump".
+fn jumps_phrase(jumps: i64) -> String {
+    if jumps == 1 {
+        "1 jump".to_string()
+    } else {
+        format!("{jumps} jumps")
+    }
+}
+
+/// A configured T-minus mark rendered in plain words: 120 -> "2 hours",
+/// 30 -> "30 minutes", 90 -> "90 minutes", 2880 -> "2 days".
+fn humanize_minutes(minutes: i64) -> String {
+    if minutes <= 0 {
+        return "moments".to_string();
+    }
+    if minutes % 1440 == 0 {
+        let days = minutes / 1440;
+        return format!("{days} day{}", if days == 1 { "" } else { "s" });
+    }
+    if minutes % 60 == 0 {
+        let hours = minutes / 60;
+        return format!("{hours} hour{}", if hours == 1 { "" } else { "s" });
+    }
+    format!("{minutes} minutes")
+}
+
+/// The plain-words countdown from `observed_at` to `start`, for the phone
+/// banner ("fight opens in 6 hours"). Deterministic under the feed's virtual
+/// clock (no wall-clock read). A start already in the past reads "moments".
+fn humanize_minutes_from(observed_at: DateTime<Utc>, start: DateTime<Utc>) -> String {
+    let minutes = (start - observed_at).num_minutes();
+    humanize_minutes(minutes.max(0))
+}
+
+/// `images.evetech.net` alliance logo url, mirroring the killfeed's
+/// `str_alliance_icon`.
+fn sov_alliance_logo(alliance_id: i64) -> String {
+    format!("https://images.evetech.net/alliances/{alliance_id}/logo?size=64")
+}
+
+/// The plain-language footer phrase naming the alert stage (ticket 20).
+fn sov_stage_footer_phrase(stage: SovAlertStage) -> String {
+    match stage {
+        SovAlertStage::Appeared => "Timer appeared".to_string(),
+        SovAlertStage::TMinus(minutes) => format!("Timer T-{minutes}m"),
+        SovAlertStage::Reachable(_) => "Timer now reachable".to_string(),
+        SovAlertStage::TzWindowEntered(_) => "Vuln window shift".to_string(),
+    }
+}
+
+/// The embed colour per stage (ticket 20: the stage changes the colour).
+fn sov_stage_color(stage: SovAlertStage) -> u32 {
+    match stage {
+        // orange (appeared), red (imminent T-minus), blue (now reachable),
+        // purple (timezone window).
+        SovAlertStage::Appeared => 0xE6_7E_22,
+        SovAlertStage::TMinus(_) => 0xE7_4C_3C,
+        SovAlertStage::Reachable(_) => 0x34_98_DB,
+        SovAlertStage::TzWindowEntered(_) => 0x9B_59_B6,
+    }
+}
+
+#[cfg(test)]
+mod dense_render_tests {
+    use super::*;
+
+    #[test]
+    fn event_phrases_are_plain_language_never_raw_enums() {
+        assert_eq!(sov_event_phrase("ihub_defense"), ("hub", "is under attack"));
+        assert_eq!(sov_event_phrase("tcu_defense"), ("TCU", "is under attack"));
+        assert_eq!(
+            sov_event_phrase("station_defense"),
+            ("station", "is under attack")
+        );
+        assert_eq!(
+            sov_event_phrase("station_freeport"),
+            ("station", "freeport event")
+        );
+        // An unknown future enum degrades to a generic phrase, never echoes
+        // the wire value.
+        let (subject, predicate) = sov_event_phrase("some_future_event");
+        assert!(!subject.contains('_'));
+        assert!(!predicate.contains('_'));
+    }
+
+    #[test]
+    fn humanize_minutes_reads_as_words() {
+        assert_eq!(humanize_minutes(120), "2 hours");
+        assert_eq!(humanize_minutes(60), "1 hour");
+        assert_eq!(humanize_minutes(30), "30 minutes");
+        assert_eq!(humanize_minutes(90), "90 minutes");
+        assert_eq!(humanize_minutes(2880), "2 days");
+    }
+
+    #[test]
+    fn jumps_phrase_pluralizes() {
+        assert_eq!(jumps_phrase(1), "1 jump");
+        assert_eq!(jumps_phrase(6), "6 jumps");
+    }
+
+    #[test]
+    fn capitalize_first_uppercases_a_bare_subject() {
+        assert_eq!(capitalize_first("hub"), "Hub");
+        assert_eq!(capitalize_first("station"), "Station");
     }
 }

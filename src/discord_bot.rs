@@ -722,16 +722,127 @@ pub fn contract_notification_embed(message: &ContractNotificationMessage) -> Cre
     embed
 }
 
-/// Renders one sov campaign notification (spec "Embed": title, fields,
-/// footer naming the stage). Mirrors `contract_notification_embed`.
+/// Renders one sov campaign notification. Ticket 20 rebuilt this on the
+/// killfeed embed's principles: title (with an optional url), an author line
+/// (with its own url/icon), a thumbnail, an embed colour, a compact
+/// description, inline fields, a footer with an icon, and an embed
+/// timestamp. Every dense part is an `Option` on the stored message, so a
+/// delivery row persisted before ticket 20 (all `None`) renders in the old
+/// shape: title, fields, and footer text only.
 pub fn sov_campaign_embed(message: &sov_feed::SovNotificationMessage) -> CreateEmbed {
     let mut embed = CreateEmbed::default();
-    embed.title(&message.title);
+    apply_dense_embed_parts(
+        &mut embed,
+        DenseEmbedParts {
+            title: &message.title,
+            url: message.url.as_deref(),
+            author: message.author.as_deref(),
+            author_url: message.author_url.as_deref(),
+            author_icon: message.author_icon.as_deref(),
+            description: message.description.as_deref(),
+            thumbnail_url: message.thumbnail_url.as_deref(),
+            color: message.color,
+            footer: &message.footer,
+            footer_icon: message.footer_icon.as_deref(),
+            timestamp: message.timestamp,
+        },
+    );
     for field in &message.fields {
         embed.field(&field.name, &field.value, field.inline);
     }
-    embed.footer(|builder| builder.text(&message.footer));
     embed
+}
+
+/// The dense-embed parts shared by the sov and watchlist renderers
+/// (ticket 20). Borrowed slices so neither renderer clones the stored
+/// message just to build an embed.
+struct DenseEmbedParts<'a> {
+    title: &'a str,
+    url: Option<&'a str>,
+    author: Option<&'a str>,
+    author_url: Option<&'a str>,
+    author_icon: Option<&'a str>,
+    description: Option<&'a str>,
+    thumbnail_url: Option<&'a str>,
+    color: Option<u32>,
+    footer: &'a str,
+    footer_icon: Option<&'a str>,
+    timestamp: Option<DateTime<Utc>>,
+}
+
+/// Applies the title/url/author/description/thumbnail/colour/footer/timestamp
+/// of a dense feed embed. Absent parts are simply not set, so a pre-ticket-20
+/// message renders with only its title and footer text.
+fn apply_dense_embed_parts(embed: &mut CreateEmbed, parts: DenseEmbedParts<'_>) {
+    embed.title(parts.title);
+    if let Some(url) = parts.url {
+        embed.url(url);
+    }
+    if let Some(author) = parts.author {
+        let author_url = parts.author_url.map(ToOwned::to_owned);
+        let author_icon = parts.author_icon.map(ToOwned::to_owned);
+        embed.author(|builder| {
+            builder.name(author);
+            if let Some(url) = author_url {
+                builder.url(url);
+            }
+            if let Some(icon) = author_icon {
+                builder.icon_url(icon);
+            }
+            builder
+        });
+    }
+    if let Some(description) = parts.description {
+        embed.description(description);
+    }
+    if let Some(thumbnail_url) = parts.thumbnail_url {
+        embed.thumbnail(thumbnail_url);
+    }
+    if let Some(color) = parts.color {
+        embed.color(Colour::new(color));
+    }
+    embed.footer(|builder| {
+        builder.text(parts.footer);
+        if let Some(icon) = parts.footer_icon {
+            builder.icon_url(icon);
+        }
+        builder
+    });
+    if let Some(timestamp) = parts.timestamp {
+        embed.timestamp(timestamp.to_rfc3339());
+    }
+}
+
+/// Builds the message `content` and the `allowed_mentions` id lists for a
+/// sov/watchlist delivery (ticket 20). The content leads with the user
+/// and/or role mention tokens (whichever the subscription configured),
+/// followed by the stored plain-text summary line for phone banners; a row
+/// persisted before ticket 20 carries no summary, so the content is just the
+/// role mention exactly as before. `allowed_mentions` lists exactly the ids
+/// present in the prefix, so only the intended user/role ping fires.
+fn dense_delivery_content(
+    ping_user_id: Option<u64>,
+    role_id: Option<u64>,
+    summary: Option<&str>,
+) -> (String, Vec<u64>, Vec<u64>) {
+    let mut prefix_parts = Vec::new();
+    let mut user_ids = Vec::new();
+    let mut role_ids = Vec::new();
+    if let Some(user_id) = ping_user_id {
+        prefix_parts.push(format!("<@{user_id}>"));
+        user_ids.push(user_id);
+    }
+    if let Some(role_id) = role_id {
+        prefix_parts.push(format!("<@&{role_id}>"));
+        role_ids.push(role_id);
+    }
+    let prefix = prefix_parts.join(" ");
+    let content = match summary {
+        Some(summary) if !prefix.is_empty() => format!("{prefix} {summary}"),
+        Some(summary) => summary.to_string(),
+        None => prefix,
+    };
+    (content, user_ids, role_ids)
 }
 
 pub struct DiscordSovDelivery {
@@ -752,29 +863,61 @@ impl sov_feed::SovDelivery for DiscordSovDelivery {
     ) -> Result<String, sov_feed::SovDeliveryError> {
         let message = ChannelId(delivery.channel_id)
             .send_message(&self.http, |builder| {
-                if let Some(role_id) = delivery.role_id {
-                    builder.content(format!("<@&{role_id}>"));
-                }
-                builder.allowed_mentions(|mentions| {
-                    let mentions = mentions.empty_parse();
-                    match delivery.role_id {
-                        Some(role_id) => mentions.roles([role_id]),
-                        None => mentions,
-                    }
-                });
-                builder.set_embed(sov_campaign_embed(&delivery.message));
-                builder
-                    .0
-                    .insert("nonce", Value::String(delivery.nonce.clone()));
-                builder
-                    .0
-                    .insert("enforce_nonce", Value::Bool(delivery.enforce_nonce));
+                configure_sov_delivery_message(builder, &delivery);
                 builder
             })
             .await
             .map_err(sov_delivery_error)?;
         Ok(message.id.to_string())
     }
+}
+
+fn configure_sov_delivery_message<'a, 'builder>(
+    builder: &'builder mut CreateMessage<'a>,
+    delivery: &sov_feed::PreparedSovDelivery,
+) -> &'builder mut CreateMessage<'a> {
+    let (content, user_ids, role_ids) = dense_delivery_content(
+        delivery.ping_user_id,
+        delivery.role_id,
+        delivery.message.content.as_deref(),
+    );
+    if !content.is_empty() {
+        builder.content(content);
+    }
+    builder.allowed_mentions(|mentions| {
+        let mentions = mentions.empty_parse();
+        let mentions = if user_ids.is_empty() {
+            mentions
+        } else {
+            mentions.users(user_ids.clone())
+        };
+        if role_ids.is_empty() {
+            mentions
+        } else {
+            mentions.roles(role_ids.clone())
+        }
+    });
+    builder.set_embed(sov_campaign_embed(&delivery.message));
+    builder
+        .0
+        .insert("nonce", Value::String(delivery.nonce.clone()));
+    builder
+        .0
+        .insert("enforce_nonce", Value::Bool(delivery.enforce_nonce));
+    builder
+}
+
+#[cfg(test)]
+pub(crate) fn configured_sov_delivery_payload_for_test(
+    delivery: &sov_feed::PreparedSovDelivery,
+) -> serde_json::Map<String, Value> {
+    let mut builder = CreateMessage::default();
+    configure_sov_delivery_message(&mut builder, delivery);
+    builder
+        .0
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
 }
 
 /// Classifies a Serenity send failure as transient or permanent, reusing
@@ -909,11 +1052,25 @@ impl sov_feed::SovTickerResolver for DiscordSovTickerResolver {
 /// the event kind). Mirrors [`sov_campaign_embed`].
 pub fn watchlist_embed(message: &watchlist_feed::WatchlistNotificationMessage) -> CreateEmbed {
     let mut embed = CreateEmbed::default();
-    embed.title(&message.title);
+    apply_dense_embed_parts(
+        &mut embed,
+        DenseEmbedParts {
+            title: &message.title,
+            url: message.url.as_deref(),
+            author: message.author.as_deref(),
+            author_url: message.author_url.as_deref(),
+            author_icon: message.author_icon.as_deref(),
+            description: message.description.as_deref(),
+            thumbnail_url: message.thumbnail_url.as_deref(),
+            color: message.color,
+            footer: &message.footer,
+            footer_icon: message.footer_icon.as_deref(),
+            timestamp: message.timestamp,
+        },
+    );
     for field in &message.fields {
         embed.field(&field.name, &field.value, field.inline);
     }
-    embed.footer(|builder| builder.text(&message.footer));
     embed
 }
 
@@ -935,29 +1092,61 @@ impl watchlist_feed::WatchlistDelivery for DiscordWatchlistDelivery {
     ) -> Result<String, watchlist_feed::WatchlistDeliveryError> {
         let message = ChannelId(delivery.channel_id)
             .send_message(&self.http, |builder| {
-                if let Some(role_id) = delivery.role_id {
-                    builder.content(format!("<@&{role_id}>"));
-                }
-                builder.allowed_mentions(|mentions| {
-                    let mentions = mentions.empty_parse();
-                    match delivery.role_id {
-                        Some(role_id) => mentions.roles([role_id]),
-                        None => mentions,
-                    }
-                });
-                builder.set_embed(watchlist_embed(&delivery.message));
-                builder
-                    .0
-                    .insert("nonce", Value::String(delivery.nonce.clone()));
-                builder
-                    .0
-                    .insert("enforce_nonce", Value::Bool(delivery.enforce_nonce));
+                configure_watchlist_delivery_message(builder, &delivery);
                 builder
             })
             .await
             .map_err(watchlist_delivery_error)?;
         Ok(message.id.to_string())
     }
+}
+
+fn configure_watchlist_delivery_message<'a, 'builder>(
+    builder: &'builder mut CreateMessage<'a>,
+    delivery: &watchlist_feed::PreparedWatchlistDelivery,
+) -> &'builder mut CreateMessage<'a> {
+    let (content, user_ids, role_ids) = dense_delivery_content(
+        delivery.ping_user_id,
+        delivery.role_id,
+        delivery.message.content.as_deref(),
+    );
+    if !content.is_empty() {
+        builder.content(content);
+    }
+    builder.allowed_mentions(|mentions| {
+        let mentions = mentions.empty_parse();
+        let mentions = if user_ids.is_empty() {
+            mentions
+        } else {
+            mentions.users(user_ids.clone())
+        };
+        if role_ids.is_empty() {
+            mentions
+        } else {
+            mentions.roles(role_ids.clone())
+        }
+    });
+    builder.set_embed(watchlist_embed(&delivery.message));
+    builder
+        .0
+        .insert("nonce", Value::String(delivery.nonce.clone()));
+    builder
+        .0
+        .insert("enforce_nonce", Value::Bool(delivery.enforce_nonce));
+    builder
+}
+
+#[cfg(test)]
+pub(crate) fn configured_watchlist_delivery_payload_for_test(
+    delivery: &watchlist_feed::PreparedWatchlistDelivery,
+) -> serde_json::Map<String, Value> {
+    let mut builder = CreateMessage::default();
+    configure_watchlist_delivery_message(&mut builder, delivery);
+    builder
+        .0
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
 }
 
 /// Classifies a Serenity send failure as transient or permanent, reusing
@@ -1013,16 +1202,25 @@ impl watchlist_feed::WatchlistEntityResolver for DiscordWatchlistResolver {
     async fn corporation(&self, corporation_id: i64) -> watchlist_feed::WatchlistCorporation {
         let id = match u64::try_from(corporation_id) {
             Ok(id) => id,
-            Err(_) => {
-                return watchlist_feed::WatchlistCorporation {
-                    name: None,
-                    ticker: None,
-                }
-            }
+            Err(_) => return watchlist_feed::WatchlistCorporation::default(),
         };
+        // Ticket 20: the dense embed also needs the corporation's member
+        // count, founding date, and current alliance from
+        // `GET /corporations/{id}/`; a failed fetch degrades each to `None`
+        // (the renderer omits the missing part rather than printing a
+        // placeholder).
+        let details = self
+            .app_state
+            .esi_client
+            .get_corporation_details(id)
+            .await
+            .unwrap_or_default();
         watchlist_feed::WatchlistCorporation {
             name: get_name(&self.app_state, id).await,
             ticker: get_ticker(&self.app_state, id, false).await,
+            member_count: details.member_count,
+            date_founded: details.date_founded,
+            alliance_id: details.alliance_id,
         }
     }
 
@@ -2870,6 +3068,203 @@ pub(crate) async fn get_ticker(
             trace!("Failed to fetch ticker for {}: {}", id, e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod dense_delivery_tests {
+    use super::*;
+
+    // A fixed, fake Discord user id (never a real one) for the mention tests.
+    const FAKE_USER_ID: u64 = 424_242_424_242_424_242;
+    const FAKE_ROLE_ID: u64 = 313_131_313_131_313_131;
+
+    fn sov_delivery(
+        ping_user_id: Option<u64>,
+        role_id: Option<u64>,
+        content: Option<&str>,
+    ) -> sov_feed::PreparedSovDelivery {
+        sov_feed::PreparedSovDelivery {
+            delivery_id: 1,
+            guild_id: 10,
+            channel_id: 20,
+            subscription_name: "hostile-timers".to_string(),
+            subject_kind: "campaign".to_string(),
+            subject_id: 5,
+            stage: "appeared".to_string(),
+            role_id,
+            ping_user_id,
+            message: sov_feed::SovNotificationMessage {
+                title: "X.I.X hub in 5LAJ-8 (The Spire) is under attack".to_string(),
+                fields: vec![],
+                footer: "Timer appeared".to_string(),
+                content: content.map(ToOwned::to_owned),
+                ..Default::default()
+            },
+            nonce: "sov-1".to_string(),
+            enforce_nonce: true,
+            attempt_count: 1,
+            delivery_claim_token: None,
+        }
+    }
+
+    #[test]
+    fn sov_user_only_mention_pings_exactly_the_user() {
+        let delivery = sov_delivery(Some(FAKE_USER_ID), None, Some("under attack"));
+        let payload = configured_sov_delivery_payload_for_test(&delivery);
+        assert_eq!(
+            payload["content"],
+            Value::String(format!("<@{FAKE_USER_ID}> under attack"))
+        );
+        assert_eq!(
+            payload["allowed_mentions"]["users"],
+            serde_json::json!([FAKE_USER_ID.to_string()])
+        );
+        assert!(payload["allowed_mentions"].get("roles").is_none());
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn sov_role_only_mention_pings_exactly_the_role() {
+        let delivery = sov_delivery(None, Some(FAKE_ROLE_ID), Some("under attack"));
+        let payload = configured_sov_delivery_payload_for_test(&delivery);
+        assert_eq!(
+            payload["content"],
+            Value::String(format!("<@&{FAKE_ROLE_ID}> under attack"))
+        );
+        assert_eq!(
+            payload["allowed_mentions"]["roles"],
+            serde_json::json!([FAKE_ROLE_ID.to_string()])
+        );
+        assert!(payload["allowed_mentions"].get("users").is_none());
+    }
+
+    #[test]
+    fn sov_both_mentions_ping_both_ids() {
+        let delivery = sov_delivery(Some(FAKE_USER_ID), Some(FAKE_ROLE_ID), Some("under attack"));
+        let payload = configured_sov_delivery_payload_for_test(&delivery);
+        assert_eq!(
+            payload["content"],
+            Value::String(format!("<@{FAKE_USER_ID}> <@&{FAKE_ROLE_ID}> under attack"))
+        );
+        assert_eq!(
+            payload["allowed_mentions"]["users"],
+            serde_json::json!([FAKE_USER_ID.to_string()])
+        );
+        assert_eq!(
+            payload["allowed_mentions"]["roles"],
+            serde_json::json!([FAKE_ROLE_ID.to_string()])
+        );
+    }
+
+    #[test]
+    fn sov_no_mentions_still_carries_the_summary_content() {
+        let delivery = sov_delivery(None, None, Some("under attack"));
+        let payload = configured_sov_delivery_payload_for_test(&delivery);
+        assert_eq!(
+            payload["content"],
+            Value::String("under attack".to_string())
+        );
+        assert!(payload["allowed_mentions"].get("users").is_none());
+        assert!(payload["allowed_mentions"].get("roles").is_none());
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn sov_old_row_without_summary_renders_role_only_content() {
+        // A pre-ticket-20 row (no stored content): role mention alone,
+        // exactly the old behaviour, with no user ping.
+        let delivery = sov_delivery(None, Some(FAKE_ROLE_ID), None);
+        let payload = configured_sov_delivery_payload_for_test(&delivery);
+        assert_eq!(
+            payload["content"],
+            Value::String(format!("<@&{FAKE_ROLE_ID}>"))
+        );
+    }
+
+    fn watchlist_delivery(
+        ping_user_id: Option<u64>,
+        role_id: Option<u64>,
+        content: Option<&str>,
+    ) -> watchlist_feed::PreparedWatchlistDelivery {
+        watchlist_feed::PreparedWatchlistDelivery {
+            delivery_id: 1,
+            guild_id: 10,
+            channel_id: 20,
+            subscription_name: "corp-watch".to_string(),
+            event_kind: "corp_joined".to_string(),
+            entity_id: 99,
+            evidence_key: "1:2026-09-06".to_string(),
+            role_id,
+            ping_user_id,
+            message: watchlist_feed::WatchlistNotificationMessage {
+                title: "Blank-Space [TAYLR] joined Snuffed Out".to_string(),
+                fields: vec![],
+                footer: "Corporation Joined".to_string(),
+                content: content.map(ToOwned::to_owned),
+                ..Default::default()
+            },
+            nonce: "wl-1".to_string(),
+            enforce_nonce: true,
+            attempt_count: 1,
+            delivery_claim_token: None,
+        }
+    }
+
+    #[test]
+    fn watchlist_both_mentions_ping_both_ids() {
+        let delivery = watchlist_delivery(Some(FAKE_USER_ID), Some(FAKE_ROLE_ID), Some("joined"));
+        let payload = configured_watchlist_delivery_payload_for_test(&delivery);
+        assert_eq!(
+            payload["content"],
+            Value::String(format!("<@{FAKE_USER_ID}> <@&{FAKE_ROLE_ID}> joined"))
+        );
+        assert_eq!(
+            payload["allowed_mentions"]["users"],
+            serde_json::json!([FAKE_USER_ID.to_string()])
+        );
+        assert_eq!(
+            payload["allowed_mentions"]["roles"],
+            serde_json::json!([FAKE_ROLE_ID.to_string()])
+        );
+    }
+
+    #[test]
+    fn watchlist_user_only_mention_pings_exactly_the_user() {
+        let delivery = watchlist_delivery(Some(FAKE_USER_ID), None, Some("joined"));
+        let payload = configured_watchlist_delivery_payload_for_test(&delivery);
+        assert_eq!(
+            payload["content"],
+            Value::String(format!("<@{FAKE_USER_ID}> joined"))
+        );
+        assert_eq!(
+            payload["allowed_mentions"]["users"],
+            serde_json::json!([FAKE_USER_ID.to_string()])
+        );
+        assert!(payload["allowed_mentions"].get("roles").is_none());
+    }
+
+    #[test]
+    fn dense_embed_renders_new_optional_parts_and_old_rows_stay_flat() {
+        let mut message = sov_feed::SovNotificationMessage {
+            title: "T".to_string(),
+            fields: vec![],
+            footer: "F".to_string(),
+            ..Default::default()
+        };
+        // Old-shape row: no author/thumbnail/colour set on the embed.
+        let old = sov_campaign_embed(&message);
+        assert!(old.0.get("author").is_none());
+        assert!(old.0.get("thumbnail").is_none());
+        // New-shape row populates the dense parts.
+        message.author = Some("Watched alliance X.I.X \u{b7} hostile-timers".to_string());
+        message.thumbnail_url =
+            Some("https://images.evetech.net/alliances/1/logo?size=64".to_string());
+        message.color = Some(0xE6_7E_22);
+        let dense = sov_campaign_embed(&message);
+        assert!(dense.0.get("author").is_some());
+        assert!(dense.0.get("thumbnail").is_some());
+        assert_eq!(dense.0["color"], serde_json::json!(0xE6_7E_22));
     }
 }
 

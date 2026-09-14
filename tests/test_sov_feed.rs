@@ -20,10 +20,10 @@ use killbot_rust::esi_cache::{CacheMetadata, EsiError, EsiResponse};
 use killbot_rust::sov_feed::{
     DynamicChainSovReachability, PathRisk, PreparedSovDelivery, SovAlertStage, SovCampaign,
     SovChainCollector, SovChainStatus, SovClock, SovCollector, SovDelivery, SovDeliveryError,
-    SovFilter, SovFilterCondition, SovFilterNode, SovMapEntry, SovNotificationMessage,
-    SovReachabilityInfo, SovReachabilitySource, SovStore, SovStructure, SovSubscription,
-    SovSystemDirectory, SovSystemInfo, SovTickerResolver, SovWatchlistSource, SovereigntyEsi,
-    StargateGraph, StargateGraphFile, StaticSovReachability, WandererChainSource,
+    SovEmbedField, SovFilter, SovFilterCondition, SovFilterNode, SovMapEntry,
+    SovNotificationMessage, SovReachabilityInfo, SovReachabilitySource, SovStore, SovStructure,
+    SovSubscription, SovSystemDirectory, SovSystemInfo, SovTickerResolver, SovWatchlistSource,
+    SovereigntyEsi, StargateGraph, StargateGraphFile, StaticSovReachability, WandererChainSource,
     WandererConnection, WandererConnectionType, WandererError, WandererMassStatus,
     WandererShipSizeType, WandererSystem, WandererTimeStatus, SOV_HUB_STRUCTURE_TYPE_IDS,
 };
@@ -556,6 +556,7 @@ async fn subscribe_with_options(
         filter,
         options,
         role_id,
+        ping_user_id: None,
     };
     store
         .upsert_subscription(&subscription)
@@ -760,7 +761,46 @@ async fn a_new_non_baseline_campaign_within_the_window_posts_exactly_once() {
     let sent = delivery.sent();
     assert_eq!(sent[0].subject_id, new_campaign.campaign_id);
     assert_eq!(sent[0].role_id, Some(999));
-    assert_eq!(sent[0].message.footer, "Appeared");
+    assert!(
+        sent[0].message.footer.starts_with("Timer appeared"),
+        "footer: {}",
+        sent[0].message.footer
+    );
+
+    // Ticket 20 dense embed (exact golden for the `appeared` stage): a
+    // plain-language title/content, the "Subscription <name>" author line
+    // (this filter has no defender leaf), the inline "Starts" field alone
+    // (no reachability graph, no hub-vulnerability window observed), the
+    // orange appeared colour, Dotlan/zKillboard links, and the countdown
+    // timestamps -- never a raw ESI enum, a bare id, or "Unknown".
+    let unix = new_campaign.start_time.timestamp();
+    let logo = "https://images.evetech.net/alliances/99012982/logo?size=64".to_string();
+    let expected = SovNotificationMessage {
+        title: "TEST hub in Jita (The Forge) is under attack".to_string(),
+        content: Some(
+            "TEST hub in Jita (The Forge) is under attack, fight opens in 179 minutes".to_string(),
+        ),
+        description: Some(format!(
+            "Fight opens <t:{unix}:F> (<t:{unix}:R>)\n\
+             Entosis: defenders 60% \u{b7} attackers 40%\n\
+             Jita \u{b7} The Forge \u{b7} [Dotlan](https://evemaps.dotlan.net/system/30004737) \u{b7} [zKillboard](https://zkillboard.com/system/30004737/)"
+        )),
+        fields: vec![SovEmbedField {
+            name: "Starts".to_string(),
+            value: format!("<t:{unix}:f>"),
+            inline: true,
+        }],
+        footer: "Timer appeared \u{2022} EVETime 27/08/2026, 00:00".to_string(),
+        author: Some("Subscription watch-all".to_string()),
+        author_url: None,
+        author_icon: None,
+        thumbnail_url: Some(logo.clone()),
+        url: Some("https://evemaps.dotlan.net/system/30004737".to_string()),
+        color: Some(0xE6_7E_22),
+        footer_icon: Some(logo),
+        timestamp: Some(new_campaign.start_time),
+    };
+    assert_eq!(sent[0].message, expected);
 
     // A third cycle with no ESI change and no new campaigns must not
     // double-post: the unique constraint on (subscription, subject_kind,
@@ -1552,15 +1592,49 @@ async fn a_campaign_across_virtual_time_gets_appeared_then_each_tminus_mark_once
     assert_eq!(delivery.sent_count(), 3);
 
     let sent = delivery.sent();
+    // Ticket 20 exact golden for the `T-minus` stage (T-120): the title and
+    // content read "fight opens in 2 hours" (the mark humanized, not the
+    // live countdown), the footer names the mark, and the colour is the
+    // imminent red. Fired at exactly T-120 (observed 00:05 EVE), no
+    // reachability graph and no sovereignty map loaded.
+    let tminus_120 = sent
+        .iter()
+        .find(|d| d.stage == "tminus:120")
+        .expect("T-120 mark was delivered");
+    let unix = new_campaign.start_time.timestamp();
+    let logo = "https://images.evetech.net/alliances/99006751/logo?size=64".to_string();
+    let expected = SovNotificationMessage {
+        title: "TEST hub in Turnur (Tenal) is under attack, fight opens in 2 hours".to_string(),
+        content: Some(
+            "TEST hub in Turnur (Tenal) is under attack, fight opens in 2 hours".to_string(),
+        ),
+        description: Some(format!(
+            "Fight opens <t:{unix}:F> (<t:{unix}:R>)\n\
+             Entosis: defenders 60% \u{b7} attackers 40%\n\
+             Turnur \u{b7} Tenal \u{b7} [Dotlan](https://evemaps.dotlan.net/system/30005174) \u{b7} [zKillboard](https://zkillboard.com/system/30005174/)"
+        )),
+        fields: vec![SovEmbedField {
+            name: "Starts".to_string(),
+            value: format!("<t:{unix}:f>"),
+            inline: true,
+        }],
+        footer: "Timer T-120m \u{2022} EVETime 27/08/2026, 00:05".to_string(),
+        author: Some("Subscription watch-all".to_string()),
+        author_url: None,
+        author_icon: None,
+        thumbnail_url: Some(logo.clone()),
+        url: Some("https://evemaps.dotlan.net/system/30005174".to_string()),
+        color: Some(0xE7_4C_3C),
+        footer_icon: Some(logo),
+        timestamp: Some(new_campaign.start_time),
+    };
+    assert_eq!(tminus_120.message, expected);
     assert!(sent
         .iter()
-        .any(|d| d.stage == "appeared" && d.message.footer == "Appeared"));
+        .any(|d| d.stage == "appeared" && d.message.footer.starts_with("Timer appeared")));
     assert!(sent
         .iter()
-        .any(|d| d.stage == "tminus:120" && d.message.footer == "T-120m"));
-    assert!(sent
-        .iter()
-        .any(|d| d.stage == "tminus:30" && d.message.footer == "T-30m"));
+        .any(|d| d.stage == "tminus:30" && d.message.footer.starts_with("Timer T-30m")));
 
     database.destroy().await;
 }
@@ -2479,15 +2553,45 @@ async fn reachable_subscription_posts_only_the_reachable_campaign_and_the_embed_
     assert_eq!(delivery.sent_count(), 1);
     let sent = delivery.sent();
     assert_eq!(sent[0].subject_id, reachable_campaign.campaign_id);
-    let reachability_field = sent[0]
-        .message
-        .fields
-        .iter()
-        .find(|field| field.name == "Reachability")
-        .expect("embed carries a Reachability field for the reachable campaign");
-    assert!(reachability_field.value.contains("1 jump"));
-    assert!(reachability_field.value.contains("Turnur"));
-    assert!(reachability_field.value.contains("Jita"));
+    // Ticket 20 exact golden: the subscription has a `Reachable` leaf and
+    // the hub (1 jump) is within its `max_jumps` (11), so the inline
+    // "Route" field replaces "Distance"; the gate-only route carries no
+    // Path Risk field.
+    let unix = reachable_campaign.start_time.timestamp();
+    let logo = "https://images.evetech.net/alliances/99006751/logo?size=64".to_string();
+    let expected = SovNotificationMessage {
+        title: "TEST hub in Jita (The Forge) is under attack".to_string(),
+        content: Some(
+            "TEST hub in Jita (The Forge) is under attack, fight opens in 119 minutes".to_string(),
+        ),
+        description: Some(format!(
+            "Fight opens <t:{unix}:F> (<t:{unix}:R>)\n\
+             Entosis: defenders 60% \u{b7} attackers 40%\n\
+             Jita \u{b7} The Forge \u{b7} 1 jump from Turnur \u{b7} [Dotlan](https://evemaps.dotlan.net/system/30004737) \u{b7} [zKillboard](https://zkillboard.com/system/30004737/)"
+        )),
+        fields: vec![
+            SovEmbedField {
+                name: "Starts".to_string(),
+                value: format!("<t:{unix}:f>"),
+                inline: true,
+            },
+            SovEmbedField {
+                name: "Route".to_string(),
+                value: "Turnur \u{2192} Jita".to_string(),
+                inline: true,
+            },
+        ],
+        footer: "Timer appeared \u{2022} EVETime 27/08/2026, 00:00".to_string(),
+        author: Some("Subscription roamers".to_string()),
+        author_url: None,
+        author_icon: None,
+        thumbnail_url: Some(logo.clone()),
+        url: Some("https://evemaps.dotlan.net/system/30004737".to_string()),
+        color: Some(0xE6_7E_22),
+        footer_icon: Some(logo),
+        timestamp: Some(reachable_campaign.start_time),
+    };
+    assert_eq!(sent[0].message, expected);
     assert_eq!(
         store
             .count_deliveries_for(unreachable_campaign.campaign_id, SovAlertStage::Appeared)
@@ -2583,6 +2687,211 @@ async fn reachable_composes_with_defender_via_and() {
     let sent = delivery.sent();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].subject_id, matches_both.campaign_id);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_reachable_leaf_out_of_range_shows_distance_not_route() {
+    // The subscription has a `Reachable` leaf (max 2 jumps) but the alert
+    // fires via its `Defender` leaf instead; the hub is 5 jumps away, out
+    // of the reachable leaf's range, so the inline field is the plain
+    // "Distance", never "Route" (ticket 20 review finding 1).
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "reach-or-defender",
+        SovFilter {
+            root: SovFilterNode::Or(vec![
+                SovFilterNode::Condition(SovFilterCondition::Reachable {
+                    max_jumps: 2,
+                    allow_frigate_holes: false,
+                }),
+                SovFilterNode::Condition(SovFilterCondition::Defender {
+                    alliance_ids: vec![99_006_751],
+                    watchlist: false,
+                }),
+            ]),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let matched = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(2),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![matched.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    // Reachable in 5 jumps -- more than the leaf's max of 2.
+    let reachability: Arc<dyn SovReachabilitySource> = Arc::new(FakeSovReachability::with(vec![(
+        30_004_737,
+        5,
+        vec![30_005_174, 30_004_737],
+    )]));
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability,
+    );
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    clock.advance(ChronoDuration::seconds(10));
+    collector.collect_cycle().await.expect("second cycle");
+
+    let sent = delivery.sent();
+    assert_eq!(sent.len(), 1);
+    let unix = matched.start_time.timestamp();
+    let logo = "https://images.evetech.net/alliances/99006751/logo?size=64".to_string();
+    let expected = SovNotificationMessage {
+        title: "TEST hub in Jita (The Forge) is under attack".to_string(),
+        content: Some(
+            "TEST hub in Jita (The Forge) is under attack, fight opens in 119 minutes".to_string(),
+        ),
+        description: Some(format!(
+            "Fight opens <t:{unix}:F> (<t:{unix}:R>)\n\
+             Entosis: defenders 60% \u{b7} attackers 40%\n\
+             Jita \u{b7} The Forge \u{b7} 5 jumps from Turnur \u{b7} [Dotlan](https://evemaps.dotlan.net/system/30004737) \u{b7} [zKillboard](https://zkillboard.com/system/30004737/)"
+        )),
+        fields: vec![
+            SovEmbedField {
+                name: "Starts".to_string(),
+                value: format!("<t:{unix}:f>"),
+                inline: true,
+            },
+            SovEmbedField {
+                name: "Distance".to_string(),
+                value: "5 jumps".to_string(),
+                inline: true,
+            },
+        ],
+        footer: "Timer appeared \u{2022} EVETime 27/08/2026, 00:00".to_string(),
+        author: Some("Watched alliance TEST \u{b7} reach-or-defender".to_string()),
+        author_url: Some("https://zkillboard.com/alliance/99006751/".to_string()),
+        author_icon: Some(logo.clone()),
+        thumbnail_url: Some(logo.clone()),
+        url: Some("https://evemaps.dotlan.net/system/30004737".to_string()),
+        color: Some(0xE6_7E_22),
+        footer_icon: Some(logo),
+        timestamp: Some(matched.start_time),
+    };
+    assert_eq!(sent[0].message, expected);
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+async fn a_29_jump_hub_on_a_defender_only_subscription_shows_distance_and_no_route() {
+    // A `Defender`-only subscription has no `Reachable` leaf at all, so even
+    // a far-away (29-jump) hub is shown as a bare "Distance", never a route
+    // (ticket 20 review finding 1). The author line reads "Watched alliance"
+    // because the subscription filters on a defender.
+    let database = TemporaryDatabase::new().await;
+    let (store, limiter) = provisioned_stores(&database).await;
+    subscribe(
+        &store,
+        "defenders",
+        SovFilter {
+            root: SovFilterNode::Condition(SovFilterCondition::Defender {
+                alliance_ids: vec![99_006_751],
+                watchlist: false,
+            }),
+        },
+        None,
+    )
+    .await;
+
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+    let matched = campaign(
+        1,
+        30_004_737,
+        99_006_751,
+        observed_at + ChronoDuration::hours(2),
+    );
+    let esi = FakeSovereigntyEsi::new(vec![
+        Ok(EsiResponse::fresh(
+            vec![],
+            fresh_metadata(observed_at, "etag-1"),
+        )),
+        Ok(EsiResponse::fresh(
+            vec![matched.clone()],
+            fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
+        )),
+    ]);
+    let delivery = Arc::new(FakeSovDelivery::new(false));
+    let clock = VirtualSovClock::new(observed_at);
+    let reachability: Arc<dyn SovReachabilitySource> = Arc::new(FakeSovReachability::with(vec![(
+        30_004_737,
+        29,
+        vec![30_005_174, 30_004_737],
+    )]));
+    let collector = collector_with_reachability(
+        store.clone(),
+        limiter,
+        esi,
+        delivery.clone(),
+        clock.clone(),
+        reachability,
+    );
+
+    collector.collect_cycle().await.expect("baseline cycle");
+    clock.advance(ChronoDuration::seconds(10));
+    collector.collect_cycle().await.expect("second cycle");
+
+    let sent = delivery.sent();
+    assert_eq!(sent.len(), 1);
+    let unix = matched.start_time.timestamp();
+    let logo = "https://images.evetech.net/alliances/99006751/logo?size=64".to_string();
+    let expected = SovNotificationMessage {
+        title: "TEST hub in Jita (The Forge) is under attack".to_string(),
+        content: Some(
+            "TEST hub in Jita (The Forge) is under attack, fight opens in 119 minutes".to_string(),
+        ),
+        description: Some(format!(
+            "Fight opens <t:{unix}:F> (<t:{unix}:R>)\n\
+             Entosis: defenders 60% \u{b7} attackers 40%\n\
+             Jita \u{b7} The Forge \u{b7} 29 jumps from Turnur \u{b7} [Dotlan](https://evemaps.dotlan.net/system/30004737) \u{b7} [zKillboard](https://zkillboard.com/system/30004737/)"
+        )),
+        fields: vec![
+            SovEmbedField {
+                name: "Starts".to_string(),
+                value: format!("<t:{unix}:f>"),
+                inline: true,
+            },
+            SovEmbedField {
+                name: "Distance".to_string(),
+                value: "29 jumps".to_string(),
+                inline: true,
+            },
+        ],
+        footer: "Timer appeared \u{2022} EVETime 27/08/2026, 00:00".to_string(),
+        author: Some("Watched alliance TEST \u{b7} defenders".to_string()),
+        author_url: Some("https://zkillboard.com/alliance/99006751/".to_string()),
+        author_icon: Some(logo.clone()),
+        thumbnail_url: Some(logo.clone()),
+        url: Some("https://evemaps.dotlan.net/system/30004737".to_string()),
+        color: Some(0xE6_7E_22),
+        footer_icon: Some(logo),
+        timestamp: Some(matched.start_time),
+    };
+    assert_eq!(sent[0].message, expected);
 
     database.destroy().await;
 }
@@ -3174,18 +3483,25 @@ async fn gate_only_route_has_no_path_risk_line_in_the_delivered_embed() {
     assert_eq!(report.alerts_prepared, 1);
     let sent = delivery.sent();
     assert_eq!(sent.len(), 1);
-    assert!(sent[0]
-        .message
-        .fields
-        .iter()
-        .any(|field| field.name == "Reachability"));
-    assert!(
-        !sent[0]
-            .message
-            .fields
-            .iter()
-            .any(|field| field.name == "Path Risk"),
-        "a gate-only route must never carry a Path Risk line"
+    // Ticket 20 exact golden: the hub is in range of the `Reachable` leaf,
+    // so the inline "Route" field replaces "Distance"; a gate-only route
+    // carries no "Path Risk" field, so the fields are exactly Starts+Route.
+    let unix = reachable_campaign.start_time.timestamp();
+    assert_eq!(
+        sent[0].message.fields,
+        vec![
+            SovEmbedField {
+                name: "Starts".to_string(),
+                value: format!("<t:{unix}:f>"),
+                inline: true,
+            },
+            SovEmbedField {
+                name: "Route".to_string(),
+                value: "Turnur \u{2192} Jita".to_string(),
+                inline: true,
+            },
+        ],
+        "a gate-only route in range shows Route and never a Path Risk field"
     );
 
     database.destroy().await;
@@ -3340,23 +3656,50 @@ async fn unreachable_to_reachable_transition_fires_the_reachable_stage_once_with
     let sent = delivery.sent();
     assert_eq!(sent[0].subject_id, target_campaign.campaign_id);
     assert_eq!(sent[0].stage, "reachable:1");
-    assert_eq!(sent[0].message.footer, "now reachable");
-    assert!(
-        sent[0]
-            .message
-            .fields
-            .iter()
-            .any(|field| field.name == "Reachability"),
-        "the reachable embed carries jumps and route, like every other stage"
-    );
-    assert!(
-        sent[0]
-            .message
-            .fields
-            .iter()
-            .any(|field| field.name == "Path Risk"),
-        "the reachable embed carries Path Risk, like every other stage"
-    );
+    // Ticket 20 exact golden for the `reachable` stage: the hub (3 jumps)
+    // is within the subscription's `max_jumps` (5), so the inline "Route"
+    // field replaces "Distance", and the risky wormhole on the route
+    // carries a "Path Risk" field alongside it.
+    let unix = target_campaign.start_time.timestamp();
+    let logo = "https://images.evetech.net/alliances/99006751/logo?size=64".to_string();
+    let expected = SovNotificationMessage {
+        title: "TEST hub in Jita (The Forge) is now 3 jumps from Turnur via gates".to_string(),
+        content: Some(
+            "TEST hub in Jita (The Forge) is under attack, fight opens in 6 hours".to_string(),
+        ),
+        description: Some(format!(
+            "Fight opens <t:{unix}:F> (<t:{unix}:R>)\n\
+             Entosis: defenders 60% \u{b7} attackers 40%\n\
+             Jita \u{b7} The Forge \u{b7} 3 jumps from Turnur \u{b7} [Dotlan](https://evemaps.dotlan.net/system/30004737) \u{b7} [zKillboard](https://zkillboard.com/system/30004737/)"
+        )),
+        fields: vec![
+            SovEmbedField {
+                name: "Starts".to_string(),
+                value: format!("<t:{unix}:f>"),
+                inline: true,
+            },
+            SovEmbedField {
+                name: "Route".to_string(),
+                value: "Turnur \u{2192} Jita".to_string(),
+                inline: true,
+            },
+            SovEmbedField {
+                name: "Path Risk".to_string(),
+                value: "worst hole: EOL <4h, mass <50%".to_string(),
+                inline: true,
+            },
+        ],
+        footer: "Timer now reachable \u{2022} EVETime 27/08/2026, 00:00".to_string(),
+        author: Some("Subscription roamers".to_string()),
+        author_url: None,
+        author_icon: None,
+        thumbnail_url: Some(logo.clone()),
+        url: Some("https://evemaps.dotlan.net/system/30004737".to_string()),
+        color: Some(0x34_98_DB),
+        footer_icon: Some(logo),
+        timestamp: Some(target_campaign.start_time),
+    };
+    assert_eq!(sent[0].message, expected);
 
     // A repeated cycle with reachability unchanged never fires again.
     let report = collector
@@ -3460,7 +3803,9 @@ async fn reachable_unreachable_reachable_fires_twice_with_distinct_stage_keys() 
     assert_eq!(sent[0].stage, "reachable:1");
     assert_eq!(sent[1].stage, "reachable:2");
     assert_ne!(sent[0].stage, sent[1].stage);
-    assert!(sent.iter().all(|d| d.message.footer == "now reachable"));
+    assert!(sent
+        .iter()
+        .all(|d| d.message.footer.starts_with("Timer now reachable")));
 
     database.destroy().await;
 }
@@ -4690,10 +5035,40 @@ async fn tz_window_transition_fires_once_and_unchanged_state_does_not_refire() {
     assert_eq!(report.tz_window_prepared, 1);
     assert_eq!(delivery.sent_count(), 1);
     assert_eq!(delivery.sent()[0].stage, "tz_window_entered:1");
-    assert_eq!(
-        delivery.sent()[0].message.footer,
-        "vuln window entered 00:00\u{2013}04:00"
-    );
+    // Ticket 20 exact golden for the `tz-window` stage: a plain-language
+    // title/content, the "Vulnerable" window field (the hub's own window),
+    // no Distance/Route (no reachability graph), the purple colour, and the
+    // timezone window on both the description and the footer. The hub is
+    // Turnur (Tenal), 30_005_174, owned by alliance 99_000_001.
+    let vuln_start = (observed_at + ChronoDuration::hours(1)).timestamp();
+    let vuln_end = (observed_at + ChronoDuration::hours(4)).timestamp();
+    let logo = "https://images.evetech.net/alliances/99000001/logo?size=64".to_string();
+    let expected = SovNotificationMessage {
+        title: "TEST hub in Turnur (Tenal) is vulnerable during our timezone tonight".to_string(),
+        content: Some(
+            "TEST hub in Turnur (Tenal) is vulnerable during our timezone (00:00\u{2013}04:00)"
+                .to_string(),
+        ),
+        description: Some(format!(
+            "Our timezone window: 00:00\u{2013}04:00\n\
+             Turnur \u{b7} Tenal \u{b7} [Dotlan](https://evemaps.dotlan.net/system/30005174) \u{b7} [zKillboard](https://zkillboard.com/system/30005174/)"
+        )),
+        fields: vec![SovEmbedField {
+            name: "Vulnerable".to_string(),
+            value: format!("<t:{vuln_start}:t> to <t:{vuln_end}:t> EVE"),
+            inline: true,
+        }],
+        footer: "Vuln window shift 00:00\u{2013}04:00 \u{2022} EVETime 27/08/2026, 00:00".to_string(),
+        author: Some("Subscription prime-time".to_string()),
+        author_url: None,
+        author_icon: None,
+        thumbnail_url: Some(logo.clone()),
+        url: Some("https://evemaps.dotlan.net/system/30005174".to_string()),
+        color: Some(0x9B_59_B6),
+        footer_icon: Some(logo),
+        timestamp: Some(observed_at + ChronoDuration::hours(1)),
+    };
+    assert_eq!(delivery.sent()[0].message, expected);
 
     // A later pass observing the same in-window state must not re-fire.
     collector
@@ -5255,7 +5630,7 @@ async fn sov_map_owner_field_is_omitted_from_an_appeared_embed_when_the_map_has_
             fresh_metadata(observed_at, "etag-1"),
         )),
         Ok(EsiResponse::fresh(
-            vec![baseline_campaign, new_campaign],
+            vec![baseline_campaign, new_campaign.clone()],
             fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
         )),
     ]);
@@ -5270,8 +5645,24 @@ async fn sov_map_owner_field_is_omitted_from_an_appeared_embed_when_the_map_has_
         .await
         .expect("appeared cycle without a loaded sovereignty map");
     assert_eq!(delivery.sent_count(), 1);
+    let sent = delivery.sent();
+    // Ticket 20: with no sovereignty-map row loaded the owner is omitted
+    // entirely (not a placeholder) -- the location line drops straight from
+    // system/region to the links, with no "owner" segment.
+    let unix = new_campaign.start_time.timestamp();
+    assert_eq!(
+        sent[0].message.description.as_deref(),
+        Some(
+            format!(
+                "Fight opens <t:{unix}:F> (<t:{unix}:R>)\n\
+                 Entosis: defenders 60% \u{b7} attackers 40%\n\
+                 Turnur \u{b7} Tenal \u{b7} [Dotlan](https://evemaps.dotlan.net/system/30005174) \u{b7} [zKillboard](https://zkillboard.com/system/30005174/)"
+            )
+            .as_str()
+        )
+    );
     assert!(
-        delivery.sent()[0]
+        sent[0]
             .message
             .fields
             .iter()
@@ -5307,7 +5698,7 @@ async fn sov_map_owner_field_appears_in_an_appeared_embed_once_the_map_is_loaded
             fresh_metadata(observed_at, "etag-1"),
         )),
         Ok(EsiResponse::fresh(
-            vec![baseline_campaign, new_campaign],
+            vec![baseline_campaign, new_campaign.clone()],
             fresh_metadata(observed_at + ChronoDuration::seconds(10), "etag-2"),
         )),
     ])
@@ -5336,15 +5727,31 @@ async fn sov_map_owner_field_appears_in_an_appeared_embed_once_the_map_is_loaded
         .expect("appeared cycle with a loaded sovereignty map");
     assert_eq!(delivery.sent_count(), 1);
     let sent = delivery.sent();
-    let owner_field = sent[0]
-        .message
-        .fields
-        .iter()
-        .find(|field| field.name == "System Owner")
-        .expect("owner field present once the map is loaded");
-    // Alliance takes priority over corporation (FakeSovTickerResolver
-    // resolves every alliance ID to "TEST").
-    assert_eq!(owner_field.value, "TEST");
+    // Ticket 20: the current owner from the sovereignty map now rides the
+    // description's location line (alliance takes priority over corporation;
+    // FakeSovTickerResolver resolves every alliance ID to "TEST"), never a
+    // separate field. The system is Turnur (Tenal), 30_005_174, with no
+    // reachability graph loaded.
+    let unix = new_campaign.start_time.timestamp();
+    assert_eq!(
+        sent[0].message.description.as_deref(),
+        Some(
+            format!(
+                "Fight opens <t:{unix}:F> (<t:{unix}:R>)\n\
+                 Entosis: defenders 60% \u{b7} attackers 40%\n\
+                 Turnur \u{b7} Tenal \u{b7} owner TEST \u{b7} [Dotlan](https://evemaps.dotlan.net/system/30005174) \u{b7} [zKillboard](https://zkillboard.com/system/30005174/)"
+            )
+            .as_str()
+        )
+    );
+    assert!(
+        sent[0]
+            .message
+            .fields
+            .iter()
+            .all(|field| field.name != "System Owner"),
+        "the owner is carried in the description, never a separate field"
+    );
 
     database.destroy().await;
 }
@@ -5731,6 +6138,7 @@ async fn a_claimed_delivery_always_carries_a_stable_non_empty_nonce() {
         title: "title".to_string(),
         fields: vec![],
         footer: "Appeared".to_string(),
+        ..Default::default()
     };
     let fresh = store
         .prepare_delivery(
@@ -6199,6 +6607,7 @@ async fn prepare_and_send_campaign_delivery(
         title: "title".to_string(),
         fields: vec![],
         footer: "Appeared".to_string(),
+        ..Default::default()
     };
     let fresh = store
         .prepare_delivery(
@@ -6307,6 +6716,7 @@ async fn prune_never_removes_prepared_deliveries() {
         title: "title".to_string(),
         fields: vec![],
         footer: "Appeared".to_string(),
+        ..Default::default()
     };
     let fresh = store
         .prepare_delivery(
@@ -6349,6 +6759,7 @@ async fn prune_never_removes_permanent_failure_deliveries() {
         title: "title".to_string(),
         fields: vec![],
         footer: "Appeared".to_string(),
+        ..Default::default()
     };
     let fresh = store
         .prepare_delivery(

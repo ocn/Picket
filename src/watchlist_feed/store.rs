@@ -1357,13 +1357,14 @@ impl WatchlistStore {
             .map(|kind| kind.as_str().to_string())
             .collect();
         sqlx::query(
-            "INSERT INTO watchlist_subscriptions (guild_id, channel_id, name, event_kinds, role_id, options) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (guild_id, channel_id, name) DO UPDATE SET event_kinds = EXCLUDED.event_kinds, role_id = EXCLUDED.role_id, options = EXCLUDED.options, updated_at = now()",
+            "INSERT INTO watchlist_subscriptions (guild_id, channel_id, name, event_kinds, role_id, ping_user_id, options) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (guild_id, channel_id, name) DO UPDATE SET event_kinds = EXCLUDED.event_kinds, role_id = EXCLUDED.role_id, ping_user_id = EXCLUDED.ping_user_id, options = EXCLUDED.options, updated_at = now()",
         )
         .bind(subscription.guild_id as i64)
         .bind(subscription.channel_id as i64)
         .bind(&subscription.name)
         .bind(&event_kinds)
         .bind(subscription.role_id.map(|id| id as i64))
+        .bind(subscription.ping_user_id.map(|id| id as i64))
         .bind(&subscription.options)
         .execute(&self.pool)
         .await?;
@@ -1394,7 +1395,7 @@ impl WatchlistStore {
         guild_id: u64,
     ) -> Result<Vec<WatchlistSubscription>, sqlx::Error> {
         sqlx::query(
-            "SELECT guild_id, channel_id, name, event_kinds, role_id, options FROM watchlist_subscriptions WHERE guild_id = $1 ORDER BY channel_id, name",
+            "SELECT guild_id, channel_id, name, event_kinds, role_id, ping_user_id, options FROM watchlist_subscriptions WHERE guild_id = $1 ORDER BY channel_id, name",
         )
         .bind(guild_id as i64)
         .fetch_all(&self.pool)
@@ -1482,7 +1483,7 @@ impl WatchlistStore {
         let claim_token = format!("wl-delivery-{:032x}", rand::thread_rng().gen::<u128>());
         let lease_until = attempted_at + WATCHLIST_DELIVERY_LEASE;
         let row = sqlx::query(
-            "UPDATE watchlist_deliveries SET attempt_count = attempt_count + 1, nonce_window_until = COALESCE(nonce_window_until, $2), delivery_nonce = COALESCE(delivery_nonce, 'wl-' || id), delivery_claim_token = $3, delivery_claimed_at = $4, delivery_lease_until = $5 WHERE id = $1 AND status = 'prepared' AND (delivery_lease_until IS NULL OR delivery_lease_until <= $4) RETURNING id, guild_id, channel_id, subscription_name, event_kind, entity_id, evidence_key, message, role_id, delivery_nonce, nonce_window_until, delivery_claim_token, attempt_count",
+            "UPDATE watchlist_deliveries SET attempt_count = attempt_count + 1, nonce_window_until = COALESCE(nonce_window_until, $2), delivery_nonce = COALESCE(delivery_nonce, 'wl-' || id), delivery_claim_token = $3, delivery_claimed_at = $4, delivery_lease_until = $5 WHERE id = $1 AND status = 'prepared' AND (delivery_lease_until IS NULL OR delivery_lease_until <= $4) RETURNING id, guild_id, channel_id, subscription_name, event_kind, entity_id, evidence_key, message, role_id, (SELECT s.ping_user_id FROM watchlist_subscriptions s WHERE s.guild_id = watchlist_deliveries.guild_id AND s.channel_id = watchlist_deliveries.channel_id AND s.name = watchlist_deliveries.subscription_name) AS ping_user_id, delivery_nonce, nonce_window_until, delivery_claim_token, attempt_count",
         )
         .bind(delivery_id)
         .bind(nonce_window_until)
@@ -1682,6 +1683,9 @@ fn watchlist_subscription_from_row(row: PgRow) -> Result<WatchlistSubscription, 
         name: row.get("name"),
         event_kinds,
         role_id: row.get::<Option<i64>, _>("role_id").map(|id| id as u64),
+        ping_user_id: row
+            .get::<Option<i64>, _>("ping_user_id")
+            .map(|id| id as u64),
         options: row.get("options"),
     })
 }
@@ -1698,6 +1702,9 @@ fn prepared_watchlist_delivery_from_row(
         entity_id: row.get("entity_id"),
         evidence_key: row.get("evidence_key"),
         role_id: row.get::<Option<i64>, _>("role_id").map(|id| id as u64),
+        ping_user_id: row
+            .get::<Option<i64>, _>("ping_user_id")
+            .map(|id| id as u64),
         message: serde_json::from_value(row.get("message")).map_err(json_to_sqlx)?,
         nonce: row
             .get::<Option<String>, _>("delivery_nonce")

@@ -33,7 +33,8 @@ pub use model::{
     WarDetail, WarEvent, WarObservation, WarPageScan, WarParty, WatchedEntity, WatchlistAlliance,
     WatchlistCorporation, WatchlistDelivery, WatchlistDeliveryError, WatchlistDeliveryErrorKind,
     WatchlistEmbedField, WatchlistEntityResolver, WatchlistEvent, WatchlistEventKind,
-    WatchlistKind, WatchlistNotificationMessage, WatchlistSubscription, WATCHLIST_EVENT_KINDS,
+    WatchlistKind, WatchlistNotificationMessage, WatchlistSubscription,
+    WATCHLIST_DEFAULT_EVENT_KINDS, WATCHLIST_EVENT_KINDS,
 };
 pub use store::{
     alliance_resource_key, available_watchlist_store, corp_resource_key,
