@@ -34,7 +34,7 @@ docker compose exec -T postgres pg_dump -U killbot_contracts -d killbot_contract
 
 ### Sovereignty reachability
 
-`SOV_HOME_SYSTEM_ID` sets the reachability origin. It defaults to Turnur (`30002086`) and an empty or whitespace value is treated as unset (the default). A non-integer value logs a warning and falls back to the default rather than failing start-up.
+`SOV_HOME_SYSTEM_ID` sets the reachability origin. The compiled-in default is the original operator's home system, so set it; an empty or whitespace value is treated as unset (the default). A non-integer value logs a warning and falls back to the default rather than failing start-up.
 
 Reachability is computed over `config/stargates.json`, a static stargate adjacency map committed to the repository. Regenerate it only after a rare SDE release that changes the map, with `cargo run --bin build_stargate_graph`; see the README section [Refreshing the stargate graph](../README.md#refreshing-the-stargate-graph). If the file is missing or fails to parse, the feed still starts: `Reachable` filter leaves never match and `/sov_timers` reports the graph as unavailable.
 
@@ -370,3 +370,126 @@ after a successful go-live, and re-triage tickets 12 and 13 against the artifact
 limiter samples.
 
 The evidence artifact lives at `docs/rollouts/esi-intel-feeds-pilot.md`.
+
+## Command reference
+
+Moved from the README. The sections below are the full reference for `/sov_subscribe`, `/sov_timers`, and the watchlist commands.
+
+### Sovereignty Timer Feed
+
+The sov timer feed watches public sovereignty campaigns and posts to subscribed channels when one appears, when a configured T-minus mark is reached, and computes whether the campaign's system is reachable from your home system over stargates and, optionally, the current Wanderer wormhole chain. It also watches Sovereignty Hub vulnerability windows and alerts when one shifts into a subscription's preferred timezone. It shares the contract feed's PostgreSQL database and only starts when `CONTRACT_DATABASE_URL` is configured. Subscriptions use `/sov_subscribe` (with `max_jumps`, 1-11, `allow_frigate_holes`, `tz_window`, and `tz_shift_enabled` convenience options) and `/sov_unsubscribe`; `/sov_timers` lists the live campaigns matching a channel's subscriptions on demand.
+
+`/sov_subscribe` and `/sov_unsubscribe` require the Manage Server (`MANAGE_GUILD`) permission and cannot be used in DMs, while `/sov_timers` stays open to every member.
+
+| Command | Required arguments | Optional arguments | Result |
+| --- | --- | --- | --- |
+| `/sov_subscribe` | `name` | `filter`, `region_id`, `defender_alliance_id`, `max_jumps` (1-11), `allow_frigate_holes`, `role`, `user`, `tminus_marks`, `tz_window`, `tz_shift_enabled`, `clear` | Creates a sov subscription, or partially updates the existing one with that `name` in this channel (omitted fields are carried forward; see the partial-update note below). |
+| `/sov_unsubscribe` | `name` | None | Removes this channel's sov subscription with that `name`. |
+| `/sov_timers` | None | None | Lists the live sov campaigns matching this channel's subscriptions on demand. |
+
+`name` is the stable per-channel subscription name. `filter` is required to create a brand-new subscription (or at least one convenience option), and is optional on a re-subscribe. `region_id`, `defender_alliance_id`, `max_jumps`, and `allow_frigate_holes` are convenience options ANDed onto the filter root; `allow_frigate_holes` requires `max_jumps`. `tminus_marks` (default `120,30`), `tz_window` (default `00:00-04:00`), and `tz_shift_enabled` (default `false`) are behavioural options. `clear` removes stored fields. See the [operator runbook](docs/sov-and-watchlist-feeds.md) for the walkthrough and operations, and the option details below.
+
+Reachability is computed by breadth-first search over `config/stargates.json`, a static undirected stargate adjacency map generated from the SDE `mapSolarSystemJumps` table and committed to the repository. Set `SOV_HOME_SYSTEM_ID` to your home system; the compiled-in default is the original operator's and should not be relied on. If the file is missing or fails to parse, the bot logs an error and keeps running: `Reachable` filter leaves never match and `/sov_timers` reports the graph as unavailable, rather than the process failing to start.
+
+#### Wanderer chain reachability
+
+When `WANDERER_BASE_URL`, `WANDERER_MAP`, and `WANDERER_MAP_API_KEY` are all set, the bot additionally polls your Wanderer map every two minutes (read-only: the client type has no write methods, even though the map API key itself is write-capable on Wanderer's side) and merges the current chain's traversable connections into the same stargate graph, so a campaign beyond gate range becomes reachable when the chain opens a door to it. Two routes are cached per chain snapshot -- with and without frigate-sized holes -- selected by the `Reachable` leaf's `allow_frigate_holes` flag. Critical-mass holes never traverse; every end-of-life bucket traverses (it is a risk fact, not a filter); gate/bridge connections tracked on the map traverse as one jump. When the route crosses at least one wormhole, the alert embed and `/sov_timers` show a Path Risk line (`worst hole: EOL <4h, mass <50%`); a pure gate route shows no such line. On a Wanderer error the last good snapshot keeps serving reachability; it is reported stale after ten minutes with no successful fetch (surfaced in `/sov_timers` as `chain: stale since <t>`, or `chain: not configured` when the three variables above are not all set), and in the Runtime Health Snapshot as `sov_chain_progress`. Any of the three variables missing simply keeps reachability stargate-only, exactly as before this feature existed.
+
+#### Sov timer subscription filter grammar
+
+`/sov_subscribe filter:` accepts one JSON document: `{"root": <node>}`. A node is `{"condition": <leaf>}`, `{"and": [<node>, ...]}`, `{"or": [<node>, ...]}`, or `{"not": <node>}`. Leaf tag names are the `SovFilterCondition` variants exactly as serialized in `src/sov_feed/model.rs` (`#[serde(rename_all = "snake_case")]`):
+
+| Leaf tag | Shape | Bounds |
+| --- | --- | --- |
+| `vulnerable_within` | `{"hours": N}` | 1-720 (30 days) |
+| `defender` | `{"alliance_ids": [N, ...], "watchlist": bool}` | both fields optional but at least one must select something: a non-empty list of positive alliance IDs and/or `"watchlist": true`. `"watchlist": true` additionally matches every alliance on the subscribing server's watchlist (see "Watchlist feed" below), resolved at evaluation time, so the leaf follows `/watch add`/`/watch remove` without re-subscribing |
+| `region` | `[N, ...]` | non-empty, positive region IDs |
+| `system` | `[N, ...]` | non-empty, positive system IDs |
+| `event_type` | `["tcu_defense" \| "ihub_defense" \| "station_defense" \| "station_freeport", ...]` | non-empty |
+| `reachable` | `{"max_jumps": N, "allow_frigate_holes": bool}` | `max_jumps` 1-11; `allow_frigate_holes` defaults to `false` and, when `true`, admits frigate-sized wormhole connections on the Wanderer chain route |
+
+Two complete examples (pinned by a round-trip unit test in `src/sov_feed/model.rs`, `readme_sov_subscribe_filter_examples_round_trip`):
+
+Defense events starting within 12h in a system reachable within 8 jumps, including frigate-sized holes on the chain:
+
+```text
+{"root":{"and":[{"condition":{"vulnerable_within":{"hours":12}}},{"condition":{"reachable":{"max_jumps":8,"allow_frigate_holes":true}}}]}}
+```
+
+Campaigns in Jita that are not station freeports:
+
+```text
+{"root":{"and":[{"condition":{"system":[30000142]}},{"not":{"condition":{"event_type":["station_freeport"]}}}]}}
+```
+
+Campaigns defended by any alliance on this server's watchlist:
+
+```text
+{"root":{"condition":{"defender":{"watchlist":true}}}}
+```
+
+`/sov_subscribe` also takes convenience options instead of hand-writing the equivalent leaf: `region_id`, `defender_alliance_id`, `max_jumps`, and `allow_frigate_holes` (requires `max_jumps` also be set) are each ANDed onto the `filter` root as an extra `region`/`defender`/`reachable` leaf when supplied. `tminus_marks` is a separate per-subscription option (comma-separated T-minus minutes; default 120,30), not a filter leaf. `tz_window` (`HH:MM-HH:MM`, EVE/UTC, default `00:00-04:00`, may cross midnight) and `tz_shift_enabled` (boolean, default `false`) are likewise plain options, not filter leaves; see "Vulnerability window shift alerts" below.
+
+`role` pings a Discord role and `user` pings a specific Discord user; you can set either, both, or neither. Both are native Discord selectors (not names or mention strings). The alert's message content leads with the configured mentions followed by a plain-language summary line (a phone-banner) and `allowed_mentions` lists exactly the configured role/user ids, so only those ping. The embed itself is dense: a plain-language title of what happened, an author line naming why it matched, the defender alliance logo as the thumbnail, Discord-native timestamps for every time, and an EVE-time footer.
+
+Re-running `/sov_subscribe` with an existing `name` in the same channel is a partial update, not a full replacement: every optional top-level field you omit is carried forward from the stored subscription, and any field you supply replaces the stored value. This applies to the ping `role`, the direct-ping `user`, the `region_id`/`defender_alliance_id`/`max_jumps`/`allow_frigate_holes` convenience options, and the `filter` itself — omitting `filter` keeps the previously typed filter, so `/sov_subscribe name:X max_jumps:6` adjusts only the reachability leaf while leaving the rest of the filter, the ping role, and the other convenience options untouched. Behind the scenes the stored filter is recomposed each time from your last explicit filter and the effective convenience values, so the convenience leaves never accumulate duplicates. `filter` is therefore optional on a re-subscribe (a brand-new subscription still needs a `filter`, or at least one convenience option, to have something to match). To remove a previously set field rather than keep it, list it in the `clear` option as a comma-separated set of field names — `role`, `user`, `region_id`, `defender_alliance_id`, `max_jumps`, `allow_frigate_holes` — for example `clear:role,max_jumps`. Supplying a field and naming it in `clear` in the same command is rejected, as is an unknown `clear` name. Naming a field in `clear` that has no stored value is a no-op — it is not reported as cleared, and doing so on a brand-new subscription is not an error. The ephemeral reply states which fields were replaced, preserved, and cleared.
+
+One-time note for subscriptions created before this partial-update behaviour existed: such a "legacy" subscription has no recorded explicit filter, so its whole stored filter is treated as the base. Changing a convenience option (`region_id`, `defender_alliance_id`, `max_jumps`, `allow_frigate_holes`) on a legacy subscription therefore requires re-typing the `filter` in the same command (otherwise the change is rejected, and the subscription is left unchanged); once you do, the explicit filter and convenience values are recorded and every later partial update works without re-typing. Only re-typing the `filter` records this provenance: changing just the ping `role` or a behavioural option (`tminus_marks`, `tz_window`, `tz_shift_enabled`) on a legacy subscription needs no re-type and leaves it legacy, so the re-type requirement still guards a later convenience change.
+
+#### Vulnerability window shift alerts
+
+Every five minutes (the route's own cache age) the bot polls `GET /sovereignty/structures/` and persists Sovereignty Hubs only -- legacy TCUs, which have not been entosisable since Equinox, are filtered out at collection time by `structure_type_id`. Hourly, it polls `GET /sovereignty/map/` and replaces the current system-ownership table wholesale; from this feed on, every sov alert embed (`appeared`, `tminus`, `reachable`, and `tz_window_entered` alike) shows a "System Owner" field resolved from that map (alliance ticker, corporation ticker, or faction name, in that order; omitted when the map has not loaded the system yet).
+
+For a subscription with `tz_shift_enabled:true`, the `tz_window_entered` Alert Stage fires when a watched hub's `vulnerable_start_time..vulnerable_end_time` overlaps the subscription's `tz_window` by at least sixty minutes and the previously observed state for that hub and subscription was not in window; `Reachable` and `VulnerableWithin` filter leaves are ignored for this stage (treated as always matching), `EventType` does not apply to a structure (also treated as matching), and `Defender`, `Region`, and `System` leaves gate the alert normally. A hub whose vulnerability window is null or absent is never in window. Hubs present in the first successful structures cycle establish their in-window state silently (Sov Baseline), exactly like the reachability transition state added in an earlier ticket; leaving and re-entering the window fires again with a fresh stage key (`tz_window_entered:<n>`). The embed's footer reads `vuln window entered <window>` using the subscription's own window, not the hub's vulnerability window.
+
+### Watchlist feed
+
+Each server keeps a watchlist of alliances and corporations and receives an embed whenever a corporation joins or leaves a watched alliance, a watched entity's member count swings sharply, a watched corporation changes alliance, or a war is declared by or against a watched entity (and as that war gains allies, is retracted, or ends). It shares the contract feed's PostgreSQL database and only starts when `CONTRACT_DATABASE_URL` is configured.
+
+`/watch` (all subcommands, including `list`), `/watch_subscribe`, and `/watch_unsubscribe` require the Manage Server (`MANAGE_GUILD`) permission and cannot be used in DMs.
+
+| Command | Required arguments | Optional arguments | Result |
+| --- | --- | --- | --- |
+| `/watch add` | `kind` (`alliance` or `corporation`), `ticker` | None | Adds an alliance or corporation to this server's watchlist. |
+| `/watch remove` | `kind` (`alliance` or `corporation`), `ticker` | None | Removes an alliance or corporation from this server's watchlist. |
+| `/watch list` | None | None | Lists the watched alliances and corporations. |
+| `/watch_subscribe` | `name` | `event_kinds`, `role`, `user` | Subscribes this channel to watchlist alerts (defaults to the four membership kinds; wars are opt-in). |
+| `/watch_unsubscribe` | `name` | None | Removes this channel's watchlist subscription with that `name`. |
+
+See the [operator runbook](docs/sov-and-watchlist-feeds.md) for the enable-and-verify walkthrough, retention, and day-to-day operation.
+
+- `/watch add kind:<alliance|corporation> ticker:<text>` adds an entity. The `ticker` option is resolved through the bot's ticker cache first, then an ESI name lookup (`POST /universe/ids/`). Note ESI's ids endpoint resolves *names*, not tickers, so a bare ticker only works when it is already in the bot's cache; otherwise supply the full alliance/corporation name. For example, `ticker: Snuffed Out`. The reply confirms the resolved name and id ephemerally. Adding the same entity twice is idempotent.
+- `/watch remove kind:<...> ticker:<...>` removes an entity; `/watch list` shows the current watchlist.
+- `/watch_subscribe name:<...> event_kinds:<comma list>` subscribes the current channel. `event_kinds` defaults to the **four membership kinds** (`corp_joined`, `corp_left`, `member_delta`, `corp_changed_alliance`); **wars are opt-in** — name a war kind explicitly (`war_declared`, `war_ally_joined`, `war_retracted`, `war_finished`) or pass the keyword `all` to select every kind including the war kinds. It takes an optional `role` and an optional `user` to ping (either, both, or neither): the alert's message content leads with those mentions followed by a plain-language summary line, and `allowed_mentions` lists exactly those ids. Unlike `/sov_subscribe`, `/watch_subscribe` replaces the subscription wholesale on every invocation, so `role`/`user` are re-supplied each time (omitting one clears it). `/watch_unsubscribe name:<...>` removes a channel subscription.
+
+An hourly collector fetches each watched alliance's corporation list (`GET /alliances/{id}/corporations/`) with conditional requests through the shared ESI limiter and diffs it against the last snapshot. The first successful snapshot per alliance is a silent baseline (adding an alliance does not announce all its existing corporations); after that, a corporation appearing produces `corp_joined` and one disappearing produces `corp_left`, each delivered once per subscription with the alliance and corporation names/tickers, the event, and Dotlan/zKillboard links. Sov subscriptions can reference the watchlist as their defender filter with `{"defender": {"watchlist": true}}` (see the filter grammar above).
+
+The same collector also fetches public corporation info (`GET /corporations/{id}/`) for every watched corporation and every current member corporation of each watched alliance, persisting timestamped member-count snapshots:
+
+- **`member_delta`** — a watched entity's member count moving at least **10 %** in either direction against the snapshot **nearest seven days ago** (an alliance's count is the sum over its current member corporations' latest snapshots; a corporation's is direct). It requires roughly 6.5 days of history before it can fire, so a freshly added entity stays silent until it has a week of data. It fires **once per band crossing** and **re-arms only after the count returns inside the ±10 % band**, so a slowly shrinking alliance does not alert every hour. The embed shows the before/after counts, the percentage, the direction, and the reference window.
+- **`corp_changed_alliance`** — a watched corporation whose current alliance differs from its previous snapshot (including joining or leaving an alliance entirely). It fires once per change and shows the old → new alliance names/tickers (`none` when unaffiliated). The first snapshot per corporation is a silent baseline.
+
+Cost note: the corporation-info pass is one conditional request per corporation per hour, so a watched alliance of 150 corporations is ~150 requests per hour. It is bounded to at most 200 corporation-info fetches per cycle (least-recently-fetched first, the rest deferred to later cycles) and pauses on the shared ESI limiter, and the route's one-hour cache means most re-polls are cheap `304`s. Snapshots older than 30 days are pruned each cycle.
+
+The same collector also tracks wars each hour (the wars route's cache age):
+
+- **`war_declared`** — a war first seen above the high-water mark (the highest war id scanned) whose aggressor, defender, or any ally is a watched alliance or corporation. The embed shows the war id (with a [zKillboard war link](https://zkillboard.com/war/)), the aggressor and defender names/tickers, the `mutual` and `open_for_allies` flags, and the declared/started timestamps. `war_declared` fires only the cycle a war is first seen: a war stored before its party was watched (e.g. you add an entity later) is treated as a **silent war baseline** for that entity — no retroactive `war_declared` — but its ally joins, retraction, and finish are tracked from then on.
+- **`war_ally_joined`** — a new ally appearing in a stored watched war on a re-fetch (fires once per ally).
+- **`war_retracted`** / **`war_finished`** — the war's `retracted` / `finished` timestamp becoming set (each fires once). A war first seen already retracted or finished is announced only as `war_declared`.
+
+The head-scan reads the id-descending war list (`GET /wars/`, at most 2000 ids per page, `?max_war_id=` to page older) above the high-water mark and fetches details (`GET /wars/{id}/`) for each new id. **Every** inspected war is stored (not only the watched ones), and "watched" is derived at query time — a war is watched iff any of its parties matches a watched entity of the same kind, in any guild. That way an entity added after a war was stored starts re-fetching that war's open wars on the next cycle, while an entity that is unwatched simply drops out of the re-fetch set. Each currently-watched open war (`finished` still null) is re-fetched every cycle (bounded, least-recently-fetched, at most 200 per cycle). Finished wars older than 30 days and below the head mark are pruned, so the table stays bounded to the open-war population plus recently-finished wars.
+
+The first scan is a **silent baseline** that inspects every id that existed on the newest page when it began (wars already open are stored without posting). Because the page holds up to 2000 ids but each cycle fetches at most 200 details, the baseline spans several cycles. The first cycle reads the head to pin the head max and the page's bottom id (its floor); every later cycle then pages strictly **downward** from a persisted cursor (`?max_war_id=cursor`) rather than re-reading the head — the head drifts every hour as new wars are declared and push the oldest ids out of the 2000-id window, so an id that was on the original page but rolls off the head before the cursor reaches it is still reachable below the cursor. Ids **below the original window** (the floor) were never on the starting page and are out of scope by design. The baseline never completes on a limiter pause or an error, and wars declared while it is still running (ids above the pinned head max) are picked up — and posted as `war_declared` — by the first scan after it finishes. A war id whose detail cannot be fetched no longer freezes the mark forever: a `404` is a permanent absence and is skipped immediately (the mark advances past it), and any other error is skipped after three consecutive failed cycles. On the open-war re-fetch, a stored war that starts returning `404` (deleted by CCP) is marked gone so it drops out of the re-fetch set, and a transient error still rotates the war to the back of the least-recently-fetched order so it retries after the other open wars instead of re-selecting first every cycle.
+
+All requests are conditional and go through the shared ESI limiter; the wars routes report `x-ratelimit-group: killmail` — the same per-route bucket as killmail detail fetches — whose remaining/reset is recorded in the shared limiter row that the health snapshot surfaces.
+
+#### Refreshing the stargate graph
+
+Stargates essentially never move, so this only needs to run again after a rare SDE release that changes the map (e.g. a new region, a Pochven-style restructuring):
+
+```shell
+cargo run --bin build_stargate_graph
+```
+
+This fetches the [Fuzzwork SDE dump index page](https://www.fuzzwork.co.uk/dump/latest/) (to discover an SDE version stamp) and `mapSolarSystemJumps.csv` from the same mirror -- no other files -- then overwrites `config/stargates.json` with the parsed adjacency plus `sde_version` (the discovered stamp, or `unknown` if none was found), `source_last_modified` (the CSV response's `Last-Modified` header), `generated_at` (this run's timestamp), and the resulting `system_count`/`edge_count`. Review the diff -- `system_count`/`edge_count` should move by at most a handful of systems for an ordinary release -- and commit it like any other generated config file (`config/systems.json`, `config/ships.json`, ...).
+
