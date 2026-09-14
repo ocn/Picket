@@ -40,6 +40,15 @@ impl WatchSubscribeCommand {
             None => None,
             _ => return Err("role must be a role option".to_string()),
         };
+        // Ticket 20: an optional direct user ping beside the role. `/watch_subscribe`
+        // replaces a subscription wholesale, so `ping_user_id` is re-supplied on
+        // every invocation (there is no partial re-subscribe / carry-forward here,
+        // unlike `/sov_subscribe`); omitting `user` clears any prior user ping.
+        let ping_user_id = match get_option_value(&command.data.options, "user") {
+            Some(CommandDataOptionValue::User(user, _member)) => Some(user.id.0),
+            None => None,
+            _ => return Err("user must be a user option".to_string()),
+        };
         let event_kinds = parse_event_kinds(raw_kinds)
             .map_err(|error| format!("invalid event_kinds: {error}"))?;
         let subscription = WatchlistSubscription {
@@ -48,6 +57,7 @@ impl WatchSubscribeCommand {
             name: name.to_string(),
             event_kinds,
             role_id,
+            ping_user_id,
             options: serde_json::json!({}),
         };
         subscription.validate()?;
@@ -88,6 +98,12 @@ impl Command for WatchSubscribeCommand {
                     .name("role")
                     .description("Role to ping on alerts from this subscription.")
                     .kind(CommandOptionType::Role)
+            })
+            .create_option(|option| {
+                option
+                    .name("user")
+                    .description("User to ping directly on alerts from this subscription.")
+                    .kind(CommandOptionType::User)
             })
     }
 

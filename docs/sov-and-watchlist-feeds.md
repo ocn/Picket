@@ -258,6 +258,8 @@ This assumes the contract database already exists and the bot is running the cur
    /watch_subscribe name:hostile-intel event_kinds:corp_joined,corp_left,member_delta,corp_changed_alliance
    ```
 
+   Wars are opt-in: an omitted `event_kinds` selects exactly those four membership kinds (so the example above is equivalent to omitting `event_kinds`), while the keyword `all` — or naming a war kind explicitly, as in `#hostile-wars` above — selects the war kinds too. Both `/watch_subscribe` and `/sov_subscribe` also take a `user:` option beside `role:` (a direct Discord user ping); set either, both, or neither. The alert's message content leads with the configured `<@user>`/`<@&role>` mentions followed by a plain-language summary line, and `allowed_mentions` lists exactly those ids. `/sov_subscribe`'s `user` is a top-level carry-forward field (clear it with `clear:user`); `/watch_subscribe` replaces the row wholesale, so re-supply `user`/`role` on every invocation.
+
    and, in the same channel, a sov subscription defended by any alliance on this server's watchlist, with timezone-shift alerts enabled and no role:
 
    ```text

@@ -374,6 +374,43 @@ impl SovFilterNode {
         }
     }
 
+    /// Whether this filter tree contains any `Defender` leaf (watchlist-backed
+    /// or an explicit `alliance_ids` list). Ticket 20's dense embed uses this
+    /// to choose the author line: a subscription that filters on a defender
+    /// (the watchlist or a `defender` leaf) reads "Watched alliance
+    /// <ticker> · <name>"; otherwise "Subscription <name>".
+    pub fn has_defender_leaf(&self) -> bool {
+        match self {
+            Self::Condition(SovFilterCondition::Defender { .. }) => true,
+            Self::Condition(_) => false,
+            Self::And(nodes) | Self::Or(nodes) => nodes.iter().any(Self::has_defender_leaf),
+            Self::Not(node) => node.has_defender_leaf(),
+        }
+    }
+
+    /// The `max_jumps` of this filter tree's `Reachable` leaf, or `None`
+    /// when the tree contains no `Reachable` leaf at all. Ticket 20's dense
+    /// embed uses this to decide the Distance-vs-Route rule: the route
+    /// summary replaces the plain Distance field only when the subscription
+    /// has a `Reachable` leaf *and* the hub is within its `max_jumps`
+    /// (otherwise the hub is shown as a bare distance, since the route is
+    /// not part of what this subscription asked to reach). A subscription
+    /// combining several `Reachable` leaves (different `max_jumps`) via
+    /// `Or`/`And` is a corner case the spec does not resolve explicitly;
+    /// the most permissive (largest) `max_jumps` is used, mirroring
+    /// `allows_frigate_holes_anywhere`'s "show the widest route" choice.
+    pub fn reachable_leaf_max_jumps(&self) -> Option<i64> {
+        match self {
+            Self::Condition(SovFilterCondition::Reachable { max_jumps, .. }) => Some(*max_jumps),
+            Self::Condition(_) => None,
+            Self::And(nodes) | Self::Or(nodes) => nodes
+                .iter()
+                .filter_map(Self::reachable_leaf_max_jumps)
+                .max(),
+            Self::Not(node) => node.reachable_leaf_max_jumps(),
+        }
+    }
+
     /// Returns a copy of this tree with every watchlist-backed `Defender`
     /// leaf resolved against `watched_alliance_ids` (the guild's currently
     /// watched alliance ids), unioning them into that leaf's own
@@ -743,6 +780,10 @@ pub struct SovSubscription {
     pub filter: SovFilter,
     pub options: serde_json::Value,
     pub role_id: Option<u64>,
+    /// Optional Discord user snowflake pinged in the message content beside
+    /// (or instead of) `role_id` (ticket 20). A top-level field carried
+    /// forward / cleared under ticket 15's re-subscribe rules.
+    pub ping_user_id: Option<u64>,
 }
 
 impl SovSubscription {
@@ -1055,11 +1096,43 @@ pub struct SovEmbedField {
 /// A fully progressively-enriched notification, assembled once at prepare
 /// time and stored verbatim so a restart renders identical content
 /// (mirrors `ContractNotificationMessage` in `contract_intelligence.rs`).
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+///
+/// Ticket 20 added the dense-embed parts alongside the original
+/// `title`/`fields`/`footer`: a plain-text `content` phone-banner line, an
+/// author line (with its own url/icon), a thumbnail, an embed colour, a
+/// title url, a footer icon, and an embed timestamp. Every one is
+/// `Option` with `#[serde(default)]` so a delivery row persisted before
+/// this ticket (which carries none of them) still deserializes and renders
+/// in the old shape: title, fields, and footer text only.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct SovNotificationMessage {
     pub title: String,
     pub fields: Vec<SovEmbedField>,
     pub footer: String,
+    /// Plain-text phone-banner summary rendered into the message `content`
+    /// (the killfeed's `ping_summary` mechanism). Already neutralized of
+    /// stray mention sigils at prepare time. `None` for a pre-ticket-20 row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Embed colour as a 24-bit RGB integer (`Colour`'s wire form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer_icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
 /// A delivery claimed and ready to send, or already sent (mirrors
@@ -1074,6 +1147,11 @@ pub struct PreparedSovDelivery {
     pub subject_id: i64,
     pub stage: String,
     pub role_id: Option<u64>,
+    /// Optional Discord user snowflake to ping in the message content
+    /// (ticket 20). Read back from the subscription at claim time (the
+    /// delivery row has no user-ping column), so a `ping_user_id` changed
+    /// after prepare is honoured at send.
+    pub ping_user_id: Option<u64>,
     pub message: SovNotificationMessage,
     pub nonce: String,
     pub enforce_nonce: bool,
@@ -1764,6 +1842,7 @@ mod tests {
             },
             options: serde_json::json!({}),
             role_id: None,
+            ping_user_id: None,
         };
         assert!(subscription.validate().is_err());
     }

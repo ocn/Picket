@@ -518,7 +518,7 @@ impl SovStore {
     ) -> Result<(), sqlx::Error> {
         subscription.validate().map_err(sqlx::Error::Protocol)?;
         sqlx::query(
-            "INSERT INTO sov_subscriptions (guild_id, channel_id, name, filter, options, role_id) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (guild_id, channel_id, name) DO UPDATE SET filter = EXCLUDED.filter, options = EXCLUDED.options, role_id = EXCLUDED.role_id, updated_at = now()",
+            "INSERT INTO sov_subscriptions (guild_id, channel_id, name, filter, options, role_id, ping_user_id) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (guild_id, channel_id, name) DO UPDATE SET filter = EXCLUDED.filter, options = EXCLUDED.options, role_id = EXCLUDED.role_id, ping_user_id = EXCLUDED.ping_user_id, updated_at = now()",
         )
         .bind(subscription.guild_id as i64)
         .bind(subscription.channel_id as i64)
@@ -526,6 +526,7 @@ impl SovStore {
         .bind(serde_json::to_value(&subscription.filter).map_err(json_to_sqlx)?)
         .bind(&subscription.options)
         .bind(subscription.role_id.map(|id| id as i64))
+        .bind(subscription.ping_user_id.map(|id| id as i64))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -550,7 +551,7 @@ impl SovStore {
 
     pub async fn subscriptions(&self) -> Result<Vec<SovSubscription>, sqlx::Error> {
         sqlx::query(
-            "SELECT guild_id, channel_id, name, filter, options, role_id FROM sov_subscriptions ORDER BY guild_id, channel_id, name",
+            "SELECT guild_id, channel_id, name, filter, options, role_id, ping_user_id FROM sov_subscriptions ORDER BY guild_id, channel_id, name",
         )
         .fetch_all(&self.pool)
         .await?
@@ -568,7 +569,7 @@ impl SovStore {
         channel_id: u64,
     ) -> Result<Vec<SovSubscription>, sqlx::Error> {
         sqlx::query(
-            "SELECT guild_id, channel_id, name, filter, options, role_id FROM sov_subscriptions WHERE guild_id = $1 AND channel_id = $2 ORDER BY name",
+            "SELECT guild_id, channel_id, name, filter, options, role_id, ping_user_id FROM sov_subscriptions WHERE guild_id = $1 AND channel_id = $2 ORDER BY name",
         )
         .bind(guild_id as i64)
         .bind(channel_id as i64)
@@ -592,7 +593,7 @@ impl SovStore {
         name: &str,
     ) -> Result<Option<SovSubscription>, sqlx::Error> {
         sqlx::query(
-            "SELECT guild_id, channel_id, name, filter, options, role_id FROM sov_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND name = $3",
+            "SELECT guild_id, channel_id, name, filter, options, role_id, ping_user_id FROM sov_subscriptions WHERE guild_id = $1 AND channel_id = $2 AND name = $3",
         )
         .bind(guild_id as i64)
         .bind(channel_id as i64)
@@ -881,6 +882,21 @@ impl SovStore {
         .into_iter()
         .map(sov_structure_from_row)
         .collect()
+    }
+
+    /// One Sovereignty Hub by structure id, or `None` when the feed has not
+    /// observed it yet. Ticket 20: the campaign embed shows the hub's
+    /// vulnerability window from `sov_structures` when the hub is known
+    /// (`campaign.structure_id`), omitted otherwise.
+    pub async fn structure(&self, structure_id: i64) -> Result<Option<SovStructure>, sqlx::Error> {
+        sqlx::query(
+            "SELECT structure_id, structure_type_id, alliance_id, solar_system_id, vulnerability_occupancy_level, vulnerable_start_time, vulnerable_end_time FROM sov_structures WHERE structure_id = $1",
+        )
+        .bind(structure_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(sov_structure_from_row)
+        .transpose()
     }
 
     // --- Sovereignty map (ticket 07) ---
@@ -1179,7 +1195,7 @@ impl SovStore {
         let claim_token = format!("sov-delivery-{:032x}", rand::thread_rng().gen::<u128>());
         let lease_until = attempted_at + SOV_DELIVERY_LEASE;
         let row = sqlx::query(
-            "UPDATE sov_alert_deliveries SET attempt_count = attempt_count + 1, nonce_window_until = COALESCE(nonce_window_until, $2), delivery_nonce = COALESCE(delivery_nonce, 'sov-' || id), delivery_claim_token = $3, delivery_claimed_at = $4, delivery_lease_until = $5 WHERE id = $1 AND status = 'prepared' AND (delivery_lease_until IS NULL OR delivery_lease_until <= $4) RETURNING id, guild_id, channel_id, subscription_name, subject_kind, subject_id, stage, message, role_id, delivery_nonce, nonce_window_until, delivery_claim_token, attempt_count",
+            "UPDATE sov_alert_deliveries SET attempt_count = attempt_count + 1, nonce_window_until = COALESCE(nonce_window_until, $2), delivery_nonce = COALESCE(delivery_nonce, 'sov-' || id), delivery_claim_token = $3, delivery_claimed_at = $4, delivery_lease_until = $5 WHERE id = $1 AND status = 'prepared' AND (delivery_lease_until IS NULL OR delivery_lease_until <= $4) RETURNING id, guild_id, channel_id, subscription_name, subject_kind, subject_id, stage, message, role_id, (SELECT s.ping_user_id FROM sov_subscriptions s WHERE s.guild_id = sov_alert_deliveries.guild_id AND s.channel_id = sov_alert_deliveries.channel_id AND s.name = sov_alert_deliveries.subscription_name) AS ping_user_id, delivery_nonce, nonce_window_until, delivery_claim_token, attempt_count",
         )
         .bind(delivery_id)
         .bind(nonce_window_until)
@@ -1413,6 +1429,9 @@ fn sov_subscription_from_row(row: PgRow) -> Result<SovSubscription, sqlx::Error>
         filter: serde_json::from_value::<SovFilter>(row.get("filter")).map_err(json_to_sqlx)?,
         options: row.get("options"),
         role_id: row.get::<Option<i64>, _>("role_id").map(|id| id as u64),
+        ping_user_id: row
+            .get::<Option<i64>, _>("ping_user_id")
+            .map(|id| id as u64),
     })
 }
 
@@ -1426,6 +1445,9 @@ fn prepared_sov_delivery_from_row(row: PgRow) -> Result<PreparedSovDelivery, sql
         subject_id: row.get("subject_id"),
         stage: row.get("stage"),
         role_id: row.get::<Option<i64>, _>("role_id").map(|id| id as u64),
+        ping_user_id: row
+            .get::<Option<i64>, _>("ping_user_id")
+            .map(|id| id as u64),
         message: serde_json::from_value(row.get("message")).map_err(json_to_sqlx)?,
         nonce: row
             .get::<Option<String>, _>("delivery_nonce")

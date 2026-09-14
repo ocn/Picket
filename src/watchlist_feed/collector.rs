@@ -1261,7 +1261,9 @@ impl WatchlistCollector {
         if targets.is_empty() {
             return Ok(());
         }
-        let message = self.render_war_event(detail, event.kind, event.ally).await;
+        let message = self
+            .render_war_event(detail, event.kind, event.ally, observed_at)
+            .await;
         let prepared = self
             .insert_and_send(
                 targets,
@@ -1310,6 +1312,7 @@ impl WatchlistCollector {
         detail: &WarDetail,
         kind: WatchlistEventKind,
         ally: Option<WarParty>,
+        observed_at: DateTime<Utc>,
     ) -> WatchlistNotificationMessage {
         let aggressor_label = self.party_label(detail.aggressor).await;
         let defender_label = self.party_label(detail.defender).await;
@@ -1336,12 +1339,12 @@ impl WatchlistCollector {
             },
             WatchlistEmbedField {
                 name: "Aggressor".to_string(),
-                value: aggressor_label,
+                value: aggressor_label.clone(),
                 inline: true,
             },
             WatchlistEmbedField {
                 name: "Defender".to_string(),
-                value: defender_label,
+                value: defender_label.clone(),
                 inline: true,
             },
         ];
@@ -1396,10 +1399,36 @@ impl WatchlistCollector {
                 inline: false,
             });
         }
+        let content = crate::contract_intelligence::neutralize_summary_mentions(&title);
+        let war_color = match kind {
+            WatchlistEventKind::WarDeclared => 0xC0_39_2B,
+            WatchlistEventKind::WarAllyJoined => 0xE6_7E_22,
+            WatchlistEventKind::WarRetracted | WatchlistEventKind::WarFinished => 0x2E_CC_71,
+            _ => 0x95_A5_A6,
+        };
+        let war_url = format!("https://zkillboard.com/war/{}/", detail.war_id);
         WatchlistNotificationMessage {
             title,
             fields,
-            footer: kind.footer_label().to_string(),
+            footer: format!(
+                "{} \u{2022} EVETime {}",
+                kind.footer_label(),
+                observed_at.format("%d/%m/%Y, %H:%M")
+            ),
+            content: Some(content),
+            author: Some(format!("War #{}", detail.war_id)),
+            author_url: Some(war_url.clone()),
+            author_icon: None,
+            description: Some(format!(
+                "{aggressor_label} vs {defender_label}\nMutual: {} \u{b7} Open for allies: {}",
+                yes_no(detail.mutual),
+                yes_no(detail.open_for_allies)
+            )),
+            thumbnail_url: None,
+            url: Some(war_url),
+            color: Some(war_color),
+            footer_icon: None,
+            timestamp: Some(observed_at),
         }
     }
 
@@ -1594,7 +1623,7 @@ impl WatchlistCollector {
         if targets.is_empty() {
             return Ok(());
         }
-        let message = self.render_event(event).await;
+        let message = self.render_event(event, observed_at).await;
         let prepared = self
             .insert_and_send(
                 targets,
@@ -1847,7 +1876,7 @@ impl WatchlistCollector {
             return Ok(());
         }
         let message = self
-            .render_corp_changed_alliance(corporation_id, old_alliance, new_alliance)
+            .render_corp_changed_alliance(corporation_id, old_alliance, new_alliance, observed_at)
             .await;
         let prepared = self
             .insert_and_send(
@@ -1902,42 +1931,72 @@ impl WatchlistCollector {
             MemberDeltaDirection::Up => "up",
             MemberDeltaDirection::Down => "down",
         };
+        // Plain-language swing verb (ticket 20: "lost 12% of members" /
+        // "gained 12% of members").
+        let swing_verb = match alert.direction {
+            MemberDeltaDirection::Up => "gained",
+            MemberDeltaDirection::Down => "lost",
+        };
         let title = format!(
-            "{label} member count {direction_word} {}% ({} → {})",
+            "{label} {swing_verb} {}% of members ({} → {})",
             alert.percentage(),
-            alert.reference_count,
-            alert.current_count
+            thousands(alert.reference_count),
+            thousands(alert.current_count)
         );
+        let content = crate::contract_intelligence::neutralize_summary_mentions(&title);
+        let ref_unix = alert.reference_observed_at.timestamp();
         let fields = vec![
             WatchlistEmbedField {
                 name: "Members".to_string(),
                 value: format!(
                     "{} → {} ({direction_word} {}%)",
-                    alert.reference_count,
-                    alert.current_count,
+                    thousands(alert.reference_count),
+                    thousands(alert.current_count),
                     alert.percentage()
                 ),
-                inline: false,
+                inline: true,
             },
             WatchlistEmbedField {
-                name: "Window".to_string(),
-                value: format!(
-                    "{} → {}",
-                    alert.reference_observed_at.format("%Y-%m-%d %H:%M UTC"),
-                    observed_at.format("%Y-%m-%d %H:%M UTC")
-                ),
-                inline: false,
-            },
-            WatchlistEmbedField {
-                name: "Entity".to_string(),
-                value: format!("{label}\n{links}"),
-                inline: false,
+                name: "Since".to_string(),
+                value: format!("<t:{ref_unix}:f>"),
+                inline: true,
             },
         ];
+        let logo = match entity_kind {
+            WatchlistKind::Alliance => wl_alliance_logo(entity_id),
+            WatchlistKind::Corporation => wl_corp_logo(entity_id),
+        };
+        let (author_url, url) = match entity_kind {
+            WatchlistKind::Alliance => (
+                format!("https://zkillboard.com/alliance/{entity_id}/"),
+                format!("https://zkillboard.com/alliance/{entity_id}/"),
+            ),
+            WatchlistKind::Corporation => (
+                format!("https://zkillboard.com/corporation/{entity_id}/"),
+                format!("https://zkillboard.com/corporation/{entity_id}/"),
+            ),
+        };
         WatchlistNotificationMessage {
             title,
             fields,
-            footer: WatchlistEventKind::MemberDelta.footer_label().to_string(),
+            footer: format!(
+                "{} \u{2022} EVETime {}",
+                WatchlistEventKind::MemberDelta.footer_label(),
+                observed_at.format("%d/%m/%Y, %H:%M")
+            ),
+            content: Some(content),
+            author: Some(format!("Watching {label}")),
+            author_url: Some(author_url),
+            author_icon: Some(logo.clone()),
+            description: Some(format!(
+                "since <t:{ref_unix}:R> (<t:{ref_unix}:f>)\n{links}"
+            )),
+            thumbnail_url: Some(logo),
+            url: Some(url),
+            // blue: a membership swing (ticket 20 colour rule).
+            color: Some(0x34_98_DB),
+            footer_icon: None,
+            timestamp: Some(observed_at),
         }
     }
 
@@ -1948,6 +2007,7 @@ impl WatchlistCollector {
         corporation_id: i64,
         old_alliance: Option<i64>,
         new_alliance: Option<i64>,
+        observed_at: DateTime<Utc>,
     ) -> WatchlistNotificationMessage {
         let corporation = self.resolver.corporation(corporation_id).await;
         let corp_label = entity_label(
@@ -1958,15 +2018,17 @@ impl WatchlistCollector {
         );
         let old_label = self.alliance_label_or_none(old_alliance).await;
         let new_label = self.alliance_label_or_none(new_alliance).await;
-        let title = format!("{corp_label} changed alliance: {old_label} → {new_label}");
+        // Plain language: "Corp [T] left A [A], joined B [B]", with the
+        // half dropped when the corporation was previously unaffiliated
+        // (join only) or is now unaffiliated (leave only).
+        let title = match (old_alliance, new_alliance) {
+            (Some(_), Some(_)) => format!("{corp_label} left {old_label}, joined {new_label}"),
+            (Some(_), None) => format!("{corp_label} left {old_label}"),
+            (None, Some(_)) => format!("{corp_label} joined {new_label}"),
+            (None, None) => format!("{corp_label} changed alliance"),
+        };
+        let content = crate::contract_intelligence::neutralize_summary_mentions(&title);
         let fields = vec![
-            WatchlistEmbedField {
-                name: "Corporation".to_string(),
-                value: format!(
-                    "{corp_label}\n[zKillboard](https://zkillboard.com/corporation/{corporation_id}/) | [Dotlan](https://evemaps.dotlan.net/corp/{corporation_id})"
-                ),
-                inline: false,
-            },
             WatchlistEmbedField {
                 name: "From".to_string(),
                 value: old_label,
@@ -1981,9 +2043,28 @@ impl WatchlistCollector {
         WatchlistNotificationMessage {
             title,
             fields,
-            footer: WatchlistEventKind::CorpChangedAlliance
-                .footer_label()
-                .to_string(),
+            footer: format!(
+                "{} \u{2022} EVETime {}",
+                WatchlistEventKind::CorpChangedAlliance.footer_label(),
+                observed_at.format("%d/%m/%Y, %H:%M")
+            ),
+            content: Some(content),
+            author: Some(format!("Watching {corp_label}")),
+            author_url: Some(format!(
+                "https://zkillboard.com/corporation/{corporation_id}/"
+            )),
+            author_icon: Some(wl_corp_logo(corporation_id)),
+            description: Some(format!(
+                "[Dotlan](https://evemaps.dotlan.net/corp/{corporation_id}) \u{b7} [zKillboard](https://zkillboard.com/corporation/{corporation_id}/)"
+            )),
+            thumbnail_url: Some(wl_corp_logo(corporation_id)),
+            url: Some(format!(
+                "https://zkillboard.com/corporation/{corporation_id}/"
+            )),
+            // orange: a corporation changed alliance (ticket 20 colour rule).
+            color: Some(0xE6_7E_22),
+            footer_icon: None,
+            timestamp: Some(observed_at),
         }
     }
 
@@ -2000,7 +2081,11 @@ impl WatchlistCollector {
     /// Renders one event's notification, assembled once and stored verbatim
     /// (spec: content derived at prepare time). Resolves the corporation and
     /// alliance identity (bounded: one of each per event) at prepare time.
-    async fn render_event(&self, event: &WatchlistEvent) -> WatchlistNotificationMessage {
+    async fn render_event(
+        &self,
+        event: &WatchlistEvent,
+        observed_at: DateTime<Utc>,
+    ) -> WatchlistNotificationMessage {
         let corporation = self.resolver.corporation(event.corporation_id).await;
         let alliance = self.resolver.alliance(event.alliance_id).await;
 
@@ -2016,35 +2101,101 @@ impl WatchlistCollector {
             "Alliance",
             event.alliance_id,
         );
-        let verb = match event.kind {
-            WatchlistEventKind::CorpJoined => "joined",
-            WatchlistEventKind::CorpLeft => "left",
-            // `render_event` is only ever called for corp join/left events;
-            // the other kinds have their own renderers.
-            _ => "changed",
-        };
-        let title = format!("{corp_label} {verb} {alliance_label}");
+        let alliance_name = entity_name_only(
+            &alliance.name,
+            &alliance.ticker,
+            "Alliance",
+            event.alliance_id,
+        );
+        let joined = matches!(event.kind, WatchlistEventKind::CorpJoined);
+        let verb = if joined { "joined" } else { "left" };
+
+        // Alliance aggregate for the author line and the description
+        // "is now N corps, M members" clause (ticket 20: corp count and
+        // member total from the store).
+        let corp_count = self
+            .store
+            .current_alliance_member_ids(event.alliance_id)
+            .await
+            .map(|ids| ids.len() as i64)
+            .unwrap_or_default();
+        let member_total = self
+            .store
+            .current_alliance_member_count(event.alliance_id)
+            .await
+            .ok()
+            .and_then(|aggregate| aggregate.total);
+
+        // --- content (phone banner) ---
+        let members_clause = corporation
+            .member_count
+            .map(|count| format!(" ({} members)", thousands(count)))
+            .unwrap_or_default();
+        let content = crate::contract_intelligence::neutralize_summary_mentions(&format!(
+            "{corp_label}{members_clause} {verb} {alliance_label}"
+        ));
+
+        // --- title ---
+        let title = format!("{corp_label} {verb} {alliance_name}");
+
+        // --- description ---
+        let mut corp_facts = Vec::new();
+        if let Some(count) = corporation.member_count {
+            corp_facts.push(format!("{} members", thousands(count)));
+        }
+        if let Some(founded) = corporation.date_founded {
+            corp_facts.push(format!("founded {}", founded.format("%Y")));
+        }
+        corp_facts.push(format!(
+            "[Dotlan](https://evemaps.dotlan.net/corp/{0}) \u{b7} [zKillboard](https://zkillboard.com/corporation/{0}/)",
+            event.corporation_id
+        ));
+        let mut description_lines = vec![corp_facts.join(" \u{b7} ")];
+        let this_cycle = corporation
+            .member_count
+            .map(|count| if joined { count } else { -count });
+        let mut aggregate_clause =
+            format!("{alliance_name} is now {} corps", thousands(corp_count));
+        if let Some(total) = member_total {
+            aggregate_clause.push_str(&format!(", {} members", thousands(total)));
+        }
+        if let Some(delta) = this_cycle {
+            aggregate_clause.push_str(&format!(" ({} this cycle)", signed_thousands(delta)));
+        }
+        description_lines.push(aggregate_clause);
+        if !joined {
+            // Where the corporation went (ticket 20 corp_left).
+            let destination = match corporation.alliance_id {
+                Some(new_alliance) => {
+                    let dest = self.resolver.alliance(new_alliance).await;
+                    format!(
+                        "now in {}",
+                        entity_label(&dest.name, &dest.ticker, "Alliance", new_alliance)
+                    )
+                }
+                None => "now unaffiliated".to_string(),
+            };
+            description_lines.push(destination);
+        }
+
+        // --- author ---
+        let mut author = format!(
+            "Watching {alliance_name} \u{b7} {} corps",
+            thousands(corp_count)
+        );
+        if let Some(total) = member_total {
+            author.push_str(&format!(" \u{b7} {} members", thousands(total)));
+        }
 
         let fields = vec![
             WatchlistEmbedField {
-                name: "Alliance".to_string(),
-                value: format!(
-                    "{alliance_label}\n[zKillboard](https://zkillboard.com/alliance/{0}/) | [Dotlan](https://evemaps.dotlan.net/alliance/{0})",
-                    event.alliance_id
-                ),
-                inline: false,
-            },
-            WatchlistEmbedField {
                 name: "Corporation".to_string(),
-                value: format!(
-                    "{corp_label}\n[zKillboard](https://zkillboard.com/corporation/{0}/) | [Dotlan](https://evemaps.dotlan.net/corp/{0})",
-                    event.corporation_id
-                ),
-                inline: false,
+                value: corp_label.clone(),
+                inline: true,
             },
             WatchlistEmbedField {
-                name: "Event".to_string(),
-                value: event.kind.footer_label().to_string(),
+                name: "Alliance".to_string(),
+                value: alliance_label.clone(),
                 inline: true,
             },
         ];
@@ -2052,7 +2203,27 @@ impl WatchlistCollector {
         WatchlistNotificationMessage {
             title,
             fields,
-            footer: event.kind.footer_label().to_string(),
+            footer: format!(
+                "{} \u{2022} EVETime {}",
+                event.kind.footer_label(),
+                observed_at.format("%d/%m/%Y, %H:%M")
+            ),
+            content: Some(content),
+            author: Some(author),
+            author_url: Some(format!(
+                "https://zkillboard.com/alliance/{}/",
+                event.alliance_id
+            )),
+            author_icon: Some(wl_alliance_logo(event.alliance_id)),
+            description: Some(description_lines.join("\n")),
+            thumbnail_url: Some(wl_corp_logo(event.corporation_id)),
+            url: Some(format!(
+                "https://zkillboard.com/corporation/{}/",
+                event.corporation_id
+            )),
+            color: Some(if joined { 0x2E_CC_71 } else { 0xE7_4C_3C }),
+            footer_icon: Some(wl_alliance_logo(event.alliance_id)),
+            timestamp: Some(observed_at),
         }
     }
 
@@ -2130,6 +2301,61 @@ fn yes_no(value: bool) -> &'static str {
     }
 }
 
+/// Groups a positive integer with thousands separators (ticket 20: member
+/// counts are never abbreviated, e.g. `1,540`). Negative values keep their
+/// sign.
+fn thousands(value: i64) -> String {
+    let negative = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let mut grouped = String::new();
+    let len = digits.len();
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (len - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    if negative {
+        format!("-{grouped}")
+    } else {
+        grouped
+    }
+}
+
+/// A signed member-count delta with an explicit sign for the "this cycle"
+/// clause (ticket 20: `(+124 this cycle)` / `(-12 this cycle)`).
+fn signed_thousands(value: i64) -> String {
+    if value >= 0 {
+        format!("+{}", thousands(value))
+    } else {
+        thousands(value)
+    }
+}
+
+fn wl_alliance_logo(alliance_id: i64) -> String {
+    format!("https://images.evetech.net/alliances/{alliance_id}/logo?size=64")
+}
+
+fn wl_corp_logo(corporation_id: i64) -> String {
+    format!("https://images.evetech.net/corporations/{corporation_id}/logo?size=64")
+}
+
+/// The `Name` part of an entity label (no ticker), for the plain-language
+/// titles that read "... joined Snuffed Out" rather than repeating the
+/// ticker already carried in the corporation label.
+fn entity_name_only(
+    name: &Option<String>,
+    ticker: &Option<String>,
+    kind_label: &str,
+    id: i64,
+) -> String {
+    match (name.as_deref(), ticker.as_deref()) {
+        (Some(name), _) => name.to_string(),
+        (None, Some(ticker)) => format!("[{ticker}]"),
+        (None, None) => format!("{kind_label} {id}"),
+    }
+}
+
 /// Renders an entity as `Name [TICKER]`, falling back through
 /// `Name`, `[TICKER]`, or `<Kind> <id>` when parts are unresolved.
 fn entity_label(
@@ -2143,5 +2369,45 @@ fn entity_label(
         (Some(name), None) => name.to_string(),
         (None, Some(ticker)) => format!("[{ticker}]"),
         (None, None) => format!("{kind_label} {id}"),
+    }
+}
+
+#[cfg(test)]
+mod dense_render_tests {
+    use super::*;
+
+    #[test]
+    fn thousands_groups_without_abbreviating() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(124), "124");
+        assert_eq!(thousands(1_540), "1,540");
+        assert_eq!(thousands(1_355), "1,355");
+        assert_eq!(thousands(1_000_000), "1,000,000");
+        assert_eq!(thousands(-12), "-12");
+    }
+
+    #[test]
+    fn signed_thousands_carries_an_explicit_sign() {
+        assert_eq!(signed_thousands(124), "+124");
+        assert_eq!(signed_thousands(-124), "-124");
+        assert_eq!(signed_thousands(1_540), "+1,540");
+    }
+
+    #[test]
+    fn entity_name_only_drops_the_ticker() {
+        assert_eq!(
+            entity_name_only(
+                &Some("Snuffed Out".to_string()),
+                &Some("B B C".to_string()),
+                "Alliance",
+                1
+            ),
+            "Snuffed Out"
+        );
+        assert_eq!(
+            entity_name_only(&None, &Some("B B C".to_string()), "Alliance", 1),
+            "[B B C]"
+        );
+        assert_eq!(entity_name_only(&None, &None, "Alliance", 7), "Alliance 7");
     }
 }
