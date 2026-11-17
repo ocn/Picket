@@ -11,8 +11,14 @@ changes, and assign the final version and release date. See the
 
 ### Changed
 
-- Restrict subscription management, watchlist management, and standings-sync
-  commands to Manage Server permissions by default, and disable them in DMs.
+- Require explicit operator-managed guild user or role grants for subscription,
+  watchlist and standings changes, including buttons and SSO continuations.
+  Manage Server is no longer required; Administrator and Discord overrides do
+  not bypass the policy. Write commands remain guild-only; `/watch list` becomes
+  available to guild members. Provision grants before adopting this version.
+  The startup-only policy mounts read-only beside writable state; missing or
+  invalid policy disables writes while existing Feeds continue. See the
+  [operator guide](docs/write-authorization.md).
 - Show ship type names for individually tracked ships in killmail fleet
   composition, while retaining group names for group-based tracking.
 - Rename the project to Picket. Documentation and the repository change now;
