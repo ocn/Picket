@@ -29,19 +29,22 @@ Picket is built and run by an EVE Online Partner. If it earns a place in your se
 
 ## Get it
 
-**Invite the public instance.** It runs the Killfeed only. [Invite Picket](https://discordapp.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=149504&scope=bot), then run `/subscribe` in the channel that should receive kills.
+**Invite the public instance.** It runs the Killfeed only. [Invite Picket](https://discordapp.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=149504&scope=bot), then ask its operator to grant write access before running `/subscribe` in the channel that should receive kills.
 
 **Or self-host.** Every Feed, on your own box:
 
 ```shell
 git clone https://github.com/ocn/Picket && cd Picket
 cp docs/env.sample .env        # add DISCORD_BOT_TOKEN and DISCORD_CLIENT_ID
+mkdir -p policy
+cp policy/write-policy.example.json policy/write-policy.json
+                              # add explicit guild user/role grants; the example denies every write
 docker compose up --build -d
 ```
 
 The Killfeed works with just the two Discord variables. The Contract, Sov Timer, and Watchlist Feeds need PostgreSQL (`CONTRACT_DATABASE_URL`) and start only when it is set. Each Feed section below says what else it needs.
 
-Every subscribe, unsubscribe, and watchlist command needs the Manage Server permission and cannot be used in DMs. Server admins can loosen that per role under Server Settings, Integrations, the bot, Command permissions.
+Subscription, watchlist, and standings changes require an explicit user or role grant for that server in the operator's [Write Policy](docs/write-authorization.md). Manage Server is not required; Administrator and Discord command overrides cannot bypass the policy. Write commands cannot be started in DMs; standings continuations require the original writer and current guild membership/grant. `/watch list` is available to guild members. Existing Discord command overrides may still restrict command availability.
 
 ## Feeds
 
@@ -130,7 +133,7 @@ Full reference: [docs/sov-and-watchlist-feeds.md](docs/sov-and-watchlist-feeds.m
 | `/health` | Shows the persisted runtime health snapshot. Answers only the configured operator. |
 | `/ping` | Checks the bot is up. |
 
-The [contract runbook](docs/contract-intelligence.md) and the [sov and watchlist runbook](docs/sov-and-watchlist-feeds.md) cover start-up verification, recovery, and retention. Screenshots in this README are rendered from the bot's real payloads with `scripts/render-screenshots.mjs`.
+The [write authorization guide](docs/write-authorization.md) covers grant provisioning, adoption, restart and policy-path overrides. The [contract runbook](docs/contract-intelligence.md) and the [sov and watchlist runbook](docs/sov-and-watchlist-feeds.md) cover start-up verification, recovery, and retention. Screenshots in this README are rendered from the bot's real payloads with `scripts/render-screenshots.mjs`.
 
 ## Development
 

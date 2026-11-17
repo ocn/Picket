@@ -19,3 +19,7 @@ config-old/
 # Local issue tracker and deployment rollout records: kept out of the public repo
 .scratch/
 docs/rollouts/
+
+# Operator grants stay local; the checked-in example denies all writes.
+/policy/*
+!/policy/write-policy.example.json
