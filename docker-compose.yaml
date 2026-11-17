@@ -40,6 +40,7 @@ services:
       DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID}
       EVE_CLIENT_ID: ${EVE_CLIENT_ID}
       EVE_CLIENT_SECRET: ${EVE_CLIENT_SECRET}
+      PICKET_WRITE_POLICY_PATH: ${PICKET_WRITE_POLICY_PATH:-policy/write-policy.json}
       STRUCTURE_RESOLVER_ENABLED: ${STRUCTURE_RESOLVER_ENABLED:-false}
       STRUCTURE_RESOLVER_CHARACTER_ID: ${STRUCTURE_RESOLVER_CHARACTER_ID:-}
       STRUCTURE_RESOLVER_REFRESH_TOKEN: ${STRUCTURE_RESOLVER_REFRESH_TOKEN:-}
@@ -78,6 +79,7 @@ services:
       HEALTH_FEED_VALIDATION_CRITICAL_FAILURES: ${HEALTH_FEED_VALIDATION_CRITICAL_FAILURES:-3}
     volumes:
       - ./config:/app/config:delegated
+      - ./policy:/app/policy:ro
 
   health-watchdog:
     entrypoint: ["/bin/sh", "-c", 'umask 077; exec "$$@"', "--"]

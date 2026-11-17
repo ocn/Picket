@@ -812,6 +812,7 @@ mod tests {
             user_standings: Arc::new(Default::default()),
             user_standings_file_lock: Default::default(),
             sso_states: Arc::new(Default::default()),
+            write_policy: Arc::default(),
         })
     }
 

@@ -7,6 +7,7 @@ backups/
 **/.git/
 **/.worktrees/
 **/.scratch/
+**/.superpowers/
 **/.claude/
 **/.agents/
 **/.codex/
@@ -14,3 +15,5 @@ backups/
 **/__pycache__/
 **/*.pyc
 **/.DS_Store
+policy/*
+!policy/write-policy.example.json
