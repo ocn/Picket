@@ -419,6 +419,9 @@ async fn invalid_bindings_are_rejected_before_membership_or_business_io() {
             100
         }));
         request.channel_id.0 = if mismatch == "channel" { 999 } else { 200 };
+        let mut member = command("sync_standings").member.unwrap();
+        member.guild_id = request.guild_id.unwrap();
+        request.member = Some(member);
         let mut spy = ContinuationSpy::default();
         dispatch_component(&policy(), &states, &request, &mut spy).await;
         assert_eq!(spy.events, ["ack-private", "deny-private"]);
