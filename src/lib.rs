@@ -23,6 +23,7 @@ mod screenshot_payloads;
 pub mod sov_feed;
 pub mod structure_resolver;
 pub mod watchlist_feed;
+pub mod write_policy;
 
 use crate::commands::contract_subscribe::ContractSubscribeCommand;
 use crate::commands::contract_unsubscribe::ContractUnsubscribeCommand;
