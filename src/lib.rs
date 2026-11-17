@@ -21,27 +21,12 @@ pub mod processor;
 #[cfg(test)]
 mod screenshot_payloads;
 pub mod sov_feed;
+pub mod standings_continuation;
 pub mod structure_resolver;
 pub mod watchlist_feed;
+pub mod write_authorization;
 pub mod write_policy;
 
-use crate::commands::contract_subscribe::ContractSubscribeCommand;
-use crate::commands::contract_unsubscribe::ContractUnsubscribeCommand;
-use crate::commands::find_unsubscribed::FindUnsubscribedChannelsCommand;
-use crate::commands::health::HealthCommand;
-use crate::commands::sov_subscribe::SovSubscribeCommand;
-use crate::commands::sov_timers::SovTimersCommand;
-use crate::commands::sov_unsubscribe::SovUnsubscribeCommand;
-use crate::commands::watch::WatchCommand;
-use crate::commands::watch_subscribe::WatchSubscribeCommand;
-use crate::commands::watch_unsubscribe::WatchUnsubscribeCommand;
-use commands::diag::DiagCommand;
-use commands::subscribe::SubscribeCommand;
-use commands::sync_clear::SyncClearCommand;
-use commands::sync_remove::SyncRemoveCommand;
-use commands::sync_standings::SyncStandingsCommand;
-use commands::unsubscribe::UnsubscribeCommand;
-use commands::{Command, PingCommand};
 use config::FeedProvider;
 use discord_bot::CommandMap;
 use feed::KillmailFeed;
@@ -321,6 +306,18 @@ fn generate_queue_id() -> String {
 pub async fn run() {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
+    let policy_path = std::env::var_os("PICKET_WRITE_POLICY_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("policy/write-policy.json"));
+    write_authorization::initialize_with_policy(
+        &policy_path,
+        std::path::Path::new("config"),
+        run_with_policy,
+    )
+    .await;
+}
+
+async fn run_with_policy(write_policy: Arc<write_policy::WritePolicy>) {
     info!("Starting Killbot-Rust...");
 
     // --- Load all configurations ---
@@ -396,7 +393,7 @@ pub async fn run() {
     let subscriptions = config::load_all_subscriptions("config/");
 
     // --- Initialize application state ---
-    let app_state = Arc::new(config::AppState::new(
+    let mut app_state = config::AppState::new(
         app_config.clone(),
         systems,
         ships,
@@ -405,69 +402,11 @@ pub async fn run() {
         group_names,
         subscriptions,
         user_standings,
-    ));
-
-    // --- Initialize Commands ---
-    let mut command_map: HashMap<String, Box<dyn Command>> = HashMap::new();
-
-    let ping_command = Box::new(PingCommand);
-    command_map.insert(ping_command.name(), ping_command);
-
-    let subscribe_command = Box::new(SubscribeCommand);
-    command_map.insert(subscribe_command.name(), subscribe_command);
-
-    let unsubscribe_command = Box::new(UnsubscribeCommand);
-    command_map.insert(unsubscribe_command.name(), unsubscribe_command);
-
-    let diag_command = Box::new(DiagCommand);
-    command_map.insert(diag_command.name(), diag_command);
-
-    let health_command = Box::new(HealthCommand);
-    command_map.insert(health_command.name(), health_command);
-
-    let sync_standings_command = Box::new(SyncStandingsCommand);
-    command_map.insert(sync_standings_command.name(), sync_standings_command);
-
-    let sync_remove_command = Box::new(SyncRemoveCommand);
-    command_map.insert(sync_remove_command.name(), sync_remove_command);
-
-    let sync_clear_command = Box::new(SyncClearCommand);
-    command_map.insert(sync_clear_command.name(), sync_clear_command);
-
-    let find_unsubscribed_command = Box::new(FindUnsubscribedChannelsCommand);
-    command_map.insert(find_unsubscribed_command.name(), find_unsubscribed_command);
-
-    let contract_subscribe_command = Box::new(ContractSubscribeCommand);
-    command_map.insert(
-        contract_subscribe_command.name(),
-        contract_subscribe_command,
     );
+    app_state.write_policy = write_policy;
+    let app_state = Arc::new(app_state);
 
-    let contract_unsubscribe_command = Box::new(ContractUnsubscribeCommand);
-    command_map.insert(
-        contract_unsubscribe_command.name(),
-        contract_unsubscribe_command,
-    );
-
-    let sov_subscribe_command = Box::new(SovSubscribeCommand);
-    command_map.insert(sov_subscribe_command.name(), sov_subscribe_command);
-
-    let sov_unsubscribe_command = Box::new(SovUnsubscribeCommand);
-    command_map.insert(sov_unsubscribe_command.name(), sov_unsubscribe_command);
-
-    let sov_timers_command = Box::new(SovTimersCommand);
-    command_map.insert(sov_timers_command.name(), sov_timers_command);
-
-    let watch_command = Box::new(WatchCommand);
-    command_map.insert(watch_command.name(), watch_command);
-
-    let watch_subscribe_command = Box::new(WatchSubscribeCommand);
-    command_map.insert(watch_subscribe_command.name(), watch_subscribe_command);
-
-    let watch_unsubscribe_command = Box::new(WatchUnsubscribeCommand);
-    command_map.insert(watch_unsubscribe_command.name(), watch_unsubscribe_command);
-
-    let command_map_arc = Arc::new(command_map);
+    let command_map_arc = Arc::new(commands::registered_commands());
 
     let contract_runtime = match std::env::var("CONTRACT_DATABASE_URL") {
         Ok(database_url) => Some((
