@@ -326,6 +326,16 @@ _Avoid_: Reused release
 The version-controlled record of every Release Window, stating its date, published version or skip, and reason.
 _Avoid_: Changelog
 
+## Write authorization
+
+**User-Initiated Write**:
+A change a Discord user requests to Subscriptions, the Watchlist Feed's watched entities, or saved standings and character authorizations, including completion through buttons or SSO callbacks. Normal automated Feed delivery is independent of this permission.
+_Avoid_: Host access, arbitrary write access
+
+**Write Policy**:
+The operator-managed set of user IDs and role IDs allowed to request User-Initiated Writes in a particular Discord guild. A user must match an explicit grant; Discord administrator status alone grants no authority.
+_Avoid_: Discord command visibility, host sandbox
+
 ## Feed diagnostics
 
 **Feed Diagnostic Snapshot**:
