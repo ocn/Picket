@@ -41,6 +41,32 @@ pub trait Command: Send + Sync {
     );
 }
 
+pub fn registered_commands() -> std::collections::HashMap<String, Box<dyn Command>> {
+    let commands: Vec<Box<dyn Command>> = vec![
+        Box::new(PingCommand),
+        Box::new(diag::DiagCommand),
+        Box::new(health::HealthCommand),
+        Box::new(find_unsubscribed::FindUnsubscribedChannelsCommand),
+        Box::new(subscribe::SubscribeCommand),
+        Box::new(unsubscribe::UnsubscribeCommand),
+        Box::new(contract_subscribe::ContractSubscribeCommand),
+        Box::new(contract_unsubscribe::ContractUnsubscribeCommand),
+        Box::new(sov_subscribe::SovSubscribeCommand),
+        Box::new(sov_unsubscribe::SovUnsubscribeCommand),
+        Box::new(sov_timers::SovTimersCommand),
+        Box::new(watch::WatchCommand),
+        Box::new(watch_subscribe::WatchSubscribeCommand),
+        Box::new(watch_unsubscribe::WatchUnsubscribeCommand),
+        Box::new(sync_standings::SyncStandingsCommand),
+        Box::new(sync_remove::SyncRemoveCommand),
+        Box::new(sync_clear::SyncClearCommand),
+    ];
+    commands
+        .into_iter()
+        .map(|command| (command.name(), command))
+        .collect()
+}
+
 // --- HELPER FUNCTIONS ---
 
 pub fn get_option_value<'a>(
@@ -89,12 +115,6 @@ impl Command for PingCommand {
 
 #[cfg(test)]
 mod permission_gating_tests {
-    //! Ticket 16: every subscription-management command must register
-    //! `default_member_permissions(MANAGE_GUILD)` and `dm_permission(false)`,
-    //! while the read-open commands (`ping`, `diag`, `sov_timers`, `health`)
-    //! must carry neither key. Each test builds the command's registration
-    //! JSON and inspects the raw builder map, following the existing
-    //! `sov_subscribe_exposes_bounded_options` pattern.
     use super::contract_subscribe::ContractSubscribeCommand;
     use super::contract_unsubscribe::ContractUnsubscribeCommand;
     use super::diag::DiagCommand;
@@ -142,6 +162,22 @@ mod permission_gating_tests {
         );
     }
 
+    fn assert_write_available(command: &dyn Command) {
+        let builder = built(command);
+        assert!(
+            builder.0.get("default_member_permissions").is_none(),
+            "/{} requires application write policy only",
+            command.name()
+        );
+        assert_eq!(
+            builder
+                .0
+                .get("dm_permission")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+    }
+
     fn assert_no_default_permission(command: &dyn Command) {
         let name = command.name();
         let builder = built(command);
@@ -156,63 +192,63 @@ mod permission_gating_tests {
     }
 
     #[test]
-    fn subscribe_is_gated_on_manage_guild() {
-        assert_gated_on_manage_guild(&SubscribeCommand);
+    fn subscribe_is_available_in_guild_without_manage_guild() {
+        assert_write_available(&SubscribeCommand);
     }
 
     #[test]
-    fn unsubscribe_is_gated_on_manage_guild() {
-        assert_gated_on_manage_guild(&UnsubscribeCommand);
+    fn unsubscribe_is_available_in_guild_without_manage_guild() {
+        assert_write_available(&UnsubscribeCommand);
     }
 
     #[test]
-    fn contract_subscribe_is_gated_on_manage_guild() {
-        assert_gated_on_manage_guild(&ContractSubscribeCommand);
+    fn contract_subscribe_is_available_in_guild_without_manage_guild() {
+        assert_write_available(&ContractSubscribeCommand);
     }
 
     #[test]
-    fn contract_unsubscribe_is_gated_on_manage_guild() {
-        assert_gated_on_manage_guild(&ContractUnsubscribeCommand);
+    fn contract_unsubscribe_is_available_in_guild_without_manage_guild() {
+        assert_write_available(&ContractUnsubscribeCommand);
     }
 
     #[test]
-    fn sov_subscribe_is_gated_on_manage_guild() {
-        assert_gated_on_manage_guild(&SovSubscribeCommand);
+    fn sov_subscribe_is_available_in_guild_without_manage_guild() {
+        assert_write_available(&SovSubscribeCommand);
     }
 
     #[test]
-    fn sov_unsubscribe_is_gated_on_manage_guild() {
-        assert_gated_on_manage_guild(&SovUnsubscribeCommand);
+    fn sov_unsubscribe_is_available_in_guild_without_manage_guild() {
+        assert_write_available(&SovUnsubscribeCommand);
     }
 
     #[test]
-    fn watch_group_is_gated_on_manage_guild() {
-        assert_gated_on_manage_guild(&WatchCommand);
+    fn watch_group_is_available_in_guild_without_manage_guild() {
+        assert_write_available(&WatchCommand);
     }
 
     #[test]
-    fn watch_subscribe_is_gated_on_manage_guild() {
-        assert_gated_on_manage_guild(&WatchSubscribeCommand);
+    fn watch_subscribe_is_available_in_guild_without_manage_guild() {
+        assert_write_available(&WatchSubscribeCommand);
     }
 
     #[test]
-    fn watch_unsubscribe_is_gated_on_manage_guild() {
-        assert_gated_on_manage_guild(&WatchUnsubscribeCommand);
+    fn watch_unsubscribe_is_available_in_guild_without_manage_guild() {
+        assert_write_available(&WatchUnsubscribeCommand);
     }
 
     #[test]
-    fn sync_standings_is_gated_on_manage_guild() {
-        assert_gated_on_manage_guild(&SyncStandingsCommand);
+    fn sync_standings_is_available_in_guild_without_manage_guild() {
+        assert_write_available(&SyncStandingsCommand);
     }
 
     #[test]
-    fn sync_remove_is_gated_on_manage_guild() {
-        assert_gated_on_manage_guild(&SyncRemoveCommand);
+    fn sync_remove_is_available_in_guild_without_manage_guild() {
+        assert_write_available(&SyncRemoveCommand);
     }
 
     #[test]
-    fn sync_clear_is_gated_on_manage_guild() {
-        assert_gated_on_manage_guild(&SyncClearCommand);
+    fn sync_clear_is_available_in_guild_without_manage_guild() {
+        assert_write_available(&SyncClearCommand);
     }
 
     #[test]
