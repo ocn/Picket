@@ -192,6 +192,7 @@ fn app_state_for_ping_limiter() -> Arc<AppState> {
         user_standings: Arc::new(Default::default()),
         user_standings_file_lock: Mutex::new(()),
         sso_states: Arc::new(Default::default()),
+        write_policy: Arc::default(),
     })
 }
 
