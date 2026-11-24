@@ -43,16 +43,21 @@ The feed operates as a simple state machine:
 2. **Poll** -- Request `/ephemeral/{sequence}.json`.
    - **200 OK** -- Parse the killmail, advance the sequence, persist the
      checkpoint, and hand the killmail to the processing pipeline.
-   - **404 Not Found** -- The next killmail hasn't been published yet. Wait
-     `R2Z2_POLL_INTERVAL_SECS` (default 6s) and retry the same sequence.
+   - **404 Not Found** -- Check `/ephemeral/sequence.json`. If the missing
+     sequence is behind that pointer, skip it and try the following sequence.
+     Otherwise wait `R2Z2_POLL_INTERVAL_SECS` (default 6s) and retry the same
+     sequence.
    - **429 Too Many Requests** -- Wait 10-20s (jittered) and retry.
    - **5xx / transport error** -- Exponential backoff (1s to 60s, jittered)
      and retry.
 
 3. **Resync** -- If the feed hits `R2Z2_MAX_CONSECUTIVE_404S` (default 10) or
    stays in the 404 loop for longer than `R2Z2_RESYNC_TIMEOUT_SECS` (default
-   300s), it re-fetches `/ephemeral/sequence.json` to jump to the current head.
-   This handles gaps in the sequence caused by the ephemeral retention window.
+   300s), it resets the 404 tracking window while retaining the pending
+   sequence and normal polling delay. The discovery pointer updates every
+   51 killmails and may lag sequences already consumed, so it must not rewind
+   the cursor. Forward recovery past missing historical sequences happens
+   through the per-404 pointer check above.
 
 4. **Checkpoint** -- After each successfully processed killmail, the next
    sequence number is atomically written to `config/r2z2_sequence.json`
@@ -69,8 +74,8 @@ All settings have sensible defaults. Override via environment variables:
 | `R2Z2_CONNECT_TIMEOUT_SECS` | 10 | TCP connect timeout |
 | `R2Z2_REQUEST_TIMEOUT_SECS` | 15 | Per-request timeout |
 | `R2Z2_POLL_INTERVAL_SECS` | 6 | Delay between polls on 404 |
-| `R2Z2_MAX_CONSECUTIVE_404S` | 10 | 404s before resync |
-| `R2Z2_RESYNC_TIMEOUT_SECS` | 300 | Max time in 404 loop before resync |
+| `R2Z2_MAX_CONSECUTIVE_404S` | 10 | 404s before resetting the tracking window |
+| `R2Z2_RESYNC_TIMEOUT_SECS` | 300 | Max time in the 404 tracking window |
 | `ESI_HTTP_TIMEOUT_SECS` | 15 | ESI/Fuzzwork client timeout |
 | `KILLMAIL_PROCESS_TIMEOUT_SECS` | 60 | Watchdog: max time per killmail |
 

@@ -49,11 +49,19 @@ pub struct R2z2Feed {
     state: Mutex<R2z2State>,
     config: Arc<AppConfig>,
     checkpoint_path: PathBuf,
+    base_url: String,
 }
 
 impl R2z2Feed {
     pub fn new(config: &Arc<AppConfig>) -> Self {
-        let checkpoint_path = PathBuf::from("config/r2z2_sequence.json");
+        Self::with_endpoint(
+            config,
+            R2Z2_BASE_URL.to_string(),
+            PathBuf::from("config/r2z2_sequence.json"),
+        )
+    }
+
+    fn with_endpoint(config: &Arc<AppConfig>, base_url: String, checkpoint_path: PathBuf) -> Self {
         let initial_sequence = Self::load_checkpoint(&checkpoint_path);
 
         let client = Client::builder()
@@ -73,6 +81,7 @@ impl R2z2Feed {
             }),
             config: Arc::clone(config),
             checkpoint_path,
+            base_url,
         }
     }
 
@@ -118,7 +127,7 @@ impl R2z2Feed {
     /// Fetch the current latest sequence from R2Z2's sequence.json.
     /// Retries indefinitely on failure with exponential backoff.
     async fn fetch_sequence(&self, state: &mut R2z2State) -> i64 {
-        let url = format!("{}/ephemeral/sequence.json", R2Z2_BASE_URL);
+        let url = format!("{}/ephemeral/sequence.json", self.base_url);
 
         loop {
             match self.client.get(&url).send().await {
@@ -191,7 +200,7 @@ impl R2z2Feed {
         }
     }
 
-    /// Try to resync: reset state and fetch fresh sequence.
+    /// Whether the 404 tracking window has reached either configured threshold.
     fn needs_resync(&self, state: &R2z2State) -> bool {
         if state.consecutive_404s >= self.config.r2z2_max_consecutive_404s {
             return true;
@@ -236,7 +245,7 @@ impl KillmailFeed for R2z2Feed {
             self.save_checkpoint(state.sequence);
         }
 
-        let url = format!("{}/ephemeral/{}.json", R2Z2_BASE_URL, state.sequence);
+        let url = format!("{}/ephemeral/{}.json", self.base_url, state.sequence);
 
         match self.client.get(&url).send().await {
             Ok(response) => {
@@ -293,14 +302,11 @@ impl KillmailFeed for R2z2Feed {
 
                     if self.needs_resync(&state) {
                         warn!(
-                            "R2Z2: {} consecutive 404s, resyncing from sequence.json",
-                            state.consecutive_404s
+                            "R2Z2: {} consecutive 404s; discovery sequence {} is not ahead of pending sequence {}, retaining cursor",
+                            state.consecutive_404s, latest_sequence, missing_sequence
                         );
                         state.consecutive_404s = 0;
                         state.first_404_at = None;
-                        state.sequence = self.fetch_sequence(&mut state).await;
-                        self.save_checkpoint(state.sequence);
-                        return Ok(None);
                     }
 
                     // Wait poll_interval before returning
@@ -383,6 +389,263 @@ impl KillmailFeed for R2z2Feed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    type Replies = HashMap<String, VecDeque<(u16, serde_json::Value)>>;
+
+    struct HttpFixture {
+        base_url: String,
+        directory: tempfile::TempDir,
+        replies: Arc<StdMutex<Replies>>,
+        requests: Arc<StdMutex<Vec<String>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl HttpFixture {
+        async fn new(sequence: i64) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let replies = Arc::new(StdMutex::new(Replies::new()));
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            let server_replies = replies.clone();
+            let server_requests = requests.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        let mut buffer = [0; 1024];
+                        let count = stream.read(&mut buffer).await.unwrap();
+                        if count == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buffer[..count]);
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    let path = request.split_whitespace().nth(1).unwrap().to_string();
+                    server_requests.lock().unwrap().push(path.clone());
+                    let (status, body) = {
+                        let mut replies = server_replies.lock().unwrap();
+                        match replies.get_mut(&path) {
+                            Some(queue) if queue.len() > 1 => queue.pop_front().unwrap(),
+                            Some(queue) => queue.front().unwrap().clone(),
+                            None => (404, serde_json::json!({})),
+                        }
+                    };
+                    let body = body.to_string();
+                    let response = format!(
+                        "HTTP/1.1 {status} fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(
+                directory.path().join("sequence.json"),
+                serde_json::json!({"sequence": sequence}).to_string(),
+            )
+            .unwrap();
+            Self {
+                base_url,
+                directory,
+                replies,
+                requests,
+                server,
+            }
+        }
+
+        fn reply(&self, path: &str, status: u16, body: serde_json::Value) {
+            self.replies
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), VecDeque::from([(status, body)]));
+        }
+
+        fn feed(&self, config: &Arc<AppConfig>) -> R2z2Feed {
+            R2z2Feed::with_endpoint(
+                config,
+                self.base_url.clone(),
+                self.directory.path().join("sequence.json"),
+            )
+        }
+    }
+
+    impl Drop for HttpFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    fn fixture_config() -> Arc<AppConfig> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "discord_bot_token": "fixture", "discord_client_id": 0,
+                "eve_client_id": "", "eve_client_secret": "",
+                "r2z2_poll_interval_secs": 1,
+                "r2z2_max_consecutive_404s": 1,
+                "r2z2_resync_timeout_secs": 300,
+                "r2z2_request_timeout_secs": 2,
+                "r2z2_connect_timeout_secs": 2
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn fixture_killmail(killmail_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "killmail_id": killmail_id, "hash": "fixture",
+            "zkb": {
+                "hash": "fixture", "fittedValue": 1, "droppedValue": 0,
+                "destroyedValue": 1, "totalValue": 1, "points": 1,
+                "npc": false, "solo": false, "awox": false
+            }
+        })
+    }
+
+    async fn next(feed: &R2z2Feed) -> Option<ZkDataNoEsi> {
+        tokio::time::timeout(Duration::from_secs(10), feed.next())
+            .await
+            .expect("feed iteration deadline")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn count_resync_does_not_replay_and_restart_resumes_pending_sequence() {
+        let fixture = HttpFixture::new(100).await;
+        fixture.reply("/ephemeral/100.json", 200, fixture_killmail(9001));
+        fixture.reply(
+            "/ephemeral/sequence.json",
+            200,
+            serde_json::json!({"sequence": 100}),
+        );
+        let config = fixture_config();
+        let feed = fixture.feed(&config);
+        assert_eq!(next(&feed).await.unwrap().kill_id, 9001);
+        let started = Instant::now();
+        assert!(next(&feed).await.is_none());
+        let waited = started.elapsed();
+        assert!(
+            next(&feed).await.is_none(),
+            "resync must not emit sequence 100 again"
+        );
+        assert!(
+            waited >= Duration::from_secs(1),
+            "resync must retain the polling delay"
+        );
+        drop(feed);
+        fixture.reply("/ephemeral/101.json", 200, fixture_killmail(9002));
+        let restarted = fixture.feed(&config);
+        assert_eq!(next(&restarted).await.unwrap().kill_id, 9002);
+        assert_eq!(
+            fixture.requests.lock().unwrap().as_slice(),
+            [
+                "/ephemeral/100.json",
+                "/ephemeral/101.json",
+                "/ephemeral/sequence.json",
+                "/ephemeral/101.json",
+                "/ephemeral/sequence.json",
+                "/ephemeral/101.json",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn elapsed_resync_retains_cursor_and_delay_with_stale_or_equal_head() {
+        for head in [100, 101] {
+            let fixture = HttpFixture::new(100).await;
+            fixture.reply("/ephemeral/100.json", 200, fixture_killmail(9001));
+            fixture.reply(
+                "/ephemeral/sequence.json",
+                200,
+                serde_json::json!({"sequence": head}),
+            );
+            let mut config = fixture_config();
+            let settings = Arc::make_mut(&mut config);
+            settings.r2z2_max_consecutive_404s = 100;
+            settings.r2z2_resync_timeout_secs = 1;
+            let feed = fixture.feed(&config);
+            assert_eq!(next(&feed).await.unwrap().kill_id, 9001);
+            for _ in 0..3 {
+                let started = Instant::now();
+                assert!(next(&feed).await.is_none());
+                assert!(started.elapsed() >= Duration::from_secs(1));
+            }
+            assert_eq!(
+                fixture
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|path| path.as_str() == "/ephemeral/100.json")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resync_does_not_refetch_head_and_skip_newly_available_pending_sequence() {
+        let fixture = HttpFixture::new(100).await;
+        fixture.reply("/ephemeral/100.json", 200, fixture_killmail(9001));
+        fixture.reply("/ephemeral/103.json", 200, fixture_killmail(9003));
+        fixture.replies.lock().unwrap().insert(
+            "/ephemeral/sequence.json".to_string(),
+            VecDeque::from([
+                (200, serde_json::json!({"sequence": 100})),
+                (200, serde_json::json!({"sequence": 103})),
+            ]),
+        );
+        let feed = fixture.feed(&fixture_config());
+        assert_eq!(next(&feed).await.unwrap().kill_id, 9001);
+        assert!(next(&feed).await.is_none());
+        fixture.reply("/ephemeral/101.json", 200, fixture_killmail(9002));
+        assert_eq!(next(&feed).await.unwrap().kill_id, 9002);
+        assert_eq!(
+            fixture.requests.lock().unwrap().as_slice(),
+            [
+                "/ephemeral/100.json",
+                "/ephemeral/101.json",
+                "/ephemeral/sequence.json",
+                "/ephemeral/101.json",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_gap_and_null_placeholder_recovery_still_emit_subsequent_killmail() {
+        let fixture = HttpFixture::new(100).await;
+        fixture.reply(
+            "/ephemeral/sequence.json",
+            200,
+            serde_json::json!({"sequence": 102}),
+        );
+        fixture.reply(
+            "/ephemeral/101.json",
+            200,
+            serde_json::json!({
+                "killmail_id": null, "hash": null, "esi": null,
+                "zkb": {"href": "https://esi.evetech.net/killmails///"}
+            }),
+        );
+        fixture.reply("/ephemeral/102.json", 200, fixture_killmail(9002));
+        let feed = fixture.feed(&fixture_config());
+        assert!(next(&feed).await.is_none());
+        assert!(next(&feed).await.is_none());
+        assert_eq!(next(&feed).await.unwrap().kill_id, 9002);
+        assert_eq!(
+            fixture.requests.lock().unwrap().as_slice(),
+            [
+                "/ephemeral/100.json",
+                "/ephemeral/sequence.json",
+                "/ephemeral/101.json",
+                "/ephemeral/102.json",
+            ]
+        );
+    }
 
     #[test]
     fn test_checkpoint_roundtrip() {
