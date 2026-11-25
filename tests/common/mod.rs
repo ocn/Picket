@@ -83,6 +83,7 @@ pub async fn create_app_state_with_subscriptions(
         user_standings: Arc::new(Default::default()),
         user_standings_file_lock: Default::default(),
         sso_states: Arc::new(Default::default()),
+        write_policy: Arc::default(),
     })
 }
 
@@ -143,6 +144,7 @@ pub fn create_app_state_with_seeded_caches(
         user_standings: Arc::new(Default::default()),
         user_standings_file_lock: Default::default(),
         sso_states: Arc::new(Default::default()),
+        write_policy: Arc::default(),
     })
 }
 

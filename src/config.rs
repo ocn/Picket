@@ -513,6 +513,7 @@ pub struct UserStandings {
 }
 
 // Helper struct for tracking the SSO state
+#[derive(Clone)]
 pub struct SsoState {
     pub discord_user_id: UserId,
     pub subscription_id: String,
@@ -609,6 +610,7 @@ pub struct AppState {
     pub group_names: Arc<RwLock<HashMap<u32, String>>>,
     pub subscriptions: Arc<RwLock<HashMap<GuildId, Vec<Subscription>>>>,
     pub app_config: Arc<AppConfig>,
+    pub write_policy: Arc<crate::write_policy::WritePolicy>,
     pub esi_client: EsiClient,
     pub celestial_cache: Cache<u32, Arc<Celestial>>,
     pub systems_file_lock: Mutex<()>,
@@ -620,7 +622,7 @@ pub struct AppState {
     pub last_ping_times: Mutex<HashMap<u64, Instant>>,
     pub user_standings: Arc<RwLock<HashMap<UserId, UserStandings>>>,
     pub user_standings_file_lock: Mutex<()>,
-    pub sso_states: Arc<Mutex<HashMap<String, SsoState>>>, // For tracking the SSO flow
+    pub sso_states: crate::write_authorization::PendingStates, // For tracking the SSO flow
 }
 
 pub const DEFAULT_CHANNEL_PING_COOLDOWN_MINUTES: u32 = 5;
@@ -697,6 +699,7 @@ impl AppState {
             subscriptions: Arc::new(RwLock::new(subscriptions)),
             esi_client: EsiClient::new(Duration::from_secs(app_config.esi_http_timeout_secs)),
             app_config: Arc::new(app_config),
+            write_policy: Arc::default(),
             celestial_cache: Cache::new(10_000),
             systems_file_lock: Mutex::new(()),
             ships_file_lock: Mutex::new(()),

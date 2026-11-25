@@ -7,7 +7,6 @@ use serenity::builder::CreateApplicationCommand;
 use serenity::builder::{CreateActionRow, CreateButton, CreateSelectMenu};
 use serenity::model::prelude::command::CommandOptionType;
 use serenity::model::prelude::interaction::application_command::ApplicationCommandInteraction;
-use serenity::model::Permissions;
 use serenity::prelude::Context;
 use std::sync::Arc;
 use tracing::error;
@@ -34,7 +33,6 @@ impl Command for SyncStandingsCommand {
     ) -> &'a mut CreateApplicationCommand {
         command
             .name("sync_standings")
-            .default_member_permissions(Permissions::MANAGE_GUILD)
             .dm_permission(false)
             .description("Sync a subscription with your EVE contacts to ignore blues.")
             .create_option(|option| {
@@ -62,7 +60,7 @@ impl Command for SyncStandingsCommand {
         command: &ApplicationCommandInteraction,
         app_state: &Arc<AppState>,
     ) {
-        if let Err(why) = command
+        if command
             .create_interaction_response(&ctx.http, |response| {
                 response.interaction_response_data(|message| {
                     message
@@ -71,8 +69,9 @@ impl Command for SyncStandingsCommand {
                 })
             })
             .await
+            .is_err()
         {
-            error!("Cannot respond to slash command: {}", why);
+            error!(reason = "sso_response_failed", "standings_continuation");
             return;
         }
 
@@ -118,7 +117,7 @@ impl Command for SyncStandingsCommand {
             .sso_states
             .lock()
             .await
-            .insert(state.clone(), sso_state);
+            .insert(state.clone(), Arc::new(sso_state));
 
         if existing_tokens.is_empty() {
             self.initiate_sso(ctx, command, app_state, &state).await;
@@ -144,7 +143,7 @@ impl Command for SyncStandingsCommand {
             let mut components2 = CreateActionRow::default();
             components2.add_button(reauth_button);
 
-            if let Err(why) = command
+            if command
                 .user
                 .direct_message(&ctx.http, |m| {
                     m.content("You have already authorized characters. Please choose one to sync with, or authorize a new one.")
@@ -154,8 +153,9 @@ impl Command for SyncStandingsCommand {
                      })
                 })
                 .await
+                .is_err()
             {
-                error!("Error sending DM with character selection: {:?}", why);
+                error!(reason = "character_selection_dm_failed", "standings_continuation");
             }
         }
     }
@@ -168,7 +168,7 @@ impl SyncStandingsCommand {
         command: &ApplicationCommandInteraction,
         app_state: &Arc<AppState>,
         state: &str,
-    ) {
+    ) -> bool {
         let client_id = &app_state.app_config.eve_client_id;
         let redirect_uri = "https://github.headempty.space/";
         let scopes = "esi-corporations.read_contacts.v1 esi-alliances.read_contacts.v1";
@@ -186,12 +186,14 @@ impl SyncStandingsCommand {
             sso_url
         );
 
-        if let Err(why) = command
+        let sent = command
             .user
-            .direct_message(&ctx.http, |m| m.content(instructions))
+            .direct_message(&ctx.http, |message| message.content(instructions))
             .await
-        {
-            error!("Error sending DM for SSO link: {:?}", why);
+            .is_ok();
+        if !sent {
+            error!(reason = "sso_instructions_failed", "standings_continuation");
         }
+        sent
     }
 }
